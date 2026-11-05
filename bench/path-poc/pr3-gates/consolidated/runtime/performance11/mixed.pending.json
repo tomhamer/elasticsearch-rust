@@ -1,0 +1,349 @@
+{
+  "kind": "mixed",
+  "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+  "master_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+  "binary_sha256": null,
+  "out": "/home/ubuntu/pr3-performance11/comparison-mixed",
+  "artifacts": [
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/paired_cluster.py",
+      "sha256": "4b14349f4a62c7b52100ded43fccaf36b19149d74a91c9d048a73aa6f67e9975"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/measure.py",
+      "sha256": "cc66f8460bfbf9039243872b0a10246820af3c6bc86f959bd3e2585ef13e00cd"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh",
+      "sha256": "44530fc46ea38cf7e83e96840fd07f965761b01afd4bfa7ec4373fc8b93380f9"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/adapt.py",
+      "sha256": "192a9186e676e758ee9eeb8b7d2ad963ac82a4ed2a416768d01312c7e1e8d92d"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/bind_ivf.py",
+      "sha256": "1660d0d176f523d2cc0f271bc73c63c7775da3f1df8db25fe9b4d601e485ece8"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/common.py",
+      "sha256": "cfa7ff0065c27ef2aab2bbccd6f2ea60d396a4242449e99cb2ff1323fe910d84"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/compare.py",
+      "sha256": "1b219f9883d24be85ac4673a683b33cb5bb08f1ca69c6a10017389a0f252f0fc"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/ivf_compare.py",
+      "sha256": "b85e2f416425b2f1fd74670e0d8a5d54df2f0a531fbfd731379bf89cf912f2ce"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/ivf_summary.py",
+      "sha256": "c04853e5e397aea979f2cf148a7e9ed9700f7a21d12c271d741cc73a1fd9c4a2"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/live_local.py",
+      "sha256": "f9e4e6fd52a5e13ded0f7cde61c99d3207c56e3943cb3c44c7723f975d855e4c"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/prepare.py",
+      "sha256": "ed05c54775b73069f255e6c9d61ccf8fed53b6454db00400b37ce8056752f62c"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/prepare_ivf.py",
+      "sha256": "494b09831b1e645431f5c7a1f11c421b35cf042295b165aad857062ff6cff2a0"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/pressure.py",
+      "sha256": "bf24a2d5c14a2e146723b2ef3174e5a545c017aecfeabed673a41cebc4d46674"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/rally_full.py",
+      "sha256": "7ceca7675c6b996d87bbef54661782cc51c3a84aa9f3360e52dc2e01dff2304f"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/run.py",
+      "sha256": "dd4548a5e67961edbad634a8842a3484c9b87e62990c4055bcdb99b0975f95f3"
+    },
+    {
+      "path": "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/pr3-gates/consolidated/runtime/discover.py",
+      "sha256": "85b0a8d482397b936696c0016f8ee1b8b56f3fd5802c380742ebd43c32f8b16a"
+    }
+  ],
+  "commands": [
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-candidate-r1",
+      "ENGINE=candidate",
+      "SOURCE_REVISION=b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+      "BINARY=/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-master-r1",
+      "ENGINE=master",
+      "SOURCE_REVISION=ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+      "BINARY=/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-es9-r1",
+      "ENGINE=es9",
+      "SOURCE_REVISION=es9-9.5.5",
+      "BINARY=/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/bin/elasticsearch",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-candidate-r2",
+      "ENGINE=candidate",
+      "SOURCE_REVISION=b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+      "BINARY=/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-master-r2",
+      "ENGINE=master",
+      "SOURCE_REVISION=ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+      "BINARY=/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-es9-r2",
+      "ENGINE=es9",
+      "SOURCE_REVISION=es9-9.5.5",
+      "BINARY=/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/bin/elasticsearch",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-candidate-r3",
+      "ENGINE=candidate",
+      "SOURCE_REVISION=b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+      "BINARY=/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-master-r3",
+      "ENGINE=master",
+      "SOURCE_REVISION=ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+      "BINARY=/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ],
+    [
+      "/usr/bin/env",
+      "PERF_ROOT=/home/ubuntu/pr3-performance11",
+      "RUN_ID=c11-mixed-s2-es9-r3",
+      "ENGINE=es9",
+      "SOURCE_REVISION=es9-9.5.5",
+      "BINARY=/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/bin/elasticsearch",
+      "MODE=mixed",
+      "SHARDS=2",
+      "bash",
+      "/home/ubuntu/pr3-consolidated11/source/bench/path-poc/perf-validation/pr3-performance-gates/run.sh"
+    ]
+  ],
+  "runs": [
+    {
+      "engine": "candidate",
+      "repetition": 1,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-candidate-r1",
+      "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+      "binary": {
+        "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+        "sha256": null
+      },
+      "distribution_manifest": null,
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-candidate-r1-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "master",
+      "repetition": 1,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-master-r1",
+      "source_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+      "binary": {
+        "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+        "sha256": null
+      },
+      "distribution_manifest": null,
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-master-r1-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "es9",
+      "repetition": 1,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-es9-r1",
+      "source_revision": "es9-9.5.5",
+      "binary": {
+        "path": "/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/bin/elasticsearch",
+        "sha256": null
+      },
+      "distribution_manifest": {
+        "path": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-es9-r1/es-distribution.json",
+        "sha256": null
+      },
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-es9-r1-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "candidate",
+      "repetition": 2,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-candidate-r2",
+      "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+      "binary": {
+        "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+        "sha256": null
+      },
+      "distribution_manifest": null,
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-candidate-r2-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "master",
+      "repetition": 2,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-master-r2",
+      "source_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+      "binary": {
+        "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+        "sha256": null
+      },
+      "distribution_manifest": null,
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-master-r2-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "es9",
+      "repetition": 2,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-es9-r2",
+      "source_revision": "es9-9.5.5",
+      "binary": {
+        "path": "/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/bin/elasticsearch",
+        "sha256": null
+      },
+      "distribution_manifest": {
+        "path": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-es9-r2/es-distribution.json",
+        "sha256": null
+      },
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-es9-r2-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "candidate",
+      "repetition": 3,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-candidate-r3",
+      "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+      "binary": {
+        "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+        "sha256": null
+      },
+      "distribution_manifest": null,
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-candidate-r3-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "master",
+      "repetition": 3,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-master-r3",
+      "source_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+      "binary": {
+        "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+        "sha256": null
+      },
+      "distribution_manifest": null,
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-master-r3-conditions.json",
+        "sha256": null
+      }
+    },
+    {
+      "engine": "es9",
+      "repetition": 3,
+      "root": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-es9-r3",
+      "source_revision": "es9-9.5.5",
+      "binary": {
+        "path": "/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/bin/elasticsearch",
+        "sha256": null
+      },
+      "distribution_manifest": {
+        "path": "/home/ubuntu/pr3-performance11/results/c11-mixed-s2-es9-r3/es-distribution.json",
+        "sha256": null
+      },
+      "conditions": {
+        "path": "/home/ubuntu/pr3-performance11/bindings/c11-mixed-s2-es9-r3-conditions.json",
+        "sha256": null
+      }
+    }
+  ],
+  "engine_artifacts": {
+    "candidate": {
+      "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+      "sha256": null
+    },
+    "master": {
+      "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+      "sha256": null
+    },
+    "es9": {
+      "path": "/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/bin/elasticsearch",
+      "sha256": null
+    }
+  },
+  "measurements_only": false,
+  "thresholds": {
+    "master": null,
+    "es9": null
+  },
+  "preparation_status": "NOT EXECUTABLE: actual binary/artifact/condition hashes and reviewed metric thresholds unresolved"
+}

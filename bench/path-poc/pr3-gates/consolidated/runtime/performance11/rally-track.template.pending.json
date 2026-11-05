@@ -1,0 +1,32 @@
+{
+  "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+  "track": {
+    "path": null,
+    "sha256": null
+  },
+  "track_files": null,
+  "query_fraction": 1.0,
+  "original_corpora": null,
+  "data_root": "/home/ubuntu/.rally/benchmarks/data",
+  "fixture_provenance": {
+    "path": null,
+    "sha256": null
+  },
+  "distribution_files": null,
+  "rally_python": {
+    "path": null,
+    "sha256": null
+  },
+  "health_wrapper": {
+    "path": null,
+    "sha256": null
+  },
+  "rally_config": {
+    "path": null,
+    "sha256": null
+  },
+  "challenge": null,
+  "setup_index": null,
+  "final_index_counts": null,
+  "note": "One concrete config per original track/challenge/engine/repetition. Each corpus requires artifact, uncompressed_artifact, originaldocument_count andbytes; never select sample or subset."
+}

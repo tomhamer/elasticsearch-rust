@@ -1,0 +1,10 @@
+indexes/
+tools/
+lucene/lib/
+lucene/out/
+lucene/.gradle/
+lucene/build/
+corpus/*.jsonl
+corpus/*.f32
+corpus/*.log
+results/*.log

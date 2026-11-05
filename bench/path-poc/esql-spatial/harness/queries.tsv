@@ -1,0 +1,33 @@
+polygon-intersects-esql	FROM osmgeopoints | WHERE ST_Intersects(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | LIMIT 10
+polygon-intersects-count-esql	FROM osmgeopoints | WHERE ST_Intersects(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | STATS count=COUNT(*)
+polygon-contains-esql	FROM osmgeopoints | WHERE ST_Contains(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | LIMIT 10
+polygon-contains-count-esql	FROM osmgeopoints | WHERE ST_Contains(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | STATS count=COUNT(*)
+polygon-disjoint-esql	FROM osmgeopoints | WHERE ST_Disjoint(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | LIMIT 10
+polygon-disjoint-count-esql	FROM osmgeopoints | WHERE ST_Disjoint(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | STATS count=COUNT(*)
+polygon-within-esql	FROM osmgeopoints | WHERE ST_Within(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | LIMIT 10
+polygon-within-count-esql	FROM osmgeopoints | WHERE ST_Within(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | STATS count=COUNT(*)
+polygon-centroid-esql	FROM osmgeopoints | WHERE ST_Intersects(location, TO_GEOSHAPE("POLYGON((-0.1 49.0, 5.0 48.0, 15.0 49.0, 14.0 60.0, -0.1 61.0, -0.1 49.0))")) | STATS centroid=ST_CENTROID_AGG(location)
+centroid-esql	FROM osmgeopoints | STATS centroid=ST_CENTROID_AGG(location)
+centroid-to_geopoint-esql	FROM osmgeopoints | STATS centroid=ST_CENTROID_AGG(TO_GEOPOINT(location))
+bbox-intersects-esql	FROM osmgeopoints | WHERE ST_Intersects(location, TO_GEOSHAPE("BBOX((-0.1, 15.0, 61.0, 48.0))")) | LIMIT 10
+distanceFilter-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) <= 400000 | LIMIT 10
+distanceFilterEQ-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) == 73204.77053637545 | LIMIT 10
+distanceFilterGTE-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) >= 400000 | LIMIT 10
+distanceFilter10kGTE-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) >= 400000 | LIMIT 10000
+distanceFilterCount100-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) <= 100000 | STATS count=COUNT(*)
+distanceFilterCount100x200-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) >= 100000 AND ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) <= 200000 | STATS count=COUNT(*)
+distanceFilterCount200-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) <= 200000 | STATS count=COUNT(*)
+distanceFilterCount200x300-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) >= 200000 AND ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) <= 300000 | STATS count=COUNT(*)
+distanceFilterCount200x300-esql-evals	FROM osmgeopoints | EVAL point=TO_GEOPOINT("POINT(7.0 55.0)") | EVAL distance=ST_Distance(location, point) | WHERE distance >= 200000 AND distance <= 300000 | STATS count=COUNT(*)
+distanceFilterCount300-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) <= 300000 | STATS count=COUNT(*)
+distanceFilterCount300x400-esql	FROM osmgeopoints | WHERE ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) >= 300000 AND ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) <= 400000 | STATS count=COUNT(*)
+distanceSort-esql	FROM osmgeopoints | EVAL distance = ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) | SORT distance ASC | LIMIT 10
+distanceSort-esql-partial	FROM osmgeopoints | EVAL distance = ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")), loc = location::string | SORT distance ASC, loc ASC | LIMIT 10
+distanceFilterSort-esql	FROM osmgeopoints  | EVAL distance = ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")) | WHERE distance <= 400000 | SORT distance ASC | LIMIT 10
+distanceFilterSort-esql-partial	FROM osmgeopoints  | EVAL distance = ST_Distance(location, TO_GEOPOINT("POINT(7.0 55.0)")), loc = location::string | WHERE distance <= 400000 | SORT distance ASC, loc ASC | LIMIT 10
+geoGrid_geohash-esql	FROM osmgeopoints | WHERE ST_GEOHASH(location, 2) == TO_GEOHASH("u0") | LIMIT 10
+geoGrid_geotile-esql	FROM osmgeopoints | WHERE ST_GEOTILE(location, 6) == TO_GEOTILE("6/32/22") | LIMIT 10
+geoGrid_geohex-esql	FROM osmgeopoints | WHERE ST_GEOHEX(location, 1) == TO_GEOHEX("811fbffffffffff") | LIMIT 10
+geoGrid_aggs_geohash-esql	FROM osmgeopoints | WHERE ST_Intersects(location, TO_GEOSHAPE("BBOX(2.20, 2.40, 48.95, 48.75)")) | EVAL geohash = ST_GEOHASH(location, 5, TO_GEOSHAPE("BBOX(2.20, 2.40, 48.95, 48.75)")) | STATS count = COUNT(*) BY geohash
+geoGrid_aggs_geotile-esql	FROM osmgeopoints | WHERE ST_Intersects(location, TO_GEOSHAPE("BBOX(2.20, 2.40, 48.95, 48.75)")) | EVAL geotile = ST_GEOTILE(location, 13, TO_GEOSHAPE("BBOX(2.20, 2.40, 48.95, 48.75)")) | STATS count = COUNT(*) BY geotile
+geoGrid_aggs_geohex-esql	FROM osmgeopoints | WHERE ST_Intersects(location, TO_GEOSHAPE("BBOX(2.20, 2.40, 48.95, 48.75)")) | EVAL geohex = ST_GEOHEX(location, 6, TO_GEOSHAPE("BBOX(2.20, 2.40, 48.95, 48.75)")) | STATS count = COUNT(*) BY geohex

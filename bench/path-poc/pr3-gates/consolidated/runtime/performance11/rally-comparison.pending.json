@@ -1,0 +1,31 @@
+{
+  "kind": "rally",
+  "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+  "master_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+  "binary_sha256": null,
+  "out": "/home/ubuntu/pr3-performance11/comparison-rally",
+  "artifacts": null,
+  "commands": null,
+  "runs": null,
+  "engine_artifacts": {
+    "candidate": {
+      "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node",
+      "sha256": null
+    },
+    "master": {
+      "path": "/home/ubuntu/pr3-consolidated11/results/elasticsearch-node-old",
+      "sha256": null
+    },
+    "es9": {
+      "path": "/home/ubuntu/pr3-performance11/elasticsearch-9.5.5/jdk/bin/java",
+      "sha256": null
+    }
+  },
+  "required_tracks": null,
+  "required_metrics": null,
+  "measurements_only": false,
+  "thresholds": {
+    "master": null,
+    "es9": null
+  }
+}

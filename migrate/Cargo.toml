@@ -1,0 +1,30 @@
+# Standalone workspace (like cluster/): not a member of the root workspace, has
+# no dependency on the engine/http crates, and builds into its own target dir.
+[workspace]
+resolver = "3"
+
+[package]
+name = "elasticsearch-lucene-import"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+description = "Upgrade path from Lucene-backed Elasticsearch: reads ES data directories (Lucene 9/10 segments) and loads them into the Rust server"
+
+[[bin]]
+name = "es-lucene-import"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+memmap2 = "0.9"
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+ureq = { version = "2", default-features = false }
+ruzstd = "0.7"
+
+[profile.dev]
+debug = 0
+opt-level = 1
+
+[profile.release]
+opt-level = 3

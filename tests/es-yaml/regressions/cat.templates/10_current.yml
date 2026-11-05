@@ -1,0 +1,64 @@
+---
+"No templates":
+  - requires:
+      test_runner_features: [default_shards, no_xpack]
+      reason: isolated fixture with built-in template registries disabled
+  - do:
+      cat.templates: {}
+  - match: { $body: '/^$/' }
+---
+"Sort templates":
+  - requires:
+      cluster_features: [gte_v7.8.0]
+      test_runner_features: [default_shards, no_xpack]
+      reason: current template format on isolated no-xpack fixture
+  - do:
+      warnings: ['Legacy index templates are deprecated in favor of composable templates.']
+      indices.put_template:
+        name: test
+        body:
+          order: 0
+          index_patterns: ['test*']
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      warnings: ['Legacy index templates are deprecated in favor of composable templates.']
+      indices.put_template:
+        name: test_1
+        body:
+          order: 0
+          version: 1
+          index_patterns: ['test-*']
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      cat.templates:
+        h: [name, index_patterns, version]
+        s: [version]
+  - match:
+      $body: '/^test\x20+\[test\*\]\x20+\ntest_1\x20+\[test-\*\]\x20+1\n$/'
+  - do:
+      cat.templates:
+        h: [name, index_patterns, version]
+        s: ['version:desc']
+  - match:
+      $body: '/^test_1\x20+\[test-\*\]\x20+1\ntest\x20+\[test\*\]\x20+\n$/'
+---
+"Multiple template":
+  - requires:
+      cluster_features: [gte_v7.8.0]
+      test_runner_features: [default_shards, no_xpack]
+      reason: current template format on isolated no-xpack fixture
+  - do:
+      warnings: ['Legacy index templates are deprecated in favor of composable templates.']
+      indices.put_template:
+        name: test_1
+        body:
+          order: 0
+          version: 1
+          index_patterns: ['test*', 'test-*']
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      cat.templates:
+        h: [name, index_patterns]
+        v: true
+  - match:
+      $body: '/^name\x20+index_patterns\ntest_1\x20+\[test\*,\x20test-\*\]\n$/'

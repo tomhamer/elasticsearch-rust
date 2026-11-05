@@ -1,0 +1,33 @@
+[package]
+name = "elasticsearch-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node-to-node RPC for the elasticsearch cluster layer: framed TCP, handshake, typed action handlers, pooled multiplexed connections, lz4 compression, optional (mutual) TLS."
+
+[features]
+default = ["tls"]
+# rustls-based transport encryption (`xpack.security.transport.ssl.*`).
+# Uses the `ring` crypto provider only (no aws-lc build).
+# PEM loading, encrypted keys and verification modes are shared with the
+# node's other TLS contexts (`elasticsearch-ssl`).
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:elasticsearch-ssl"]
+
+[dependencies]
+elasticsearch-cluster.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+bincode.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+lz4_flex.workspace = true
+futures.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+elasticsearch-ssl = { workspace = true, optional = true }
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }

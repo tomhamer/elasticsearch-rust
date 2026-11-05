@@ -1,0 +1,6 @@
+# Default configuration of the elasticsearch image (same as the official image).
+# Override any setting with an environment variable whose name is the setting
+# (e.g. `-e discovery.type=single-node`), with `-E key=value` arguments, or by
+# mounting your own file at /usr/share/elasticsearch/config/elasticsearch.yml.
+cluster.name: "docker-cluster"
+network.host: 0.0.0.0

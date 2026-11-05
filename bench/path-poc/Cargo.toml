@@ -1,0 +1,140 @@
+[package]
+name = "es-path-poc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+payload-hnsw-poc = ["rustic-core/payload-hnsw-poc"]
+mutable-hnsw-poc = ["rustic-core/mutable-hnsw-poc"]
+mutable-hnsw-vespa-angular = ["mutable-hnsw-poc", "rustic-core/mutable-hnsw-vespa-angular"]
+oracle = ["dep:elasticsearch-engine", "dep:elasticsearch-http"]
+
+[[bin]]
+name = "numeric-sparsity-poc"
+path = "src/numeric_sparsity_poc.rs"
+
+[[bin]]
+name = "mapping-scan-poc"
+path = "src/mapping_scan_poc.rs"
+required-features = ["oracle"]
+
+[[bin]]
+name = "auto-date-count-poc"
+path = "src/auto_date_count_poc.rs"
+required-features = ["oracle"]
+
+[[bin]]
+name = "replica-path-poc"
+path = "src/replica_path_poc.rs"
+required-features = ["oracle"]
+
+[[bin]]
+name = "es-path-poc"
+path = "src/main.rs"
+
+[[bin]]
+name = "es-esql-spatial-poc"
+path = "esql-spatial/main.rs"
+required-features = ["oracle"]
+
+[[bin]]
+name = "es-path-oracle"
+path = "src/oracle.rs"
+required-features = ["oracle"]
+
+[dependencies]
+rustic-core = { path = "../../crates/rustic-core" }
+bincode.workspace = true
+serde.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+memmap2.workspace = true
+libc.workspace = true
+sha2.workspace = true
+elasticsearch-engine = { workspace = true, optional = true }
+elasticsearch-http = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "es-payload-graph"
+path = "src/payload_graph.rs"
+required-features = ["payload-hnsw-poc"]
+
+[[bin]]
+name = "rustic-vector-diagnose"
+path = "src/vector_diagnose.rs"
+
+[[bin]]
+name = "rustic-vector-lifecycle"
+path = "src/vector_lifecycle.rs"
+
+[[bin]]
+name = "rustic-vector-index-diagnose"
+path = "src/vector_index_diagnose.rs"
+
+[[bin]]
+name = "rustic-vector-filter-poc"
+path = "src/vector_filter_poc.rs"
+
+[[bin]]
+name = "rustic-vector-write-poc"
+path = "src/vector_write_poc.rs"
+required-features = ["payload-hnsw-poc"]
+
+[[bin]]
+name = "fastfield-encode-poc"
+path = "src/fastfield_encode_poc.rs"
+
+[[bin]]
+name = "segment-merge-poc"
+path = "src/segment_merge_poc.rs"
+
+[[bin]]
+name = "recovery-column-poc"
+path = "src/recovery_column_poc.rs"
+
+[[bin]]
+name = "geo-score-skip-poc"
+path = "src/geo_score_skip_poc.rs"
+
+[[bin]]
+name = "id-bloom-poc"
+path = "src/id_bloom_poc.rs"
+
+[[bin]]
+name = "compound-score-poc"
+path = "src/compound_score_poc.rs"
+
+[[bin]]
+name = "range-ordinal-poc"
+path = "src/range_ordinal_poc.rs"
+
+[[bin]]
+name = "range-search-poc"
+path = "src/range_search_poc.rs"
+
+[[bin]]
+name = "vector-multisegment-diagnose"
+path = "src/vector_multisegment_diagnose.rs"
+
+[[bin]]
+name = "mutable-hnsw-poc"
+path = "src/mutable_hnsw_poc.rs"
+required-features = ["mutable-hnsw-poc"]
+
+[[bin]]
+name = "mutable-hnsw-lifecycle-poc"
+path = "src/mutable_hnsw_lifecycle_poc.rs"
+required-features = ["mutable-hnsw-poc"]
+
+[[bin]]
+name = "mutable-store-poc"
+path = "src/mutable_store_poc.rs"
+required-features = ["mutable-hnsw-poc"]

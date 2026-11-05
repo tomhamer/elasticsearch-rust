@@ -1,0 +1,115 @@
+# elasticsearch-operator: namespace, RBAC and Deployment.
+#   kubectl apply -f cluster/deploy/operator/crd.yaml -f cluster/deploy/operator/operator.yaml
+# or: kubectl apply -k cluster/deploy/operator
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: elastic-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elasticsearch-operator
+  namespace: elastic-system
+  labels: { app.kubernetes.io/name: elasticsearch-operator }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: elasticsearch-operator
+  labels: { app.kubernetes.io/name: elasticsearch-operator }
+rules:
+  - apiGroups: ["elasticsearch.k8s.elastic.co"]
+    resources: ["elasticsearches"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["elasticsearch.k8s.elastic.co"]
+    resources: ["elasticsearches/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["elasticsearch.k8s.elastic.co"]
+    resources: ["elasticsearches/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: elasticsearch-operator
+  labels: { app.kubernetes.io/name: elasticsearch-operator }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: elasticsearch-operator
+subjects:
+  - kind: ServiceAccount
+    name: elasticsearch-operator
+    namespace: elastic-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch-operator
+  namespace: elastic-system
+  labels: { app.kubernetes.io/name: elasticsearch-operator }
+spec:
+  # Single active instance: Recreate avoids two operators acting on the
+  # same cluster during an upgrade.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app.kubernetes.io/name: elasticsearch-operator }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: elasticsearch-operator }
+    spec:
+      serviceAccountName: elasticsearch-operator
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: operator
+          image: elasticsearch-operator:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["run", "--es-timeout-secs", "10", "--health-addr", "0.0.0.0:8080"]
+          env:
+            # Empty = watch every namespace.
+            - name: WATCH_NAMESPACE
+              value: ""
+            # Image used when an Elasticsearch resource has no spec.image: <repo>:<spec.version>.
+            - name: DEFAULT_IMAGE_REPOSITORY
+              value: elasticsearch-rs
+            - name: RUST_LOG
+              value: info,kube=warn
+            - name: LOG_FORMAT
+              value: json
+          ports:
+            - { name: health, containerPort: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /healthz, port: health }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }

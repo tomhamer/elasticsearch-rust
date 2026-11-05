@@ -1,0 +1,85 @@
+{{- $root := . -}}
+{{- $cluster := include "es.clusterName" . -}}
+# Client Service: HTTP to the groups with clientService: true (ready pods only).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $cluster }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "es.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "es.selectorLabels" . | nindent 4 }}
+    elasticsearch/http-client: "true"
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: transport
+      port: {{ .Values.service.transportPort }}
+      targetPort: transport
+      protocol: TCP
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+{{- range .Values.nodeGroups }}
+{{- $g := include "es.group" (dict "root" $root "group" .) | fromYaml }}
+{{- $name := include "es.groupFullname" (dict "root" $root "group" $g) }}
+---
+# Headless governing Service of the {{ $g.name }} StatefulSet: stable pod DNS
+# and, for master-eligible groups, the discovery seed (resolves to every pod,
+# ready or not).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-headless
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "es.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $g.name }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "es.groupSelectorLabels" (dict "root" $root "group" $g) | nindent 4 }}
+  ports:
+    - name: http
+      port: 9200
+      targetPort: http
+    - name: transport
+      port: 9300
+      targetPort: transport
+{{- end }}
+{{- if .Values.metrics.exporter.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $cluster }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "es.labels" . | nindent 4 }}
+    elasticsearch/metrics: "true"
+spec:
+  clusterIP: None
+  selector:
+    {{- include "es.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.exporter.port }}
+      targetPort: metrics
+{{- end }}

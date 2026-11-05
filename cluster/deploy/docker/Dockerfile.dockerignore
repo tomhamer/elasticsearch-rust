@@ -1,0 +1,30 @@
+# Build context for `docker build -f cluster/deploy/docker/Dockerfile[.operator] .` (from
+# the repository root). BuildKit reads this file automatically because it sits
+# next to the Dockerfile. Allow-list: the root workspace (Cargo.toml +
+# Cargo.lock, the root package's src/, crates/, cluster/, vendor/ and the
+# bench/compare and bench/path-poc members, which cargo must be able to load). No tests/, docs/,
+# other bench/ data or build outputs. (~10 MB context.)
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!crates
+!cluster
+!bench
+bench/*
+!bench/compare
+!bench/path-poc
+bench/path-poc/*
+!bench/path-poc/Cargo.toml
+!bench/path-poc/src
+!vendor
+**/target
+**/target-*
+**/.DS_Store
+**/__pycache__
+**/*.mov
+cluster/docs
+cluster/deploy/helm
+cluster/deploy/k8s
+cluster/deploy/operator
+cluster/scripts

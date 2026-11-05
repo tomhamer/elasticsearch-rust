@@ -1,0 +1,287 @@
+{{- $root := . -}}
+{{- $cluster := include "es.clusterName" . -}}
+{{- $seedHosts := include "es.seedHosts" . -}}
+{{- range .Values.nodeGroups }}
+{{- $g := include "es.group" (dict "root" $root "group" .) | fromYaml }}
+{{- $name := include "es.groupFullname" (dict "root" $root "group" $g) }}
+{{- $isMaster := has "master" $g.roles }}
+{{- $groupCtx := dict "root" $root "group" $g }}
+{{- $esConfig := include "es.groupConfig" (dict "root" $root "group" $g) }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "es.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $g.name }}
+spec:
+  serviceName: {{ $name }}-headless
+  replicas: {{ $g.replicas }}
+  podManagementPolicy: {{ $root.Values.podManagementPolicy }}
+  updateStrategy:
+    type: {{ $root.Values.updateStrategy }}
+  selector:
+    matchLabels:
+      {{- include "es.groupSelectorLabels" $groupCtx | nindent 6 }}
+  {{- if $g.persistence.enabled }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+        {{- with $g.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml $g.persistence.accessModes | nindent 10 }}
+        {{- if $g.persistence.storageClassName }}
+        storageClassName: {{ $g.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $g.persistence.size | quote }}
+  {{- end }}
+  template:
+    metadata:
+      name: {{ $name }}
+      labels:
+        {{- include "es.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $g.name }}
+        elasticsearch/master: {{ $isMaster | quote }}
+        elasticsearch/http-client: {{ $g.clientService | quote }}
+        {{- with $g.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # roll the group when its elasticsearch.yml changes
+        checksum/config: {{ $esConfig | sha256sum | trunc 16 }}
+        {{- with $g.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "es.serviceAccountName" $root }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
+      enableServiceLinks: false
+      {{- with $g.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+      {{- if $g.affinity }}
+        {{- toYaml $g.affinity | nindent 8 }}
+      {{- else }}
+        podAntiAffinity:
+          {{- if eq $g.antiAffinity "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: {{ $g.antiAffinityTopologyKey }}
+              labelSelector:
+                matchLabels:
+                  {{- include "es.groupSelectorLabels" $groupCtx | nindent 18 }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: {{ $g.antiAffinityTopologyKey }}
+                labelSelector:
+                  matchLabels:
+                    {{- include "es.groupSelectorLabels" $groupCtx | nindent 20 }}
+          {{- end }}
+      {{- end }}
+      {{- if $g.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ $g.topologySpread.maxSkew }}
+          topologyKey: {{ $g.topologySpread.topologyKey }}
+          whenUnsatisfiable: {{ $g.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "es.groupSelectorLabels" $groupCtx | nindent 14 }}
+      {{- end }}
+      {{- if or $root.Values.sysctlInitContainer.enabled $root.Values.zoneAwareness.enabled $g.extraInitContainers }}
+      initContainers:
+        {{- if $root.Values.sysctlInitContainer.enabled }}
+        - name: configure-sysctl
+          image: {{ $root.Values.sysctlInitContainer.image }}
+          command: ["sh", "-c", "sysctl -w vm.max_map_count={{ $root.Values.sysctlInitContainer.vmMaxMapCount }}"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            privileged: true
+        {{- end }}
+        {{- if $root.Values.zoneAwareness.enabled }}
+        - name: zone-attribute
+          image: {{ include "es.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: ["/usr/share/elasticsearch/bin/es-zone-init"]
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: ES_ZONE_TOPOLOGY_KEY
+              value: {{ $root.Values.zoneAwareness.topologyKey | quote }}
+            - name: ES_ZONE_ATTRIBUTE
+              value: {{ $root.Values.zoneAwareness.attribute | quote }}
+          securityContext:
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: node-attributes
+              mountPath: /usr/share/elasticsearch/settings.d/attrs
+        {{- end }}
+        {{- with $g.extraInitContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: elasticsearch
+          image: {{ include "es.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 9200
+              protocol: TCP
+            - name: transport
+              containerPort: 9300
+              protocol: TCP
+          env:
+            # Settings passed as dotted environment variables (official image
+            # convention); they override elasticsearch.yml.
+            - name: node.name
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: cluster.name
+              value: {{ $cluster | quote }}
+            - name: node.roles
+              value: {{ join "," $g.roles | quote }}
+            - name: network.host
+              value: "0.0.0.0"
+            - name: network.publish_host
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: discovery.seed_hosts
+              value: {{ $seedHosts | quote }}
+            {{- if and $root.Values.zoneAwareness.enabled $root.Values.zoneAwareness.setAllocationAwareness }}
+            - name: cluster.routing.allocation.awareness.attributes
+              value: {{ $root.Values.zoneAwareness.attribute | quote }}
+            {{- end }}
+            # Used by the probe and preStop scripts.
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: ES_HEALTH_PARAMS
+              value: {{ $root.Values.clusterHealthCheckParams | quote }}
+            - name: ES_DRAIN_ON_SHUTDOWN
+              value: {{ $root.Values.drainOnShutdown.enabled | quote }}
+            - name: ES_SHUTDOWN_ALLOCATION_DELAY
+              value: {{ $root.Values.drainOnShutdown.allocationDelay | quote }}
+            - name: ES_SHUTDOWN_TIMEOUT
+              value: {{ $root.Values.drainOnShutdown.timeoutSeconds | quote }}
+            - name: ES_VOTING_EXCLUSIONS
+              value: {{ $root.Values.masterScaleDown.votingConfigExclusions | quote }}
+            {{- with $g.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml $g.resources | nindent 12 }}
+          startupProbe:
+            tcpSocket: { port: http }
+            periodSeconds: {{ $root.Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.startupProbe.failureThreshold }}
+          livenessProbe:
+            tcpSocket: { port: http }
+            periodSeconds: {{ $root.Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.livenessProbe.failureThreshold }}
+          readinessProbe:
+            exec:
+              command: ["/usr/share/elasticsearch/bin/es-readiness"]
+            {{- toYaml $root.Values.readinessProbe | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/usr/share/elasticsearch/bin/es-prestop"]
+          volumeMounts:
+            - name: elasticsearch-data
+              mountPath: /usr/share/elasticsearch/data
+            - name: elasticsearch-logs
+              mountPath: /usr/share/elasticsearch/logs
+            - name: config
+              mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
+              subPath: elasticsearch.yml
+              readOnly: true
+            {{- if $isMaster }}
+            - name: bootstrap
+              mountPath: /usr/share/elasticsearch/settings.d/bootstrap
+              readOnly: true
+            {{- end }}
+            {{- if $root.Values.zoneAwareness.enabled }}
+            - name: node-attributes
+              mountPath: /usr/share/elasticsearch/settings.d/attrs
+              readOnly: true
+            {{- end }}
+            {{- with $g.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- if $root.Values.metrics.exporter.enabled }}
+        - name: exporter
+          image: {{ $root.Values.metrics.exporter.image }}
+          args:
+            - --es.uri=http://127.0.0.1:9200
+            - --es.timeout=10s
+            - --web.listen-address=:{{ $root.Values.metrics.exporter.port }}
+            {{- with $root.Values.metrics.exporter.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: {{ $root.Values.metrics.exporter.port }}
+          securityContext:
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml $root.Values.metrics.exporter.resources | nindent 12 }}
+        {{- end }}
+        {{- with $g.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+        - name: elasticsearch-logs
+          emptyDir: {}
+        {{- if not $g.persistence.enabled }}
+        - name: elasticsearch-data
+          emptyDir: {}
+        {{- end }}
+        {{- if $isMaster }}
+        - name: bootstrap
+          configMap:
+            name: {{ $cluster }}-bootstrap
+            optional: true
+        {{- end }}
+        {{- if $root.Values.zoneAwareness.enabled }}
+        - name: node-attributes
+          emptyDir: {}
+        {{- end }}
+        {{- with $g.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

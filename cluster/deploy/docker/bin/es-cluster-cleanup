@@ -1,0 +1,54 @@
+#!/bin/bash
+# Post-scale-down cleanup (run by the Helm chart's post-upgrade hook Job):
+#
+# 1. wait (up to ES_CLEANUP_TIMEOUT seconds, default 600) until every node
+#    named in the voting config exclusions has left the cluster, then
+#    `DELETE /_cluster/voting_config_exclusions` — exclusions must not be
+#    left behind (ES caps them at cluster.max_voting_config_exclusions);
+# 2. delete node shutdown records whose node is no longer in the cluster
+#    (left by es-prestop for removed pods).
+#
+# Env: ES_URL (e.g. http://elasticsearch:9200), ES_CLEANUP_TIMEOUT.
+set -uo pipefail
+
+ES_URL="${ES_URL:?ES_URL must be set}"
+deadline=$(( $(date +%s) + ${ES_CLEANUP_TIMEOUT:-600} ))
+log() { echo "es-cluster-cleanup: $*"; }
+
+until curl -sf --max-time 5 "${ES_URL}/_cluster/health?timeout=5s" >/dev/null; do
+  [[ $(date +%s) -ge $deadline ]] && { log "cluster not reachable"; exit 1; }
+  sleep 5
+done
+
+while :; do
+  excluded="$(curl -sf --max-time 10 "${ES_URL}/_cluster/state/metadata?filter_path=metadata.cluster_coordination.voting_config_exclusions" \
+    | jq -r '.metadata.cluster_coordination.voting_config_exclusions[]?.node_name' 2>/dev/null || true)"
+  members="$(curl -sf --max-time 10 "${ES_URL}/_cat/nodes?h=name" || true)"
+  if [[ -z "$excluded" ]]; then
+    log "no voting config exclusions"
+    break
+  fi
+  still=""
+  for n in $excluded; do
+    grep -qx "$n" <<< "$members" && still="$still $n"
+  done
+  if [[ -z "$still" ]]; then
+    log "excluded nodes have left (${excluded//$'\n'/ }); clearing voting config exclusions"
+    curl -sf --max-time 30 -X DELETE "${ES_URL}/_cluster/voting_config_exclusions?wait_for_removal=false" >/dev/null || { log "clear failed"; exit 1; }
+    break
+  fi
+  if [[ $(date +%s) -ge $deadline ]]; then
+    log "timed out; nodes still present:${still} (exclusions kept; re-run or clear manually)"
+    exit 1
+  fi
+  sleep 5
+done
+
+ids="$(curl -sf --max-time 10 "${ES_URL}/_cat/nodes?h=id&full_id=true" || true)"
+for rec in $(curl -sf --max-time 10 "${ES_URL}/_nodes/shutdown" | jq -r '.nodes[]?.node_id' 2>/dev/null || true); do
+  if ! grep -qx "$rec" <<< "$ids"; then
+    log "deleting stale shutdown record of departed node ${rec}"
+    curl -s -o /dev/null --max-time 10 -X DELETE "${ES_URL}/_nodes/${rec}/shutdown" || true
+  fi
+done
+exit 0

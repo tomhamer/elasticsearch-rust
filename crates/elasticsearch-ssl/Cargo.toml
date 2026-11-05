@@ -1,0 +1,26 @@
+[package]
+name = "elasticsearch-ssl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ES SSL contexts (`<prefix>.ssl.*` settings): PEM and PKCS#12 key material, trust, verification modes and client authentication as rustls server/client configs (ring provider)."
+
+[dependencies]
+rustls.workspace = true
+# Reloadable contexts: the current config is swapped in without a lock on
+# the accept / connect paths.
+arc-swap.workspace = true
+tracing.workspace = true
+# ES's default trust (the JDK's CAs) for client contexts such as `reindex.ssl`.
+webpki-roots = "1"
+# Encrypted PEM private keys and PKCS#12 stores: OpenSSL legacy
+# `Proc-Type: 4,ENCRYPTED` keys, PKCS#8 PBES1/PBES2, PKCS#12 PBE + MAC.
+base64.workspace = true
+md-5.workspace = true
+sha1 = "0.10"
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+des = "0.8"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }

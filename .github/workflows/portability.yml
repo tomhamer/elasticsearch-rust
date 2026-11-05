@@ -1,0 +1,44 @@
+name: portability
+
+# Linux is the production target; this keeps the workspace building and a
+# single node working on Windows and macOS for development use. Run on
+# demand (Actions tab, or `gh workflow run portability.yml --ref <branch>`).
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: portability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-and-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      # Benchmark evidence under bench/ has paths longer than Windows'
+      # 260-character limit; enable Git long paths before checking out.
+      - if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace (libs, bins, tests, examples)
+        # bench/path-poc and the benches are excluded: they do not build on
+        # any platform today.
+        run: cargo check --workspace --exclude es-path-poc --lib --bins --tests --examples
+      - name: Build server
+        run: cargo build -p elasticsearch
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Runtime smoke test
+        shell: bash
+        run: |
+          bin=target/debug/elasticsearch
+          if [ "$RUNNER_OS" = "Windows" ]; then bin="$bin.exe"; fi
+          python scripts/smoke_test.py "$bin"

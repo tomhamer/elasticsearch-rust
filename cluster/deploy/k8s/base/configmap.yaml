@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-config
+  labels: { app.kubernetes.io/name: elasticsearch }
+data:
+  # Extra elasticsearch.yml settings. cluster.name, node.name, node.roles,
+  # network.* and discovery.* are set through the environment in
+  # statefulset.yaml (environment variables override this file).
+  elasticsearch.yml: |
+    action.destructive_requires_name: true
+    # Security defaults to on (as in ES 8/9). The probes and preStop hook use
+    # plain HTTP without credentials and transport has no TLS, so it is off
+    # here. Configure TLS and authentication before running in production.
+    xpack.security.enabled: false

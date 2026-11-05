@@ -1,0 +1,19 @@
+[package]
+name = "elasticsearch-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cluster state model, coordination (master election + publication), shard allocation and health. Pure logic: no I/O, driven by elasticsearch-node."
+
+[dependencies]
+elasticsearch-routing = { path = "../../../crates/elasticsearch-routing" }
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+uuid.workspace = true
+rand.workspace = true
+tracing.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+bincode.workspace = true

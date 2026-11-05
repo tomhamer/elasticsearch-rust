@@ -1,0 +1,64 @@
+{
+  "ImageId": "ami-07ab2d4b1490816c3",
+  "InstanceType": "g5.8xlarge",
+  "MinCount": 1,
+  "MaxCount": 1,
+  "KeyName": "codex-rally-pilot-20261012",
+  "SubnetId": "subnet-4df88e12",
+  "SecurityGroupIds": [
+    "sg-062e793d4a52662eb"
+  ],
+  "BlockDeviceMappings": [
+    {
+      "DeviceName": "/dev/sda1",
+      "Ebs": {
+        "VolumeSize": 1024,
+        "VolumeType": "gp3",
+        "Iops": 3000,
+        "Throughput": 125,
+        "Encrypted": true,
+        "DeleteOnTermination": false
+      }
+    }
+  ],
+  "MetadataOptions": {
+    "HttpTokens": "required",
+    "HttpEndpoint": "enabled"
+  },
+  "TagSpecifications": [
+    {
+      "ResourceType": "instance",
+      "Tags": [
+        {
+          "Key": "Name",
+          "Value": "codex-pr3-gpu-final11"
+        },
+        {
+          "Key": "Purpose",
+          "Value": "PR3-validation"
+        },
+        {
+          "Key": "CodexThread",
+          "Value": "01a1560b-7e5b-7442-873d-f488f604be48"
+        }
+      ]
+    },
+    {
+      "ResourceType": "volume",
+      "Tags": [
+        {
+          "Key": "Name",
+          "Value": "codex-pr3-gpu-final11"
+        },
+        {
+          "Key": "Purpose",
+          "Value": "PR3-validation"
+        },
+        {
+          "Key": "CodexThread",
+          "Value": "01a1560b-7e5b-7442-873d-f488f604be48"
+        }
+      ]
+    }
+  ]
+}

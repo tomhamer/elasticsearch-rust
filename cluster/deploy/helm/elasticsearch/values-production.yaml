@@ -1,0 +1,124 @@
+# Production example: 3 dedicated master-eligible nodes + 6 data nodes +
+# 2 coordinating nodes, spread across 3 availability zones with shard
+# allocation awareness on the `zone` node attribute.
+#
+#   helm install prod ./cluster/deploy/helm/elasticsearch \
+#     -n search --create-namespace -f ./cluster/deploy/helm/elasticsearch/values-production.yaml
+#
+# Assumes Kubernetes nodes carry topology.kubernetes.io/zone (every managed
+# Kubernetes sets it) and a StorageClass "fast-ssd" with
+# volumeBindingMode: WaitForFirstConsumer (so volumes are created in the
+# zone the pod is scheduled to).
+
+clusterName: prod
+
+image:
+  repository: registry.example.com/search/elasticsearch-rs
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+config:
+  # Refuse wildcard deletes.
+  action.destructive_requires_name: true
+  cluster.routing.allocation.awareness.attributes: zone
+  # Spread the copies of every shard across zones (node.attr.zone is set
+  # per pod by zoneAwareness below). Forced awareness additionally stops replicas from piling
+  # into the surviving zones when one zone is lost — list YOUR zone names:
+  # cluster.routing.allocation.awareness.force.zone.values: [us-east-1a, us-east-1b, us-east-1c]
+  # Snapshot repository location for an `fs` repository; for S3 register the
+  # repository with the API instead (see README "Snapshots").
+  # path.repo: ["/usr/share/elasticsearch/snapshots"]
+
+zoneAwareness:
+  enabled: true
+  topologyKey: topology.kubernetes.io/zone
+  attribute: zone
+  # already set explicitly in `config` above
+  setAllocationAwareness: false
+
+nodeGroupDefaults:
+  antiAffinity: hard
+  antiAffinityTopologyKey: kubernetes.io/hostname
+  topologySpread:
+    enabled: true
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: fast-ssd
+    accessModes: [ReadWriteOnce]
+
+nodeGroups:
+  # One master per zone. Masters hold the cluster state only: small and
+  # latency-sensitive; never put them under memory pressure.
+  - name: master
+    replicas: 3
+    roles: [master]
+    clientService: false
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { memory: 2Gi }
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClassName: fast-ssd
+      accessModes: [ReadWriteOnce]
+    priorityClassName: ""
+
+  # Data nodes: two per zone. Memory = engine working set + page cache for
+  # the hot part of the indices (see README "Memory sizing").
+  - name: data
+    replicas: 6
+    roles: [data, ingest]
+    clientService: false
+    resources:
+      requests: { cpu: "4", memory: 32Gi }
+      limits: { memory: 32Gi }
+    persistence:
+      enabled: true
+      size: 500Gi
+      storageClassName: fast-ssd
+      accessModes: [ReadWriteOnce]
+
+  # Coordinating-only nodes take client traffic (scatter/gather, reduce).
+  - name: coord
+    replicas: 2
+    roles: []
+    clientService: true
+    resources:
+      requests: { cpu: "2", memory: 4Gi }
+      limits: { memory: 4Gi }
+    persistence:
+      enabled: false
+    topologySpread:
+      enabled: true
+      maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+terminationGracePeriodSeconds: 180
+drainOnShutdown:
+  enabled: true
+  allocationDelay: 5m
+  timeoutSeconds: 150
+
+pdb:
+  enabled: true
+  maxUnavailable: 1
+
+sysctlInitContainer:
+  # Prefer configuring vm.max_map_count=262144 on the node pool.
+  enabled: false
+
+metrics:
+  exporter:
+    enabled: true
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+
+ingress:
+  enabled: false

@@ -1,0 +1,64 @@
+{
+  "candidate": {
+    "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+    "binary_sha256": null,
+    "url": null,
+    "process_executable": {
+      "path": null,
+      "sha256": null
+    },
+    "fixture_provenance": {
+      "path": null,
+      "sha256": null
+    },
+    "distribution_files": [],
+    "conditions": {
+      "path": null,
+      "sha256": null
+    },
+    "build_provenance": {
+      "path": null,
+      "sha256": null
+    }
+  },
+  "master": {
+    "source_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+    "binary_sha256": null,
+    "url": null,
+    "process_executable": {
+      "path": null,
+      "sha256": null
+    },
+    "fixture_provenance": {
+      "path": null,
+      "sha256": null
+    },
+    "distribution_files": [],
+    "conditions": {
+      "path": null,
+      "sha256": null
+    },
+    "build_provenance": {
+      "path": null,
+      "sha256": null
+    }
+  },
+  "es9": {
+    "source_revision": "es9-9.5.5",
+    "binary_sha256": null,
+    "url": null,
+    "process_executable": {
+      "path": null,
+      "sha256": null
+    },
+    "fixture_provenance": {
+      "path": null,
+      "sha256": null
+    },
+    "distribution_files": [],
+    "conditions": {
+      "path": null,
+      "sha256": null
+    }
+  }
+}

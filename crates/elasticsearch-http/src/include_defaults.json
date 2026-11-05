@@ -1,0 +1,401 @@
+{
+ "counted_keyword": {"index": true},
+ "aggregate_metric_double": {
+  "ignore_malformed": false,
+  "meta": {},
+  "time_series_metric": null
+ },
+ "binary": {
+  "doc_values": false,
+  "meta": {},
+  "store": false
+ },
+ "boolean": {
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false
+ },
+ "byte": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "completion": {
+  "analyzer": "simple",
+  "max_input_length": 50,
+  "meta": {},
+  "preserve_position_increments": true,
+  "preserve_separators": true,
+  "search_analyzer": "simple"
+ },
+ "constant_keyword": {
+  "meta": {}
+ },
+ "date": {
+  "doc_values": true,
+  "format": "strict_date_optional_time||epoch_millis",
+  "ignore_malformed": false,
+  "index": true,
+  "locale": "en",
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false
+ },
+ "date_nanos": {
+  "doc_values": true,
+  "format": "strict_date_optional_time_nanos||epoch_millis",
+  "ignore_malformed": false,
+  "index": true,
+  "locale": "en",
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false
+ },
+ "date_range": {
+  "coerce": true,
+  "doc_values": true,
+  "format": "strict_date_optional_time||epoch_millis",
+  "index": true,
+  "locale": "en",
+  "meta": {},
+  "store": false
+ },
+ "dense_vector": {
+  "element_type": "float",
+  "index": true,
+  "index_options": {
+   "ef_construction": 100,
+   "m": 16,
+   "type": "int8_hnsw"
+  },
+  "meta": {},
+  "similarity": "cosine"
+ },
+ "double": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "double_range": {
+  "coerce": true,
+  "doc_values": true,
+  "index": true,
+  "meta": {},
+  "store": false
+ },
+ "flattened": {
+  "depth_limit": 20,
+  "doc_values": true,
+  "eager_global_ordinals": false,
+  "ignore_above": 2147483647,
+  "index": true,
+  "index_options": "docs",
+  "meta": {},
+  "null_value": null,
+  "similarity": null,
+  "split_queries_on_whitespace": false,
+  "time_series_dimensions": []
+ },
+ "float": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "float_range": {
+  "coerce": true,
+  "doc_values": true,
+  "index": true,
+  "meta": {},
+  "store": false
+ },
+ "geo_point": {
+  "doc_values": true,
+  "ignore_malformed": false,
+  "ignore_z_value": true,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "geo_shape": {
+  "coerce": false,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "ignore_z_value": true,
+  "index": true,
+  "meta": {},
+  "on_script_error": "fail",
+  "orientation": "RIGHT",
+  "script": null,
+  "store": false
+ },
+ "half_float": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "histogram": {
+  "ignore_malformed": false,
+  "meta": {}
+ },
+ "integer": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "integer_range": {
+  "coerce": true,
+  "doc_values": true,
+  "index": true,
+  "meta": {},
+  "store": false
+ },
+ "ip": {
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false
+ },
+ "ip_range": {
+  "coerce": true,
+  "doc_values": true,
+  "index": true,
+  "meta": {},
+  "store": false
+ },
+ "join": {
+  "eager_global_ordinals": true
+ },
+ "keyword": {
+  "doc_values": true,
+  "eager_global_ordinals": false,
+  "ignore_above": 2147483647,
+  "index": true,
+  "index_options": "docs",
+  "meta": {},
+  "normalizer": null,
+  "norms": false,
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "similarity": null,
+  "split_queries_on_whitespace": false,
+  "store": false,
+  "time_series_dimension": false
+ },
+ "long": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "long_range": {
+  "coerce": true,
+  "doc_values": true,
+  "index": true,
+  "meta": {},
+  "store": false
+ },
+ "match_only_text": {
+  "meta": {}
+ },
+ "percolator": {
+  "meta": {}
+ },
+ "point": {
+  "doc_values": true,
+  "ignore_malformed": false,
+  "ignore_z_value": true,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "store": false
+ },
+ "rank_feature": {
+  "meta": {},
+  "null_value": null,
+  "positive_score_impact": true
+ },
+ "rank_features": {
+  "meta": {},
+  "positive_score_impact": true
+ },
+ "scaled_float": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "store": false,
+  "time_series_metric": null
+ },
+ "search_as_you_type": {
+  "analyzer": "default",
+  "doc_values": false,
+  "index": true,
+  "index_options": "positions",
+  "max_shingle_size": 3,
+  "meta": {},
+  "norms": true,
+  "search_analyzer": "default",
+  "search_quote_analyzer": "default",
+  "similarity": null,
+  "store": false,
+  "term_vector": "no"
+ },
+ "semantic_text": {
+  "chunking_settings": null,
+  "index_options": null,
+  "meta": {},
+  "model_settings": null,
+  "search_inference_id": null
+ },
+ "shape": {
+  "coerce": false,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "ignore_z_value": true,
+  "index": true,
+  "meta": {},
+  "orientation": "RIGHT"
+ },
+ "short": {
+  "coerce": true,
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "on_script_error": "fail",
+  "script": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "sparse_vector": {
+  "index_options": {
+   "prune": true,
+   "pruning_config": {
+    "tokens_freq_ratio_threshold": 5.0,
+    "tokens_weight_threshold": 0.4
+   }
+  },
+  "meta": {},
+  "store": false
+ },
+ "text": {
+  "analyzer": "default",
+  "eager_global_ordinals": false,
+  "fielddata": false,
+  "fielddata_frequency_filter": {
+   "max": 2147483647.0,
+   "min": 0.0,
+   "min_segment_size": 0
+  },
+  "index": true,
+  "index_options": "positions",
+  "index_phrases": false,
+  "index_prefixes": null,
+  "meta": {},
+  "norms": true,
+  "position_increment_gap": 100,
+  "search_analyzer": "default",
+  "search_quote_analyzer": "default",
+  "similarity": null,
+  "store": false,
+  "term_vector": "no"
+ },
+ "token_count": {
+  "doc_values": true,
+  "enable_position_increments": true,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "store": false
+ },
+ "unsigned_long": {
+  "doc_values": true,
+  "ignore_malformed": false,
+  "index": true,
+  "meta": {},
+  "null_value": null,
+  "store": false,
+  "time_series_dimension": false,
+  "time_series_metric": null
+ },
+ "version": {
+  "meta": {}
+ },
+ "wildcard": {
+  "ignore_above": 2147483647,
+  "meta": {},
+  "null_value": null
+ }
+}

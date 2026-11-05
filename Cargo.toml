@@ -1,0 +1,171 @@
+[package]
+name = "elasticsearch"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+# Patched dependencies keep their own package/workspace metadata. Do not
+# auto-enroll in-tree path dependencies as members of this workspace.
+exclude = ["vendor/http", "vendor/miniz_oxide", "vendor/unsafe-libyaml"]
+members = [
+    "crates/rustic-core",
+    "crates/elasticsearch-engine",
+    "crates/elasticsearch-http",
+    "crates/es-yaml-runner",
+    "crates/elasticsearch-routing",
+    "crates/elasticsearch-ssl",
+    "bench/compare",
+    "bench/path-poc",
+    "cluster/crates/elasticsearch-cluster",
+    "cluster/crates/elasticsearch-transport",
+    "cluster/crates/elasticsearch-snapshots",
+    "cluster/crates/elasticsearch-node",
+    "cluster/crates/elasticsearch-operator",
+    "cluster/crates/elasticsearch-faults",
+    "cluster/crates/es-cluster-yaml",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Core
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+bytes = "1"
+byteorder = "1"
+memmap2 = "0.9"
+crossbeam = "0.8"
+# Lock-free ordered map (the task registry) and its entries' task slots.
+crossbeam-skiplist = "0.1"
+arc-swap = "1"
+parking_lot = "0.12"
+rayon = "1"
+num-traits = "0.2"
+smallvec = "1"
+hashbrown = "0.15"
+ahash = "0.8"
+lru = "0.12"
+bitvec = "1"
+zstd = "0.13"
+# Unsafe (fast) LZ4 encoder; decoding stays the bounds-checked safe one.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame", "safe-decode"] }
+bitpacking = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+geo-types = "0.7"
+
+# HTTP / transport
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip"] }
+flate2 = "1"
+chrono-tz = "0.10"
+base64 = "0.22"
+regex = "1"
+
+# Automata (fuzzy / wildcard / regexp term matching)
+regex-automata = "0.4"
+regex-syntax = "0.8"
+
+# Benchmark comparison target (bench/compare)
+tantivy = "0.22"
+
+# Testing
+criterion = "0.5"
+proptest = "1"
+tempfile = "3"
+
+# Cluster layer
+elasticsearch-engine = { path = "crates/elasticsearch-engine" }
+elasticsearch-http = { path = "crates/elasticsearch-http" }
+elasticsearch-ssl = { path = "crates/elasticsearch-ssl" }
+elasticsearch-cluster = { path = "cluster/crates/elasticsearch-cluster" }
+elasticsearch-transport = { path = "cluster/crates/elasticsearch-transport" }
+elasticsearch-snapshots = { path = "cluster/crates/elasticsearch-snapshots" }
+elasticsearch-node = { path = "cluster/crates/elasticsearch-node" }
+serde_yaml = "0.9"
+rand = "0.8"
+sha2 = "0.10"
+futures = "0.3"
+async-trait = "0.1"
+libc = "0.2"
+hmac = "0.12"
+md-5 = "0.10"
+hex = "0.4"
+percent-encoding = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+kube = { version = "=2.0.1", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
+k8s-openapi = { version = "=0.26.1", default-features = false, features = ["v1_30"] }
+schemars = "1"
+
+[features]
+default = ["mutable-hnsw"]
+mutable-hnsw = ["elasticsearch-node/mutable-hnsw"]
+
+[dependencies]
+elasticsearch-node = { path = "cluster/crates/elasticsearch-node" }
+
+[[bin]]
+name = "elasticsearch"
+path = "src/main.rs"
+
+# ES's `bin/elasticsearch-reset-password` (`elasticsearch_node::reset_password`).
+[[bin]]
+name = "elasticsearch-reset-password"
+path = "src/bin/elasticsearch-reset-password.rs"
+
+# ES's keystore tool (`bin/elasticsearch-keystore`).
+[[bin]]
+name = "elasticsearch-keystore"
+path = "src/bin/elasticsearch-keystore.rs"
+
+# ES's `bin/elasticsearch-create-enrollment-token` (`elasticsearch_node::create_enrollment_token`).
+[[bin]]
+name = "elasticsearch-create-enrollment-token"
+path = "src/bin/elasticsearch-create-enrollment-token.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# Unwind, so a panic fails one request or shard instead of the whole node:
+# the request pools, the HTTP panic guard, shard seal/tragic handling, the
+# cluster-state applier and the master service all catch panics.
+panic = "unwind"
+
+# Iteration builds for the YAML suites: release speed without the fat-LTO link.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+panic = "unwind"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
+
+# Disk is tight on the dev machine: no debuginfo keeps target/ small.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[patch.crates-io]
+unsafe-libyaml = { path = "vendor/unsafe-libyaml" }
+http = { path = "vendor/http" }

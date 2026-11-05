@@ -1,0 +1,16 @@
+[package]
+name = "rustic-bench-compare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Head-to-head benchmark harness: rustic-core vs Tantivy (vs Lucene via bench/lucene)"
+
+[[bin]]
+name = "compare"
+path = "src/main.rs"
+
+[dependencies]
+rustic-core = { path = "../../crates/rustic-core" }
+tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true

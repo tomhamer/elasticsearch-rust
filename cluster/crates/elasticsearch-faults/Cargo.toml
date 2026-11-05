@@ -1,0 +1,20 @@
+[package]
+name = "elasticsearch-faults"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Jepsen-style fault-injection harness for the cluster-aware `elasticsearch` binary: real processes on localhost, kill -9 / SIGSTOP / restart / wipe nemeses, iptables partitions between per-node loopback addresses, concurrent clients recording histories, and checkers for the guarantees in docs/CONSISTENCY.md."
+
+[[bin]]
+name = "elasticsearch-faults"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+tokio.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
+rand.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+libc = "0.2"

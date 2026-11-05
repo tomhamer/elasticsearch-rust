@@ -1,0 +1,15 @@
+# Plain-manifest deployment of elasticsearch for users without Helm.
+# Use an overlay (overlays/single-node or overlays/three-node), not the base
+# directly:  kubectl apply -k cluster/deploy/k8s/overlays/three-node
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: default
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - services.yaml
+  - statefulset.yaml
+  - pdb.yaml
+images:
+  - name: elasticsearch-rs
+    newTag: "0.1.0"

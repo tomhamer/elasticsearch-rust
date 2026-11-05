@@ -1,0 +1,28 @@
+{{- $cluster := include "es.clusterName" . -}}
+elasticsearch cluster "{{ $cluster }}" is starting in namespace {{ .Release.Namespace }}.
+
+Node groups:
+{{- range .Values.nodeGroups }}
+{{- $g := include "es.group" (dict "root" $ "group" .) | fromYaml }}
+  - {{ include "es.groupFullname" (dict "root" $ "group" $g) }}: {{ $g.replicas }} x [{{ join ", " $g.roles }}]
+{{- end }}
+
+1. Watch the pods come up:
+     kubectl get pods -n {{ .Release.Namespace }} -l elasticsearch/cluster={{ $cluster }} -w
+
+2. Check cluster health from your machine:
+     kubectl port-forward -n {{ .Release.Namespace }} svc/{{ $cluster }} 9200:{{ .Values.service.httpPort }}
+     curl 'localhost:9200/_cluster/health?pretty'
+     curl 'localhost:9200/_cat/nodes?v'
+
+   In-cluster URL: {{ include "es.clientUrl" . }}
+
+3. Run the chart's tests:
+     helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{ if include "es.bootstrapped" . }}
+Bootstrap: the cluster already exists; cluster.initial_master_nodes is not set.
+{{- else }}
+Bootstrap: cluster.initial_master_nodes = {{ include "es.initialMasterNodes" . }}
+  (first install only; it is dropped automatically on the next `helm upgrade`.
+   If you render with `helm template`/GitOps, set clusterBootstrapped=true once the cluster has formed.)
+{{- end }}

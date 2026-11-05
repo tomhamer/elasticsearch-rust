@@ -1,0 +1,16 @@
+apiVersion: v2
+name: elasticsearch
+description: >-
+  Elasticsearch-compatible search engine written in Rust. One StatefulSet per
+  node group (dedicated masters, data tiers, coordinating nodes), with
+  discovery, safe bootstrapping, zone awareness, graceful shutdown via the
+  node shutdown API and PodDisruptionBudgets. Modelled on Elastic's official
+  chart.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+keywords: [elasticsearch, search, database]
+home: https://www.elastic.co/
+sources:
+  - https://github.com/elastic/elasticsearch

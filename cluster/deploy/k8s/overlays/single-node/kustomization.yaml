@@ -1,0 +1,17 @@
+# One node, `discovery.type: single-node` (no bootstrapping, no PDB).
+#   kubectl apply -k cluster/deploy/k8s/overlays/single-node
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: elasticsearch
+resources:
+  - namespace.yaml
+  - ../../base
+patches:
+  - path: statefulset-patch.yaml
+  - target: { kind: PodDisruptionBudget, name: elasticsearch }
+    patch: |
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: elasticsearch

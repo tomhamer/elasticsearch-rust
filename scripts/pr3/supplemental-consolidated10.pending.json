@@ -1,0 +1,27 @@
+{
+  "revision": "e684f809693fc776d7a2863fd08ac697bbcafdb5",
+  "source": "/home/ubuntu/pr3-consolidated10/source",
+  "manifest": "/home/ubuntu/pr3-consolidated10/candidate-manifest.json",
+  "manifest_sha256": "14c8f4f0fa15a41c57d2aa3c21798e186fa93ce0cad15b26c35dbc8521df146e",
+  "target": "/home/ubuntu/pr3/target",
+  "candidate": "/home/ubuntu/pr3-consolidated10/results/elasticsearch-node",
+  "candidate_sha256": null,
+  "cargo": "/home/ubuntu/.cargo/bin/cargo",
+  "cargo_sha256": null,
+  "out": "/home/ubuntu/pr3-consolidated10/supplemental-attempt-1",
+  "launcher_sha256": "99b5decb8dca7091ac70af332394487ab272bb4d9f362e254f5995b178b24fdf",
+  "helper_sha256": "7739a7ceb595562b9572d0cc8bfeabb24cad5a968ec110af5acb08f1e5308b30",
+  "ledger": "/home/ubuntu/pr3-consolidated10/supplemental/COVERAGE_CONSOLIDATED10_PREPARED.json",
+  "ledger_sha256": "fcb9aa69cfefed25dd9b4857b0b192f716cc39b0c80c1a14308b1d69a5b6c5db",
+  "s3_environment": null,
+  "completed": [
+    {
+      "service": "pr3-consolidated10",
+      "results": "/home/ubuntu/pr3-consolidated10/results"
+    },
+    {
+      "service": "pr3-consolidated10-correctness1",
+      "results": "/home/ubuntu/pr3-consolidated10-correctness1"
+    }
+  ]
+}

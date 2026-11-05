@@ -1,0 +1,61 @@
+name: perf-microbench
+
+# Performance microbenchmarks (ignored tests that time real engine paths).
+# Timings on shared GitHub-hosted runners are noisy; use a dedicated runner
+# for comparisons. Run on demand from the Actions tab or with
+# `gh workflow run perf-microbench.yml --ref <branch>`.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (a dedicated Linux runner is recommended)"
+        default: ubuntu-latest
+      benches:
+        description: "Space-separated subset (empty: all): knn merge geo auto_date distance many_leaves stats_api coord_merge pmc_tail noaa_store search_limit join_projection"
+        default: ""
+
+concurrency:
+  group: perf-microbench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  microbench:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-C target-cpu=native"
+    steps:
+      - name: Free disk space
+        if: runner.environment == 'github-hosted'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run microbenchmarks
+        shell: bash
+        run: |
+          mkdir -p perf-logs
+          want() { [ -z "${{ inputs.benches }}" ] || [[ " ${{ inputs.benches }} " == *" $1 "* ]]; }
+          fail=0
+          run() { name=$1; shift; echo "::group::$name"; if "$@" 2>&1 | tee "perf-logs/$name.log"; then :; else fail=1; fi; echo "::endgroup::"; }
+          T="cargo test --locked --profile fast"
+          want knn          && run knn          $T -p rustic-core --lib knn_k100_nc1000_ops_vs_lucene_reference -- --ignored --nocapture
+          want merge        && run merge        $T -p elasticsearch-engine --lib merge_microbench -- --ignored --nocapture
+          want geo          && run geo          $T -p elasticsearch-engine --lib geo_suite_microbench -- --ignored --nocapture
+          want auto_date    && run auto_date    $T -p elasticsearch-engine --test perf_correctness auto_date_bare_range_microbench -- --ignored --nocapture
+          want distance     && run distance     $T -p rustic-core --lib distance_visit_microbench -- --ignored --nocapture
+          want many_leaves  && run many_leaves  $T -p rustic-core --lib many_leaves_microbench -- --ignored --nocapture
+          want stats_api    && run stats_api    $T -p elasticsearch-node --test stats_api_latency -- --ignored --nocapture
+          want coord_merge  && run coord_merge  $T -p elasticsearch-node --test coordinator_merge_microbench -- --ignored --nocapture
+          want pmc_tail     && run pmc_tail     $T -p elasticsearch-node --test pmc_tail_latency -- --ignored --nocapture
+          want noaa_store   && run noaa_store   $T -p elasticsearch-engine --lib noaa_store_microbench -- --ignored --nocapture
+          want search_limit && run search_limit $T -p elasticsearch-node --test search_limit_bench -- --ignored --nocapture
+          want join_projection && run join_projection $T -p elasticsearch-engine --lib join_projection_timings -- --ignored --nocapture
+          exit $fail
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-logs
+          path: perf-logs/

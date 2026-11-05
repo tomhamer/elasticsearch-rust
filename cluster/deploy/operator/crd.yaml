@@ -1,0 +1,173 @@
+# CustomResourceDefinition for elasticsearch.k8s.elastic.co/v1 Elasticsearch.
+# Source of truth: cluster/crates/elasticsearch-operator/src/crd.rs.
+# Regenerate after changing it:
+#   cargo run --manifest-path cluster/Cargo.toml -p elasticsearch-operator -- crd > cluster/deploy/operator/crd.yaml
+# (the operator image also ships it at /crd.yaml).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: elasticsearches.elasticsearch.k8s.elastic.co
+spec:
+  group: elasticsearch.k8s.elastic.co
+  names:
+    categories: []
+    kind: Elasticsearch
+    plural: elasticsearches
+    shortNames:
+    - es
+    singular: elasticsearch
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.health
+      name: health
+      type: string
+    - description: Available nodes
+      jsonPath: .status.availableNodes
+      name: nodes
+      type: integer
+    - description: Elasticsearch version
+      jsonPath: .status.version
+      name: version
+      type: string
+    - jsonPath: .status.phase
+      name: phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ElasticsearchSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              image:
+                description: |-
+                  Container image; defaults to `<operator default image repository>:<version>`
+                  (repository from the operator's `--default-image-repository`, default `elasticsearch-rs`).
+                nullable: true
+                type: string
+              nodeSets:
+                description: Groups of identically configured nodes; each becomes one StatefulSet.
+                items:
+                  properties:
+                    config:
+                      description: Free-form `elasticsearch.yml` settings (nested or dotted keys).
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    count:
+                      default: 1
+                      description: Number of Elasticsearch nodes in this set.
+                      format: int32
+                      minimum: 0.0
+                      type: integer
+                    name:
+                      description: Name of the node set; part of the StatefulSet and pod names.
+                      type: string
+                    podTemplate:
+                      description: |-
+                        Free-form PodTemplateSpec merged over the operator's defaults; the
+                        main container is named `elasticsearch`.
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    volumeClaimTemplates:
+                      description: |-
+                        PersistentVolumeClaim templates. The claim named `elasticsearch-data`
+                        is mounted at the data path; default 1Gi ReadWriteOnce.
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                  required:
+                  - name
+                  type: object
+                type: array
+              podDisruptionBudget:
+                description: |-
+                  PodDisruptionBudget template (`{metadata, spec}`). Omitted: a default
+                  budget allowing one disruption while the cluster is green. Set with an
+                  empty `spec` (`podDisruptionBudget: {spec: {}}`) to disable.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              updateStrategy:
+                description: Constraints applied to rolling changes and topology changes.
+                nullable: true
+                properties:
+                  changeBudget:
+                    description: |-
+                      ECK semantics: `maxSurge` = how many pods may exist above the total
+                      desired count during changes (absent or negative: unbounded);
+                      `maxUnavailable` = how many pods may be unavailable (absent: 1; negative:
+                      unbounded).
+                    nullable: true
+                    properties:
+                      maxSurge:
+                        format: int32
+                        nullable: true
+                        type: integer
+                      maxUnavailable:
+                        format: int32
+                        nullable: true
+                        type: integer
+                    type: object
+                type: object
+              version:
+                description: Elasticsearch version (used for the default image tag and reported in status).
+                type: string
+            required:
+            - nodeSets
+            - version
+            type: object
+          status:
+            nullable: true
+            properties:
+              availableNodes:
+                default: 0
+                format: int32
+                type: integer
+              conditions:
+                items:
+                  properties:
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    status:
+                      description: '`True`, `False` or `Unknown`.'
+                      type: string
+                    type:
+                      description: '`ReconciliationComplete`, `RunningDesiredVersion`, `ElasticsearchIsReachable`, `ResourcesAwareManagement`.'
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              health:
+                description: '`green`, `yellow`, `red` or `unknown`.'
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: '`Ready`, `ApplyingChanges`, `MigratingData`, `Stalled` or `Invalid`.'
+                nullable: true
+                type: string
+              version:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: Elasticsearch
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

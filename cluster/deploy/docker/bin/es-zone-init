@@ -1,0 +1,35 @@
+#!/bin/bash
+# Init container helper: copy a Kubernetes *node* label (default
+# topology.kubernetes.io/zone) into an Elasticsearch node attribute.
+#
+# The downward API cannot expose node labels, so this reads
+# GET /api/v1/nodes/$NODE_NAME with the pod's service account (needs a
+# ClusterRole with `get` on `nodes`) and writes the file
+# $ES_ATTRS_DIR/node.attr.<attribute>, which docker-entrypoint.sh turns into
+# `-E node.attr.<attribute>=<value>`.
+#
+# Env: NODE_NAME (required; fieldRef spec.nodeName), ES_ZONE_TOPOLOGY_KEY,
+#      ES_ZONE_ATTRIBUTE (default zone), ES_ATTRS_DIR (default
+#      /usr/share/elasticsearch/settings.d/attrs), ES_ZONE_REQUIRED (default
+#      true: fail the pod if the label is missing, rather than silently
+#      starting without awareness).
+set -euo pipefail
+
+KEY="${ES_ZONE_TOPOLOGY_KEY:-topology.kubernetes.io/zone}"
+ATTR="${ES_ZONE_ATTRIBUTE:-zone}"
+DIR="${ES_ATTRS_DIR:-/usr/share/elasticsearch/settings.d/attrs}"
+SA=/var/run/secrets/kubernetes.io/serviceaccount
+: "${NODE_NAME:?NODE_NAME must be set from spec.nodeName}"
+
+node_json="$(curl -sf --max-time 10 --retry 5 --retry-delay 2 --cacert "$SA/ca.crt" \
+  -H "Authorization: Bearer $(cat "$SA/token")" "https://kubernetes.default.svc/api/v1/nodes/${NODE_NAME}")"
+value="$(jq -r --arg k "$KEY" '.metadata.labels[$k] // empty' <<< "$node_json")"
+
+if [[ -z "$value" ]]; then
+  echo "es-zone-init: node ${NODE_NAME} has no label ${KEY}" >&2
+  [[ "${ES_ZONE_REQUIRED:-true}" == "true" ]] && exit 1
+  exit 0
+fi
+mkdir -p "$DIR"
+printf '%s\n' "$value" > "${DIR}/node.attr.${ATTR}"
+echo "es-zone-init: node.attr.${ATTR}=${value} (from ${KEY} of ${NODE_NAME})"

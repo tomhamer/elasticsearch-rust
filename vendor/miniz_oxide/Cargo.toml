@@ -1,0 +1,17 @@
+[package]
+name = "rustic-miniz-oxide"
+version = "0.9.1"
+edition = "2021"
+license = "MIT OR Zlib OR Apache-2.0"
+description = "Pinned miniz_oxide with a before-allocation workspace size hook"
+[lib]
+name = "miniz_oxide"
+path = "src/lib.rs"
+[features]
+default = ["with-alloc"]
+with-alloc = []
+std = []
+block-boundary = []
+[dependencies]
+adler2 = { version = "2.0", default-features = false }
+[workspace]

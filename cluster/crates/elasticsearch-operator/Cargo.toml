@@ -1,0 +1,29 @@
+[package]
+name = "elasticsearch-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kubernetes operator for the elasticsearch cluster (ECK-compatible subset)"
+
+[[bin]]
+name = "elasticsearch-operator"
+path = "src/main.rs"
+
+[dependencies]
+# kube 2.0.x is the newest line whose MSRV (1.85) fits the pinned 1.87 toolchain.
+kube = { version = "=2.0.1", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
+k8s-openapi = { version = "=0.26.1", default-features = false, features = ["v1_30"] }
+schemars = "1"
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+serde_yaml.workspace = true
+tokio.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
+async-trait.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+

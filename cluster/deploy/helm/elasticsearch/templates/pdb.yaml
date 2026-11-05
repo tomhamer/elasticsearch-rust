@@ -1,0 +1,22 @@
+{{- if .Values.pdb.enabled }}
+{{- $root := . -}}
+{{- range .Values.nodeGroups }}
+{{- $g := include "es.group" (dict "root" $root "group" .) | fromYaml }}
+{{- if gt (int $g.replicas) 0 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "es.groupFullname" (dict "root" $root "group" $g) }}-pdb
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "es.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $g.name }}
+spec:
+  maxUnavailable: {{ $root.Values.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "es.groupSelectorLabels" (dict "root" $root "group" $g) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,41 @@
+[package]
+name = "elasticsearch-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Elasticsearch 8.x-compatible REST server (axum) over elasticsearch-engine."
+
+[dependencies]
+elasticsearch-engine = { path = "../elasticsearch-engine" }
+# HTTPS on the REST listener (`xpack.security.http.ssl.*`).
+elasticsearch-ssl.workspace = true
+tokio-rustls.workspace = true
+unsafe-libyaml = "0.2.11"
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+serde.workspace = true
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+flate2.workspace = true
+miniz_oxide = { package = "rustic-miniz-oxide", path = "../../vendor/miniz_oxide" }
+futures.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+memchr = "2"
+chrono.workspace = true
+base64.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+rustic-core = { path = "../rustic-core" }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "http_load"
+harness = false
+
+[[bench]]
+name = "http_compare"
+harness = false

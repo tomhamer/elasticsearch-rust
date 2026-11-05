@@ -1,0 +1,39 @@
+{{- $cluster := include "es.clusterName" . }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $cluster }}-test-cluster-health
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "es.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    # Keep the finished pod so `helm test --logs` can read it; the next
+    # `helm test` replaces it.
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: health
+      image: {{ include "es.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      env:
+        - name: ES_URL
+          value: {{ include "es.clientUrl" . | quote }}
+      command:
+        - bash
+        - -euo
+        - pipefail
+        - -c
+        - |
+          echo "waiting for cluster health {{ .Values.tests.waitForStatus }} at ${ES_URL}"
+          out="$(curl -sS --max-time 150 "${ES_URL}/_cluster/health?wait_for_status={{ .Values.tests.waitForStatus }}&timeout={{ .Values.tests.timeout }}")"
+          echo "$out"
+          [ "$(jq -r .timed_out <<< "$out")" = "false" ]
+          [ "$(jq -r .cluster_name <<< "$out")" = "{{ $cluster }}" ]
+          echo "cluster is {{ .Values.tests.waitForStatus }}"

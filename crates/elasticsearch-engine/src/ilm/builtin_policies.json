@@ -1,0 +1,1301 @@
+{
+  ".deprecation-indexing-ilm-policy": {
+    "_meta": {
+      "description": "ILM policy used for deprecation logs",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "30d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "10gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  ".fleet-actions-results-ilm-policy": {
+    "_meta": {
+      "description": "default policy for fleet action results indices",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "300gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  ".fleet-file-fromhost-data-ilm-policy": {
+    "_meta": {
+      "description": "policy for fleet uploaded files",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "7d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "7d",
+            "max_primary_shard_size": "10gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  ".fleet-file-fromhost-meta-ilm-policy": {
+    "_meta": {
+      "description": "policy for fleet uploaded file metadata",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "10gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  ".fleet-file-tohost-data-ilm-policy": {
+    "_meta": {
+      "description": "policy for fleet deliverable files",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "24d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "14d",
+            "max_primary_shard_size": "10gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  ".fleet-file-tohost-meta-ilm-policy": {
+    "_meta": {
+      "description": "policy for fleet deliverable file metadata",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "10gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  ".monitoring-8-ilm-policy": {
+    "_meta": {
+      "defaults": {
+        "delete_min_age": "Using value of [3d] based on the monitoring plugin default"
+      },
+      "description": "Index lifecycle policy generated for [monitoring-*-8] data streams"
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "3d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "3d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "180-days-default": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot, warm, and cold phases with a retention of 180 days",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "cold": {
+        "actions": {},
+        "min_age": "30d"
+      },
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "180d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "180-days@lifecycle": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot, warm, and cold phases with a retention of 180 days",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "cold": {
+        "actions": {},
+        "min_age": "30d"
+      },
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "180d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "30-days-default": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot and warm phases with a retention of 30 days",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "30d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "30-days@lifecycle": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot and warm phases with a retention of 30 days",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "30d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "365-days-default": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot, warm, and cold phases with a retention of 365 days",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "cold": {
+        "actions": {},
+        "min_age": "30d"
+      },
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "365d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "365-days@lifecycle": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot, warm, and cold phases with a retention of 365 days",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "cold": {
+        "actions": {},
+        "min_age": "30d"
+      },
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "365d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "7-days-default": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot and warm phases with a retention of 7 days",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "7d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "7d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "7-days@lifecycle": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot and warm phases with a retention of 7 days",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "7d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "7d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "90-days-default": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot, warm, and cold phases with a retention of 90 days",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "cold": {
+        "actions": {},
+        "min_age": "30d"
+      },
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "90-days@lifecycle": {
+    "_meta": {
+      "description": "built-in ILM policy using the hot, warm, and cold phases with a retention of 90 days",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "cold": {
+        "actions": {},
+        "min_age": "30d"
+      },
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      },
+      "warm": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "shrink": {
+            "allow_write_after_shrink": false,
+            "number_of_shards": 1
+          }
+        },
+        "min_age": "2d"
+      }
+    }
+  },
+  "ilm-history-ilm-policy": {
+    "_meta": {
+      "description": "default policy for the ILM history indices",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "logs": {
+    "_meta": {
+      "description": "default policy for the logs index template installed by x-pack",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "logs-apm.app_logs-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "10d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "logs-apm.error_logs-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "10d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "logs@lifecycle": {
+    "_meta": {
+      "description": "default policy for the logs index template installed by x-pack",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics": {
+    "_meta": {
+      "description": "default policy for the metrics index template installed by x-pack",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.app_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.internal_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_destination_10m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "180d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "14d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_destination_1m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "7d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_destination_60m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "390d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_summary_10m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "180d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "14d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_summary_1m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "7d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_summary_60m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "390d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_transaction_10m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "180d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "14d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_transaction_1m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "7d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.service_transaction_60m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "390d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.transaction_10m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "180d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "14d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.transaction_1m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "7d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics-apm.transaction_60m_metrics-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "390d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "metrics@lifecycle": {
+    "_meta": {
+      "description": "default policy for the metrics index template installed by x-pack",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "slm-history-ilm-policy": {
+    "_meta": {
+      "description": "default policy for the SLM history indices",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "synthetics": {
+    "_meta": {
+      "description": "default policy for the synthetics index template installed by x-pack",
+      "managed": true
+    },
+    "deprecated": true,
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "synthetics@lifecycle": {
+    "_meta": {
+      "description": "default policy for the synthetics index template installed by x-pack",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "traces-apm.rum_traces-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "90d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "traces-apm.sampled_traces-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "1h"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "1h"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "traces-apm.traces-default_policy": {
+    "_meta": {
+      "description": "Default ILM policy for APM managed datastreams",
+      "managed": true
+    },
+    "phases": {
+      "delete": {
+        "actions": {
+          "delete": {
+            "delete_searchable_snapshot": true
+          }
+        },
+        "min_age": "10d"
+      },
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
+  "traces@lifecycle": {
+    "_meta": {
+      "description": "default policy for the traces index template installed by x-pack",
+      "managed": true
+    },
+    "deprecated": false,
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "30d",
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  }
+}

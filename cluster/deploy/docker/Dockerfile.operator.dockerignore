@@ -1,0 +1,23 @@
+# Build context for `docker build -f cluster/deploy/docker/Dockerfile[.operator] .` (from
+# the repository root). BuildKit reads this file automatically because it sits
+# next to the Dockerfile. Allow-list: the cluster workspace (cluster/) depends
+# by path on crates/ (engine, http, rustic-core), whose `*.workspace = true`
+# keys are inherited from the root Cargo.toml (itself a package: src/main.rs
+# must exist for cargo to load it). Nothing else is needed: no
+# bench/, tests/, docs/, or build outputs. (~10 MB context.)
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!crates
+!cluster
+**/target
+**/target-*
+**/.DS_Store
+**/__pycache__
+**/*.mov
+cluster/docs
+cluster/deploy/helm
+cluster/deploy/k8s
+cluster/deploy/operator
+cluster/scripts

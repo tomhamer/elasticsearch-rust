@@ -1,0 +1,17 @@
+{
+  "source_revision": "743334f328b4a42ed66ef7c3861fc7d5471d6f96",
+  "binary_sha256": null,
+  "artifacts": [],
+  "commands": [],
+  "kind": "rolling",
+  "out": "/home/ubuntu/pr3-consolidated2/gate-reports/rolling",
+  "native": "/home/ubuntu/pr3-consolidated2/results/elasticsearch-node---test-rolling_capabilities.log",
+  "old_binary": {
+    "path": "/home/ubuntu/pr3-consolidated2/results/elasticsearch-node-old",
+    "sha256": null
+  },
+  "candidate_binary": {
+    "path": "/home/ubuntu/pr3-consolidated2/results/elasticsearch-node",
+    "sha256": null
+  }
+}

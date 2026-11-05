@@ -1,0 +1,59 @@
+[package]
+name = "elasticsearch-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The cluster-aware Elasticsearch node: coordination driver, cluster state applier, replication + recovery, request routing, cluster REST APIs and the `elasticsearch` binary."
+
+[[bin]]
+name = "elasticsearch-node"
+path = "src/bin/elasticsearch-node.rs"
+
+[features]
+gpu = ["elasticsearch-engine/gpu"]
+default = ["mutable-hnsw"]
+mutable-hnsw = ["elasticsearch-engine/mutable-hnsw"]
+
+[dependencies]
+rayon.workspace = true
+elasticsearch-engine.workspace = true
+elasticsearch-http.workspace = true
+elasticsearch-cluster.workspace = true
+elasticsearch-transport.workspace = true
+elasticsearch-ssl.workspace = true
+elasticsearch-snapshots.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+serde_yaml.workspace = true
+bincode.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+axum.workspace = true
+tower = { workspace = true, features = ["util"] }
+futures.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+rand.workspace = true
+lz4_flex.workspace = true
+libc = "0.2"
+flate2 = "1"
+# Byte search over response bodies (front uuid canonicalization).
+memchr = "2"
+# Keystore crypto (PBKDF2-HMAC-SHA512, AES-GCM, SHA-256): the `ring` already
+# linked for rustls.
+ring = "0.17"
+# Global allocator: glibc malloc's arena locks and fragmentation showed up
+# as ~20% of a bulk-indexing profile.
+mimalloc = { version = "0.1", default-features = false }
+# Security auto-configuration: self-signed CAs and node certificates (PEM).
+rcgen.workspace = true
+base64.workspace = true
+# `elasticsearch-reset-password`: calls the node over HTTP(S).
+reqwest = { workspace = true, features = ["rustls-tls"] }
+
+[dev-dependencies]
+tempfile.workspace = true

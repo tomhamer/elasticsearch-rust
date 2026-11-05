@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Build/test on the EC2 builder instead of the laptop (disk is nearly full).
+#   cluster/scripts/remote-cargo test -p elasticsearch-node
+# Runs in the repo root (one workspace: engine, http and cluster crates).
+# `--root` is accepted and ignored (it used to select the root workspace).
+# Source of truth stays on the laptop; each call rsyncs.
+set -euo pipefail
+dir=.
+if [[ "${1:-}" == "--root" ]]; then shift; fi
+exec "$(dirname "$0")/ec2-e2e.sh" cargo "$dir" "$@"

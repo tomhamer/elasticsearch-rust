@@ -1,0 +1,23 @@
+{
+  "status": "pending actual GPU host deployment and runtime library pins; not executable yet",
+  "source": "/home/ubuntu/pr3-consolidated11/source",
+  "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+  "source_manifest": {
+    "path": "/home/ubuntu/pr3-consolidated11/candidate-manifest.json",
+    "sha256": "b826e46e83bccf39233e884a342360f9d4444b46568bcb5729ce731576829c40"
+  },
+  "out": "/home/ubuntu/pr3-consolidated11/gpu-final-attempt-1",
+  "yaml_root": "/home/ubuntu/es955-yaml",
+  "yaml_manifest": {
+    "path": null,
+    "sha256": null
+  },
+  "library_directories": [],
+  "runtime_libraries": [],
+  "jobs": 24,
+  "rustflags": "-C target-cpu=native",
+  "port_base": 24000,
+  "run_name": "pr3-consolidated11-gpu-1",
+  "launcher_sha256": "2134ef8687242363bf772048db5ae477ca1dc2aed2392b8901eb85308e84562e",
+  "helper_sha256": "7739a7ceb595562b9572d0cc8bfeabb24cad5a968ec110af5acb08f1e5308b30"
+}

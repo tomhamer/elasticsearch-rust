@@ -1,0 +1,240 @@
+# Default values: a 3-node cluster where every node is master-eligible and
+# holds data (the equivalent of Elastic's chart defaults). See
+# values-production.yaml for dedicated masters + data nodes across zones.
+
+# cluster.name. Also the prefix of every object name:
+# StatefulSets are <clusterName>-<nodeGroup>, the client Service is <clusterName>.
+clusterName: elasticsearch
+
+image:
+  repository: elasticsearch-rs
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Extra labels on every object.
+labels: {}
+
+# Cluster-wide elasticsearch.yml settings (nested or dotted keys), merged
+# under each node group's `config`. Settings the chart manages through the
+# environment (cluster.name, node.name, node.roles, network.host,
+# network.publish_host, discovery.seed_hosts, cluster.initial_master_nodes)
+# take precedence over anything set here.
+config:
+  # Security defaults to on (as in ES 8/9). The probes, preStop hook and tests
+  # of this chart use plain HTTP without credentials and transport has no TLS,
+  # so the chart turns it off explicitly. Configure TLS and authentication
+  # before running in production.
+  xpack.security.enabled: false
+#  action.destructive_requires_name: true
+#  path.repo: ["/usr/share/elasticsearch/snapshots"]
+
+# --- Bootstrapping -----------------------------------------------------------
+# On the first install the chart passes cluster.initial_master_nodes (the pod
+# names of every master-eligible node) through the <clusterName>-bootstrap
+# ConfigMap, which is NOT part of the pod template. On `helm upgrade` the
+# chart detects (via `lookup`) that a master StatefulSet already exists and
+# renders that ConfigMap empty, so pods restarted later never re-bootstrap.
+#
+# Notes (as in the official chart):
+# * `helm template` / GitOps tools that render offline cannot `lookup`; set
+#   clusterBootstrapped: true after the cluster has formed in that case;
+# * never rename master groups or change their replica counts in the same
+#   upgrade that first installs the cluster;
+# * if all master data volumes are lost, the cluster must be re-bootstrapped
+#   (set clusterBootstrapped: false and delete the master StatefulSets).
+clusterBootstrapped: false
+
+# --- Node groups ------------------------------------------------------------
+# Every entry becomes one StatefulSet + headless Service + PDB. Any key of
+# nodeGroupDefaults may be overridden per group.
+nodeGroups:
+  - name: default
+    replicas: 3
+    roles: [master, data, ingest, remote_cluster_client]
+
+nodeGroupDefaults:
+  replicas: 1
+  roles: [master, data, ingest, remote_cluster_client]
+  # elasticsearch.yml settings for this group only (merged over `config`).
+  config: {}
+  # Container resources. There is no JVM heap to size: the engine uses
+  # native memory plus the OS page cache (mmap) — give the pod enough memory
+  # limit headroom for the page cache of the hot data set.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      memory: 2Gi
+  persistence:
+    enabled: true
+    size: 30Gi
+    # "" = cluster default StorageClass.
+    storageClassName: ""
+    accessModes: [ReadWriteOnce]
+    annotations: {}
+  # Include this group's pods behind the client (HTTP) Service.
+  clientService: true
+  nodeSelector: {}
+  tolerations: []
+  # A non-empty affinity replaces the generated anti-affinity.
+  affinity: {}
+  # soft: prefer one pod of the group per host; hard: require it.
+  antiAffinity: soft
+  antiAffinityTopologyKey: kubernetes.io/hostname
+  topologySpread:
+    enabled: true
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    # DoNotSchedule makes zone balance a hard constraint.
+    whenUnsatisfiable: ScheduleAnyway
+  priorityClassName: ""
+  podAnnotations: {}
+  podLabels: {}
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  extraInitContainers: []
+  extraContainers: []
+
+# --- Pod behaviour ------------------------------------------------------------
+podManagementPolicy: Parallel   # or OrderedReady
+updateStrategy: RollingUpdate   # or OnDelete (restart pods yourself)
+terminationGracePeriodSeconds: 120
+
+# The readiness probe waits for this cluster health (once per container
+# start) before the pod first reports ready; then only checks the local node.
+clusterHealthCheckParams: "wait_for_status=yellow&timeout=1s"
+
+readinessProbe:
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  successThreshold: 3
+  failureThreshold: 3
+livenessProbe:
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 5
+startupProbe:
+  periodSeconds: 10
+  timeoutSeconds: 5
+  # 10s x 60 = up to 10 minutes for recovery of local shards at start.
+  failureThreshold: 60
+
+# Graceful shutdown through the node shutdown API (preStop hook es-prestop):
+# restarts register type=restart (allocation_delay avoids rebuilding replicas
+# during the restart); pods being removed by a scale-down register
+# type=remove and wait (bounded by timeoutSeconds) for their shards to move.
+# The record is deleted by the readiness probe once the node is back.
+drainOnShutdown:
+  enabled: true
+  allocationDelay: 5m
+  # Must be below terminationGracePeriodSeconds.
+  timeoutSeconds: 100
+
+# Master scale-down: when a master-eligible pod is stopped because its
+# StatefulSet was scaled below its ordinal, preStop adds a voting config
+# exclusion for it; the post-upgrade cleanup Job clears the exclusions once
+# the node has left. Scale masters down ONE AT A TIME (one helm upgrade per
+# removed master) and never below a majority of the current voters.
+masterScaleDown:
+  votingConfigExclusions: true
+  cleanupJob: true
+  cleanupTimeoutSeconds: 600
+
+# Copy a Kubernetes node label into node.attr.<attribute> (init container
+# es-zone-init; needs `get nodes`, granted through a ClusterRole when
+# rbac.create is true).
+zoneAwareness:
+  enabled: false
+  topologyKey: topology.kubernetes.io/zone
+  attribute: zone
+  # Also set cluster.routing.allocation.awareness.attributes=<attribute>.
+  setAllocationAwareness: true
+
+# Raise vm.max_map_count on the host. The engine memory-maps segment files;
+# hosts with many shards/segments can exceed the kernel default (65530).
+# The pods bind 0.0.0.0, so the bootstrap checks are enforced and a node
+# refuses to start (exit 78) below 262144: set it here or on the nodes.
+# Requires a privileged init container — off by default; prefer setting the
+# sysctl on the nodes (node pool config / DaemonSet).
+sysctlInitContainer:
+  enabled: false
+  image: busybox:1.36
+  vmMaxMapCount: 262144
+
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  runAsUser: 1000
+  runAsGroup: 0
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  runAsNonRoot: true
+  runAsUser: 1000
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  # Role (get statefulsets, for scale-down detection in preStop) and, with
+  # zoneAwareness, a ClusterRole (get nodes).
+  create: true
+
+pdb:
+  enabled: true
+  maxUnavailable: 1
+
+# Client Service (HTTP 9200) in front of groups with clientService: true.
+service:
+  type: ClusterIP
+  httpPort: 9200
+  transportPort: 9300
+  annotations: {}
+  labels: {}
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: elasticsearch.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Prometheus metrics via the community elasticsearch-exporter as a sidecar
+# (scrapes the local node's REST API), optionally with a ServiceMonitor.
+metrics:
+  exporter:
+    enabled: false
+    image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.9.0
+    port: 9114
+    extraArgs: []
+    resources:
+      requests: { cpu: 25m, memory: 32Mi }
+      limits: { memory: 64Mi }
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+tests:
+  # helm test waits for this status.
+  waitForStatus: green
+  timeout: 120s

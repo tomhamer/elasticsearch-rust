@@ -1,0 +1,2493 @@
+{
+  "version": "9.5.5",
+  "source": "official ES9.5.5 release REST capabilities endpoint",
+  "entries": [
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_component_template/{name}",
+        "capabilities": [
+          "dlm.downsampling_method"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_component_template/{name}",
+        "capabilities": [
+          "dlm.frozen_after"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_component_template/{name}",
+        "capabilities": [
+          "failure_store.lifecycle.frozen_after_rejected"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_component_template",
+        "capabilities": [
+          "local_param_deprecated"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_component_template/{id}",
+        "capabilities": [
+          "component_template_tracking_info"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_synonyms/{rule_id}",
+        "capabilities": [
+          "synonyms_refresh_param"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/_snapshot/{repository}/{snapshot}",
+        "parameters": [
+          "wait_for_completion"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "columnar_index_modes"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}/_mapping",
+        "capabilities": [
+          "reject_runtime_field_shadowing_sort_field"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_cluster/settings",
+        "capabilities": [
+          "repositories.default_repository_setting"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cat/circuit_breaker"
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_snapshot/{repository}/{snapshot}",
+        "parameters": [
+          "state"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cluster/health",
+        "capabilities": [
+          "unassigned_pri_shard_count"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cat/nodes",
+        "capabilities": [
+          "available_processors_availability"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_doc",
+        "capabilities": [
+          "failure_store_status"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_index_template/{template}",
+        "capabilities": [
+          "data_stream_options.failure_store"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_data_stream",
+        "parameters": [
+          "verbose"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_data_stream/{target}/_options",
+        "capabilities": [
+          "failure_store.lifecycle"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_data_stream/{target}/_options",
+        "capabilities": [
+          "failure_store.lifecycle.frozen_after_rejected"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_component_template/{template}",
+        "capabilities": [
+          "data_stream_options.failure_store.lifecycle"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_aliases",
+        "capabilities": [
+          "fix_filtered_data_stream_alias_removal"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_data_stream/{target}",
+        "capabilities": [
+          "failure_store.lifecycle"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_data_stream/{target}",
+        "capabilities": [
+          "failure_store.lifecycle.default_retention"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_rollover",
+        "capabilities": [
+          "index_expression_selectors"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_rollover",
+        "capabilities": [
+          "return-404-on-missing-target"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/logs_search/_rollover",
+        "capabilities": [
+          "max_size_deprecation"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_template",
+        "capabilities": [
+          "local_param_deprecated"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_xpack/usage",
+        "capabilities": [
+          "global_retention_telemetry"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_xpack/usage",
+        "capabilities": [
+          "frozen_after_telemetry"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "disable_sequence_numbers"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_index_template/{name}",
+        "capabilities": [
+          "dlm.downsampling_method"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_index_template/{name}",
+        "capabilities": [
+          "dlm.frozen_after"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_index_template/{name}",
+        "capabilities": [
+          "failure_store.lifecycle.frozen_after_rejected"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_index_template/{id}",
+        "capabilities": [
+          "index_template_tracking_info"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_capabilities",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": []
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_resolve/index/*",
+        "capabilities": [
+          "mode_filter"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_ingest/pipeline/{id}",
+        "capabilities": [
+          "pipeline_tracking_info"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_close",
+        "capabilities": [
+          "wait-for-active-shards-index-setting-removed"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "lookup_index_mode"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "poorly_formatted_bad_request"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "hunspell_dict_400"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "synthetic_nested_dense_vector_bug_fix"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "knn_query_vector_base64"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "knn_retriever_optional_num_candidates"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_search",
+        "capabilities": [
+          "knn_quantized_vector_rescore_oversample"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/{index}/_block/{block}"
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "dense_vector_docvalue_fields"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_search",
+        "capabilities": [
+          "exclude_source_vectors_setting"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "dense_vector_docvalue_fields",
+          "dense_vector_docvalue_fields_format"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_search",
+        "capabilities": [
+          "exclude_vectors_param"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_search",
+        "capabilities": [
+          "knn_quantized_vector_rescore"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_nodes/stats",
+        "capabilities": [
+          "dense_vector_off_heap_stats"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "optimized_scalar_quantization_bbq"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "knn_filter_on_nested_fields"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "bit_dense_vector_synthetic_source"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cluster/stats",
+        "capabilities": [
+          "verbose-dense-vector-mapping-stats"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "vectordb_document_index_mode"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "optimized_scalar_quantization_bbq",
+          "dense_vector_updatable_bbq"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_search",
+        "capabilities": [
+          "exclude_vectors_param",
+          "exclude_source_vectors_setting"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_search",
+        "capabilities": [
+          "highlight_max_analyzed_offset_default"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_search",
+        "capabilities": [
+          "highlight_number_of_fragments_bounded"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_get_index_template",
+        "capabilities": [
+          "local_param_deprecated"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "range_regexp_interval_queries"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "field_exists_query_for_text_fields_no_index_or_dv"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/_internal/desired_nodes",
+        "capabilities": [
+          "plain_text_empty_response"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/_internal/desired_balance",
+        "capabilities": [
+          "plain_text_empty_response"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_internal/desired_balance",
+        "capabilities": [
+          "desired_balance_node_weights_in_response"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cluster/allocation/explain",
+        "capabilities": [
+          "query_parameter_support"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_ilm/policy/my_timeseries_lifecycle",
+        "capabilities": [
+          "max_size_deprecation"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_ilm/policy/{name}",
+        "capabilities": [
+          "searchable_snapshot_force_merge_on_clone"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_analyze",
+        "capabilities": [
+          "analyze_max_char_count"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cat/segments",
+        "capabilities": [
+          "allow_closed"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_cluster/voting_config_exclusions",
+        "capabilities": [
+          "plain_text_empty_response"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/_cluster/voting_config_exclusions",
+        "capabilities": [
+          "plain_text_empty_response"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "reject_runtime_field_shadowing_sort_field"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cluster/stats",
+        "capabilities": [
+          "human-readable-total-docs-size"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_cluster/stats",
+        "capabilities": [
+          "ccs-stats"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/{index}",
+        "capabilities": [
+          "logsdb_index_mode"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_data_stream/{index}",
+        "capabilities": [
+          "data_stream_lifecycle_effective_retention"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/{index}/_lifecycle/explain",
+        "capabilities": [
+          "data_stream_lifecycle_effective_retention"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_data_stream/{index}/_lifecycle",
+        "capabilities": [
+          "data_stream_lifecycle_effective_retention"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_data_stream/{index}/_lifecycle",
+        "capabilities": [
+          "data_stream_global_retention"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_data_stream/{name}/_lifecycle",
+        "capabilities": [
+          "dlm.downsampling_method"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_data_stream/{name}/_lifecycle",
+        "capabilities": [
+          "dlm.frozen_after"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "pipeline_aggs_parent_multi_bucket_error"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_xpack/usage",
+        "capabilities": [
+          "logging_usage"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_migration/reindex",
+        "capabilities": [
+          "migration_reindex"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "aggregate_metric_double_v0",
+          "dense_vector_agg_metric_double_if_version"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "aggregate_metric_double_avg_as_default_metric",
+          "dense_vector_agg_metric_double_if_version"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "aggregate_metric_double_v0"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "enable_lookup_join_on_aliases"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "explain",
+          "no_brackets_in_unquoted_index_names",
+          "explain_with_remote_plans"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "documents_found_and_values_loaded"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "query_params_multi_values"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "parameter_for_limit",
+          "parameter_for_sample"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "parameter_for_limit",
+          "parameter_for_sample",
+          "query_params_multi_values"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "cast_string_literal_to_temporal_amount"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "normalized_limit_error_message"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "fix_no_columns"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "empty_list_param_as_null"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fix_nested_subfield_extraction"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fix_nested_subfield_extraction",
+          "optional_fields_fix_load_partially_mapped"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "query_monitoring"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fix_index_like_question_mark_wildcard",
+          "handle_determinization_complexity"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "flattened_datatype"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "join_lookup_v12"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "join_lookup_v12",
+          "lookup_join_on_boolean_expression",
+          "fn_field_extract"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "dense_vector_agg_metric_double_if_version",
+          "date_range_field_type_v3",
+          "histogram_release_version"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_fix_unmapped_load_convert_function"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_unmapped_load_null_fallback"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "bucket_inclusive_upper_bound"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "implicit_casting_string_literal_to_temporal_amount"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "column_metadata_bucket_v2"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "column_metadata_bucket_v2",
+          "approximation_v7"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "column_metadata_bucket_v2",
+          "tbucket"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "match_operator_colon"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "match_additional_types"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fn_match_runtime_filter"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "full_text_functions_disjunctions_compute_engine"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "agg_values_spatial"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "spatial_grid_types"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "enrich_strict_range_types"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "support_partial_results"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_fix_unmapped_object_value"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "function_stats"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "snapshot_test_for_telemetry_v2",
+          "fn_byte_length",
+          "match_function_options",
+          "ts_command_v0",
+          "time_series_translation_in_analyzer",
+          "cosine_vector_similarity_function",
+          "inline_stats",
+          "promql_command_v0",
+          "uri_parts_command",
+          "registered_domain_command",
+          "user_agent_command",
+          "ip_location_command",
+          "fn_json_extract",
+          "esql_limit_by",
+          "dedup_command",
+          "highlight_v2"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "non_snapshot_test_for_telemetry_v2",
+          "fn_contains",
+          "promql_command_v0",
+          "esql_limit_by",
+          "time_series_translation_in_analyzer"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "usage_contains_took"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "views_telemetry"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_query/view",
+        "capabilities": [
+          "view_index_abstraction"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "loading_non_indexed_ip_fields"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "metadata_fields",
+          "metadata_ignored_field"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fix_count_distinct_source_error"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "sorting_on_source_and_counters_forbidden"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "sort_returning_source_ok"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "grok_validation"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "fix_doubly_released_null_blocks_in_valuesourcereader"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "fix_limit_truncation_with_zero_columns"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "fix_set_wrong_line_column"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_v5",
+          "flattened_datatype"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "dense_vector_field_type_released"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "agg_top"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "sample_v3"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "match_phrase_function"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "knn_function_v3"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "term_function"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "top_snippets_foldable_query_check"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "dense_vector_agg_metric_double_if_version"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "sorting_on_source_and_counters_forbidden",
+          "dense_vector_agg_metric_double_if_version"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "aggregate_metric_double_no_rows_count_0"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "union_types_fix_rename_resolution"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "aggregate_metric_double_v0",
+          "fix_unsigned_long_to_aggregate_metric_double"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "ts_permit_text_becoming_keyword_when_grouped_on",
+          "ts_command_v0"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "ts_command_v0",
+          "ts_rename_timestamp_error_message",
+          "inline_stats_with_no_columns"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "ts_command_v0",
+          "fn_first_fix_null_sort_dropped_timestamp",
+          "fn_last_fix_null_sort_dropped_timestamp"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "aggregate_metric_double_avg_as_default_metric"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "promql_command_v0",
+          "fix_promql_time_bucket_v2"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "promql_command_v0",
+          "fix_promql_time_bucket_v2",
+          "optional_fields_nullify_tech_preview"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "promql_command_v0",
+          "fix_promql_time_bucket_v2",
+          "promql_unmapped_fields_filter_nulls",
+          "optional_fields_nullify_tech_preview"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "promql_command_v0",
+          "promql_unmapped_fields_filter_nulls",
+          "fix_promql_time_bucket_v2"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "promql_resolve_unkown"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "sorting_on_histogram_and_tsid_forbidden"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "promql_label_matcher_params"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "flattened_datatype",
+          "flattened_datatype_sorted_keys"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "ts_command_v0",
+          "flattened_datatype",
+          "flattened_datatype_sorted_keys"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fix_passthrough_field_caps_object_parent"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_query/dataset",
+        "capabilities": [
+          "data_sources"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_query/dataset/{name}",
+        "capabilities": [
+          "dataset_declared_schema"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "lookup_join_sort_warning"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "enable_lookup_join_on_remote"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "lookup_join_on_multiple_fields"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "union_types",
+          "union_types_remove_fields",
+          "casting_operator"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "REPORT_ORIGINAL_TYPES"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "case_mv"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "suggested_cast",
+          "implicit_casting_date_and_date_nanos",
+          "aggregate_metric_double_v0"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "no_brackets_in_unquoted_index_names"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "no_brackets_in_unquoted_index_names",
+          "fork_v9"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "tables_types"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "global_timezone_parameter_with_output"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "query_settings_request_body"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_fix_load_keyword_with_multifields"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "short_error_messages_for_unsupported_fields"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "base_conversion"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_v2"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_v5",
+          "optional_fields_fix_unmapped_load_multi_index_pattern",
+          "optional_fields_load_with_fork_subqueries_and_views"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "lookup_join_text",
+          "join_lookup_v12"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fn_st_geometrytype"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "union_types",
+          "union_types_remove_fields"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "to_lower_empty_string"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_fix_load_partially_mapped"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_unmapped_load_auto_cast_two_legged_punks"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "tstep",
+          "tstep_explicit_bounds",
+          "fn_tstep_implicit_timestamp"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "tstep",
+          "tstep_explicit_bounds",
+          "tstep_bucket_count",
+          "fn_tstep_implicit_timestamp"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "fn_reverse",
+          "functions_never_emit_text"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "functions_never_emit_text"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "method",
+          "path",
+          "parameters",
+          "capabilities"
+        ],
+        "capabilities": [
+          "handle_determinization_complexity"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [
+          "capabilities"
+        ],
+        "capabilities": [
+          "like_parameter_support"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_query/data_source",
+        "capabilities": [
+          "data_sources"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "optional_fields_load_with_fork_subqueries_and_views",
+          "views_with_branching"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_enrich/stats",
+        "capabilities": [
+          "size-in-bytes"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_migration/deprecations",
+        "capabilities": [
+          "data_streams",
+          "ilm_policies",
+          "templates"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "aggregate_metric_double_defaults_to_average"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_bulk",
+        "capabilities": [
+          "failure_store_status"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/_bulk",
+        "capabilities": [
+          "failure_store_status"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_downsample/{target_index}",
+        "capabilities": [
+          "downsampling.store_reset_counters"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "transform_rank_rrf_to_retriever"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "nested_retriever_inner_hits_support",
+          "exclude_source_vectors_setting"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_eql/search",
+        "parameters": [],
+        "capabilities": [
+          "filters_on_keys_fix"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/_inference",
+        "capabilities": [
+          "default_elser_2"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_downsample/{target_index}",
+        "capabilities": [
+          "downsample.sampling_mode.last_value"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_downsample/{target_index}",
+        "capabilities": [
+          "downsample.sampling_mode.last_value",
+          "downsampling.exponential_histograms",
+          "downsampling.tdigest_histograms"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_downsample/{target_index}",
+        "capabilities": [
+          "downsample.sampling_mode.last_value",
+          "downsampling.tdigest"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_downsample/{target_index}",
+        "capabilities": [
+          "downsampling.tdigest"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "capabilities": [
+          "tsdb_tstep"
+        ]
+      },
+      "supported": false
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/{index}/_downsample/{target_index}",
+        "capabilities": [
+          "downsample.multi_field_fix"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "kql_query"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "capabilities": [
+          "kql_query_boolean_field_query"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "ts_command_v0",
+          "metrics_info_command"
+        ]
+      },
+      "supported": true
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/_query",
+        "parameters": [],
+        "capabilities": [
+          "ts_command_v0",
+          "ts_info_command"
+        ]
+      },
+      "supported": true
+    }
+  ]
+}

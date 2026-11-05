@@ -1,0 +1,89 @@
+[package]
+name = "rustic-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+base64.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+byteorder.workspace = true
+memmap2.workspace = true
+crossbeam.workspace = true
+parking_lot.workspace = true
+ahash.workspace = true
+rayon.workspace = true
+num-traits.workspace = true
+smallvec.workspace = true
+lru.workspace = true
+libc.workspace = true
+bitvec.workspace = true
+zstd.workspace = true
+lz4_flex.workspace = true
+bitpacking.workspace = true
+bincode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+geo-types.workspace = true
+regex-automata.workspace = true
+regex-syntax.workspace = true
+fst = "0.4"
+unicode-segmentation = "1"
+libm = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[features]
+# The mutable per-field HNSW owner is the only supported ANN backend: legacy
+# segmented-graph maintenance was removed (PR #62), so a build without it
+# cannot seal or merge graph-mapped vector fields. The ES crate and every
+# workspace build already enabled it; standalone builds now match them.
+default = ["mutable-hnsw-poc"]
+# CUDA/cuVS are loaded at runtime; CPU-only builds have no CUDA dependency.
+gpu = []
+# Query execution counters (query::stats) for benchmarks and diagnosis; off
+# by default: without it they compile to nothing.
+query-stats = []
+# S3-compatible object-store backend (codec::object_store::s3); no extra crates.
+s3 = []
+# Isolated filter-aware graph experiment; disabled in the default ES build.
+payload-hnsw-poc = []
+# Mutable HNSW graph per field (default). Historical name: the ES crate's
+# `mutable-hnsw` feature forwards to it.
+mutable-hnsw-poc = []
+# Test-only seams other crates' tests use (never in a production build;
+# the engine enables it for its tests through its dev-dependencies).
+test-seams = []
+# Opt-in A/B: f32 SIMD products with double angular normalization.
+mutable-hnsw-vespa-angular = ["mutable-hnsw-poc"]
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "term_dictionary"
+harness = false
+
+[[bench]]
+name = "range_query"
+harness = false
+
+[[bench]]
+name = "postings"
+harness = false
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "indexing"
+harness = false

@@ -1,0 +1,20 @@
+[package]
+name = "es-yaml-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs Elasticsearch's YAML REST test suite against the in-process elasticsearch-http server."
+publish = false
+
+[dependencies]
+elasticsearch-http = { path = "../elasticsearch-http" }
+elasticsearch-engine = { path = "../elasticsearch-engine" }
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+regex.workspace = true
+tempfile.workspace = true
+chrono.workspace = true
+base64.workspace = true

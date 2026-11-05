@@ -1,0 +1,118 @@
+#!/bin/bash
+# `elasticsearch-plugin` for this image. The node is a single native binary
+# with no plugin runtime (no JVM, no plugin class loading), so nothing can be
+# installed into it. This tool keeps the official CLI's contract for the
+# automation that calls it (Helm charts, ECK init containers, Dockerfiles that
+# `RUN bin/elasticsearch-plugin install --batch ...`):
+#
+#   list [-v]                 lists the (normally empty) plugins directory
+#   install [--batch] IDS...  succeeds for plugins that are built into the
+#                             node or are modules in ES 9 (as ES does for
+#                             those: a message, no failure); fails for every
+#                             other plugin with ES's exit codes
+#   remove IDS...             fails: nothing is ever installed
+#
+# Exit codes as ES's `ExitCodes`: 64 usage, 74 I/O error, 78 config.
+set -uo pipefail
+
+ES_HOME="${ES_HOME:-/usr/share/elasticsearch}"
+PLUGINS_DIR="${ES_HOME}/plugins"
+
+# ES 9 `InstallPluginAction.PLUGINS_CONVERTED_TO_MODULES`.
+CONVERTED_TO_MODULES=" repository-azure repository-gcs repository-s3 ingest-attachment "
+# Official plugins whose features the node has built in.
+BUILT_IN=" mapper-size mapper-murmur3 mapper-annotated-text "
+# The rest of ES 9.5's official plugins (`plugins.txt`).
+OFFICIAL=" analysis-icu analysis-kuromoji analysis-nori analysis-phonetic analysis-smartcn analysis-stempel analysis-ukrainian discovery-azure-classic discovery-ec2 discovery-gce repository-hdfs store-smb "
+
+fail() { # message exit-code
+  echo "ERROR: $1, with exit code $2" >&2
+  exit "$2"
+}
+
+usage() {
+  cat <<'EOF'
+A tool for managing installed elasticsearch plugins
+
+Commands
+--------
+list - Lists installed elasticsearch plugins
+install - Install a plugin
+remove - removes plugins from Elasticsearch
+
+Non-option arguments:
+command
+
+Option             Description
+------             -----------
+-E <KeyValuePair>  Configure a setting
+-h, --help         Show help
+-s, --silent       Show minimal output
+-v, --verbose      Show verbose output
+EOF
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+verbose=false
+silent=false
+ids=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -v|--verbose) verbose=true ;;
+    -s|--silent) silent=true ;;
+    -b|--batch) ;;
+    -h|--help) usage; exit 0 ;;
+    -E) shift ;;
+    -E*) ;;
+    --purge|-p) ;;
+    -*) fail "$1 is not a recognized option" 64 ;;
+    *) ids+=("$1") ;;
+  esac
+  shift
+done
+
+case "$cmd" in
+  list)
+    [[ -d "$PLUGINS_DIR" ]] || fail "Plugins directory missing: ${PLUGINS_DIR}" 74
+    $verbose && echo "Plugins directory: ${PLUGINS_DIR}"
+    find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%f\n' | LC_ALL=C sort
+    ;;
+  install)
+    [[ ${#ids[@]} -gt 0 ]] || fail "at least one plugin id is required" 64
+    seen=" "
+    for id in "${ids[@]}"; do
+      [[ "$seen" == *" $id "* ]] && fail "duplicate plugin id [$id]" 64
+      seen+="$id "
+    done
+    for id in "${ids[@]}"; do
+      $silent || echo "-> Installing ${id}"
+      if [[ "$id" == "x-pack" ]]; then
+        fail "this distribution of Elasticsearch contains X-Pack by default" 78
+      elif [[ "$CONVERTED_TO_MODULES" == *" $id "* ]]; then
+        echo "[${id}] is no longer a plugin but instead a module packaged with this distribution of Elasticsearch" >&2
+      elif [[ "$BUILT_IN" == *" $id "* ]]; then
+        echo "[${id}] is built into this distribution of Elasticsearch; nothing to install" >&2
+      elif [[ "$OFFICIAL" == *" $id "* ]]; then
+        fail "plugin [${id}] is not supported by this distribution of Elasticsearch (it has no plugin runtime)" 64
+      elif [[ "$id" != *:* ]]; then
+        fail "Unknown plugin ${id}" 64
+      else
+        fail "installing plugins from [${id}] is not supported by this distribution of Elasticsearch (it has no plugin runtime)" 64
+      fi
+    done
+    ;;
+  remove)
+    [[ ${#ids[@]} -gt 0 ]] || fail "at least one plugin id is required" 64
+    for id in "${ids[@]}"; do
+      fail "plugin [${id}] not found; run 'elasticsearch-plugin list' to get list of installed plugins" 64
+    done
+    ;;
+  ""|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    fail "Unknown command [${cmd}]" 64
+    ;;
+esac

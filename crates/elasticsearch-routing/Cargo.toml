@@ -1,0 +1,8 @@
+[package]
+name = "elasticsearch-routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Elasticsearch-compatible document routing (murmur3 over UTF-16, routing_num_shards, partitions); no dependencies"
+
+[dependencies]

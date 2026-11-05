@@ -1,0 +1,48 @@
+#!/bin/bash
+# Readiness probe (same semantics as Elastic's official Helm chart):
+#
+# * until the node has once been ready since the container started, wait for
+#   the *cluster* to reach $ES_HEALTH_PARAMS (default
+#   `wait_for_status=yellow&timeout=1s`) — so a StatefulSet RollingUpdate
+#   does not move on to the next pod before the cluster has recovered;
+# * afterwards only check that the node answers
+#   `GET /_cluster/health?local=true` (a lost master must not make every pod
+#   unready at once).
+#
+# On the first success, if ES_DRAIN_ON_SHUTDOWN=true, delete this node's own
+# shutdown record left by es-prestop (`DELETE /_nodes/{id}/shutdown`), which
+# re-enables normal allocation for it.
+#
+# Env: ES_URL (default http://127.0.0.1:9200), ES_HEALTH_PARAMS,
+#      ES_DRAIN_ON_SHUTDOWN, ES_PROBE_TIMEOUT (seconds, default 3).
+set -uo pipefail
+
+ES_URL="${ES_URL:-http://127.0.0.1:9200}"
+PARAMS="${ES_HEALTH_PARAMS:-wait_for_status=yellow&timeout=1s}"
+T="${ES_PROBE_TIMEOUT:-3}"
+START_FILE=/tmp/.es_start_file
+
+code() {
+  curl -s -o /dev/null --max-time "$T" -w '%{http_code}' "${ES_URL}$1"
+}
+
+if [[ -f "$START_FILE" ]]; then
+  [[ "$(code '/_cluster/health?local=true')" == "200" ]] && exit 0
+  echo "node HTTP layer not answering /_cluster/health?local=true" >&2
+  exit 1
+fi
+
+c="$(code "/_cluster/health?${PARAMS}")"
+if [[ "$c" != "200" ]]; then
+  echo "cluster not ready yet (/_cluster/health?${PARAMS} -> ${c})" >&2
+  exit 1
+fi
+touch "$START_FILE"
+
+if [[ "${ES_DRAIN_ON_SHUTDOWN:-false}" == "true" ]]; then
+  id="$(curl -s --max-time "$T" "${ES_URL}/_nodes/_local" | jq -r '.nodes | keys[0] // empty' 2>/dev/null || true)"
+  if [[ -n "$id" ]]; then
+    curl -s -o /dev/null --max-time "$T" -X DELETE "${ES_URL}/_nodes/${id}/shutdown" || true
+  fi
+fi
+exit 0

@@ -1,0 +1,2 @@
+Vendored from the published miniz_oxide 0.9.1 source (MIT/Zlib/Apache licenses retained).
+The only algorithm-source patch is `CompressorOxide::boxed_heap_bytes`, exposing the exact boxed state and nested fixed-array sizes so HTTP compression can admit workspace before construction. Compression algorithms are unchanged. This crate has a distinct package name to avoid changing other flate2 users or feature-unified backends. Its only enabled dependency is adler2; HTTP uses the existing fast level and raw deflate wrapped in standard gzip framing.

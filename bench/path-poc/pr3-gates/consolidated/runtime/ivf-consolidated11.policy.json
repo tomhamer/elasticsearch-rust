@@ -1,0 +1,9 @@
+{
+  "measurements_only": true,
+  "review_reference": "docs/pr3/FINAL11_GATE_PREPARATION.md (matched workload design; no acceptance threshold)",
+  "k": 10,
+  "num_candidates": 100,
+  "repetitions": 3,
+  "mixed_seconds": 120,
+  "mixed_updates_per_second": 1000
+}

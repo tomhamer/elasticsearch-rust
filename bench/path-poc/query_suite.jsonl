@@ -1,0 +1,7 @@
+{"id":"terms_aggregation","class":"terms_aggregation","request":{"size":0,"_source":false,"track_total_hits":true,"aggs":{"tags":{"terms":{"field":"tag","size":100}}}}}
+{"id":"numeric_stats","class":"numeric_stats","request":{"size":0,"_source":false,"track_total_hits":true,"aggs":{"prices":{"stats":{"field":"price"}}}}}
+{"id":"range_aggregation","class":"range_aggregation","request":{"size":0,"_source":false,"track_total_hits":true,"query":{"range":{"price":{"gte":100,"lt":800}}},"aggs":{"prices":{"range":{"field":"price","ranges":[{"key":"low","to":300},{"key":"middle","from":300,"to":700},{"key":"high","from":700}]}}}}}
+{"id":"filter_aggregation","class":"filter_aggregation","request":{"size":0,"_source":false,"track_total_hits":true,"query":{"range":{"price":{"gte":100,"lt":800}}},"aggs":{"tag":{"filter":{"term":{"tag":"tag33"}},"aggs":{"mean":{"avg":{"field":"price"}}}}}}}
+{"id":"global_aggregation","class":"global_aggregation","request":{"size":0,"_source":false,"track_total_hits":true,"query":{"term":{"tag":"tag33"}},"aggs":{"all":{"global":{},"aggs":{"prices":{"stats":{"field":"price"}}}}}}}
+{"id":"boolean_filter","class":"boolean_filter","request":{"size":10,"_source":false,"track_total_hits":true,"sort":[{"id":"asc"}],"query":{"bool":{"filter":[{"terms":{"tag":["tag33","tag7"]}},{"range":{"price":{"gte":100,"lt":800}}}]}}}}
+{"id":"numeric_sort","class":"numeric_sort","request":{"size":10,"_source":false,"track_total_hits":true,"sort":[{"price":"desc"},{"id":"asc"}],"query":{"match_all":{}}}}

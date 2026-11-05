@@ -1,0 +1,1670 @@
+{
+ "projects": {
+  "modules/aggregations": [
+   {
+    "args": [
+     "aggregations/date_agg_per_day_of_week/Date aggregartion per day of week",
+     "week-date behaviour has changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregations/time_series/Configure with no synthetic source",
+     "temporary until backport"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregations/percentiles_hdr_metric/Negative values test",
+     "returned exception has changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregations/moving_fn/linearWeightedAvg",
+     "math was wrong in previous versions"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/analysis-common": [
+   {
+    "args": [
+     "tokens.0.token",
+     "absen\u021b",
+     "romanian"
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "indices.analyze/15_analyze/Custom analyzer is not buildable",
+     "error response changed with #123743"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/data-streams": [
+   {
+    "args": [
+     "data_stream/10_basic/Create hidden data stream",
+     "warning does not exist for compatibility"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/10_basic/Create data stream with failure store",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/10_basic/Delete data stream with failure store",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/10_basic/Delete data stream with failure store uninitialized",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/30_auto_create_data_stream/Don't initialize failure store during data stream auto-creation on successful index",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/150_tsdb/TSDB failures go to failure store",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/150_tsdb/dynamic templates",
+     "The _tsid has changed in a new index version. This tests verifies the exact _tsid value with is too brittle for compatibility testing."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/150_tsdb/dynamic templates - conflicting aliases",
+     "The _tsid has changed in a new index version. This tests verifies the exact _tsid value with is too brittle for compatibility testing."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/150_tsdb/dynamic templates with nesting",
+     "The _tsid has changed in a new index version. This tests verifies the exact _tsid value with is too brittle for compatibility testing."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/170_modify_data_stream/Modify a data stream's failure store",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Failure redirects to original failure store during index change if final pipeline changes target",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Ensure failure is redirected to correct failure store after a reroute processor",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Test failure store status with bulk request",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Redirect ingest failure in data stream to failure store",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Failure redirects to correct failure store when pipeline loop is detected",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Failure redirects to correct failure store when index loop is detected",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Failure redirects to original failure store during index change if self referenced",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Redirect shard failure in data stream to failure store",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/190_failure_store_redirection/Version conflicts are not redirected to failure store",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/Lazily roll over a data stream's failure store after an ingest failure",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/A failure store marked for lazy rollover should only be rolled over when there is a failure",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/Roll over a data stream's failure store without conditions",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/Lazily roll over a data stream's failure store after a shard failure",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/Don't roll over a data stream's failure store when conditions aren't met",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/Roll over a data stream's failure store with conditions",
+     "Configuring the failure store via data stream templates is not supported anymore."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/Rolling over a failure store on a data stream without the failure store enabled should work",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/200_rollover_failure_store/Rolling over an uninitialized failure store should initialize it",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/A failure store marked for lazy rollover should only be rolled over when there is a failure",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/Don't roll over a data stream's failure store when conditions aren't met",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/Rolling over a failure store on a data stream without the failure store enabled should work",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/Rolling over an uninitialized failure store should initialize it",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/Roll over a data stream's failure store with conditions",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/Lazily roll over a data stream's failure store after an ingest failure",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/Lazily roll over a data stream's failure store after a shard failure",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/210_rollover_failure_store/Roll over a data stream's failure store without conditions",
+     "Rolling over a data stream using target_failure_store is no longer supported."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "data_stream/240_failure_store_info/Get failure store info from explicitly enabled failure store and disabled lifecycle",
+     "failure store lifecycle is not using anymore the data stream lifecycle"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/ingest-common": [
+   {
+    "args": [
+     "ingest/30_date_processor/Test week based date parsing",
+     "week-date behaviour has changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ingest/120_grok/Test Grok Patterns Retrieval",
+     "only counting the number of patterns, which may change"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/ip-location": [
+   {
+    "args": [
+     "ingest_geoip/40_geoip_databases/Test adding, getting, and removing geoip databases",
+     "get databases behavior began returning more results in 8.16"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ingest_geoip/60_ip_location_databases/Test adding, getting, and removing ip location databases",
+     "get databases behavior began returning more results in 9.2.1"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/lang-mustache": [
+   {
+    "args": [
+     "profile",
+     2,
+     "Test that parameters can be used"
+    ],
+    "op": "replaceValueInLength"
+   }
+  ],
+  "modules/lang-painless": [
+   {
+    "args": [
+     "painless/146_dense_vector_bit_basic/Dot Product is not supported",
+     "inner product is now supported"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/mapper-extras": [
+   {
+    "args": [
+     "match_only_text/10_basic/synthetic_source match_only_text as multi-field with ignored keyword as parent",
+     "ignore_above now uses sorted binary doc values"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/reindex": [
+   {
+    "args": [
+     "reindex/20_validation/specifying size fails",
+     "size is rejected in 9.0"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "modules/streams": [
+   {
+    "args": [
+     "The 'logs' stream is deprecated. Use individual stream names such as 'logs.otel' and 'logs.ecs' instead"
+    ],
+    "op": "addAllowedWarningRegex"
+   }
+  ],
+  "rest-api-spec": [
+   {
+    "args": [
+     "profile.shards.0.dfs.knn.0.query.0.description",
+     "DocAndScoreQuery[0,...][0.009673266,...],0.009673266",
+     "dfs knn vector profiling"
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "profile.shards.0.dfs.knn.0.query.0.description",
+     "DocAndScoreQuery[0,...][0.009673266,...],0.009673266",
+     "dfs knn vector profiling with vector_operations_count"
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "profile.shards.0.dfs.knn.0.collector.0.name",
+     "TopScoreDocCollector",
+     "dfs knn vector profiling"
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "profile.shards.0.dfs.knn.0.collector.0.name",
+     "TopScoreDocCollector",
+     "dfs knn vector profiling with vector_operations_count"
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "test_index.mappings.properties.embedding.index_options.confidence_interval",
+     null
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "cat.aliases/10_basic/Deprecated local parameter",
+     "CAT APIs not covered by compatibility policy"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "cat.shards/10_basic/Help",
+     "sync_id is removed in 9.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search/330_fetch_fields/Test with subobjects: auto",
+     "subobjects auto removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search/500_date_range/from, to, include_lower, include_upper deprecated",
+     "deprecated parameters are removed in 9.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.highlight/30_max_analyzed_offset/Plain highlighter with max_analyzed_offset < 0 should FAIL",
+     "semantics of test has changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/70_dense_vector_telemetry/Field mapping stats with field details",
+     "default dense vector field mapping has changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "range/20_synthetic_source/Double range",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "range/20_synthetic_source/Float range",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "range/20_synthetic_source/Integer range",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "range/20_synthetic_source/IP range",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "range/20_synthetic_source/Long range",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "range/20_synthetic_source/Date range Rounding Fixes",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "index/92_metrics_auto_subobjects/Metrics object indexing with synthetic source",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "index/92_metrics_auto_subobjects/Root without subobjects with synthetic source",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "index/92_metrics_auto_subobjects/Root with metrics",
+     "subobjects auto removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "index/92_metrics_auto_subobjects/Metrics object indexing",
+     "subobjects auto removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "index/91_metrics_no_subobjects/Metrics object indexing with synthetic source",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "index/91_metrics_no_subobjects/Root without subobjects with synthetic source",
+     "_source.mode mapping attribute is no-op since 9.0.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.create/20_synthetic_source/subobjects auto",
+     "subobjects auto removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.create/20_synthetic_source/synthetic_source with copy_to inside nested object",
+     "temporary until backported"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.create/20_synthetic_source/synthetic_source with copy_to pointing to ambiguous field and subobjects auto",
+     "subobjects auto removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.put_index_template/15_composition/Composable index templates that include subobjects: auto on arbitrary field",
+     "subobjects auto removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.put_index_template/15_composition/Composable index templates that include subobjects: auto at root",
+     "subobjects auto removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "cluster.desired_nodes/10_basic/Test delete desired nodes with node_version generates a warning",
+     "node_version warning is removed in 9.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "cluster.desired_nodes/10_basic/Test update desired nodes with node_version generates a warning",
+     "node_version warning is removed in 9.0"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/05_dimension_and_metric_in_non_tsdb_index/can't shadow dimensions",
+     "Dimensions can be shadowed in non tsdb indices"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/05_dimension_and_metric_in_non_tsdb_index/can't shadow metrics",
+     "Metrics can be shadowed in non tsdb indices"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/15_timestamp_mapping/unable to create a time series index with @timestamp runtime field",
+     "error message changed when sort field shadow rejection was added"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/20_mapping/nested fields",
+     "nested field support in tsdb indices is now supported"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "logsdb/10_settings/routing path allowed in logs mode with routing on sort fields",
+     "Unknown feature routing.logsb_route_on_sort_fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.create/21_synthetic_source_stored/field param - keep nested array",
+     "Synthetic source keep arrays now stores leaf arrays natively"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.create/21_synthetic_source_stored/field param - keep root array",
+     "Synthetic source keep arrays now stores leaf arrays natively"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "cluster.info/30_info_thread_pool/Cluster HTTP Info",
+     "The search_throttled thread pool has been removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "synonyms/80_synonyms_from_index/Fail loading synonyms from index if synonyms_set doesn't exist",
+     "Synonyms do no longer fail if the synonyms_set doesn't exist"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "get/100_synthetic_source/indexed dense vectors",
+     "Vectors are not returned by default"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "get/100_synthetic_source/non-indexed dense vectors",
+     "Vectors are not returned by default"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/90_sparse_vector/stored sparse_vector synthetic source",
+     "Vectors are not returned by default"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/90_sparse_vector/sparse_vector synthetic source",
+     "Vectors are not returned by default"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "logsdb/10_settings/start time not allowed in logs mode",
+     "we don't validate for index_mode=tsdb when setting start_date/end_date anymore"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "logsdb/10_settings/end time not allowed in logs mode",
+     "we don't validate for index_mode=tsdb when setting start_date/end_date anymore"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "logsdb/10_settings/override sort mode settings",
+     "we changed the error message"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "logsdb/10_settings/override sort missing settings",
+     "we changed the error message"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "logsdb/10_settings/override sort order settings",
+     "we changed the error message"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/10_settings/set start_time and end_time without timeseries mode",
+     "we don't validate for index_mode=tsdb when setting start_date/end_date anymore"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/10_settings/set start_time, end_time and routing_path via put settings api without time_series mode",
+     "we don't validate for index_mode=tsdb when setting start_date/end_date anymore"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search/140_pre_filter_search_shards/prefilter on non-indexed date fields",
+     "prefiltering can now use skippers on dv-only fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/42_knn_search_bbq_flat/Vector rescoring has same scoring as exact search for kNN section",
+     "rescoring is now bulk, floating point values are slightly different"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "Use of the \\[max_size\\] rollover condition has been deprecated in favour of the \\[max_primary_shard_size\\] condition and will be removed in a later version"
+    ],
+    "op": "addAllowedWarningRegex"
+   },
+   {
+    "args": [
+     "Parameter \\[confidence_interval\\] in \\[index_options\\] for dense_vector field \\[[^\\]]+\\] is deprecated and will be removed in a future version"
+    ],
+    "op": "addAllowedWarningRegex"
+   },
+   {
+    "args": [
+     "search.vectors/42_knn_search_bbq_flat/Vector rescoring has same scoring as exact search for kNN section",
+     "scores have changed slightly with native implementations"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/41_knn_search_bbq_hnsw/Vector rescoring has same scoring as exact search for kNN section",
+     "scores have changed slightly with native implementations"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/41_knn_search_half_byte_quantized/Vector rescoring has the same scoring as exact search for kNN section",
+     "scores have changed slightly with native implementations"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/41_knn_search_byte_quantized/Vector rescoring has the same scoring as exact search for kNN section",
+     "scores have changed slightly with native implementations"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/42_knn_search_int4_flat/Vector rescoring has the same scoring as exact search for kNN section",
+     "scores have changed slightly with native implementations"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/42_knn_search_int8_flat/Vector rescoring has the same scoring as exact search for kNN section",
+     "scores have changed slightly with native implementations"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/41_knn_search_byte_quantized/KNN Vector similarity search only",
+     "min similarity score changed with Lucene 10.4"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/42_knn_search_int8_flat/KNN Vector similarity search only",
+     "min similarity score changed with Lucene 10.4"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/180_update_dense_vector_type/Allowed dense vector updates on same type but different other index_options, int8_hnsw",
+     "confidence_interval handling differs between old/new versions during compat runs"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/180_update_dense_vector_type/Allowed dense vector updates on same type but different other index_options, int8_flat",
+     "confidence_interval handling differs between old/new versions during compat runs"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "search.vectors/180_update_dense_vector_type/Allowed dense vector updates on same type but different other index_options, int4_flat",
+     "confidence_interval handling differs between old/new versions during compat runs"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "get/100_synthetic_source/fields with ignore_malformed",
+     "Malformed values are now stored in binary doc values which sort differently than stored fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "delete/70_tsdb/basic tsdb delete",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/routing_path matches object",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/ids query",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/create operation on top of old document fails over bulk",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/delete over _bulk",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/delete",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/index a new document on top of an old one",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/generates a consistent id",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/create operation on top of old document fails",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/get",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/routing_path matches deep object",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "tsdb/25_id_generation/index a new document on top of an old one over bulk",
+     "ids have changed after introduction of synthetic id"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "scroll/12_slices/Sliced scroll",
+     "doc to slice mapping changed with shard-oblivious-slicing"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "scroll/12_slices/Sliced scroll with doc values",
+     "doc to slice mapping changed with shard-oblivious-slicing"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "indices.put_mapping/10_basic/Put mappings with explicit _doc type",
+     "_doc-wrapped mapping sources are now accepted rather than rejected"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "x-pack/plugin": [
+   {
+    "args": [
+     "\\.ml-anomalies-shared.mappings._meta.version",
+     "\\.ml-anomalies-shared-000001.mappings._meta.version"
+    ],
+    "op": "replaceIsTrue"
+   },
+   {
+    "args": [
+     "\\.ml-anomalies-shared.mappings.new_field.mapping.new_field.type",
+     "\\.ml-anomalies-shared-000001.mappings.new_field.mapping.new_field.type"
+    ],
+    "op": "replaceKeyInMatch"
+   },
+   {
+    "args": [
+     "index",
+     ".ml-anomalies-shared",
+     ".ml-anomalies-shared-000001"
+    ],
+    "op": "replaceValueTextByKeyValue"
+   },
+   {
+    "args": [
+     "index",
+     ".ml-anomalies-custom-all-test-1,.ml-anomalies-custom-all-test-2",
+     ".ml-anomalies-custom-all-test-1-000001,.ml-anomalies-custom-all-test-2-000001"
+    ],
+    "op": "replaceValueTextByKeyValue"
+   },
+   {
+    "args": [
+     "index",
+     ".ml-anomalies-custom-all-test-1",
+     ".ml-anomalies-custom-all-test-1-000001"
+    ],
+    "op": "replaceValueTextByKeyValue"
+   },
+   {
+    "args": [
+     "index",
+     ".ml-anomalies-custom-all-test-2",
+     ".ml-anomalies-custom-all-test-2-000001"
+    ],
+    "op": "replaceValueTextByKeyValue"
+   },
+   {
+    "args": [
+     "counted_keyword/20_no_index/Counted keyword with index false is not searchable",
+     "counted_keyword with index:false now reports searchable:true via doc values"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/60_usage/Basic ESQL usage output (telemetry)",
+     "The telemetry output changed. We dropped a column. That's safe."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/datafeeds_crud/Test put and update datafeed with max_consecutive_extraction_failures",
+     "Feature #159554 reverted from 9.5; field no longer supported"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/datafeeds_crud/Test put datafeed with invalid max_consecutive_extraction_failures",
+     "Feature #159554 reverted from 9.5; field no longer supported"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "inference/inference_crud/Test get all",
+     "Assertions on number of inference models break due to default configs"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/60_usage/Basic ESQL usage output (telemetry) snapshot version",
+     "The number of functions is constantly increasing"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/60_usage/Basic ESQL usage output (telemetry) non-snapshot version",
+     "The number of functions is constantly increasing"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/80_text/reverse text",
+     "The output type changed from TEXT to KEYWORD."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/80_text/values function",
+     "The output type changed from TEXT to KEYWORD."
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "privileges/11_builtin/Test get builtin privileges",
+     "unnecessary to test compatibility"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/61_enrich_ip/Invalid IP strings",
+     "We switched from exceptions to null+warnings for ENRICH runtime errors"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/180_match_operator/match with non text field",
+     "Match operator can now be used on non-text fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/180_match_operator/match with functions",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/180_match_operator/match within eval",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/40_unsupported_types/semantic_text declared in mapping",
+     "The semantic text field format changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/Alias as lookup index",
+     "LOOKUP JOIN does not support index aliases for now"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/alias-repeated-alias",
+     "LOOKUP JOIN does not support index aliases for now"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/alias-repeated-index",
+     "LOOKUP JOIN does not support index aliases for now"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/alias-pattern-multiple",
+     "LOOKUP JOIN does not support index aliases for now"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/alias-pattern-single",
+     "LOOKUP JOIN does not support index aliases for now"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/180_match_operator/match with disjunctions",
+     "Disjunctions in full text functions work now"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/130_spatial/values unsupported for geo_point",
+     "Spatial types are now supported in VALUES aggregation"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/130_spatial/values unsupported for geo_point status code",
+     "Spatial types are now supported in VALUES aggregation"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     ".*rollup functionality will be removed in Elasticsearch.*",
+     "Index \\[\\.profiling-.*\\] name begins with a dot.* and will not be allowed in a future Elasticsearch version."
+    ],
+    "op": "addAllowedWarningRegex"
+   },
+   {
+    "args": [
+     "esql/40_tsdb/from doc with aggregate_metric_double",
+     "TODO: support for subset of metric fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/40_tsdb/stats on aggregate_metric_double",
+     "TODO: support for subset of metric fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/40_tsdb/from index pattern unsupported counter",
+     "TODO: support for subset of metric fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/40_unsupported_types/unsupported",
+     "TODO: support for subset of metric fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/40_unsupported_types/unsupported with sort",
+     "TODO: support for subset of metric fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "service_accounts/10_basic/Test get service accounts",
+     "Enterprise Search service account removed, invalidating the current tests"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "service_accounts/10_basic/Test service account tokens",
+     "Enterprise Search service account removed, invalidating the current tests"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/3rd_party_deployment/Test clear deployment cache",
+     "Deprecated route removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/3rd_party_deployment/Test start and stop deployment with cache",
+     "Deprecated route removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/3rd_party_deployment/Test start and stop multiple deployments",
+     "Deprecated route removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/3rd_party_deployment/Test update model alias on pytorch model to undeployed model",
+     "Deprecated route removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/job_cat_apis/Test cat anomaly detector jobs",
+     "Flush API is deprecated"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/jobs_get_stats/Test get job stats after uploading data prompting the creation of some stats",
+     "Flush API is deprecated"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/jobs_get_stats/Test get job stats for closed job",
+     "Flush API is deprecated"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/jobs_get_stats/Test reading v54 data counts and model size stats",
+     "Version 5.4 support removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/inference_crud/Test deprecation of include model definition param",
+     "Query parameter removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/post_data/Test flush and close job WITHOUT sending any data",
+     "Flush API is deprecated"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/post_data/Test flush with skip_time",
+     "Flush API is deprecated"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/post_data/Test POST data job api, flush, close and verify DataCounts doc",
+     "Flush API is deprecated"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "Size",
+     49,
+     "Test flamegraph from profiling-events"
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "Size",
+     49,
+     "Test flamegraph from test-events"
+    ],
+    "op": "replaceValueInMatch"
+   },
+   {
+    "args": [
+     "esql/90_non_indexed/fetch",
+     "Temporary until backported"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/63_enrich_int_range/Invalid age as double",
+     "TODO: require disable allow_partial_results"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/191_lookup_join_on_datastreams/data streams not supported in LOOKUP JOIN",
+     "Added support for aliases in JOINs"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/non-lookup index",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/fails with non-lookup index",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/192_lookup_join_on_aliases/alias-pattern-multiple",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/192_lookup_join_on_aliases/fails when alias or pattern resolves to multiple",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/10_basic/Test wrong LIMIT parameter",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/sparse_vector_search/Search on a sparse_vector field with dots in the field names",
+     "Vectors are no longer returned by default"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/sparse_vector_search/Search on a nested sparse_vector field with dots in the field names and conflicting child fields",
+     "Vectors are no longer returned by default"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/lookup-no-key-only-key",
+     "Requires the fix"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/190_lookup_join/basic",
+     "New SORT warning not in original test"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/191_lookup_join_text/keyword-keyword",
+     "New SORT warning not in original test"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/191_lookup_join_text/text-keyword",
+     "New SORT warning not in original test"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/192_lookup_join_on_aliases/alias-as-lookup-index",
+     "New SORT warning not in original test"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/192_lookup_join_on_aliases/alias-repeated-alias",
+     "New SORT warning not in original test"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/192_lookup_join_on_aliases/alias-repeated-index",
+     "New SORT warning not in original test"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/192_lookup_join_on_aliases/alias-pattern-single",
+     "New SORT warning not in original test"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "ml/data_frame_analytics_crud/Test put config with remote source index",
+     "Error message changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/40_tsdb/PromQL irate on counter field",
+     "We filter out null values now"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/40_tsdb/to_aggregate_metric_double with multi_values",
+     "We convert correctly the unsigned long"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "Parameter \\[default_metric\\] is deprecated and will be removed in a future version"
+    ],
+    "op": "addAllowedWarningRegex"
+   },
+   {
+    "args": [
+     "aggregate-metrics/10_basic/Sort",
+     "Average is used now instead of the default metric"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregate-metrics/10_basic/Test term query on aggregate metric field",
+     "Average is used now instead of the default metric"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregate-metrics/10_basic/Test range query on aggregate metric field",
+     "Average is used now instead of the default metric"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregate-metrics/20_min_max_agg/Test min_max aggs with query",
+     "Average is used now instead of the default metric"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregate-metrics/40_avg_agg/Test avg agg with query",
+     "Default metric cannot be defined, so the query is empty"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregate-metrics/30_sum_agg/Test sum agg with query",
+     "Default metric cannot be defined, so the query is empty"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregate-metrics/50_value_count_agg/Test value_count agg with query",
+     "Default metric cannot be defined, so the query is empty"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "analytics/histogram/histogram with synthetic source and ignore_malformed",
+     "Malformed values are now stored in binary doc values which sort differently than stored fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "analytics/t_digest_fieldtype/histogram with synthetic source and ignore_malformed",
+     "Malformed values are now stored in binary doc values which sort differently than stored fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "aggregate-metrics/100_synthetic_source/aggregate_metric_double with ignore_malformed",
+     "Malformed values are now stored in binary doc values which sort differently than stored fields"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/180_match_operator/match on eval column",
+     "Match works now with non-mapped columns"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "esql/180_match_operator/match on overwritten column",
+     "Match works now with non-mapped columns"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "Legacy monitoring API _monitoring/bulk is deprecated for removal in Elasticsearch 10\\.0\\."
+    ],
+    "op": "addAllowedWarningRegex"
+   }
+  ],
+  "x-pack/plugin/downsample/qa/rest": [
+   {
+    "args": [
+     "Parameter \\[default_metric\\] is deprecated and will be removed in a future version"
+    ],
+    "op": "addAllowedWarningRegex"
+   },
+   {
+    "args": [
+     "downsample/10_basic/Downsample a downsampled index",
+     "Default metric has been removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "downsample/10_basic/Downsample histogram as label",
+     "Default metric has been removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "downsample/10_basic/Downsample index",
+     "Default metric has been removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "downsample/10_basic/Downsample index with multi-value dimensions",
+     "Counter downsampling has changed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "downsample-with-security/10_basic/Downsample index",
+     "Default metric has been removed"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "downsample/40_runtime_fields/Runtime fields accessing metric fields in downsample target index",
+     "Using average as the value of an aggregate metric double"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "downsample-with-security/40_runtime_fields/Runtime fields accessing metric fields in downsample target index",
+     "Using average as the value of an aggregate metric double"
+    ],
+    "op": "skipTest"
+   }
+  ],
+  "x-pack/plugin/ent-search": [
+   {
+    "args": [
+     "Behavioral Analytics is deprecated and will be removed in a future release."
+    ],
+    "op": "addAllowedWarning"
+   }
+  ],
+  "x-pack/plugin/eql/qa/rest": [
+   {
+    "args": [
+     "Parameter \\[default_metric\\] is deprecated and will be removed in a future version"
+    ],
+    "op": "addAllowedWarningRegex"
+   }
+  ],
+  "x-pack/plugin/stack": [
+   {
+    "args": [
+     "stack/10_basic/Test kibana reporting index auto creation",
+     "warning does not exist for compatibility"
+    ],
+    "op": "skipTest"
+   },
+   {
+    "args": [
+     "cat.shards/10_basic/Help",
+     "sync_id is removed in 9.0"
+    ],
+    "op": "skipTest"
+   }
+  ]
+ },
+ "source": "elasticsearch essrc-9.5.5",
+ "suites": {
+  "main": [
+   "x-pack/plugin"
+  ],
+  "oss": [
+   "rest-api-spec",
+   "modules/data-streams",
+   "x-pack/plugin"
+  ],
+  "plug": [
+   "x-pack/plugin/downsample/qa/rest",
+   "x-pack/plugin/ent-search",
+   "x-pack/plugin/eql/qa/rest",
+   "x-pack/plugin/stack"
+  ],
+  "sec": [
+   "x-pack/plugin"
+  ]
+ }
+}

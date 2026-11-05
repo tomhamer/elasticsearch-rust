@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: elasticsearch
+          env:
+            - name: discovery.seed_hosts
+              $patch: delete
+            - name: discovery.type
+              value: single-node
+            # nothing to drain to on a single node
+            - name: ES_DRAIN_ON_SHUTDOWN
+              value: "false"
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi

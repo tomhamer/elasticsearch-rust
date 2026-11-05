@@ -1,0 +1,37 @@
+# A plain ECK `Elasticsearch` resource running the Rust engine: the only
+# rustic-specific line is `spec.image`. Everything else (TLS, the `elastic`
+# user, seed hosts, readiness, rolling changes, scaling) is done by the stock
+# Elastic Cloud on Kubernetes operator.
+#
+#   kubectl apply -f elasticsearch.yaml
+#
+# `version` is the Elasticsearch version the engine implements; ECK uses it
+# to pick its behaviour (it must be a version ECK supports).
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: rustic
+spec:
+  version: 9.5.5
+  image: elasticsearch-rs:eck          # your registry/elasticsearch-rs:<tag>
+  nodeSets:
+    - name: default
+      count: 3
+      podTemplate:
+        spec:
+          containers:
+            - name: elasticsearch
+              resources:
+                requests:
+                  memory: 2Gi
+                  cpu: 500m
+                limits:
+                  memory: 2Gi
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data   # ECK's data volume name: keep it
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: 5Gi

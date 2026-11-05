@@ -1,0 +1,30 @@
+[package]
+name = "elasticsearch-snapshots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Snapshot/restore for the elasticsearch cluster layer: blob stores (fs, s3, url), repository format, incremental shard snapshots, restore planning and SLM logic. Storage only: no engine dependency."
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+sha2.workspace = true
+rand.workspace = true
+base64.workspace = true
+lz4_flex.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
+hmac = "0.12"
+md-5 = "0.10"
+hex = "0.4"
+regex = "1"
+percent-encoding = "2"
+
+[dev-dependencies]
+tempfile.workspace = true

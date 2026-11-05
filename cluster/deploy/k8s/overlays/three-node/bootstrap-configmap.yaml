@@ -1,0 +1,9 @@
+# Read by the image entrypoint from /usr/share/elasticsearch/settings.d/bootstrap:
+# every key becomes `-E <key>=<value>`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-bootstrap
+  labels: { app.kubernetes.io/name: elasticsearch }
+data:
+  cluster.initial_master_nodes: elasticsearch-0,elasticsearch-1,elasticsearch-2

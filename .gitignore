@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Bench artifacts (regenerable)
+bench/tools/
+bench/indexes/
+bench/corpus/corpus.jsonl
+bench/corpus/vectors.f32
+bench/corpus/queries.jsonl
+bench/corpus/*.log
+
+# ES YAML REST suite (downloaded by tests/es-yaml/fetch.sh)
+tests/es-yaml/test/
+tests/es-yaml/api/
+tests/es-yaml/VERSION
+tests/es-yaml/v[0-9]*/
+
+# Python bytecode
+__pycache__/
+*.pyc

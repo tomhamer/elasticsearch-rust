@@ -1,0 +1,98 @@
+[
+  {
+    "name": "sequence_2stage_nofilter_fetch1000_size_1000",
+    "query": "sequence by source.ip, destination.ip [process where true] [process where true]"
+  },
+  {
+    "name": "sequence_2stage_equalityFilter_maxspan1m_fetch1000_size500_slow",
+    "query": "sequence by source.ip, destination.ip with maxspan=1m [process where user.name != \"SYSTEM\"] [process where user.name == \"SYSTEM\"]"
+  },
+  {
+    "name": "sequence_2stage_nofilter_fetch1000_size1000_tail1000_head200",
+    "query": "sequence by source.ip, destination.ip [process where true] [process where true] | tail 1000 | head 200"
+  },
+  {
+    "name": "sequence_4stage_nofilter_maxspan5m_fetch1000_size100_head100_tail50",
+    "query": "sequence by source.ip, destination.ip with maxspan=5m [process where true] [process where true] [process where true] [network where true] |head 100 | tail 50"
+  },
+  {
+    "name": "sequence_3stage_startsWithfilter_maxspan30m_fetch1000_size100_tail100_head50",
+    "query": "sequence by host.name with maxspan=30m [process where startsWith(process.name, \"ssh\") == true] by process.ppid [process where startsWith(process.name, \"ssh\") == false] by process.ppid [process where startsWith(process.name, \"ssh\") == true] by process.pid | tail 100 | head 50"
+  },
+  {
+    "name": "condition_allMatches",
+    "query": "any where true"
+  },
+  {
+    "name": "condition_noMatches",
+    "query": "any where false"
+  },
+  {
+    "name": "condition_scriptFilter",
+    "query": "process where startsWith(concat(process.name, \" \", process.pid), \"ssh\")"
+  },
+  {
+    "name": "sequence_2stages_baseline",
+    "query": "sequence [any where true] [any where true]"
+  },
+  {
+    "name": "sequence_2stages_headThenTail",
+    "query": "sequence [any where true] [any where true] | head 200 | tail 100"
+  },
+  {
+    "name": "sequence_2stages_tailThenHead",
+    "query": "sequence [any where true] [any where true] | tail 200 | head 100"
+  },
+  {
+    "name": "sequence_2stages_maxspan1m",
+    "query": "sequence with maxspan=1m [any where true] [any where true]"
+  },
+  {
+    "name": "sequence_2stages_nullJoin",
+    "query": "sequence by ?source.ip [process where true] [process where true]"
+  },
+  {
+    "name": "sequence_3stages",
+    "query": "sequence [process where process.pid == 910] [process where process.pid == 911] [process where process.pid == 912]"
+  },
+  {
+    "name": "sequence_5stages",
+    "query": "sequence [process where process.pid == 910] [process where process.pid == 911] [process where process.pid == 912] [process where process.pid == 913] [process where process.pid == 914]"
+  },
+  {
+    "name": "sequence_10stages",
+    "query": "sequence [process where process.pid == 910] [process where process.pid == 911] [process where process.pid == 912] [process where process.pid == 913] [process where process.pid == 914] [process where process.pid == 915] [process where process.pid == 916] [process where process.pid == 917] [process where process.pid == 918] [process where process.pid == 919]"
+  },
+  {
+    "name": "sequence_2stages_fewThenFew_noJoinKey",
+    "query": "sequence [process where process.pid == 910] [process where process.pid == 911]"
+  },
+  {
+    "name": "sequence_2stages_fewThenMany_noJoinKey",
+    "query": "sequence [process where process.pid == 910] [process where process.pid > 80000]"
+  },
+  {
+    "name": "sequence_2stages_manyThenFew_noJoinKey",
+    "query": "sequence [process where process.pid > 80000] [process where process.pid == 911]"
+  },
+  {
+    "name": "sequence_2stages_manyThenMany_noJoinKey",
+    "query": "sequence [process where process.pid > 80000] [process where process.pid > 80000]"
+  },
+  {
+    "name": "sequence_2stages_fewThenFew_highCardJoinKey",
+    "query": "sequence by process.ppid [process where process.pid == 910] [process where process.pid == 911]"
+  },
+  {
+    "name": "sequence_2stages_fewThenMany_highCardJoinKey",
+    "query": "sequence by process.ppid [process where process.pid == 910] [process where process.pid > 80000]"
+  },
+  {
+    "name": "sequence_2stages_manyThenFew_highCardJoinKey",
+    "query": "sequence by process.ppid [process where process.pid > 80000] [process where process.pid == 911]"
+  },
+  {
+    "name": "sequence_2stages_manyThenMany_highCardJoinKey",
+    "query": "sequence by process.ppid [process where process.pid == 910] [process where process.pid == 911]"
+  }
+]

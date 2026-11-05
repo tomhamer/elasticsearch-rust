@@ -1,0 +1,189 @@
+{
+  "status": "SOURCE PREPARATION ONLY; no workload launched",
+  "candidate_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+  "master_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+  "source_root": "/home/ubuntu/pr3-consolidated11/source",
+  "source_manifest": {
+    "path": "/home/ubuntu/pr3-consolidated11/candidate-manifest.json",
+    "sha256": "b826e46e83bccf39233e884a342360f9d4444b46568bcb5729ce731576829c40"
+  },
+  "source_manifest_entries": 15044,
+  "helper_hashes": {
+    "bench/path-poc/perf-validation/paired_cluster.py": "4b14349f4a62c7b52100ded43fccaf36b19149d74a91c9d048a73aa6f67e9975",
+    "bench/path-poc/perf-validation/pr3-performance-gates/measure.py": "cc66f8460bfbf9039243872b0a10246820af3c6bc86f959bd3e2585ef13e00cd",
+    "bench/path-poc/perf-validation/pr3-performance-gates/run.sh": "44530fc46ea38cf7e83e96840fd07f965761b01afd4bfa7ec4373fc8b93380f9",
+    "bench/path-poc/pr3-gates/consolidated/adapt.py": "192a9186e676e758ee9eeb8b7d2ad963ac82a4ed2a416768d01312c7e1e8d92d",
+    "bench/path-poc/pr3-gates/consolidated/bind_ivf.py": "1660d0d176f523d2cc0f271bc73c63c7775da3f1df8db25fe9b4d601e485ece8",
+    "bench/path-poc/pr3-gates/consolidated/common.py": "cfa7ff0065c27ef2aab2bbccd6f2ea60d396a4242449e99cb2ff1323fe910d84",
+    "bench/path-poc/pr3-gates/consolidated/compare.py": "1b219f9883d24be85ac4673a683b33cb5bb08f1ca69c6a10017389a0f252f0fc",
+    "bench/path-poc/pr3-gates/consolidated/ivf_compare.py": "b85e2f416425b2f1fd74670e0d8a5d54df2f0a531fbfd731379bf89cf912f2ce",
+    "bench/path-poc/pr3-gates/consolidated/ivf_summary.py": "c04853e5e397aea979f2cf148a7e9ed9700f7a21d12c271d741cc73a1fd9c4a2",
+    "bench/path-poc/pr3-gates/consolidated/live_local.py": "f9e4e6fd52a5e13ded0f7cde61c99d3207c56e3943cb3c44c7723f975d855e4c",
+    "bench/path-poc/pr3-gates/consolidated/prepare.py": "ed05c54775b73069f255e6c9d61ccf8fed53b6454db00400b37ce8056752f62c",
+    "bench/path-poc/pr3-gates/consolidated/prepare_ivf.py": "494b09831b1e645431f5c7a1f11c421b35cf042295b165aad857062ff6cff2a0",
+    "bench/path-poc/pr3-gates/consolidated/pressure.py": "bf24a2d5c14a2e146723b2ef3174e5a545c017aecfeabed673a41cebc4d46674",
+    "bench/path-poc/pr3-gates/consolidated/rally_full.py": "7ceca7675c6b996d87bbef54661782cc51c3a84aa9f3360e52dc2e01dff2304f",
+    "bench/path-poc/pr3-gates/consolidated/run.py": "dd4548a5e67961edbad634a8842a3484c9b87e62990c4055bcdb99b0975f95f3",
+    "bench/path-poc/pr3-gates/consolidated/runtime/discover.py": "85b0a8d482397b936696c0016f8ee1b8b56f3fd5802c380742ebd43c32f8b16a"
+  },
+  "hosts": [
+    {
+      "instance_id": "i-0a6f1cb2f11bdc8c6",
+      "last_reported_ip": null,
+      "live_proof": null
+    },
+    {
+      "instance_id": "i-05e7c37a440b30af0",
+      "last_reported_ip": null,
+      "live_proof": null
+    },
+    {
+      "instance_id": "i-06d965e0467ab20e3",
+      "last_reported_ip": "13.221.33.240",
+      "live_proof": null
+    }
+  ],
+  "prerequisites": [
+    {
+      "service": "pr3-consolidated11",
+      "results": "/home/ubuntu/pr3-consolidated11/results",
+      "explicit_exit_required": true,
+      "inactive_required": true
+    },
+    {
+      "service": "pr3-consolidated11-correctness1",
+      "results": "/home/ubuntu/pr3-consolidated11-correctness1",
+      "explicit_exit_required": true,
+      "inactive_required": true
+    }
+  ],
+  "required_kinds": [
+    "mixed",
+    "idle",
+    "segments",
+    "rally",
+    "pressure",
+    "profile"
+  ],
+  "ivf_gates": "Separate IVF owner must bind same11 revision for both1M dimensions and comparison; not omitted or replaced by dense Rally",
+  "historical_corpus_locators": {
+    "full_dense_corpus": {
+      "documents": 10000000,
+      "compressed": {
+        "path": "/home/ubuntu/.rally/benchmarks/data/dense_vector_floats/documents.json.bz2",
+        "bytes": 7689453829,
+        "sha256": "48190312016d3235dc32a198c3240c47b5739682bbc6bf348e1c0815aed24e83"
+      },
+      "uncompressed": {
+        "path": "/home/ubuntu/.rally/benchmarks/data/dense_vector_floats/documents.json",
+        "bytes": 20905226599,
+        "sha256": "70ec2e5ed132d3b68ec45fc7e0753a899c441f37d352466490b9508c5db4f3dc"
+      },
+      "evidence": {
+        "repository_path": "bench/path-poc/perf-validation/results/full-vector-corpus-preparation-resume/sha256.txt",
+        "sha256": "1651bcb20b96e8d9801dab1482027a6f38d046bf0e1f62d88e34d91e7bde3c7d"
+      },
+      "status": "historical retained hashes; remote existence/hash must be verified"
+    },
+    "full_pmc_corpus": {
+      "documents": 574199,
+      "compressed_bytes": 5931724449,
+      "uncompressed_bytes": 23256051757,
+      "path_candidate": "/home/ubuntu/.rally/benchmarks/data/pmc",
+      "sha256": null,
+      "evidence": {
+        "repository_path": "bench/path-poc/perf-validation/prepare_full_pmc_corpus_v3.sh",
+        "sha256": "1f47088e98db710f5584b4740435f3e9dd401f47d35fb3cb3faeafa0a9b9131a"
+      }
+    },
+    "tracks": {
+      "inventory_evidence": {
+        "repository_path": "bench/path-poc/perf-validation/rally-repair-v281/track-inventory-v288.json",
+        "sha256": "c28c7225eda75b9b2d0cbcd94ec59ad44a238e8448787c7e1f53dabe0cd54fad"
+      },
+      "inventory_names": [
+        "big5",
+        "cohere_vector",
+        "dense_vector",
+        "elastic/apm",
+        "elastic/endpoint",
+        "elastic/logs",
+        "elastic/security",
+        "elser-ingest-speedtest",
+        "eql",
+        "esql",
+        "geonames",
+        "geopoint",
+        "geopointshape",
+        "geoshape",
+        "github_archive",
+        "has_privileges",
+        "has_privileges_bystander",
+        "http_logs",
+        "joins",
+        "k8s_metrics",
+        "metricbeat",
+        "msmarco-jina-10m-vector",
+        "msmarco-passage-ranking",
+        "msmarco-v2-vector",
+        "nested",
+        "noaa",
+        "nyc_taxis",
+        "openai_vector",
+        "percolator",
+        "pmc",
+        "random_vector",
+        "search/mteb/dbpedia",
+        "so",
+        "so_vector",
+        "sql",
+        "tsdb",
+        "tsdb_k8s_queries",
+        "wiki_en_cohere_vector_int8",
+        "wikipedia"
+      ],
+      "inventory_is_required_scope": false,
+      "reason": "schema inventory includes alternative corpora/challenges; root must select original requested workload matrix, not every alternative",
+      "rendered_candidates": [
+        "/home/ubuntu/perf-validation/full-corpus-tracks",
+        "/home/ubuntu/perf-validation/upstream-tracks",
+        "/home/ubuntu/new-rally-tracks-20261021"
+      ]
+    },
+    "retained_full_cache_names": [
+      "dense_vector_floats",
+      "geonames",
+      "geopoint",
+      "geopointshape",
+      "metricbeat",
+      "nested",
+      "noaa",
+      "percolator",
+      "pmc"
+    ]
+  },
+  "unresolved": [
+    "actual successful candidate/master binary hashes",
+    "all3 taskhost liveidentity, IP, locks, workload idle state",
+    "two-node comparable finite cgroups, CPU/driver affinities, storage, kernel",
+    "full original requested Rally challenge matrix, rendered tracks, every compressed/plain cache SHA and archive-decompression equivalence",
+    "RallyPython/config/healthwrapper/dependency hashes and original final index counts",
+    "permetric reviewer acceptance thresholds against bothreferences",
+    "pressure retained shard/sourcefilter and realRSS>85% target<=60% workload",
+    "post-timing profile actual retained process and artifactSHA"
+  ],
+  "execution_policy": {
+    "no_build_overlap": true,
+    "no_tracing_during_timings": true,
+    "repetitions_per_engine": 3,
+    "engines": [
+      "candidate",
+      "master",
+      "es9"
+    ],
+    "rally_query_fraction": 1,
+    "full_corpus_only": true,
+    "sequential_exclusive_workloads": true,
+    "historical_jobs_restart": false
+  }
+}

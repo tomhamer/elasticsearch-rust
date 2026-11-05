@@ -1,0 +1,43 @@
+---
+"Test cat indices output for closed index":
+  - requires:
+      reason:  "Supplemental current-version assertion: closed indices replicated since 7.2.0"
+      cluster_features: ["gte_v7.2.0"]
+  - requires:
+      test_runner_features: ["allowed_warnings"]
+
+  - do:
+      indices.create:
+        index: index-2
+        body:
+          settings:
+            number_of_shards: 3
+            number_of_replicas: 0
+
+  - do:
+      indices.close:
+        index: index-2
+  - is_true: acknowledged
+
+  - do:
+      cluster.health:
+        wait_for_status: green
+
+  - do:
+      cat.indices:
+        index: index-*
+
+  - match:
+      $body: |
+        /^(green  \s+
+           close   \s+
+           index-2 \s+
+           ([a-zA-Z0-9=/_+]|[\\\-]){22} \s+
+           3       \s+
+           0       \s+
+                   \s+
+                   \s+
+                   \s+
+                   \s*
+         )
+         $/

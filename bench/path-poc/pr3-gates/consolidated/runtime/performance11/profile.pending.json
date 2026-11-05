@@ -1,0 +1,33 @@
+{
+  "kind": "profile",
+  "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+  "master_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+  "binary_sha256": null,
+  "out": "/home/ubuntu/pr3-performance11/diagnostic-profile",
+  "artifacts": null,
+  "commands": null,
+  "runs": [],
+  "completed_timing_reports": [
+    {
+      "path": "/home/ubuntu/pr3-performance11/comparison-mixed/summary.json",
+      "sha256": null
+    },
+    {
+      "path": "/home/ubuntu/pr3-performance11/comparison-idle/summary.json",
+      "sha256": null
+    },
+    {
+      "path": "/home/ubuntu/pr3-performance11/comparison-segments/summary.json",
+      "sha256": null
+    },
+    {
+      "path": "/home/ubuntu/pr3-performance11/comparison-rally/summary.json",
+      "sha256": null
+    }
+  ],
+  "profile": {
+    "path": null,
+    "sha256": null
+  },
+  "note": "Only after allauthoritative timings. Retainbinary perf.data onEC2, collectstdio text; no gdb or profiledacceptance timings."
+}

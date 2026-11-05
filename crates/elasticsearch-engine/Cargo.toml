@@ -1,0 +1,72 @@
+[package]
+name = "elasticsearch-engine"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Everything Elasticsearch puts above Lucene on a single node, minus HTTP: mappings, documents, translog, Query DSL, aggregations, index/cluster metadata."
+
+[dependencies]
+lz4_flex.workspace = true
+memchr = "2"
+rustic-core = { path = "../rustic-core" }
+elasticsearch-routing = { path = "../elasticsearch-routing" }
+# `reindex.ssl.*`: TLS for `_reindex` from an `https://` remote.
+elasticsearch-ssl = { path = "../elasticsearch-ssl" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip"] }
+parking_lot = "0.12"
+# The task registry: a lock-free skip list (every search registers tasks)
+# whose entries give up their task when it finishes.
+crossbeam-skiplist.workspace = true
+arc-swap.workspace = true
+rayon = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+regex = "1"
+regex-automata.workspace = true
+fancy-regex = "0.19"
+tracing = "0.1"
+ahash = "0.8"
+bincode = "1"
+crc32fast = "1"
+indexmap = "2"
+lru = "0.12"
+bcrypt = "0.15"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+getrandom = "0.2"
+libm = "0.2"
+flate2.workspace = true
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+serde_yaml = "0.9"
+ryu = "1"
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+
+[features]
+gpu = ["rustic-core/gpu"]
+default = ["mutable-hnsw"]
+mutable-hnsw = ["rustic-core/mutable-hnsw-poc"]
+# rustic-core's query execution counters (wiki_search_bench WB_SLOW).
+query-stats = ["rustic-core/query-stats"]
+# Real CPU transformer inference for the `elasticsearch` inference service (multilingual-e5-small).
+candle-models = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
+
+[dev-dependencies]
+rustic-core = { path = "../rustic-core", features = ["test-seams"] }
+tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "script_score"
+harness = false
+
+[[example]]
+name = "wiki_search_bench"
+required-features = ["query-stats"]

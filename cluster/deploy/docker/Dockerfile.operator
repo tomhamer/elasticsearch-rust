@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+#
+# elasticsearch-operator image. Build from the REPOSITORY ROOT:
+#
+#   docker build -f cluster/deploy/docker/Dockerfile.operator -t elasticsearch-operator:dev .
+ARG RUST_VERSION=1.87
+ARG DEBIAN_RELEASE=bookworm
+
+FROM rust:${RUST_VERSION}-slim-${DEBIAN_RELEASE} AS builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config ca-certificates build-essential \
+ && rm -rf /var/lib/apt/lists/*
+# Flaky HTTP/2 to crates.io (seen on EC2) -> HTTP/1.1 + more retries.
+ENV CARGO_HTTP_MULTIPLEXING=false CARGO_NET_RETRY=10
+WORKDIR /src
+COPY . .
+# `--locked` builds exactly the root Cargo.lock. Pass `--build-arg CARGO_LOCKED=`
+# to build while the lock file is behind a Cargo.toml change.
+ARG CARGO_LOCKED=--locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build ${CARGO_LOCKED} --release \
+        -p elasticsearch-operator --bin elasticsearch-operator \
+ && mkdir -p /out \
+ && cp target/release/elasticsearch-operator /out/ \
+ && { strip /out/elasticsearch-operator || true; } \
+ && /out/elasticsearch-operator crd > /out/crd.yaml
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /out/elasticsearch-operator /usr/local/bin/elasticsearch-operator
+COPY --from=builder /out/crd.yaml /crd.yaml
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/elasticsearch-operator"]
+CMD ["run"]

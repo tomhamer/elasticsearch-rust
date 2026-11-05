@@ -1,0 +1,247 @@
+{
+ "sig_top": {
+  "aggregations": {
+   "s": {
+    "bg_count": 800,
+    "buckets": [
+     {
+      "bg_count": 38,
+      "doc_count": 8,
+      "key": "k40",
+      "score": 0.002631578947368423
+     },
+     {
+      "bg_count": 19,
+      "doc_count": 4,
+      "key": "k36",
+      "score": 0.0013157894736842116
+     },
+     {
+      "bg_count": 19,
+      "doc_count": 4,
+      "key": "k16",
+      "score": 0.0013157894736842116
+     },
+     {
+      "bg_count": 19,
+      "doc_count": 4,
+      "key": "k11",
+      "score": 0.0013157894736842116
+     }
+    ],
+    "doc_count": 160
+   }
+  },
+  "request": {
+   "aggs": {
+    "s": {
+     "significant_terms": {
+      "field": "k",
+      "min_doc_count": 1,
+      "size": 4
+     }
+    }
+   },
+   "query": {
+    "term": {
+     "p": "a"
+    }
+   },
+   "size": 0
+  }
+ },
+ "terms_k3": {
+  "aggregations": {
+   "t": {
+    "buckets": [
+     {
+      "doc_count": 40,
+      "key": "k20"
+     },
+     {
+      "doc_count": 40,
+      "key": "k37"
+     },
+     {
+      "doc_count": 39,
+      "key": "k01"
+     }
+    ],
+    "doc_count_error_upper_bound": 38,
+    "sum_other_doc_count": 681
+   }
+  },
+  "request": {
+   "aggs": {
+    "t": {
+     "terms": {
+      "field": "k",
+      "size": 3
+     }
+    }
+   },
+   "size": 0
+  }
+ },
+ "terms_k5_err": {
+  "aggregations": {
+   "t": {
+    "buckets": [
+     {
+      "doc_count": 40,
+      "doc_count_error_upper_bound": 0,
+      "key": "k20"
+     },
+     {
+      "doc_count": 40,
+      "doc_count_error_upper_bound": 0,
+      "key": "k37"
+     },
+     {
+      "doc_count": 39,
+      "doc_count_error_upper_bound": 0,
+      "key": "k01"
+     },
+     {
+      "doc_count": 39,
+      "doc_count_error_upper_bound": 0,
+      "key": "k10"
+     },
+     {
+      "doc_count": 39,
+      "doc_count_error_upper_bound": 0,
+      "key": "k18"
+     }
+    ],
+    "doc_count_error_upper_bound": 38,
+    "sum_other_doc_count": 603
+   }
+  },
+  "request": {
+   "aggs": {
+    "t": {
+     "terms": {
+      "field": "k",
+      "show_term_doc_count_error": true,
+      "size": 5
+     }
+    }
+   },
+   "size": 0
+  }
+ },
+ "terms_sig": {
+  "aggregations": {
+   "t": {
+    "buckets": [
+     {
+      "doc_count": 160,
+      "key": "a",
+      "s": {
+       "bg_count": 800,
+       "buckets": [
+        {
+         "bg_count": 38,
+         "doc_count": 8,
+         "key": "k40",
+         "score": 0.002631578947368423
+        },
+        {
+         "bg_count": 19,
+         "doc_count": 4,
+         "key": "k36",
+         "score": 0.0013157894736842116
+        },
+        {
+         "bg_count": 19,
+         "doc_count": 4,
+         "key": "k11",
+         "score": 0.0013157894736842116
+        }
+       ],
+       "doc_count": 160
+      }
+     },
+     {
+      "doc_count": 160,
+      "key": "b",
+      "s": {
+       "bg_count": 800,
+       "buckets": [
+        {
+         "bg_count": 19,
+         "doc_count": 4,
+         "key": "k11",
+         "score": 0.0013157894736842116
+        },
+        {
+         "bg_count": 19,
+         "doc_count": 4,
+         "key": "k15",
+         "score": 0.0013157894736842116
+        },
+        {
+         "bg_count": 19,
+         "doc_count": 4,
+         "key": "k16",
+         "score": 0.0013157894736842116
+        }
+       ],
+       "doc_count": 160
+      }
+     },
+     {
+      "doc_count": 160,
+      "key": "c",
+      "s": {
+       "bg_count": 800,
+       "buckets": [
+        {
+         "bg_count": 37,
+         "doc_count": 8,
+         "key": "k09",
+         "score": 0.004054054054054058
+        },
+        {
+         "bg_count": 38,
+         "doc_count": 8,
+         "key": "k40",
+         "score": 0.002631578947368423
+        },
+        {
+         "bg_count": 19,
+         "doc_count": 4,
+         "key": "k15",
+         "score": 0.0013157894736842116
+        }
+       ],
+       "doc_count": 160
+      }
+     }
+    ],
+    "doc_count_error_upper_bound": 0,
+    "sum_other_doc_count": 320
+   }
+  },
+  "request": {
+   "aggs": {
+    "t": {
+     "aggs": {
+      "s": {
+       "significant_terms": {
+        "field": "k",
+        "min_doc_count": 1,
+        "size": 3
+       }
+      }
+     },
+     "terms": {
+      "field": "p",
+      "size": 3
+     }
+    }
+   },
+   "size": 0
+  }
+ }
+}

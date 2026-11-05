@@ -1,0 +1,21 @@
+{
+  "source_revision": "b4b8827032f98c9fab43f6dc0c0f93f750ee08e0",
+  "binary_sha256": null,
+  "fixture_provenance": {
+    "path": "/home/ubuntu/pr3-performance11/bindings/three-host-pressure.json",
+    "sha256": null
+  },
+  "documents": null,
+  "writers": null,
+  "document_bytes": null,
+  "placement": {
+    "index": null,
+    "source_node": null,
+    "target_node": null,
+    "documents": null,
+    "sustain_seconds": 65,
+    "cooldown_seconds": 600,
+    "timeout_seconds": null
+  },
+  "preparation_status": "Actual3host resident shard workload, limits and immutable source processes must be provisioned and proven; no generated telemetry"
+}

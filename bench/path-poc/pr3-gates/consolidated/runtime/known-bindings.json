@@ -1,0 +1,167 @@
+{
+  "status": "prepared_locally_consolidated2_pending_upload_launch_and_build",
+  "candidate_revision": "743334f328b4a42ed66ef7c3861fc7d5471d6f96",
+  "master_revision": "ffe4b591d1c4516aa9e7839d50a05d6c00cf1cbe",
+  "host": {
+    "instance_id": "i-06d965e0467ab20e3",
+    "last_reported_ip": "34.239.45.154",
+    "status": "root_started_build_preparation; reverify before use"
+  },
+  "expected_paths": {
+    "source": "/home/ubuntu/pr3-consolidated2/source",
+    "master_source": "/home/ubuntu/pr3-consolidated2/master",
+    "results": "/home/ubuntu/pr3-consolidated2/results",
+    "candidate_binary": "/home/ubuntu/pr3-consolidated2/results/elasticsearch-node",
+    "master_binary": "/home/ubuntu/pr3-consolidated2/results/elasticsearch-node-old",
+    "candidate_manifest": "/home/ubuntu/pr3-consolidated2/candidate-manifest.json"
+  },
+  "binary_hashes": {
+    "candidate": null,
+    "master": null
+  },
+  "binary_hash_status": "pending actual successful build; never inferred from source",
+  "es_distribution_candidates": [
+    "/home/ubuntu/ref/elasticsearch-9.5.5",
+    "/home/ubuntu/perf-validation/elasticsearch-9.5.5"
+  ],
+  "yaml_root_candidate": "/home/ubuntu/es955-yaml",
+  "full_dense_corpus": {
+    "documents": 10000000,
+    "compressed": {
+      "path": "/home/ubuntu/.rally/benchmarks/data/dense_vector_floats/documents.json.bz2",
+      "bytes": 7689453829,
+      "sha256": "48190312016d3235dc32a198c3240c47b5739682bbc6bf348e1c0815aed24e83"
+    },
+    "uncompressed": {
+      "path": "/home/ubuntu/.rally/benchmarks/data/dense_vector_floats/documents.json",
+      "bytes": 20905226599,
+      "sha256": "70ec2e5ed132d3b68ec45fc7e0753a899c441f37d352466490b9508c5db4f3dc"
+    },
+    "evidence": {
+      "repository_path": "bench/path-poc/perf-validation/results/full-vector-corpus-preparation-resume/sha256.txt",
+      "sha256": "1651bcb20b96e8d9801dab1482027a6f38d046bf0e1f62d88e34d91e7bde3c7d"
+    },
+    "status": "historical retained hashes; remote existence/hash must be verified"
+  },
+  "full_pmc_corpus": {
+    "documents": 574199,
+    "compressed_bytes": 5931724449,
+    "uncompressed_bytes": 23256051757,
+    "path_candidate": "/home/ubuntu/.rally/benchmarks/data/pmc",
+    "sha256": null,
+    "evidence": {
+      "repository_path": "bench/path-poc/perf-validation/prepare_full_pmc_corpus_v3.sh",
+      "sha256": "1f47088e98db710f5584b4740435f3e9dd401f47d35fb3cb3faeafa0a9b9131a"
+    }
+  },
+  "tracks": {
+    "inventory_evidence": {
+      "repository_path": "bench/path-poc/perf-validation/rally-repair-v281/track-inventory-v288.json",
+      "sha256": "c28c7225eda75b9b2d0cbcd94ec59ad44a238e8448787c7e1f53dabe0cd54fad"
+    },
+    "inventory_names": [
+      "big5",
+      "cohere_vector",
+      "dense_vector",
+      "elastic/apm",
+      "elastic/endpoint",
+      "elastic/logs",
+      "elastic/security",
+      "elser-ingest-speedtest",
+      "eql",
+      "esql",
+      "geonames",
+      "geopoint",
+      "geopointshape",
+      "geoshape",
+      "github_archive",
+      "has_privileges",
+      "has_privileges_bystander",
+      "http_logs",
+      "joins",
+      "k8s_metrics",
+      "metricbeat",
+      "msmarco-jina-10m-vector",
+      "msmarco-passage-ranking",
+      "msmarco-v2-vector",
+      "nested",
+      "noaa",
+      "nyc_taxis",
+      "openai_vector",
+      "percolator",
+      "pmc",
+      "random_vector",
+      "search/mteb/dbpedia",
+      "so",
+      "so_vector",
+      "sql",
+      "tsdb",
+      "tsdb_k8s_queries",
+      "wiki_en_cohere_vector_int8",
+      "wikipedia"
+    ],
+    "inventory_is_required_scope": false,
+    "reason": "schema inventory includes alternative corpora/challenges; root must select original requested workload matrix, not every alternative",
+    "rendered_candidates": [
+      "/home/ubuntu/perf-validation/full-corpus-tracks",
+      "/home/ubuntu/perf-validation/upstream-tracks",
+      "/home/ubuntu/new-rally-tracks-20261021"
+    ]
+  },
+  "ivf": {
+    "required_documents_each": 1000000,
+    "dimensions": [
+      128,
+      768
+    ],
+    "required_query_count_minimum": 100,
+    "retained_candidates": [
+      {
+        "root": "/home/ubuntu/recovery-comparison/vectors10m",
+        "documents": 10000000,
+        "dimensions": 128,
+        "queries": 3,
+        "sha256": "dd586ed9f0cd3a72a2a14607b0a6d5ed2e1cea94cbba72f2d3430218477d37be",
+        "directly_satisfies": false
+      },
+      {
+        "root": "/home/ubuntu/perf-validation",
+        "discover_glob": "*768*/manifest.json",
+        "directly_satisfies": null
+      }
+    ],
+    "generator": {
+      "repository_path": "bench/corpus/vectors.py",
+      "sha256": "d05ecd7e376d837a8feb94460a985b54a2d4e6ec36eb79d777d492b3125821ad"
+    },
+    "preparation_policy": "Generate exact requested standalone synthetic1M fixtures if no matching retained corpus; never use reduced Rally corpus as full Rally evidence"
+  },
+  "threshold_policy": {
+    "status": "reviewer_decision_required_before_acceptance",
+    "numeric_policy_found": false,
+    "source": {
+      "repository_path": "bench/path-poc/perf-validation/pr3-performance-gates/README.md",
+      "sha256": "2ad8a90d6b59dd55556d428f4ec0ff8d587204366d0faec41c412fe4b500e938"
+    },
+    "workload_fixed_bounds": {
+      "mixed_seconds": 120,
+      "mixed_offered_docs_per_second": 1000,
+      "mixed_query_rate": 20,
+      "mixed_shards": 2,
+      "mixed_replicas": [
+        1,
+        0,
+        1
+      ],
+      "driver_max_lag_seconds": 1,
+      "driver_max_drain_seconds": 5
+    },
+    "note": "Lag/drain bounds validate load generation, not product p99/throughput acceptance. Do not replace absent acceptance policy with implicit ratios."
+  },
+  "previous_attempt": {
+    "candidate": "5f86d83502fc03c334d25d3076372233c55b5ff6",
+    "outcome": "failed before build: nested vendor workspaces",
+    "repair": "7c2ddddc",
+    "historical_binding_file": "failed-consolidated1-bindings.json"
+  }
+}

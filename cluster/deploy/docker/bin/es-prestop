@@ -1,0 +1,89 @@
+#!/bin/bash
+# preStop hook: prepare the node for a graceful stop, bounded by
+# ES_SHUTDOWN_TIMEOUT (keep it below terminationGracePeriodSeconds).
+#
+# 1. Work out whether this pod is being *removed* (StatefulSet scaled below
+#    this pod's ordinal) or just *restarted* (rolling update, eviction,
+#    node drain). Needs `get` on statefulsets (namespace Role); if the API
+#    is not reachable we assume a restart.
+# 2. Removed + master-eligible + ES_VOTING_EXCLUSIONS=true:
+#    `POST /_cluster/voting_config_exclusions?node_names=<pod>` so the
+#    cluster shrinks its voting configuration before the voter disappears.
+#    (Never done for restarts: excluding a voter that comes back is wrong.)
+#    Exclusions are cleared afterwards by the chart's post-upgrade cleanup
+#    Job (es-cluster-cleanup) once the node has left.
+# 3. If ES_DRAIN_ON_SHUTDOWN=true: register a node shutdown —
+#    `PUT /_nodes/{id}/shutdown` type `restart` (with allocation_delay, so
+#    replicas are not rebuilt elsewhere during a short restart) or type
+#    `remove` when the pod is being removed (shards migrate away) — and
+#    poll `GET /_nodes/{id}/shutdown` until status COMPLETE or timeout.
+#    The record of a restart is deleted by es-readiness when the node is
+#    back.
+#
+# Env: ES_URL, ES_DRAIN_ON_SHUTDOWN, ES_SHUTDOWN_TYPE (restart|remove, the
+#      type used for restarts; default restart), ES_SHUTDOWN_ALLOCATION_DELAY
+#      (default 5m), ES_SHUTDOWN_TIMEOUT (seconds, default 100),
+#      ES_VOTING_EXCLUSIONS (default true), POD_NAME, POD_NAMESPACE.
+set -uo pipefail
+
+ES_URL="${ES_URL:-http://127.0.0.1:9200}"
+TIMEOUT="${ES_SHUTDOWN_TIMEOUT:-100}"
+deadline=$(( $(date +%s) + TIMEOUT ))
+log() { echo "es-prestop: $*" >&2; }
+
+POD="${POD_NAME:-$(hostname)}"
+ORDINAL="${POD##*-}"
+STS="${POD%-*}"
+NS="${POD_NAMESPACE:-$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo default)}"
+
+removing=false
+SA=/var/run/secrets/kubernetes.io/serviceaccount
+if [[ -r "$SA/token" && "$ORDINAL" =~ ^[0-9]+$ ]]; then
+  replicas="$(curl -s --max-time 5 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat "$SA/token")" \
+    "https://kubernetes.default.svc/apis/apps/v1/namespaces/${NS}/statefulsets/${STS}" | jq -r '.spec.replicas // empty' 2>/dev/null || true)"
+  if [[ "$replicas" =~ ^[0-9]+$ && "$ORDINAL" -ge "$replicas" ]]; then
+    removing=true
+  fi
+fi
+log "pod=${POD} statefulset=${STS} removing=${removing}"
+
+local_node="$(curl -s --max-time 5 "${ES_URL}/_nodes/_local" 2>/dev/null || true)"
+id="$(jq -r '.nodes | keys[0] // empty' <<< "$local_node" 2>/dev/null || true)"
+is_master="$(jq -r '[.nodes[].roles[]?] | index("master") != null' <<< "$local_node" 2>/dev/null || echo false)"
+if [[ -z "$id" ]]; then
+  log "node not reachable; nothing to prepare"
+  exit 0
+fi
+
+if [[ "$removing" == "true" && "$is_master" == "true" && "${ES_VOTING_EXCLUSIONS:-true}" == "true" ]]; then
+  log "master-eligible node is being removed: adding voting config exclusion"
+  curl -s -o /dev/null --max-time 30 -X POST "${ES_URL}/_cluster/voting_config_exclusions?node_names=${POD}&timeout=30s" \
+    || log "voting config exclusion failed"
+fi
+
+if [[ "${ES_DRAIN_ON_SHUTDOWN:-false}" != "true" ]]; then
+  exit 0
+fi
+
+type="${ES_SHUTDOWN_TYPE:-restart}"
+[[ "$removing" == "true" ]] && type=remove
+if [[ "$type" == "restart" ]]; then
+  body="{\"type\":\"restart\",\"reason\":\"preStop ${POD}\",\"allocation_delay\":\"${ES_SHUTDOWN_ALLOCATION_DELAY:-5m}\"}"
+else
+  body="{\"type\":\"remove\",\"reason\":\"preStop ${POD}\"}"
+fi
+log "registering ${type} shutdown for node ${id}"
+curl -s -o /dev/null --max-time 10 -X PUT -H 'Content-Type: application/json' -d "$body" "${ES_URL}/_nodes/${id}/shutdown" \
+  || { log "shutdown registration failed"; exit 0; }
+
+while [[ $(date +%s) -lt $deadline ]]; do
+  status="$(curl -s --max-time 5 "${ES_URL}/_nodes/${id}/shutdown" | jq -r '.nodes[0].status // empty' 2>/dev/null || true)"
+  if [[ "$status" == "COMPLETE" ]]; then
+    log "shutdown preparation COMPLETE"
+    exit 0
+  fi
+  log "shutdown status: ${status:-unknown}"
+  sleep 2
+done
+log "timed out after ${TIMEOUT}s waiting for shutdown preparation; stopping anyway"
+exit 0

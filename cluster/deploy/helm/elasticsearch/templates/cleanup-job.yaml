@@ -1,0 +1,50 @@
+{{- if .Values.masterScaleDown.cleanupJob }}
+{{- $cluster := include "es.clusterName" . }}
+# After every upgrade: once nodes excluded from the voting configuration
+# (by es-prestop during a master scale-down) have left, clear the
+# exclusions; drop shutdown records of nodes that are gone.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $cluster }}-post-upgrade-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "es.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: {{ add .Values.masterScaleDown.cleanupTimeoutSeconds 120 }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: elasticsearch-cleanup
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cleanup
+          image: {{ include "es.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/share/elasticsearch/bin/es-cluster-cleanup"]
+          env:
+            - name: ES_URL
+              value: {{ include "es.clientUrl" . | quote }}
+            - name: ES_CLEANUP_TIMEOUT
+              value: {{ .Values.masterScaleDown.cleanupTimeoutSeconds | quote }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+{{- end }}

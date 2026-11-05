@@ -1,0 +1,17 @@
+# Smallest useful cluster: 3 master-eligible data nodes.
+#   kubectl apply -f cluster/deploy/operator/examples/quickstart.yaml
+#   kubectl get es quickstart -w
+#   kubectl port-forward svc/quickstart-es-http 9200
+# The pods bind 0.0.0.0, so the bootstrap checks are enforced: every
+# Kubernetes node needs vm.max_map_count >= 262144 (see cluster/deploy/README.md).
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: quickstart
+spec:
+  version: 0.1.0
+  nodeSets:
+    - name: default
+      count: 3
+      config:
+        node.roles: [master, data, ingest]
