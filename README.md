@@ -63,7 +63,16 @@ flushes every 30 seconds and force-merges.
 
 ### Vector search at scale
 
-These runs used 2.58M OpenAI embeddings (1536 dimensions) on two nodes with
+At 270M vectors (BIGANN, 128 dimensions, `int8_hnsw`) on two r7g.8xlarge data
+nodes, with k = 10 and `num_candidates` 100:
+
+| Concurrent clients | elasticsearch-rust | ES 9.5.5 | Speedup |
+|---|---:|---:|---:|
+| 64 | **8,041 searches/s** | 1,405 searches/s | **5.7×** |
+| 128 | **8,861 searches/s** | 1,349 searches/s | **6.6×** |
+| 256–2,048 | **9,000–9,500 searches/s** | 270–460 searches/s | **20–33×** |
+
+The runs below used 2.58M OpenAI embeddings (1536 dimensions) on two nodes with
 6.5 GB each.
 
 | | elasticsearch-rust | ES 9.5.5 |
@@ -77,15 +86,6 @@ These runs used 2.58M OpenAI embeddings (1536 dimensions) on two nodes with
 
 `bbq_disk` (IVF) with 1M vectors on two nodes with one replica beats ES on
 both recall and p50 latency in every query group.
-
-At 270M vectors (BIGANN, 128 dimensions, `int8_hnsw`) on two r7g.8xlarge data
-nodes, with k = 10 and `num_candidates` 100:
-
-| Concurrent clients | elasticsearch-rust | ES 9.5.5 | Speedup |
-|---|---:|---:|---:|
-| 64 | **8,041 searches/s** | 1,405 searches/s | **5.7×** |
-| 128 | **8,861 searches/s** | 1,349 searches/s | **6.6×** |
-| 256–2,048 | **9,000–9,500 searches/s** | 270–460 searches/s | **20–33×** |
 
 ### Rally: elasticsearch-rust vs Elasticsearch 9.5.5
 
@@ -409,6 +409,40 @@ shard, instead of one per segment.
 | Test harnesses | [`crates/es-yaml-runner`](crates/es-yaml-runner), [`cluster/crates/es-cluster-yaml`](cluster/crates/es-cluster-yaml), [`cluster/crates/elasticsearch-faults`](cluster/crates/elasticsearch-faults) | The ES YAML suite (in-process and multi-node) and Jepsen-style fault injection |
 
 Cluster design: [cluster/ARCHITECTURE.md](cluster/ARCHITECTURE.md).
+
+---
+
+## Download
+
+Prebuilt releases for Linux, x86_64 and ARM64 (glibc 2.35 or newer: Ubuntu
+22.04, Debian 12, RHEL 9 or later).
+
+| Platform | Download | SHA-256 |
+|---|---|---|
+| Linux x86_64 | [elasticsearch-rust-linux-x86_64.tar.gz](https://elasticsearch-rust-releases.s3.amazonaws.com/releases/latest/elasticsearch-rust-linux-x86_64.tar.gz) | [checksum](https://elasticsearch-rust-releases.s3.amazonaws.com/releases/latest/elasticsearch-rust-linux-x86_64.tar.gz.sha256) |
+| Linux ARM64 | [elasticsearch-rust-linux-aarch64.tar.gz](https://elasticsearch-rust-releases.s3.amazonaws.com/releases/latest/elasticsearch-rust-linux-aarch64.tar.gz) | [checksum](https://elasticsearch-rust-releases.s3.amazonaws.com/releases/latest/elasticsearch-rust-linux-aarch64.tar.gz.sha256) |
+| Docker (amd64, arm64) | `public.ecr.aws/f5r1z8l0/elasticsearch-rust:latest` | |
+
+```sh
+curl -LO https://elasticsearch-rust-releases.s3.amazonaws.com/releases/latest/elasticsearch-rust-linux-x86_64.tar.gz
+tar xzf elasticsearch-rust-linux-x86_64.tar.gz
+cd elasticsearch-rust-*-linux-x86_64
+./bin/elasticsearch -E discovery.type=single-node
+./bin/elasticsearch-reset-password -u elastic -i      # in a second shell
+curl -k -u elastic https://localhost:9200
+```
+
+With Docker:
+
+```sh
+docker run -p 9200:9200 -e discovery.type=single-node -e ELASTIC_PASSWORD=changeme \
+  public.ecr.aws/f5r1z8l0/elasticsearch-rust:latest
+curl -k -u elastic:changeme https://localhost:9200
+```
+
+Security is on by default, as in Elasticsearch: the node generates its TLS
+certificates on first start. For multi-node clusters, raise
+`vm.max_map_count` to at least 262144 on each host, as Elasticsearch requires.
 
 ---
 
