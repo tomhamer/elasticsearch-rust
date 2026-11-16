@@ -265,6 +265,12 @@ pub fn ensure(node: &Node) -> bool {
             changed = true;
         }
     }
+    // Built-in lifecycle policies: missing or older ones (re)installed.
+    changed |= node.ilm.ensure_builtins();
+    // `ProfilingIndexTemplateRegistry` (behind `xpack.profiling.templates.enabled`).
+    changed |= crate::profiling::ensure_registry(node);
+    // `WatcherIndexTemplateRegistry`: the history policy and template.
+    changed |= crate::watcher::ensure_registry(node);
     if changed {
         if let Err(e) = node.persist_state() {
             tracing::warn!("persisting built-in templates failed: {e}");
@@ -276,6 +282,35 @@ pub fn ensure(node: &Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ProfilingIndexTemplateRegistry`: nothing until
+    /// `xpack.profiling.templates.enabled`; then the reconcile installs its
+    /// templates and `profiling-60-days` (no profiling call needed), and an
+    /// older policy (`_meta.version`) is upgraded.
+    #[test]
+    fn profiling_registry_follows_its_setting_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        ensure(&node);
+        assert!(node.ilm.policy("profiling-60-days").is_none());
+        assert!(!node.templates.read().index.contains_key("profiling-events"));
+        node.cluster_settings.write().0.insert(crate::profiling::TEMPLATES_ENABLED.into(), serde_json::json!("true"));
+        assert!(ensure(&node));
+        let p = node.ilm.policy("profiling-60-days").expect("installed by the registry");
+        assert_eq!(p.policy["_meta"]["version"], crate::profiling::INDEX_TEMPLATE_VERSION, "{:?}", p.policy);
+        assert_eq!(p.policy["phases"]["delete"]["min_age"], "60d");
+        for t in ["profiling-events", "profiling-metrics", "profiling-hosts", "profiling-stacktraces"] {
+            assert!(node.templates.read().index.contains_key(t), "{t}");
+        }
+        // An older install's policy (lower `_meta.version`) is upgraded.
+        let mut old = p.policy.clone();
+        old["_meta"]["version"] = serde_json::json!(crate::profiling::INDEX_TEMPLATE_VERSION - 1);
+        old["phases"]["delete"]["min_age"] = serde_json::json!("30d");
+        node.ilm.replace_policy("profiling-60-days", old).unwrap();
+        assert!(ensure(&node));
+        assert_eq!(node.ilm.policy("profiling-60-days").unwrap().policy["phases"]["delete"]["min_age"], "60d");
+        assert!(!ensure(&node));
+    }
 
     #[test]
     fn registries_reconcile_missing_cluster_metadata_without_downgrading() {
@@ -294,5 +329,42 @@ mod tests {
         assert!(node.templates.read().component.contains_key("apm@mappings"));
         assert_eq!(node.templates.read().component["logs@mappings"]["version"], 999999);
         assert!(!ensure(&node));
+    }
+
+    /// A user template named like a built-in one (`metrics`), without a
+    /// `version`, is replaced by the built-in on the next reconcile, as ES's
+    /// `IndexTemplateRegistry` does ("upgrading composable index template"
+    /// when the current one has no version). Its `metrics-*` pattern goes
+    /// with it, so `metrics-a` matches no template (the built-in is
+    /// `metrics-*-*`) — ES's answer too. A user template with its own name
+    /// and a higher priority wins; one at the built-in's name with a higher
+    /// `version` is kept.
+    #[test]
+    fn user_template_named_like_a_builtin_follows_es_registry_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        ensure(&node);
+        let builtin = node.templates.read().index["metrics"].clone();
+        assert_eq!(builtin["index_patterns"], serde_json::json!(["metrics-*-*"]));
+        let user = serde_json::json!({"index_patterns": ["metrics-*"], "data_stream": {}, "priority": 500, "template": {"settings": {"index.number_of_replicas": "0"}}});
+        node.templates.write().index.insert("metrics".into(), user.clone());
+        assert!(ensure(&node), "the version-less user template is upgraded");
+        assert_eq!(node.templates.read().index["metrics"]["index_patterns"], builtin["index_patterns"]);
+        let e = node.create_data_stream("metrics-a").unwrap_err();
+        assert_eq!(e.reason, "no matching index template found for data stream [metrics-a]");
+        // Its own name and a higher priority: used for `metrics-a`, and for
+        // `metrics-x-y` over the built-in.
+        node.templates.write().index.insert("my-metrics".into(), user.clone());
+        assert!(!ensure(&node));
+        node.create_data_stream("metrics-a").unwrap();
+        node.create_data_stream("metrics-x-y").unwrap();
+        assert_eq!(node.template_for("metrics-x-y").0, node.template_for("metrics-a").0);
+        // At the built-in's name with a higher version: kept.
+        let mut versioned = user;
+        versioned["index_patterns"] = serde_json::json!(["vmetrics-*"]);
+        versioned["version"] = serde_json::json!(i64::MAX);
+        node.templates.write().index.insert("metrics".into(), versioned);
+        assert!(!ensure(&node));
+        assert_eq!(node.templates.read().index["metrics"]["index_patterns"], serde_json::json!(["vmetrics-*"]));
     }
 }

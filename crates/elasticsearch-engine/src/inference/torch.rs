@@ -23,42 +23,70 @@ use std::rc::Rc;
 // ---------------------------------------------------------------------------
 // Zip archive reading
 
-/// The files of a zip archive, by name.
+/// Largest total of expanded archive members (all members together).
+pub const MAX_ARCHIVE_BYTES: usize = 1 << 30;
+/// Most archive entries read.
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+
+/// The files of a zip archive, by name (at most [`MAX_ARCHIVE_BYTES`] expanded).
 pub fn unzip(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
+    unzip_within(bytes, MAX_ARCHIVE_BYTES)
+}
+
+/// [`unzip`] with an aggregate budget for the expanded members: a member
+/// is inflated through a bounded reader, never past what remains.
+pub fn unzip_within(bytes: &[u8], budget: usize) -> Result<HashMap<String, Vec<u8>>> {
     let bad = || EsError::illegal_argument("model definition is not a valid TorchScript archive");
-    let u16_at = |o: usize| -> Option<usize> { bytes.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize) };
-    let u32_at = |o: usize| -> Option<usize> { bytes.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) };
+    let too_big = || EsError::illegal_argument(format!("model definition archive expands beyond the limit of [{budget}] bytes"));
+    let u16_at = |o: usize| -> Option<usize> { bytes.get(o..o.checked_add(2)?).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize) };
+    let u32_at = |o: usize| -> Option<usize> { bytes.get(o..o.checked_add(4)?).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) };
     // End of central directory record (scan back over a trailing comment).
     let eocd = (0..bytes.len().saturating_sub(21)).rev().find(|&i| bytes[i..].starts_with(&[0x50, 0x4b, 0x05, 0x06])).ok_or_else(bad)?;
     let entries = u16_at(eocd + 10).ok_or_else(bad)?;
+    if entries > MAX_ARCHIVE_ENTRIES {
+        return Err(bad());
+    }
     let mut cd = u32_at(eocd + 16).ok_or_else(bad)?;
     let mut out = HashMap::new();
+    let mut left = budget;
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(bad);
     for _ in 0..entries {
         if u32_at(cd) != Some(0x0201_4b50) {
             return Err(bad());
         }
-        let method = u16_at(cd + 10).ok_or_else(bad)?;
-        let csize = u32_at(cd + 20).ok_or_else(bad)?;
-        let name_len = u16_at(cd + 28).ok_or_else(bad)?;
-        let extra_len = u16_at(cd + 30).ok_or_else(bad)?;
-        let comment_len = u16_at(cd + 32).ok_or_else(bad)?;
-        let local = u32_at(cd + 42).ok_or_else(bad)?;
-        let name = String::from_utf8_lossy(bytes.get(cd + 46..cd + 46 + name_len).ok_or_else(bad)?).into_owned();
-        cd += 46 + name_len + extra_len + comment_len;
+        let method = u16_at(add(cd, 10)?).ok_or_else(bad)?;
+        let csize = u32_at(add(cd, 20)?).ok_or_else(bad)?;
+        let name_len = u16_at(add(cd, 28)?).ok_or_else(bad)?;
+        let extra_len = u16_at(add(cd, 30)?).ok_or_else(bad)?;
+        let comment_len = u16_at(add(cd, 32)?).ok_or_else(bad)?;
+        let local = u32_at(add(cd, 42)?).ok_or_else(bad)?;
+        let name_start = add(cd, 46)?;
+        let name = String::from_utf8_lossy(bytes.get(name_start..add(name_start, name_len)?).ok_or_else(bad)?).into_owned();
+        cd = add(add(add(name_start, name_len)?, extra_len)?, comment_len)?;
         if u32_at(local) != Some(0x0403_4b50) {
             return Err(bad());
         }
-        let start = local + 30 + u16_at(local + 26).ok_or_else(bad)? + u16_at(local + 28).ok_or_else(bad)?;
-        let raw = bytes.get(start..start + csize).ok_or_else(bad)?;
+        let start = add(add(add(local, 30)?, u16_at(add(local, 26)?).ok_or_else(bad)?)?, u16_at(add(local, 28)?).ok_or_else(bad)?)?;
+        let raw = bytes.get(start..add(start, csize)?).ok_or_else(bad)?;
         let data = match method {
-            0 => raw.to_vec(),
+            0 => {
+                if raw.len() > left {
+                    return Err(too_big());
+                }
+                raw.to_vec()
+            }
             8 => {
                 let mut v = Vec::new();
-                flate2::read::DeflateDecoder::new(raw).read_to_end(&mut v).map_err(|_| bad())?;
+                // One byte past the budget tells "too big" from "exactly fits".
+                flate2::read::DeflateDecoder::new(raw).take(left as u64 + 1).read_to_end(&mut v).map_err(|_| bad())?;
+                if v.len() > left {
+                    return Err(too_big());
+                }
                 v
             }
             _ => return Err(bad()),
         };
+        left -= data.len();
         out.insert(name, data);
     }
     Ok(out)
@@ -310,7 +338,18 @@ enum Expr {
 struct P {
     t: Vec<Tok>,
     i: usize,
+    depth: usize,
 }
+
+/// Deepest expression nesting the parser accepts (and so the evaluator
+/// recurses); TorchScript emitted by tracing is shallow.
+pub const MAX_EXPR_DEPTH: usize = 128;
+/// Deepest `for` block nesting.
+pub const MAX_BLOCK_DEPTH: usize = 32;
+/// Largest tensor (elements) one operation may create.
+pub const MAX_TENSOR_ELEMENTS: usize = 50_000_000;
+/// Elements all tensors of one run may allocate together.
+pub const MAX_RUN_ELEMENTS: usize = 200_000_000;
 
 impl P {
     fn peek(&self) -> Option<&Tok> {
@@ -351,6 +390,15 @@ impl P {
         }
     }
     fn expr(&mut self) -> Result<Expr> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(unsupported(&format!("expressions nested deeper than {MAX_EXPR_DEPTH}")));
+        }
+        let e = self.expr_inner();
+        self.depth -= 1;
+        e
+    }
+    fn expr_inner(&mut self) -> Result<Expr> {
         if self.eat('-') {
             return Ok(Expr::Neg(Box::new(self.expr()?)));
         }
@@ -427,6 +475,13 @@ fn indent_of(l: &str) -> usize {
 }
 
 fn parse_block(lines: &[&str], i: &mut usize, indent: usize) -> Result<Vec<Stmt>> {
+    parse_block_at(lines, i, indent, 0)
+}
+
+fn parse_block_at(lines: &[&str], i: &mut usize, indent: usize, depth: usize) -> Result<Vec<Stmt>> {
+    if depth > MAX_BLOCK_DEPTH {
+        return Err(unsupported(&format!("blocks nested deeper than {MAX_BLOCK_DEPTH}")));
+    }
     let mut out = Vec::new();
     while *i < lines.len() {
         let l = lines[*i];
@@ -445,7 +500,7 @@ fn parse_block(lines: &[&str], i: &mut usize, indent: usize) -> Result<Vec<Stmt>
             let (var, it) = rest.split_once(" in ").ok_or_else(|| unsupported("for loop"))?;
             let it = it.trim_end_matches(':');
             let body_indent = lines.get(*i).map(|l| indent_of(l)).unwrap_or(indent + 2);
-            let body = parse_block(lines, i, body_indent.max(indent + 1))?;
+            let body = parse_block_at(lines, i, body_indent.max(indent + 1), depth + 1)?;
             out.push(Stmt::For(var.trim().to_string(), parse_expr(it)?, body));
         } else if s == "pass" {
         } else {
@@ -454,7 +509,7 @@ fn parse_block(lines: &[&str], i: &mut usize, indent: usize) -> Result<Vec<Stmt>
             let eq = toks.iter().position(|t| *t == Tok::Sym('='));
             match (toks.first(), eq) {
                 (Some(Tok::Ident(n)), Some(p)) if p == 1 || toks.get(1) == Some(&Tok::Sym(':')) => {
-                    let mut pp = P { t: toks[p + 1..].to_vec(), i: 0 };
+                    let mut pp = P { t: toks[p + 1..].to_vec(), i: 0, depth: 0 };
                     out.push(Stmt::Assign(n.clone(), pp.expr()?));
                 }
                 _ => out.push(Stmt::Expr(parse_expr(s)?)),
@@ -465,7 +520,7 @@ fn parse_block(lines: &[&str], i: &mut usize, indent: usize) -> Result<Vec<Stmt>
 }
 
 fn parse_expr(s: &str) -> Result<Expr> {
-    let mut p = P { t: lex(s)?, i: 0 };
+    let mut p = P { t: lex(s)?, i: 0, depth: 0 };
     let e = p.expr()?;
     if p.i < p.t.len() {
         return Err(unsupported(&format!("trailing syntax in [{s}]")));
@@ -533,7 +588,7 @@ impl Program {
         for (i, p) in self.params.iter().enumerate() {
             env.insert(p.clone(), args.get(i).cloned().map(Val::Tensor).unwrap_or(Val::None));
         }
-        let mut st = Interp { env, rng: Rng(0x853c_49e6_748f_ea9b), steps: 0 };
+        let mut st = Interp { env, rng: Rng(0x853c_49e6_748f_ea9b), steps: 0, allocated: 0 };
         match st.block(&self.body)? {
             Some(Val::Tensor(t)) => Ok(t),
             Some(Val::List(l)) => l.first().map(Val::tensor).transpose()?.ok_or_else(|| unsupported("empty output")),
@@ -564,11 +619,31 @@ struct Interp {
     env: HashMap<String, Val>,
     rng: Rng,
     steps: u64,
+    /// Tensor elements allocated so far in this run.
+    allocated: usize,
+}
+
+/// Elements of a tensor of `shape`, refusing overflow and the per-tensor limit.
+fn checked_numel(shape: &[usize]) -> Result<usize> {
+    let n = shape.iter().try_fold(1usize, |acc, d| acc.checked_mul(*d)).ok_or_else(|| unsupported("tensor too large"))?;
+    if n > MAX_TENSOR_ELEMENTS {
+        return Err(unsupported("tensor too large"));
+    }
+    Ok(n)
 }
 
 const MAX_STEPS: u64 = 10_000_000;
 
 impl Interp {
+    /// Admit `n` more tensor elements against the per-tensor and per-run budgets.
+    fn admit(&mut self, n: usize) -> Result<()> {
+        if n > MAX_TENSOR_ELEMENTS {
+            return Err(unsupported("tensor too large"));
+        }
+        self.allocated = self.allocated.checked_add(n).filter(|a| *a <= MAX_RUN_ELEMENTS).ok_or_else(|| unsupported("tensors exceed the memory budget of one inference"))?;
+        Ok(())
+    }
+
     fn block(&mut self, b: &[Stmt]) -> Result<Option<Val>> {
         for s in b {
             self.steps += 1;
@@ -591,6 +666,10 @@ impl Interp {
                                 1 => (0, self.eval(&a[0])?.as_i64()?),
                                 _ => (self.eval(&a[0])?.as_i64()?, self.eval(&a[1])?.as_i64()?),
                             };
+                            // Each iteration is a step: a range longer than the step budget cannot finish.
+                            if hi.saturating_sub(lo) > MAX_STEPS as i64 {
+                                return Err(unsupported("program too long"));
+                            }
                             (lo..hi).map(Val::Int).collect()
                         }
                         other => match self.eval(other)? {
@@ -708,10 +787,8 @@ impl Interp {
             "torch.dim" => Val::Int(arg(0)?.tensor()?.shape.len() as i64),
             "torch.ones" | "torch.zeros" | "torch.rand" | "torch.full" => {
                 let shape = arg(0)?.shape()?;
-                let n: usize = shape.iter().product();
-                if n > 50_000_000 {
-                    return Err(unsupported("tensor too large"));
-                }
+                let n = checked_numel(&shape)?;
+                self.admit(n)?;
                 let (data, dt) = match f {
                     "torch.ones" => (vec![1.0; n], dtype(DType::Float)),
                     "torch.zeros" => (vec![0.0; n], dtype(DType::Float)),
@@ -721,7 +798,8 @@ impl Interp {
                 Val::Tensor(Tensor::new(shape, data, dt))
             }
             "torch.arange" => {
-                let n = arg(0)?.as_i64()?.max(0) as usize;
+                let n = usize::try_from(arg(0)?.as_i64()?.max(0)).map_err(|_| unsupported("tensor too large"))?;
+                self.admit(n)?;
                 Val::Tensor(Tensor::new(vec![n], (0..n).map(|x| x as f64).collect(), dtype(DType::Long)))
             }
             "torch.tensor" => {
@@ -736,22 +814,46 @@ impl Interp {
                 }
             }
             "torch.add" | "torch.sub" | "torch.mul" | "torch.div" => {
+                // PyTorch semantics (finding 357): `add`/`sub` scale the
+                // second operand by `alpha`, `div` honours `rounding_mode`,
+                // and tensors broadcast per trailing dimension.
                 let (x, y) = (arg(0)?, arg(1)?);
-                let op = |p: f64, q: f64| match f {
-                    "torch.add" => p + q,
-                    "torch.sub" => p - q,
-                    "torch.mul" => p * q,
-                    _ => p / q,
+                let alpha = match k.get("alpha").cloned().or_else(|| a.get(2).cloned()) {
+                    Some(v) if matches!(f, "torch.add" | "torch.sub") => Some(v),
+                    Some(_) | None => None,
                 };
+                let rounding = match k.get("rounding_mode").or_else(|| if f == "torch.div" { a.get(2) } else { None }) {
+                    None | Some(Val::None) => None,
+                    Some(Val::Str(m)) if m == "trunc" || m == "floor" => Some(m.clone()),
+                    Some(_) => return Err(unsupported("div rounding_mode")),
+                };
+                let scale = match &alpha {
+                    None => 1.0,
+                    Some(v) => v.as_f64()?,
+                };
+                let op = |p: f64, q: f64| match f {
+                    "torch.add" => p + scale * q,
+                    "torch.sub" => p - scale * q,
+                    "torch.mul" => p * q,
+                    _ => match rounding.as_deref() {
+                        Some("trunc") => (p / q).trunc(),
+                        Some(_) => (p / q).floor(),
+                        None => p / q,
+                    },
+                };
+                let alpha_float = matches!(alpha, Some(Val::Float(_)));
                 match (&x, &y) {
-                    (Val::Int(p), Val::Int(q)) if f != "torch.div" => Val::Int(op(*p as f64, *q as f64) as i64),
+                    (Val::Int(p), Val::Int(q)) if (f != "torch.div" || rounding.is_some()) && !alpha_float => Val::Int(op(*p as f64, *q as f64) as i64),
                     (Val::Tensor(_), _) | (_, Val::Tensor(_)) => {
                         let (tx, ty) = (x.tensor()?, y.tensor()?);
-                        let (vx, vy) = (tx.values(), ty.values());
-                        let (shape, n) = if tx.numel() >= ty.numel() { (tx.shape.clone(), tx.numel()) } else { (ty.shape.clone(), ty.numel()) };
-                        let pick = |v: &Vec<f64>, i: usize| if v.len() == 1 { v[0] } else { v[i % v.len().max(1)] };
-                        let data: Vec<f64> = (0..n).map(|i| op(pick(&vx, i), pick(&vy, i))).collect();
-                        let dt = if tx.dtype == DType::Float || ty.dtype == DType::Float || f == "torch.div" { DType::Float } else { DType::Long };
+                        let shape = broadcast_shape(&tx.shape, &ty.shape)?;
+                        let n = checked_numel(&shape)?;
+                        self.admit(n)?;
+                        let (vx, vy) = (broadcast_values(&tx, &shape), broadcast_values(&ty, &shape));
+                        let data: Vec<f64> = vx.iter().zip(&vy).map(|(p, q)| op(*p, *q)).collect();
+                        let float = tx.dtype == DType::Float || ty.dtype == DType::Float || alpha_float || (f == "torch.div" && rounding.is_none());
+                        let dt = if float { DType::Float } else { DType::Long };
+                        let data = if dt == DType::Long { data.into_iter().map(f64::trunc).collect() } else { data };
                         Val::Tensor(Tensor::new(shape, data, dt))
                     }
                     _ => Val::Float(op(x.as_f64()?, y.as_f64()?)),
@@ -807,10 +909,78 @@ impl Interp {
                 }
                 Val::Tensor(t)
             }
-            "torch.to" => Val::Tensor(arg(0)?.tensor()?),
+            "torch.to" => {
+                // `to(dtype)`, `to(device, dtype)`, `to(dtype=..)`: convert
+                // the values; a device-only move keeps them (finding 357).
+                let t = arg(0)?.tensor()?;
+                let target = k.get("dtype").cloned().or_else(|| a.iter().skip(1).find(|v| matches!(v, Val::DType(_) | Val::Int(_))).cloned());
+                match target {
+                    None | Some(Val::None) => Val::Tensor(t),
+                    Some(v) => {
+                        let dt = match v {
+                            Val::DType(d) => d,
+                            Val::Int(c) => dtype_of_code(c),
+                            _ => return Err(unsupported("to() dtype")),
+                        };
+                        let vals: Vec<f64> = t.values().into_iter().map(|x| match dt {
+                            DType::Long => x.trunc(),
+                            DType::Bool => (x != 0.0) as i64 as f64,
+                            DType::Float => x,
+                        }).collect();
+                        Val::Tensor(Tensor::new(t.shape.clone(), vals, dt))
+                    }
+                }
+            }
             _ => return Err(unsupported(f)),
         })
     }
+}
+
+/// The PyTorch broadcast shape of `a` and `b`: dimensions aligned from the
+/// right, each pair equal or one of them 1.
+fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
+    let n = a.len().max(b.len());
+    let mut out = vec![0; n];
+    for i in 0..n {
+        let da = if i + a.len() >= n { a[i + a.len() - n] } else { 1 };
+        let db = if i + b.len() >= n { b[i + b.len() - n] } else { 1 };
+        out[i] = match (da, db) {
+            (x, y) if x == y => x,
+            (1, y) => y,
+            (x, 1) => x,
+            (x, y) => {
+                return Err(EsError::illegal_argument(format!(
+                    "The size of tensor a ({x}) must match the size of tensor b ({y}) at non-singleton dimension {i}"
+                )))
+            }
+        };
+    }
+    Ok(out)
+}
+
+/// `t`'s values expanded to `shape` (a broadcast of `t.shape`), row-major.
+fn broadcast_values(t: &Tensor, shape: &[usize]) -> Vec<f64> {
+    let v = t.values();
+    let own = contiguous_strides(&t.shape);
+    let lead = shape.len() - t.shape.len();
+    // Stride of each output dimension in `t`'s values (0 where broadcast).
+    let strides: Vec<usize> = (0..shape.len())
+        .map(|i| if i < lead || t.shape[i - lead] == 1 { 0 } else { own[i - lead] })
+        .collect();
+    let n: usize = shape.iter().product();
+    let mut out = Vec::with_capacity(n);
+    let mut idx = vec![0usize; shape.len()];
+    for _ in 0..n {
+        out.push(v[idx.iter().zip(&strides).map(|(i, s)| i * s).sum::<usize>()]);
+        for k in (0..idx.len()).rev() {
+            idx[k] += 1;
+            if idx[k] < shape[k] {
+                break;
+            }
+            idx[k] = 0;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -818,47 +988,68 @@ impl Interp {
 
 /// Token ids of `text` for a WordPiece vocabulary; unknown words map to
 /// `[UNK]`. `lower`: `do_lower_case`; `special`: add `[CLS]` / `[SEP]`.
+/// Words longer than this become `[UNK]` without a vocabulary search (ES
+/// `WordPieceTokenFilter` `max_input_chars_per_word`).
+pub const MAX_INPUT_CHARS_PER_WORD: usize = 100;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: vocabulary lookups made by [`wordpiece`].
+    pub static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// BERT basic tokenization + WordPiece of `text` to at most `max_len` ids
+/// (with `[CLS]` / `[SEP]` when `special`); whether the text was truncated.
+/// The work is bounded by the sequence limit, not the input (finding 160):
+/// words are split lazily and tokenizing stops as soon as one id more than
+/// fits has been produced; a word longer than
+/// [`MAX_INPUT_CHARS_PER_WORD`] is `[UNK]`, so a match search costs at most
+/// that many squared character steps.
 pub fn wordpiece(text: &str, vocab: &[String], lower: bool, special: bool, max_len: usize) -> (Vec<i64>, bool) {
     let index: HashMap<&str, i64> = vocab.iter().enumerate().map(|(i, t)| (t.as_str(), i as i64)).collect();
     let unk = index.get("[UNK]").copied().unwrap_or(0);
-    let mut words: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for c in text.chars() {
-        if c.is_whitespace() || c.is_control() {
-            if !cur.is_empty() {
-                words.push(std::mem::take(&mut cur));
-            }
-        } else if c.is_ascii_punctuation() || (!c.is_ascii() && !c.is_alphanumeric()) {
-            if !cur.is_empty() {
-                words.push(std::mem::take(&mut cur));
-            }
-            words.push(c.to_string());
+    let budget = if special { max_len.saturating_sub(2) } else { max_len };
+    let mut ids: Vec<i64> = Vec::new();
+    let mut piece = String::new();
+    let mut emit = |w: &str, ids: &mut Vec<i64>| {
+        let lowered;
+        let w = if lower {
+            lowered = w.to_lowercase();
+            lowered.as_str()
         } else {
-            cur.push(c);
+            w
+        };
+        #[cfg(test)]
+        LOOKUPS.with(|n| n.set(n.get() + 1));
+        if let Some(id) = index.get(w) {
+            ids.push(*id);
+            return;
         }
-    }
-    if !cur.is_empty() {
-        words.push(cur);
-    }
-    let mut ids = Vec::new();
-    for w in words {
-        let w = if lower { w.to_lowercase() } else { w };
-        if index.contains_key(w.as_str()) {
-            ids.push(index[w.as_str()]);
-            continue;
+        let bounds: Vec<usize> = w.char_indices().map(|(b, _)| b).chain(std::iter::once(w.len())).collect();
+        let chars = bounds.len() - 1;
+        if chars > MAX_INPUT_CHARS_PER_WORD {
+            ids.push(unk);
+            return;
         }
         // Greedy longest-match-first WordPiece.
-        let chars: Vec<char> = w.chars().collect();
         let mut start = 0;
         let mut pieces = Vec::new();
-        let mut bad = false;
-        while start < chars.len() {
-            let mut end = chars.len();
+        while start < chars {
+            let mut end = chars;
             let mut found = None;
             while start < end {
-                let sub: String = chars[start..end].iter().collect();
-                let sub = if start > 0 { format!("##{sub}") } else { sub };
-                if let Some(id) = index.get(sub.as_str()) {
+                let sub = &w[bounds[start]..bounds[end]];
+                #[cfg(test)]
+                LOOKUPS.with(|n| n.set(n.get() + 1));
+                let hit = if start > 0 {
+                    piece.clear();
+                    piece.push_str("##");
+                    piece.push_str(sub);
+                    index.get(piece.as_str())
+                } else {
+                    index.get(sub)
+                };
+                if let Some(id) = hit {
                     found = Some(*id);
                     break;
                 }
@@ -870,18 +1061,38 @@ pub fn wordpiece(text: &str, vocab: &[String], lower: bool, special: bool, max_l
                     start = end;
                 }
                 None => {
-                    bad = true;
-                    break;
+                    ids.push(unk);
+                    return;
                 }
             }
         }
-        if bad {
-            ids.push(unk);
-        } else {
-            ids.extend(pieces);
+        ids.extend(pieces);
+    };
+    let mut cur_start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if ids.len() > budget {
+            break;
+        }
+        let sep = c.is_whitespace() || c.is_control();
+        // Punctuation and (BERT `tokenize_cjk_chars`, finding 343) each
+        // CJK ideograph are words of their own.
+        let punct = c.is_ascii_punctuation() || (!c.is_ascii() && !c.is_alphanumeric()) || is_cjk(c);
+        if sep || punct {
+            if let Some(s) = cur_start.take() {
+                emit(&text[s..i], &mut ids);
+            }
+            if punct && ids.len() <= budget {
+                emit(&text[i..i + c.len_utf8()], &mut ids);
+            }
+        } else if cur_start.is_none() {
+            cur_start = Some(i);
         }
     }
-    let budget = if special { max_len.saturating_sub(2) } else { max_len };
+    if let Some(s) = cur_start {
+        if ids.len() <= budget {
+            emit(&text[s..], &mut ids);
+        }
+    }
     let truncated = ids.len() > budget;
     ids.truncate(budget);
     if special {
@@ -893,9 +1104,245 @@ pub fn wordpiece(text: &str, vocab: &[String], lower: bool, special: bool, max_l
     (ids, truncated)
 }
 
+/// BERT's CJK ideograph ranges (`BasicTokenizer.isCjkChar`).
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x2A700..=0x2B73F | 0x2B740..=0x2B81F | 0x2B820..=0x2CEAF | 0xF900..=0xFAFF | 0x2F800..=0x2FA1F)
+}
+
+/// A model vocabulary (`PUT _ml/trained_models/{id}/vocabulary`): the
+/// tokens, and the BPE `merges` / Unigram `scores` its tokenizer needs.
+#[derive(Default)]
+pub struct NlpVocab {
+    pub tokens: Vec<String>,
+    pub merges: Vec<String>,
+    pub scores: Vec<f64>,
+    #[cfg(feature = "candle-models")]
+    built: std::sync::Mutex<HashMap<String, std::sync::Arc<tokenizers::Tokenizer>>>,
+}
+
+impl std::fmt::Debug for NlpVocab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NlpVocab").field("tokens", &self.tokens.len()).field("merges", &self.merges.len()).field("scores", &self.scores.len()).finish()
+    }
+}
+
+impl NlpVocab {
+    pub fn from_body(v: &serde_json::Value) -> NlpVocab {
+        let strs = |k: &str| v[k].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        NlpVocab {
+            tokens: strs("vocabulary"),
+            merges: strs("merges"),
+            scores: v["scores"].as_array().map(|a| a.iter().filter_map(serde_json::Value::as_f64).collect()).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    fn id(&self, token: &str) -> Option<i64> {
+        self.tokens.iter().position(|t| t == token).map(|i| i as i64)
+    }
+}
+
+/// `(class, separator, unknown)` special tokens of a tokenizer family.
+/// The unknown token of a tokenizer family.
+pub fn unknown_token(family: &str) -> &'static str {
+    specials(family).2
+}
+
+fn specials(family: &str) -> (&'static str, &'static str, &'static str) {
+    match family {
+        "bert" => ("[CLS]", "[SEP]", "[UNK]"),
+        "mpnet" => ("<s>", "</s>", "[UNK]"),
+        _ => ("<s>", "</s>", "<unk>"),
+    }
+}
+
+/// Token ids of `text` for an uploaded model whose `tokenization` is
+/// `{family: cfg}` and whether the input was truncated (finding 343, ES
+/// `NlpTokenizer.build`): BERT / MPNet use WordPiece after BERT's basic
+/// tokenization (CJK ideographs split, accents stripped when lowercasing),
+/// RoBERTa byte-level BPE over the vocabulary's `merges`, XLM-RoBERTa a
+/// Unigram model over its `scores`, each with its own special tokens. A
+/// family this node cannot tokenize is refused, never approximated with
+/// another family's rules.
+pub fn tokenize(family: &str, cfg: &serde_json::Value, text: &str, v: &NlpVocab) -> Result<(Vec<i64>, bool)> {
+    let lower = cfg.get("do_lower_case").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let special = cfg.get("with_special_tokens").and_then(serde_json::Value::as_bool).unwrap_or(true);
+    let max_len = cfg.get("max_sequence_length").and_then(serde_json::Value::as_u64).unwrap_or(512) as usize;
+    let mut ids = match family {
+        "bert" | "mpnet" | "roberta" | "xlm_roberta" => subword_ids(family, cfg, text, v, lower)?,
+        other => return Err(EsError::illegal_argument(format!("tokenization [{other}] is not supported for uploaded models on this node"))),
+    };
+    let budget = if special { max_len.saturating_sub(2) } else { max_len };
+    let truncated = ids.len() > budget;
+    ids.truncate(budget);
+    if special {
+        let (cls, sep, unk) = specials(family);
+        let unk = v.id(unk).unwrap_or(0);
+        ids.insert(0, v.id(cls).unwrap_or(unk));
+        ids.push(v.id(sep).unwrap_or(unk));
+    }
+    Ok((ids, truncated))
+}
+
+/// The subword ids of `text` (no special tokens).
+#[cfg(feature = "candle-models")]
+fn subword_ids(family: &str, cfg: &serde_json::Value, text: &str, v: &NlpVocab, lower: bool) -> Result<Vec<i64>> {
+    use serde_json::json;
+    if matches!(family, "bert" | "mpnet") && v.id("[UNK]").is_none() {
+        // No unknown token to map unknown words to: the plain WordPiece.
+        return Ok(wordpiece(text, &v.tokens, lower, false, usize::MAX).0);
+    }
+    let fail = |e: String| EsError::new(500, "status_exception", format!("failed to build the [{family}] tokenizer: {e}"));
+    let key = format!("{family}\u{0}{cfg}");
+    let cached = v.built.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+    let tok = match cached {
+        Some(t) => t,
+        None => {
+            let vocab_map = || serde_json::Value::Object(v.tokens.iter().enumerate().map(|(i, t)| (t.clone(), json!(i))).collect());
+            let spec = match family {
+                "bert" | "mpnet" => json!({
+                    "version": "1.0",
+                    "normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true, "strip_accents": lower, "lowercase": lower},
+                    "pre_tokenizer": {"type": "BertPreTokenizer"},
+                    "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": vocab_map()}
+                }),
+                "roberta" => {
+                    if v.merges.is_empty() {
+                        return Err(EsError::illegal_argument("the [roberta] tokenizer requires the vocabulary's [merges]"));
+                    }
+                    let prefix = cfg.get("add_prefix_space").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                    json!({
+                        "version": "1.0",
+                        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": prefix, "trim_offsets": true, "use_regex": true},
+                        "model": {"type": "BPE", "dropout": null, "unk_token": v.id("<unk>").map(|_| "<unk>"), "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "vocab": vocab_map(), "merges": v.merges}
+                    })
+                }
+                _ => {
+                    if v.scores.len() != v.tokens.len() {
+                        return Err(EsError::illegal_argument("the [xlm_roberta] tokenizer requires one vocabulary [scores] entry per token"));
+                    }
+                    let pieces: Vec<serde_json::Value> = v.tokens.iter().zip(&v.scores).map(|(t, s)| json!([t, s])).collect();
+                    json!({
+                        "version": "1.0",
+                        "normalizer": {"type": "Sequence", "normalizers": [{"type": "Nmt"}, {"type": "NFKC"}]},
+                        "pre_tokenizer": {"type": "Metaspace", "replacement": "\u{2581}", "prepend_scheme": "always", "split": true},
+                        "model": {"type": "Unigram", "unk_id": v.id("<unk>"), "vocab": pieces, "byte_fallback": false}
+                    })
+                }
+            };
+            let t: tokenizers::Tokenizer = spec.to_string().parse().map_err(|e: Box<dyn std::error::Error + Send + Sync>| fail(e.to_string()))?;
+            let t = std::sync::Arc::new(t);
+            v.built.lock().unwrap_or_else(|e| e.into_inner()).insert(key, t.clone());
+            t
+        }
+    };
+    let enc = tok.encode(text, false).map_err(|e| fail(e.to_string()))?;
+    Ok(enc.get_ids().iter().map(|&i| i as i64).collect())
+}
+
+/// Without the tokenizer library only BERT-style WordPiece is available.
+#[cfg(not(feature = "candle-models"))]
+fn subword_ids(family: &str, _cfg: &serde_json::Value, text: &str, v: &NlpVocab, lower: bool) -> Result<Vec<i64>> {
+    match family {
+        "bert" | "mpnet" => Ok(wordpiece(text, &v.tokens, lower, false, usize::MAX).0),
+        other => Err(EsError::illegal_argument(format!("tokenization [{other}] is not supported for uploaded models on this node"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding 160: tokenizing work is bounded by the sequence limit and
+    /// the per-word cap, not by the input length.
+    #[test]
+    fn wordpiece_work_is_bounded() {
+        let v: Vec<String> = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "a", "##a", "b"].iter().map(|s| s.to_string()).collect();
+        let lookups = |text: &str, max_len: usize| {
+            LOOKUPS.with(|n| n.set(0));
+            let (ids, truncated) = wordpiece(text, &v, false, true, max_len);
+            (ids, truncated, LOOKUPS.with(|n| n.get()))
+        };
+        // One long unknown word: [UNK] without a quadratic search.
+        for len in [1_000usize, 100_000] {
+            let (ids, _, n) = lookups(&"z".repeat(len), 16);
+            assert_eq!(ids, vec![2, 1, 3]);
+            assert!(n <= 2, "{len}: {n} lookups");
+        }
+        // At the cap, the search is at most cap^2 lookups.
+        let (_, _, n) = lookups(&"z".repeat(MAX_INPUT_CHARS_PER_WORD), 16);
+        assert!(n <= MAX_INPUT_CHARS_PER_WORD * MAX_INPUT_CHARS_PER_WORD + 1, "{n}");
+        // Much more text than fits: the work stops at the budget.
+        for words in [1_000usize, 100_000] {
+            let text = vec!["b"; words].join(" ");
+            let (ids, truncated, n) = lookups(&text, 8);
+            assert_eq!(ids.len(), 8);
+            assert!(truncated);
+            assert!(n <= 8, "{words} words: {n} lookups");
+        }
+        // Short texts are unchanged.
+        let (ids, truncated, _) = lookups("a aa b", 16);
+        assert_eq!((ids, truncated), (vec![2, 4, 4, 5, 6, 3], false));
+    }
+
+    /// Finding 343: each tokenizer family uses its own rules and special
+    /// tokens; BERT splits CJK ideographs and strips accents when
+    /// lowercasing.
+    #[cfg(feature = "candle-models")]
+    #[test]
+    fn tokenizer_families_follow_their_own_rules() {
+        let vocab = |toks: &[&str]| NlpVocab { tokens: toks.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        let cfg = |lower: bool| serde_json::json!({"do_lower_case": lower, "with_special_tokens": true, "max_sequence_length": 512});
+        let bert = vocab(&["[PAD]", "[UNK]", "[CLS]", "[SEP]", "中", "文", "cafe", "noir"]);
+        assert_eq!(tokenize("bert", &cfg(true), "中文 Café NOIR", &bert).unwrap().0, vec![2, 4, 5, 6, 7, 3]);
+        // Cased: no lowercasing, no accent stripping.
+        assert_eq!(tokenize("bert", &cfg(false), "cafe Café", &bert).unwrap().0, vec![2, 6, 1, 3]);
+        let mpnet = vocab(&["<s>", "<pad>", "</s>", "[UNK]", "hello"]);
+        assert_eq!(tokenize("mpnet", &cfg(true), "hello", &mpnet).unwrap().0, vec![0, 4, 2]);
+        // RoBERTa: byte-level BPE with its merges, `<s>` / `</s>`.
+        let mut rob = vocab(&["<s>", "<pad>", "</s>", "<unk>", "h", "i", "\u{120}", "hi", "\u{120}h", "\u{120}hi"]);
+        rob.merges = vec!["\u{120} h".into(), "\u{120}h i".into(), "h i".into()];
+        assert_eq!(tokenize("roberta", &cfg(false), "hi hi", &rob).unwrap().0, vec![0, 7, 9, 2]);
+        // `add_prefix_space` makes the first word a space-prefixed one.
+        assert_eq!(tokenize("roberta", &serde_json::json!({"add_prefix_space": true}), "hi", &rob).unwrap().0, vec![0, 9, 2]);
+        // XLM-RoBERTa: Unigram over the scores, `▁` word prefix.
+        let mut xlm = vocab(&["<s>", "<pad>", "</s>", "<unk>", "\u{2581}", "\u{2581}he", "llo", "\u{2581}hello", "h", "e", "l", "o"]);
+        xlm.scores = vec![0.0, 0.0, 0.0, 0.0, -5.0, -3.0, -3.0, -1.0, -8.0, -8.0, -8.0, -8.0];
+        assert_eq!(tokenize("xlm_roberta", &cfg(false), "hello", &xlm).unwrap().0, vec![0, 7, 2]);
+        assert!(tokenize("bert_ja", &cfg(false), "x", &bert).is_err());
+        // Truncation keeps room for the special tokens.
+        let (ids, truncated) = tokenize("bert", &serde_json::json!({"do_lower_case": true, "max_sequence_length": 4}), "cafe noir cafe noir", &bert).unwrap();
+        assert_eq!((ids, truncated), (vec![2, 6, 7, 3], true));
+    }
+
+    /// Finding 357: arithmetic broadcasts per trailing dimension, `alpha`
+    /// scales, `rounding_mode` rounds and `to` converts.
+    #[test]
+    fn arithmetic_follows_pytorch_semantics() {
+        let run = |body: &str| Program::parse(&forward(body)).unwrap().run(&[1]);
+        // [2,1] + [3] -> [2,3]: out[i][j] = r[i] + j.
+        let r = run("    torch.manual_seed(7)\n    return torch.rand([2, 1])\n").unwrap().values();
+        let out = run("    torch.manual_seed(7)\n    a = torch.rand([2, 1])\n    return torch.add(a, torch.arange(3))\n").unwrap();
+        assert_eq!(out.shape, vec![2, 3]);
+        let want: Vec<f64> = (0..2).flat_map(|i| (0..3).map(move |j| (i, j))).map(|(i, j)| r[i] + j as f64).collect();
+        assert_eq!(out.values(), want);
+        // [1,2,1] * [1,1,2] -> [1,2,2].
+        let out = run("    return torch.mul(torch.full([1, 2, 1], 3.), torch.ones([1, 1, 2]))\n").unwrap();
+        assert_eq!((out.shape.clone(), out.values()), (vec![1, 2, 2], vec![3.0; 4]));
+        // alpha, by keyword and by position.
+        assert_eq!(run("    return torch.add(torch.arange(3), torch.ones([3]), alpha=2)\n").unwrap().values(), vec![2.0, 3.0, 4.0]);
+        assert_eq!(run("    return torch.sub(torch.arange(3), torch.ones([3]), 3)\n").unwrap().values(), vec![-3.0, -2.0, -1.0]);
+        assert_eq!(run("    return torch.div(torch.full([2], -7.), torch.full([2], 2.), rounding_mode=\"floor\")\n").unwrap().values(), vec![-4.0, -4.0]);
+        assert_eq!(run("    return torch.div(torch.full([2], -7.), torch.full([2], 2.), rounding_mode=\"trunc\")\n").unwrap().values(), vec![-3.0, -3.0]);
+        // to(dtype) converts; a long result of true division is float.
+        let out = run("    return torch.to(torch.full([2], 2.7), 4)\n").unwrap();
+        assert_eq!((out.values(), out.dtype), (vec![2.0, 2.0], DType::Long));
+        let out = run("    return torch.to(torch.full([1], 2.7), dtype=11)\n").unwrap();
+        assert_eq!((out.values(), out.dtype), (vec![1.0], DType::Bool));
+        // Incompatible shapes are refused, not wrapped around.
+        let e = run("    return torch.add(torch.ones([2]), torch.ones([3]))\n").err().unwrap();
+        assert!(e.reason.contains("must match the size of tensor b (3)"), "{}", e.reason);
+    }
 
     #[test]
     fn interprets_text_expansion_model() {
@@ -922,5 +1369,96 @@ mod tests {
     fn wordpiece_tokenizes() {
         let v: Vec<String> = ["[PAD]", "[UNK]", "these", "are", "my", "words", "wash", "##ing"].iter().map(|s| s.to_string()).collect();
         assert_eq!(wordpiece("these are washing machines", &v, false, false, 512).0, vec![2, 3, 6, 7, 1]);
+    }
+
+    fn forward(body: &str) -> String {
+        format!("class T(Module):\n  def forward(self: __torch__.T,\n    input_ids: Tensor) -> Tensor:\n{body}")
+    }
+
+    #[test]
+    fn tensor_sizes_are_admitted_before_allocation() {
+        for body in [
+            "    return torch.arange(50000001)\n",
+            "    return torch.zeros([4294967296, 4294967296, 4294967296])\n",
+            "    return torch.ones([50000001])\n",
+        ] {
+            let e = Program::parse(&forward(body)).unwrap().run(&[1]).err().unwrap();
+            assert!(e.reason.contains("tensor too large"), "{body}: {}", e.reason);
+        }
+        // Just under the per-tensor limit is fine; the per-run budget stops repetition.
+        let mut st = Interp { env: HashMap::new(), rng: Rng(1), steps: 0, allocated: 0 };
+        for _ in 0..MAX_RUN_ELEMENTS / MAX_TENSOR_ELEMENTS {
+            st.admit(MAX_TENSOR_ELEMENTS).unwrap();
+        }
+        assert!(st.admit(1).unwrap_err().reason.contains("memory budget"));
+        // A loop longer than the step budget fails before materialising its range.
+        let p = Program::parse(&forward("    for i in range(1000000000000):\n      pass\n    return torch.zeros([1])\n")).unwrap();
+        assert!(p.run(&[1]).err().unwrap().reason.contains("program too long"));
+    }
+
+    #[test]
+    fn parser_nesting_is_bounded() {
+        let deep = format!("    return {}1{}\n", "(".repeat(100_000), ")".repeat(100_000));
+        let e = Program::parse(&forward(&deep)).err().expect("deep nesting is refused");
+        assert!(e.reason.contains("nested deeper"), "{}", e.reason);
+        let ok = format!("    return torch.zeros([{}1{}])\n", "(".repeat(100), ")".repeat(100));
+        assert!(Program::parse(&forward(&ok)).is_ok());
+        let mut body = String::new();
+        for d in 0..40 {
+            body.push_str(&format!("{}for i{d} in range(1):\n", " ".repeat(4 + 2 * d)));
+        }
+        body.push_str(&format!("{}pass\n", " ".repeat(4 + 80)));
+        assert!(Program::parse(&forward(&body)).err().expect("deep blocks are refused").reason.contains("nested deeper"));
+    }
+
+    fn zip_one(name: &str, data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(data).unwrap();
+        let comp = enc.finish().unwrap();
+        let mut z = Vec::new();
+        let le16 = |v: usize| (v as u16).to_le_bytes();
+        let le32 = |v: usize| (v as u32).to_le_bytes();
+        z.extend(le32(0x0403_4b50));
+        z.extend([20, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend(le32(comp.len()));
+        z.extend(le32(data.len()));
+        z.extend(le16(name.len()));
+        z.extend(le16(0));
+        z.extend(name.as_bytes());
+        z.extend(&comp);
+        let cd = z.len();
+        z.extend(le32(0x0201_4b50));
+        z.extend([20, 0, 20, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend(le32(comp.len()));
+        z.extend(le32(data.len()));
+        z.extend(le16(name.len()));
+        z.extend([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend(le32(0));
+        z.extend(name.as_bytes());
+        let cd_len = z.len() - cd;
+        z.extend(le32(0x0605_4b50));
+        z.extend([0, 0, 0, 0, 1, 0, 1, 0]);
+        z.extend(le32(cd_len));
+        z.extend(le32(cd));
+        z.extend([0, 0]);
+        z
+    }
+
+    #[test]
+    fn archive_expansion_is_bounded() {
+        let data = vec![b'a'; 4096];
+        let z = zip_one("code/__torch__.py", &data);
+        assert_eq!(unzip_within(&z, 4096).unwrap()["code/__torch__.py"].len(), 4096);
+        let e = unzip_within(&z, 4095).unwrap_err();
+        assert!(e.reason.contains("expands beyond the limit"), "{}", e.reason);
+        // Malformed: truncated archives and offsets past the end are errors, not panics.
+        for cut in [10, z.len() / 2, z.len() - 5] {
+            assert!(unzip_within(&z[..cut], 1 << 20).is_err());
+        }
+        let mut bad = z.clone();
+        let n = bad.len();
+        bad[n - 6..n - 2].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(unzip_within(&bad, 1 << 20).is_err());
     }
 }

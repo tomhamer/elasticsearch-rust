@@ -102,8 +102,140 @@ pub fn get_str<'a>(flat: &'a FlatSettings, key: &str) -> Option<&'a str> {
     flat.get(key).and_then(Value::as_str)
 }
 
+/// A boolean setting as read after validation: `true` / `false` (a JSON
+/// boolean or its string), else `default`. Values are checked strictly
+/// where they enter (node start, `_cluster/settings`, index settings; see
+/// [`parse_bool`]), so nothing else reaches here.
 pub fn get_bool(flat: &FlatSettings, key: &str, default: bool) -> bool {
-    get_str(flat, key).map(|s| s == "true").unwrap_or(default)
+    flat.get(key).and_then(|v| bool_value(v).ok()).unwrap_or(default)
+}
+
+/// ES `Booleans.parseBoolean(String)`, the parser of every boolean
+/// setting (`Setting.boolSetting`) and of boolean request parameters: only
+/// `true` and `false`, case-sensitive; anything else (`tru`, `TRUE`,
+/// `yes`, `1`, empty) is an `illegal_argument_exception`.
+pub fn parse_bool(s: &str) -> Result<bool> {
+    match s {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(EsError::illegal_argument(bool_error(other))),
+    }
+}
+
+/// Java `Character.isWhitespace`: Unicode `White_Space` without the
+/// no-break spaces (U+00A0, U+2007, U+202F) and NEL (U+0085, a control in
+/// Java), plus the information separators U+001C..U+001F.
+pub fn java_whitespace(c: char) -> bool {
+    matches!(c, '\u{1C}'..='\u{1F}') || (c.is_whitespace() && !matches!(c, '\u{85}' | '\u{A0}' | '\u{2007}' | '\u{202F}'))
+}
+
+/// ES `Strings.hasText`: some character that is not Java whitespace.
+pub fn has_text(s: &str) -> bool {
+    s.chars().any(|c| !java_whitespace(c))
+}
+
+/// ES `RestRequest.paramAsBoolean(key, boolean)`: absent is `default`,
+/// present but empty is `true` (the bare `?pretty`), whitespace only is
+/// `default` (`Booleans.parseBoolean(String, boolean)`), anything else is
+/// [`parse_bool`] (strict).
+pub fn param_bool(value: Option<&str>, default: bool) -> Result<bool> {
+    match value {
+        None => Ok(default),
+        Some("") => Ok(true),
+        Some(v) if !has_text(v) => Ok(default),
+        Some(v) => parse_bool(v),
+    }
+}
+
+/// ES's message for a value that is not a boolean.
+pub fn bool_error(value: &str) -> String {
+    format!("Failed to parse value [{value}] as only [true] or [false] are allowed.")
+}
+
+/// [`parse_bool`] over a settings value (a JSON boolean, or its text).
+pub fn bool_value(v: &Value) -> Result<bool> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::String(s) => parse_bool(s),
+        other => parse_bool(&other.to_string()),
+    }
+}
+
+/// Settings whose registered default is `true` / `false` but which take
+/// other values too (not `Setting.boolSetting`s).
+const NOT_BOOLEAN: &[&str] = &[
+    // `AutoCreateIndex`: a boolean or a list of index patterns.
+    "action.auto_create_index",
+    // `index.auto_expand_replicas`: `false` or a range (`0-1`, `0-all`).
+    "index.auto_expand_replicas",
+    // `checksum` as well as true / false.
+    "index.shard.check_on_startup",
+    // Removed in 7; archived, not validated.
+    "index.mapper.dynamic",
+];
+
+/// Boolean node / cluster settings the captured registry does not list
+/// (filtered from it, affix families) and rustic-only boolean settings.
+const BOOLEAN_PATTERNS: &[&str] = &[
+    // `SSLConfigurationSettings.enabled` of each TLS context.
+    "xpack.security.transport.ssl.enabled",
+    "xpack.security.http.ssl.enabled",
+    "xpack.security.remote_cluster_server.ssl.enabled",
+    "xpack.security.remote_cluster_client.ssl.enabled",
+    "xpack.http.ssl.enabled",
+    "reindex.ssl.enabled",
+    // `RealmSettings.ENABLED_SETTING`: `xpack.security.authc.realms.<type>.<name>.enabled`.
+    "xpack.security.authc.realms.*.*.enabled",
+    // Repository clients.
+    "s3.client.*.path_style_access",
+    "s3.client.*.disable_chunked_encoding",
+    "s3.client.*.use_throttle_retries",
+    "s3.client.*.add_purpose_custom_query_parameter",
+    "s3.client.*.always_sign_requests",
+    "s3.client.*.tenacious_retries.enabled",
+    "gcs.client.*.tenacious_retries.enabled",
+    // 9.x settings missing from the capture.
+    "xpack.otel_data.enabled",
+    "xpack.prometheus.enabled",
+    "xpack.watcher.history.cleaner_service.enabled",
+    // Rustic-only boolean settings.
+    "stateless.enabled",
+    "indices.recovery.file_based",
+    "snapshot.restore.file_based",
+    "xpack.license.enable_enterprise_features",
+];
+
+fn segments_match(pattern: &str, key: &str) -> bool {
+    let (p, k): (Vec<&str>, Vec<&str>) = (pattern.split('.').collect(), key.split('.').collect());
+    p.len() == k.len() && p.iter().zip(&k).all(|(p, k)| (*p == "*" && !k.is_empty()) || p == k)
+}
+
+/// Whether `key` is a boolean node / cluster setting (`Setting.boolSetting`).
+pub fn is_bool_cluster_setting(key: &str) -> bool {
+    if NOT_BOOLEAN.contains(&key) || key.starts_with("node.attr.") {
+        return false;
+    }
+    matches!(REGISTRY.cluster.get(key).map(|(d, _)| d.as_str()), Some(Some("true" | "false")))
+        || BOOLEAN_PATTERNS.iter().any(|p| segments_match(p, key))
+}
+
+/// The boolean index settings of a create / update / template request
+/// (`IndexScopedSettings.validate`): each strictly `true` / `false`, in
+/// key order. Checked where a user's settings enter, not when stored
+/// metadata is applied or recovered (a value accepted by an older version
+/// must not keep an index from opening).
+pub fn validate_bool_index_settings(flat: &FlatSettings) -> Result<()> {
+    for (k, v) in flat {
+        if !v.is_null() && is_bool_index_setting(k) {
+            bool_value(v)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `key` is a boolean index setting.
+pub fn is_bool_index_setting(key: &str) -> bool {
+    !NOT_BOOLEAN.contains(&key) && matches!(REGISTRY.index.get(key).and_then(Value::as_str), Some("true" | "false"))
 }
 
 pub fn get_usize(flat: &FlatSettings, key: &str, default: usize) -> usize {
@@ -183,6 +315,17 @@ pub fn is_dynamic(key: &str) -> bool {
         || key.starts_with("index.lifecycle.")
         || key.starts_with("index.blocks.")
 }
+
+/// Private index settings Elasticsearch itself changes on open indices
+/// (`index.downsample.status`: `started` → `success` once the downsample is
+/// complete). Users cannot update them; a committed cluster change or the
+/// owning task can, without closing the index.
+pub fn is_private_dynamic(key: &str) -> bool {
+    key == DOWNSAMPLE_STATUS
+}
+
+/// `IndexMetadata.INDEX_DOWNSAMPLE_STATUS`.
+pub const DOWNSAMPLE_STATUS: &str = "index.downsample.status";
 
 /// Validate the values of known settings.
 pub fn validate(flat: &FlatSettings) -> Result<()> {
@@ -536,11 +679,14 @@ fn validate_cluster_value(k: &str, v: &Value) -> Result<()> {
         }
         _ => {}
     }
+    if is_bool_cluster_setting(k) {
+        parse_bool(&s)?;
+        return Ok(());
+    }
     let Some((def, _)) = REGISTRY.cluster.get(k) else { return Ok(()) };
     match def.as_str() {
-        Some("true") | Some("false") if s != "true" && s != "false" => {
-            return Err(EsError::illegal_argument(format!("Failed to parse value [{s}] as only [true] or [false] are allowed.")));
-        }
+        // Not a boolean setting (`action.auto_create_index`).
+        Some("true") | Some("false") => {}
         Some(d) if d.parse::<i64>().is_ok() && s.parse::<i64>().is_err() && !s.chars().any(|c| c.is_ascii_digit()) => {
             return Err(EsError::illegal_argument(format!("Failed to parse value [{s}] for setting [{k}]"))
                 .caused_by(EsError::new(400, "number_format_exception", format!("For input string: \"{s}\""))));
@@ -715,10 +861,8 @@ pub fn index_defaults(own: &FlatSettings) -> FlatSettings {
             "index.mapping.synthetic_id" => Value::String(crate::tsdb::synthetic_id(own).to_string()),
             // `IndexMode.isColumnar`.
             "index.use_time_series_doc_values_format" if matches!(mode.as_str(), "time_series" | "logsdb" | "columnar" | "logsdb_columnar") => Value::String("true".into()),
-            "index.merge.scheduler.max_thread_count" => {
-                let n = crate::processors::get();
-                Value::String((n / 2).clamp(1, 4).to_string())
-            }
+            // The shard's merge scheduler default (`shard::merge_threads`).
+            "index.merge.scheduler.max_thread_count" => Value::String(crate::shard::merge_threads().to_string()),
             _ => v.clone(),
         };
         out.insert(k.clone(), v);
@@ -777,6 +921,41 @@ pub fn index_defaults(own: &FlatSettings) -> FlatSettings {
 
 #[cfg(test)]
 mod tests {
+
+    /// ES `Booleans.parseBoolean` for every boolean setting: only `true` /
+    /// `false`; patterns, enums and ranges with a boolean default are not
+    /// booleans.
+    #[test]
+    fn boolean_settings_parse_strictly() {
+        for bad in ["tru", "TRUE", "True", "yes", "no", "1", "0", "on", ""] {
+            assert_eq!(parse_bool(bad).unwrap_err().reason, format!("Failed to parse value [{bad}] as only [true] or [false] are allowed."));
+            let flat: FlatSettings = [("action.destructive_requires_name".to_string(), serde_json::json!(bad))].into_iter().collect();
+            let e = validate_cluster_update("persistent", &flat).unwrap_err();
+            assert_eq!((e.kind.as_str(), e.reason.as_str()), ("illegal_argument_exception", format!("Failed to parse value [{bad}] as only [true] or [false] are allowed.").as_str()));
+            let idx: FlatSettings = [("index.hidden".to_string(), serde_json::json!(bad))].into_iter().collect();
+            assert!(validate_bool_index_settings(&idx).is_err(), "{bad}");
+        }
+        assert!(parse_bool("true").unwrap() && !parse_bool("false").unwrap());
+        for k in ["xpack.security.enabled", "xpack.security.http.ssl.enabled", "xpack.security.transport.ssl.enabled",
+                  "xpack.security.authc.realms.ldap.corp.enabled", "reindex.ssl.enabled", "node.store.allow_mmap", "stateless.enabled"] {
+            assert!(is_bool_cluster_setting(k), "{k}");
+        }
+        for k in ["action.auto_create_index", "node.attr.xpack.installed", "vectors.indexing.use_gpu", "xpack.security.authc.realms.ldap.corp.order"] {
+            assert!(!is_bool_cluster_setting(k), "{k}");
+        }
+        for k in ["index.hidden", "index.blocks.write", "index.queries.cache.enabled"] {
+            assert!(is_bool_index_setting(k), "{k}");
+        }
+        for k in ["index.auto_expand_replicas", "index.shard.check_on_startup", "index.number_of_shards"] {
+            assert!(!is_bool_index_setting(k), "{k}");
+        }
+        let ok: FlatSettings = [("action.auto_create_index".to_string(), serde_json::json!("+logs*,-*")), ("search.allow_expensive_queries".to_string(), serde_json::json!(false))].into_iter().collect();
+        validate_cluster_update("persistent", &ok).unwrap();
+        let ok: FlatSettings = [("index.auto_expand_replicas".to_string(), serde_json::json!("0-1")), ("index.hidden".to_string(), serde_json::json!(true)), ("index.blocks.write".to_string(), serde_json::json!("false"))].into_iter().collect();
+        validate_bool_index_settings(&ok).unwrap();
+        // Read back: JSON booleans count (they read as the default before).
+        assert!(get_bool(&ok, "index.hidden", false));
+    }
     use super::*;
 
     #[test]

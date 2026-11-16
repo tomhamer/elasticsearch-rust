@@ -55,26 +55,76 @@ impl Distance {
 }
 
 /// Optimal-string-alignment distance (Damerau with adjacent transpositions).
+/// Three rolling rows: linear workspace.
 pub fn osa(a: &[char], b: &[char]) -> usize {
-    let (n, m) = (a.len(), b.len());
-    let mut d = vec![vec![0usize; m + 1]; n + 1];
-    for (i, row) in d.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for j in 0..=m {
-        d[0][j] = j;
-    }
-    for i in 1..=n {
+    let m = b.len();
+    let mut prev2: Vec<usize> = vec![0; m + 1];
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur: Vec<usize> = vec![0; m + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
         for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            let mut v = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                v = v.min(d[i - 2][j - 2] + 1);
+                v = v.min(prev2[j - 2] + 1);
             }
-            d[i][j] = v;
+            cur[j] = v;
         }
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
     }
-    d[n][m]
+    prev[m]
+}
+
+/// [`osa`] when it is at most `k`, else `None`: only the diagonal band
+/// `|i - j| <= k` is computed (`O(len * k)` work, three rows of workspace),
+/// as Lucene's Levenshtein automata bound a fuzzy match by its edits.
+pub fn osa_within(a: &[char], b: &[char], k: usize) -> Option<usize> {
+    banded(a, b, k, true)
+}
+
+/// [`levenshtein`] when it is at most `k`, else `None` (banded, as [`osa_within`]).
+pub fn levenshtein_within(a: &[char], b: &[char], k: usize) -> Option<usize> {
+    banded(a, b, k, false)
+}
+
+fn banded(a: &[char], b: &[char], k: usize, transpositions: bool) -> Option<usize> {
+    let (n, m) = (a.len(), b.len());
+    if n.abs_diff(m) > k {
+        return None;
+    }
+    let inf = k + 1;
+    let mut prev2: Vec<usize> = vec![inf; m + 1];
+    let mut prev: Vec<usize> = (0..=m).map(|j| j.min(inf)).collect();
+    let mut cur: Vec<usize> = vec![inf; m + 1];
+    for i in 1..=n {
+        let lo = i.saturating_sub(k).max(1);
+        let hi = (i + k).min(m);
+        // Cells left of the band (and column 0) are out of reach.
+        cur[lo - 1] = if lo == 1 { i.min(inf) } else { inf };
+        let mut row_min = cur[lo - 1];
+        for j in lo..=hi {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            if transpositions && i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(prev2[j - 2] + 1);
+            }
+            cur[j] = v.min(inf);
+            row_min = row_min.min(cur[j]);
+        }
+        if hi < m {
+            cur[hi + 1] = inf;
+        }
+        if row_min > k {
+            return None;
+        }
+        // Rows are reused: each row writes its band plus one cell either
+        // side, which covers every cell the next two rows read.
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    (prev[m] <= k).then_some(prev[m])
 }
 
 pub fn levenshtein(a: &[char], b: &[char]) -> usize {
@@ -290,5 +340,37 @@ mod tests {
         assert!((Distance::Levenshtein.similarity("abcd", "abce") - 0.75).abs() < 1e-6);
         assert!(Distance::JaroWinkler.similarity("martha", "marhta") > 0.95);
         assert!(Distance::NGram.similarity("hello", "hello") > 0.99);
+    }
+
+    /// #168: the banded distances agree with the full ones within the bound
+    /// and refuse beyond it; a one-edit pair of 16,000-char terms is decided
+    /// with work and workspace linear in the length.
+    #[test]
+    fn banded_distances_match_full_within_bound() {
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for _ in 0..3000 {
+            let a: Vec<char> = (0..next() % 9).map(|_| (b'a' + (next() % 3) as u8) as char).collect();
+            let b: Vec<char> = (0..next() % 9).map(|_| (b'a' + (next() % 3) as u8) as char).collect();
+            let (o, l) = (osa(&a, &b), levenshtein(&a, &b));
+            for k in 0..4 {
+                assert_eq!(osa_within(&a, &b, k), (o <= k).then_some(o), "{a:?} {b:?} {k}");
+                assert_eq!(levenshtein_within(&a, &b, k), (l <= k).then_some(l), "{a:?} {b:?} {k}");
+            }
+        }
+        let long: Vec<char> = (0..16_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let mut near = long.clone();
+        near[15_990] = '#';
+        let started = std::time::Instant::now();
+        assert_eq!(osa_within(&long, &near, 2), Some(1));
+        assert_eq!(levenshtein_within(&long, &near, 2), Some(1));
+        let mut swapped = long.clone();
+        swapped.swap(15_000, 15_001);
+        assert_eq!(osa_within(&long, &swapped, 1), Some(1));
+        assert_eq!(levenshtein_within(&long, &swapped, 1), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "banded, not quadratic");
     }
 }

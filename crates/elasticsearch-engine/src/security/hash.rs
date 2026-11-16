@@ -152,11 +152,19 @@ fn pbkdf2_verify(pw: &[u8], hash: &str, prefix: &str) -> bool {
     ct_eq(&pbkdf2_raw(pw, &salt, iters, expected.len()), &expected)
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time equality of two byte strings (length is not secret).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Whether verifying against `hash` is deliberately expensive (bcrypt,
+/// PBKDF2): such verification runs off the networking runtime, on the
+/// bounded security crypto pool, never inline on an async worker.
+pub fn is_expensive(hash: &str) -> bool {
+    is_bcrypt(hash) || hash.starts_with("{PBKDF2}") || hash.starts_with("{PBKDF2_STRETCH}")
 }
 
 /// Verify `pw` against any supported stored hash format.

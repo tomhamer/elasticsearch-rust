@@ -26,6 +26,14 @@ pub fn has_stored(lk: &FieldLookup) -> bool {
 /// The stored values of `src` for every `store: true` field, as the JSON
 /// stored in [`STORED_FIELD`]. `None` when the document has none.
 pub fn build(src: &Value, lk: &FieldLookup) -> Option<String> {
+    build_with(src, lk, &[])
+}
+
+/// [`build`] plus the values index-time field scripts emitted
+/// (`scripted`, by field): a scripted `store: true` field stores what its
+/// script produced, which `_source` never holds (ES `indexScriptValues`
+/// indexes them through the field's `indexValue`, stored field included).
+pub fn build_with(src: &Value, lk: &FieldLookup, scripted: &[(String, Vec<Value>)]) -> Option<String> {
     if lk.stored_fields.is_empty() {
         return None;
     }
@@ -38,6 +46,12 @@ pub fn build(src: &Value, lk: &FieldLookup) -> Option<String> {
             out.insert(n.clone(), Value::Array(vals));
         }
     }
+    for (n, vals) in scripted {
+        if vals.is_empty() || !lk.fields.get(n).is_some_and(|f| f.stored && f.script.is_some()) {
+            continue;
+        }
+        out.insert(n.clone(), Value::Array(vals.clone()));
+    }
     if out.is_empty() {
         None
     } else {
@@ -47,9 +61,77 @@ pub fn build(src: &Value, lk: &FieldLookup) -> Option<String> {
 
 /// Add the stored-fields block of `src` to `doc`.
 pub fn attach(doc: &mut Document, src: &Value, lk: &FieldLookup) {
-    if let Some(json) = build(src, lk) {
+    attach_with(doc, src, lk, &[]);
+}
+
+/// [`attach`] with the values of index-time field scripts ([`build_with`]).
+pub fn attach_with(doc: &mut Document, src: &Value, lk: &FieldLookup, scripted: &[(String, Vec<Value>)]) {
+    if let Some(json) = build_with(src, lk, scripted) {
         doc.fields.push((block_field(lk), FieldValue::Keyword(json)));
     }
+}
+
+/// Reserved key of the stored-fields block: the values of the fields with
+/// stored term vectors that the stored `_source` does not keep (excluded
+/// by `_source.includes` / `excludes`, or `_source` disabled). ES keeps
+/// the vectors themselves; they are rebuilt from these values exactly
+/// (the field's analysis is deterministic). Not a field name: neither
+/// `stored_fields` nor field-level security exposes it.
+pub const TERM_VECTOR_KEY: &str = "\u{0}term_vectors";
+
+/// Keep, in `doc`'s stored-fields block, the values of `src` (the
+/// document as indexed) for the fields with stored term vectors that
+/// `kept` (the `_source` stored for it; `None`: none) lacks.
+pub fn attach_term_vector_values(doc: &mut Document, src: &Value, kept: Option<&Value>, lk: &FieldLookup) {
+    let Some(block) = lk.stored_block_id else { return };
+    if lk.term_vector_fields.is_empty() {
+        return;
+    }
+    let mut tv = Map::new();
+    for n in &lk.term_vector_fields {
+        let Some(f) = lk.fields.get(n) else { continue };
+        let path = if f.is_multi_field { n.rsplit_once('.').map(|x| x.0).unwrap_or(n) } else { n.as_str() };
+        let vals: Vec<Value> = crate::highlight::source_values(src, path).into_iter().filter(|v| !v.is_object()).cloned().collect();
+        if vals.is_empty() {
+            continue;
+        }
+        let kept_vals: Vec<&Value> = kept.map(|k| crate::highlight::source_values(k, path).into_iter().filter(|v| !v.is_object()).collect()).unwrap_or_default();
+        if kept_vals.len() == vals.len() && kept_vals.iter().zip(&vals).all(|(a, b)| *a == b) {
+            continue;
+        }
+        tv.insert(path.to_string(), Value::Array(vals));
+    }
+    if tv.is_empty() {
+        return;
+    }
+    // Into the document's block (written by [`attach_with`]), or a new one.
+    if let Some(i) = doc.fields.iter().position(|(id, v)| *id == block && v.as_text().is_some_and(|s| s.starts_with('{'))) {
+        if let Some(Value::Object(mut m)) = doc.fields[i].1.as_text().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+            m.insert(TERM_VECTOR_KEY.to_string(), Value::Object(tv));
+            doc.fields[i].1 = FieldValue::Keyword(Value::Object(m).to_string());
+        }
+        return;
+    }
+    let mut m = Map::new();
+    m.insert(TERM_VECTOR_KEY.to_string(), Value::Object(tv));
+    doc.fields.push((block, FieldValue::Keyword(Value::Object(m).to_string())));
+}
+
+/// `src` (a stored `_source`, possibly filtered, `{}` when disabled) with
+/// the values `doc`'s stored-fields block keeps for fields with stored
+/// term vectors ([`attach_term_vector_values`]) where it has none.
+pub fn with_term_vector_values(src: Value, doc: &Document) -> Value {
+    let Some(Value::Object(tv)) = from_doc(doc).remove(TERM_VECTOR_KEY) else { return src };
+    let mut src = src;
+    for (path, vals) in tv {
+        if !crate::highlight::source_values(&src, &path).is_empty() {
+            continue;
+        }
+        if let Some(o) = src.as_object_mut() {
+            o.insert(path, vals);
+        }
+    }
+    src
 }
 
 /// The field the stored-fields block of `lk`'s index is written to.
@@ -78,6 +160,36 @@ pub fn drop_from_block(doc: &mut Document, lk: &FieldLookup, names: &[String]) {
     } else {
         doc.fields[i].1 = FieldValue::Keyword(Value::Object(m).to_string());
     }
+}
+
+/// Field-level security on a stored document read for a caller: the
+/// stored-fields block keeps only the fields `allows` permits, and the
+/// `_ignored_source` entries (original field names and values) are
+/// dropped. Reserved metadata fields are kept.
+pub fn restrict(doc: &mut Document, allows: &dyn Fn(&str) -> bool) {
+    doc.fields.retain_mut(|(id, v)| {
+        if *id == crate::mapping::IGNORED_SOURCE_FIELD {
+            return false;
+        }
+        if *id != STORED_FIELD && *id < FIRST_USER_FIELD {
+            return true;
+        }
+        let Some(text) = v.as_text() else { return false };
+        let parsed = serde_json::from_str::<Value>(text);
+        // `_field_names` values of older indices: plain names.
+        let plain_kept = *id == STORED_FIELD && allows(text);
+        match parsed {
+            Ok(Value::Object(mut m)) => {
+                m.retain(|k, _| allows(k));
+                if m.is_empty() {
+                    return false;
+                }
+                *v = FieldValue::Keyword(Value::Object(m).to_string());
+                true
+            }
+            _ => plain_kept,
+        }
+    });
 }
 
 /// The stored-fields block of a stored document. A stored document holds

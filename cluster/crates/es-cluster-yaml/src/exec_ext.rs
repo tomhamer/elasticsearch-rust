@@ -148,6 +148,27 @@ async fn cluster_prereq_skip(ctx: &mut Ctx<'_>, step: &Value, base: &str, requir
     Ok(None)
 }
 
+/// `x-pack/qa/multi-cluster-search-security` (`Clusters`): both the
+/// fulfilling (remote) and the querying cluster run with security on and
+/// `test_user` (superuser) as the REST client's user.
+fn mcss_security_config() -> (elasticsearch_engine::security::SecConfig, String) {
+    use elasticsearch_engine::security::{hash::Hasher, SecConfig};
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let h = HASH.get_or_init(|| Hasher::Pbkdf2(1000).hash("x-pack-test-password")).clone();
+    let mut c = SecConfig::default();
+    c.enabled = true;
+    c.trial = true;
+    c.api_key_enabled = true;
+    c.file_users.insert("test_user".into(), h);
+    c.file_user_roles.insert("test_user".into(), vec!["superuser".into()]);
+    (c, basic("test_user", "x-pack-test-password"))
+}
+
+/// Whether `file` belongs to the multi-cluster search security suite.
+fn is_mcss(file: &TestFile) -> bool {
+    matches!(file.dir.as_str(), "basic_license" | "full_license")
+}
+
 /// Export the same module realms used by the shared runner for real external fixtures.
 pub fn external_fixture(module: &str) -> Value {
     let mut cfg = match module {
@@ -166,6 +187,7 @@ pub fn external_fixture(module: &str) -> Value {
         "ent-search" => entsearch_security_config().0,
         "fleet" => fleet_security_config().0,
         "ccr" => ccr_security_config().0,
+        "mcss-fulfilling" | "mcss-querying" => mcss_security_config().0,
         "inference" => inference_security_config().0,
         "searchable-snapshots" => admin_superuser_config().0,
         "watcher-security" => watcher_security_config(),
@@ -194,6 +216,16 @@ pub fn external_fixture(module: &str) -> Value {
         (elasticsearch_engine::warnings::TEST_MODULES_SETTING):if module == "async-search" { "x-pack-test-deprecated-query" } else { "" },
     });
     let mut settings = settings;
+    if module.starts_with("mcss-") {
+        settings["xpack.ml.enabled"] = serde_json::json!("false");
+    }
+    // The querying cluster's remote (`Clusters.queryingCluster`); the
+    // fixture launcher adds the fulfilling cluster's address (`seeds` or
+    // `mode: proxy` + `proxy_address`).
+    if module == "mcss-querying" {
+        settings["cluster.remote.connections_per_cluster"] = serde_json::json!("1");
+        settings["cluster.remote.my_remote_cluster.skip_unavailable"] = serde_json::json!("false");
+    }
     if module == "stateless" {
         // StatelessPlugin.additionalSettings supplies this node override.
         settings["data_streams.failure_store.refresh_interval"] = serde_json::json!("30s");
@@ -222,6 +254,12 @@ pub fn external_fixture(module: &str) -> Value {
         secure_settings.insert("xpack.security.transport.ssl.secure_key_passphrase".into(), serde_json::json!("testnode"));
         config_files.insert("testnode.crt".into(), serde_json::json!(include_str!("../../../../crates/es-yaml-runner/resources/testnode.crt")));
         config_files.insert("testnode.pem".into(), serde_json::json!(include_str!("../../../../crates/es-yaml-runner/resources/testnode.pem")));
+    }
+    if matches!(module, "inference" | "inference-2" | "inference-multi-node") {
+        // ES's inference test clusters download the real ELSER model for the
+        // default-endpoint tests (`InferenceRestIT`); rustic has no ELSER, so
+        // these fixtures enable its built-in stand-in explicitly.
+        settings["xpack.inference.builtin_fallback"] = serde_json::json!("lexical");
     }
     if module == "searchable-snapshots" {
         // `SearchableSnapshotsClientYamlTestSuiteIT`'s shared cache.
@@ -262,7 +300,7 @@ pub fn external_fixture(module: &str) -> Value {
         // assert on topology: `inference/qa/multi-node` runs 3 nodes;
         // `AutoscalingRestIT` declares none (ES's default single node) and
         // asserts the policy's total capacity equals one node's.
-        "settings":settings,"security":cfg.enabled,"nodes":match module { "inference-multi-node" => 3, "autoscaling" | "watcher-single" | "gpu-single" | "gpu-disabled" | "gpu-unsupported" => 1, _ => 2 },
+        "settings":settings,"security":cfg.enabled,"nodes":match module { "inference-multi-node" => 3, "autoscaling" | "watcher-single" | "gpu-single" | "gpu-disabled" | "gpu-unsupported" | "searchable-snapshots" => 1, _ => 2 },
         "inference_test_services":matches!(module,"inference" | "inference-2" | "inference-multi-node" | "rank-rrf" | "rank-rrf-license" | "ent-search" | "main"),
         "per_node_settings":per_node_settings,
         "config_files":config_files,
@@ -279,6 +317,7 @@ pub async fn run_test(specs: &Specs, file: &TestFile, steps: &[Value], base: &st
             "ent-search" => Some(entsearch_security_config().1),
             "inference" => Some(inference_security_config().1),
             "ccr" => Some(ccr_security_config().1),
+            _ if is_mcss(file) => Some(mcss_security_config().1),
             "fleet" => Some(fleet_security_config().1),
             "searchable-snapshots" => Some(admin_superuser_config().1),
             _ if is_watcher_security(file) => Some(basic("watcher_manager", XPACK_PASSWORD)),
@@ -343,7 +382,11 @@ mod reference_gate_tests {
         assert!(fleet["file_users"].get("elastic_admin").is_some());
         assert!(fleet["file_users"].get("fleet_unprivileged_secrets").is_some());
         assert_eq!(fleet["file_user_roles"]["fleet_unprivileged_secrets"], serde_json::json!(["unprivileged_secrets"]));
-        for (module, user) in [("ccr", "ccr-user"), ("inference", "inference_user"), ("ent-search", "entsearch-admin")] {
+        let querying = external_fixture("mcss-querying");
+        assert_eq!(querying["settings"]["cluster.remote.my_remote_cluster.skip_unavailable"], "false");
+        assert_eq!(querying["settings"]["cluster.remote.connections_per_cluster"], "1");
+        assert!(external_fixture("mcss-fulfilling")["settings"].get("cluster.remote.connections_per_cluster").is_none());
+        for (module, user) in [("ccr", "ccr-user"), ("inference", "inference_user"), ("ent-search", "entsearch-admin"), ("mcss-fulfilling", "test_user"), ("mcss-querying", "test_user")] {
             let fixture = external_fixture(module);
             assert_eq!(fixture["security"], true);
             assert!(fixture["file_users"].get(user).is_some());
@@ -371,11 +414,17 @@ mod reference_gate_tests {
         assert_eq!(plain["security"], false);
         assert_eq!(plain["inference_test_services"], true);
         assert_eq!(plain["nodes"], 2);
+        // ES's inference clusters can download ELSER; rustic's enable the stand-in.
+        assert_eq!(plain["settings"]["xpack.inference.builtin_fallback"], "lexical");
+        assert!(core["settings"].get("xpack.inference.builtin_fallback").is_none());
         let multi = external_fixture("inference-multi-node");
         assert_eq!(multi["inference_test_services"], true);
         assert_eq!(multi["nodes"], 3);
         assert_eq!(external_fixture("autoscaling")["nodes"], 1);
         assert_eq!(external_fixture("watcher-single")["nodes"], 1);
+        // `SearchableSnapshotsClientYamlTestSuiteIT` is one node (`stats.yml`
+        // reads "the" node id from `nodes.info`).
+        assert_eq!(external_fixture("searchable-snapshots")["nodes"], 1);
         assert!(external_fixture("main")["file_users"].get("inference_user").is_some());
     }
 

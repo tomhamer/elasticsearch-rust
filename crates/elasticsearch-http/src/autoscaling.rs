@@ -2,10 +2,9 @@
 //!
 //! Policies (roles + decider settings) live in the extension state (ES:
 //! `AutoscalingMetadata` in cluster state). The capacity report runs the
-//! `fixed` decider exactly as ES does (required capacity = the configured
-//! per-node resources times `nodes`); the storage, shard and ML deciders ES
-//! enables by default for data / frozen / ml roles only report a reason, as
-//! a single node has nothing to scale.
+//! `fixed` decider as ES does (required capacity = the configured per-node
+//! resources times `nodes`) and the storage, frozen and ML deciders over
+//! this node ([`elasticsearch_engine::autoscaling`]).
 
 use crate::{method_not_allowed, Req, Resp, R};
 use axum::http::Method;
@@ -28,7 +27,8 @@ const FIXED_SETTINGS: &[&str] = &["storage", "memory", "processors", "nodes"];
 const DECIDERS: &[(&str, &[&str], bool)] = &[
     ("fixed", &[], false),
     ("reactive_storage", &["data", "data_content", "data_hot", "data_warm", "data_cold"], true),
-    ("proactive_storage", &["data", "data_content", "data_hot", "data_warm", "data_cold"], true),
+    // ES `ProactiveStorageDeciderService.roles`: data and data_hot only.
+    ("proactive_storage", &["data", "data_hot"], true),
     ("frozen_storage", &["data_frozen"], true),
     ("frozen_shards", &["data_frozen"], true),
     ("frozen_existence", &["data_frozen"], true),
@@ -263,7 +263,20 @@ fn get_capacity(node: &Node) -> R {
             let (req, mut res) = if dn == "fixed" {
                 fixed_result(ds)
             } else {
-                (None, json!({"reason_summary": format!("{dn} decider has nothing to scale on a single node")}))
+                // The storage, frozen and ML deciders over this node (the
+                // whole tier when the policy's roles are its own).
+                let empty = Map::new();
+                let mut timers = ml_timers().lock().unwrap_or_else(|e| e.into_inner());
+                let d = elasticsearch_engine::autoscaling::standalone_decision(node, dn, ds.as_object().unwrap_or(&empty), matches_node,
+                    elasticsearch_engine::autoscaling::NodeDisk { total: fs.total, free: fs.free }, sys.total_mem, timers.entry(format!("{}#{name}", node.data.display())).or_default());
+                let req = d.capacity.map(|c| {
+                    let i = |b: Option<u64>| b.map(|b| b as i64);
+                    let node_part = (c.node_storage.is_some() || c.node_memory.is_some()).then(|| capacity_json(i(c.node_storage), i(c.node_memory), None));
+                    let mut v = json!({"total": capacity_json(i(c.total_storage), i(c.total_memory), None)});
+                    if let Some(n) = node_part { v["node"] = n; }
+                    v
+                });
+                (req, json!({"reason_summary": d.summary, "reason_details": d.details}))
             };
             match req {
                 Some(r) => {
@@ -291,22 +304,38 @@ fn get_capacity(node: &Node) -> R {
     Ok(Resp::ok(json!({"policies": out})))
 }
 
+/// Each policy's ML scale-down timer (ES `ScaleTimer`), per node (data
+/// path + policy: nodes of one process keep their own).
+fn ml_timers() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, elasticsearch_engine::autoscaling::ScaleTimer>> {
+    static TIMERS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, elasticsearch_engine::autoscaling::ScaleTimer>>> = std::sync::OnceLock::new();
+    TIMERS.get_or_init(Default::default)
+}
+
 /// `AutoscalingCapacity.upperBound`: the per-resource maximum.
 fn upper_bound(a: &Value, b: &Value) -> Value {
     let max = |k: &str| -> Value {
         let mut m = Map::new();
         for res in ["storage", "memory", "processors"] {
             match (a[k].get(res).and_then(Value::as_f64), b[k].get(res).and_then(Value::as_f64)) {
+                // ES `AutoscalingCapacity.upperBound`: a resource one side
+                // does not state is the other side's.
                 (Some(x), Some(y)) => {
                     let v = x.max(y);
                     m.insert(res.into(), if res == "processors" { json!(v) } else { json!(v as i64) });
                 }
-                _ => {}
+                (Some(v), None) | (None, Some(v)) => {
+                    m.insert(res.into(), if res == "processors" { json!(v) } else { json!(v as i64) });
+                }
+                (None, None) => {}
             }
         }
         Value::Object(m)
     };
-    json!({"node": max("node"), "total": max("total")})
+    let mut out = json!({"total": max("total")});
+    if a.get("node").is_some() || b.get("node").is_some() {
+        out["node"] = max("node");
+    }
+    out
 }
 
 /// `/_autoscaling/...`
@@ -331,5 +360,47 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
             crate::blocking(move || get_capacity(&node)).await
         }
         _ => crate::not_found_handler(&req),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(r: Resp) -> Value {
+        match r.body {
+            crate::RespBody::Json(v) => v,
+            other => panic!("not json: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// #417: a data policy for this node's roles and an ML policy get a
+    /// required capacity from their deciders (they used to report only a
+    /// reason, which left the policy without any), and a fixed override is
+    /// combined with the defaults.
+    #[test]
+    fn standalone_data_and_ml_policies_calculate_their_required_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let svc = node.create_index("logs", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}})).unwrap();
+        let docs: Vec<elasticsearch_engine::index::WriteReq> = (0..20).map(|i| elasticsearch_engine::index::WriteReq::Index { id: Some(i.to_string()), source: json!({"n": i}).to_string(), routing: None, cond: Default::default() }).collect();
+        assert!(svc.write(docs, true).iter().all(|r| r.is_ok()));
+        svc.flush().unwrap();
+        let roles: BTreeSet<String> = NODE_ROLES.iter().map(|r| r.to_string()).collect();
+        let st = ext(&node);
+        st.autoscaling_policies.write().insert("all".into(), json!({"roles": roles.iter().collect::<Vec<_>>(), "deciders": default_deciders(&roles)}));
+        st.autoscaling_policies.write().insert("fixed".into(), json!({"roles": ["data_hot"], "deciders": {"fixed": {"memory": "1gb"}, "reactive_storage": {}, "proactive_storage": {}}}));
+        st.autoscaling_policies.write().insert("ml".into(), json!({"roles": ["ml"], "deciders": {"ml": {}}}));
+        let v = body(get_capacity(&node).unwrap());
+        let all = &v["policies"]["all"];
+        let fs = crate::sysinfo::fs(&node.data);
+        // At least this node's disk (more when it is past the watermark).
+        assert!(all["required_capacity"]["total"]["storage"].as_u64().is_some_and(|b| b >= fs.total), "{all}");
+        assert!(all["deciders"]["reactive_storage"]["reason_summary"].is_string(), "{all}");
+        assert!(all["deciders"]["ml"]["required_capacity"]["total"]["memory"].is_u64(), "{all}");
+        let fixed = &v["policies"]["fixed"];
+        assert_eq!(fixed["required_capacity"]["total"]["memory"], json!(1i64 << 30), "{fixed}");
+        assert_eq!(fixed["required_capacity"]["total"]["storage"], json!(0), "an empty tier needs no storage: {fixed}");
+        assert_eq!(v["policies"]["ml"]["required_capacity"]["total"]["memory"], json!(0));
     }
 }

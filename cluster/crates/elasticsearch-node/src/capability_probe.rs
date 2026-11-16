@@ -33,6 +33,9 @@ struct Cache {
     cluster: String,
     local: AdmittedDiscoveryNode,
     peers: parking_lot::Mutex<Entries<AdmittedDiscoveryNode>>,
+    /// Processes (`id`, `ephemeral_id`, `transport_address`) with a
+    /// background probe in flight ([`observe_members_async`]).
+    probing: parking_lot::Mutex<std::collections::HashSet<(String, String, String)>>,
     _memory: Reservation,
 }
 static PROOFS: OnceLock<parking_lot::Mutex<Entries<Weak<Cache>>>> = OnceLock::new();
@@ -54,7 +57,7 @@ pub(crate) fn register(transport: &TransportService) -> Result<(),Box<dyn std::e
     let local=transport.admit_discovery_node(transport.local_node())?;
     let memory=memory::breakers().reserve_native((std::mem::size_of::<Cache>()+2*std::mem::size_of::<usize>()+transport.cluster_name().len()) as u64,"capability cache owner")?;
     let mut cluster=String::new();cluster.try_reserve_exact(transport.cluster_name().len())?;cluster.push_str(transport.cluster_name());
-    let owner=Arc::new(Cache{cluster,local:local.clone(),peers:Default::default(),_memory:memory.into_result_owner()});
+    let owner=Arc::new(Cache{cluster,local:local.clone(),peers:Default::default(),probing:Default::default(),_memory:memory.into_result_owner()});
     {
         let mut owners=owners().lock();owners.values.retain(|owner|owner.strong_count()>0);
         owners.push(Arc::downgrade(&owner))?;
@@ -148,8 +151,54 @@ pub(crate) fn require_writer_proofs(state: &ClusterState, local: &DiscoveryNode)
     Ok(())
 }
 
+/// Most background probes in flight at once; members beyond it wait for the
+/// next publication or [`reprobe_missing`].
+const MAX_BACKGROUND_PROBES: usize = 256;
+
+/// [`observe_members`] off the caller's path: a publication is applied
+/// without first connecting to every member (ES applies it and lets
+/// `NodeConnectionsService` connect asynchronously). After a full-cluster
+/// restart the restored state names members at dead addresses, and waiting
+/// for their 2 s connect bound before accepting each publication made the
+/// first publications of a new master lose to competing elections.
+///
+/// Nothing is granted meanwhile: an unproven member keeps the safe default
+/// (no feature activation, writes and the segment format floor held at
+/// what is already proven) until its probe lands. One probe per process is
+/// in flight at a time; one that fails is retried by the next publication
+/// naming the member or by [`reprobe_missing`].
+pub(crate) fn observe_members_async(transport: &TransportService, nodes: &BTreeMap<String, DiscoveryNode>) {
+    let Some(owner) = proofs(transport) else { return };
+    let todo: Vec<DiscoveryNode> = {
+        let mut probing = owner.probing.lock();
+        nodes
+            .values()
+            .filter(|node| unproven(transport, node))
+            .filter(|node| probing.len() < MAX_BACKGROUND_PROBES && probing.insert(process_key(node)))
+            .cloned()
+            .collect()
+    };
+    let owner = Arc::downgrade(&owner);
+    for node in todo {
+        let transport = transport.clone();
+        let owner = owner.clone();
+        tokio::spawn(async move {
+            let _ = verify(&transport, &node, false).await;
+            if let Some(owner) = owner.upgrade() {
+                owner.probing.lock().remove(&process_key(&node));
+            }
+        });
+    }
+}
+
+fn process_key(node: &DiscoveryNode) -> (String, String, String) {
+    (node.id.clone(), node.ephemeral_id.clone(), node.transport_address.clone())
+}
+
 /// Warm proofs for reachable peers, without granting anything to unverified
 /// relayed claims. Feature activation and writes still demand those proofs.
+/// Waits for every probe; coordination uses [`observe_members_async`].
+#[allow(dead_code)]
 pub(crate) async fn observe_members(transport: &TransportService, nodes: &BTreeMap<String, DiscoveryNode>) {
     observe(transport, nodes.values()).await
 }

@@ -9,11 +9,15 @@ use crate::analysis::{Token, TokenFilter};
 /// A stemming function over a single (lowercased) word.
 pub type StemFn = fn(&str) -> String;
 
-fn apply(tokens: Vec<Token>, f: StemFn) -> Vec<Token> {
+/// Stem every token but the keyword ones (Lucene stem filters skip a
+/// token whose `KeywordAttribute` is set).
+pub(crate) fn apply(tokens: Vec<Token>, f: StemFn) -> Vec<Token> {
     tokens
         .into_iter()
         .map(|mut t| {
-            t.text = f(&t.text);
+            if !t.keyword {
+                t.text = f(&t.text);
+            }
             t
         })
         .collect()
@@ -67,6 +71,12 @@ pub fn snowball_fn(language: &str) -> Option<StemFn> {
         "hungarian" => stemmer::hungarian::stem,
         "romanian" => stemmer::romanian::stem,
         "turkish" => stemmer::turkish::stem,
+        "armenian" => stemmer::sb_armenian::stem,
+        "basque" => stemmer::sb_basque::stem,
+        "catalan" => stemmer::sb_catalan::stem,
+        "estonian" => stemmer::sb_estonian::stem,
+        "irish" => stemmer::sb_irish::stem,
+        "lithuanian" => stemmer::sb_lithuanian::stem,
         _ => return None,
     })
 }
@@ -105,7 +115,19 @@ pub fn stemmer_fn(name: &str) -> Option<StemFn> {
         "minimal_french" | "minimalfrench" => light::french_minimal,
         "light_spanish" | "lightspanish" => light::spanish_light,
         "light_italian" | "lightitalian" => light::italian_light,
-        "light_portuguese" | "lightportuguese" | "brazilian" => light::portuguese_light,
+        "light_portuguese" | "lightportuguese" => light::portuguese_light,
+        // ES `StemmerTokenFilterFactory`: `brazilian` is Lucene's
+        // `BrazilianStemmer`; the other Lucene language stemmers (SIDE 005).
+        "brazilian" => stemmer::lucene::brazilian,
+        "czech" => stemmer::lucene::czech,
+        "bulgarian" => stemmer::lucene::bulgarian,
+        "latvian" => stemmer::lucene::latvian,
+        "hindi" => stemmer::lucene::hindi,
+        "bengali" => stemmer::lucene::bengali,
+        "sorani" => stemmer::lucene::sorani,
+        "indonesian" => stemmer::lucene::indonesian,
+        "greek" => stemmer::lucene::greek,
+        "galician" => stemmer::lucene::galician,
         "minimal_portuguese" | "minimalportuguese" => light::portuguese_minimal,
         "light_swedish" | "lightswedish" => light::swedish_light,
         "light_norwegian" | "lightnorwegian" => light::norwegian_light,
@@ -298,7 +320,7 @@ mod tests {
     use super::*;
 
     fn tok(text: &str) -> Vec<Token> {
-        vec![Token { text: text.into(), position: 4, offset_from: 0, offset_to: text.len() as u32 }]
+        vec![Token { text: text.into(), position: 4, offset_from: 0, offset_to: text.len() as u32, keyword: false }]
     }
 
     #[test]

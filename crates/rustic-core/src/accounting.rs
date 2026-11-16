@@ -88,6 +88,8 @@ pub fn report() -> String {
     let budget = crate::admission::shared();
     out.push(format!("admission_used={} admission_limit={}", budget.used(), budget.limit()));
     out.push(format!("code_log_anon={} code_log_mapped={}", CODE_LOG_ANON_BYTES.load(Ordering::Relaxed), CODE_LOG_MAPPED_BYTES.load(Ordering::Relaxed)));
+    let labels = crate::admission::label_report(20);
+    if !labels.is_empty() { out.push(format!("admission_labels: {labels}")); }
     out.join(" ")
 }
 

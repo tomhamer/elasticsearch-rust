@@ -5,8 +5,11 @@ use crate::{blocking, method_not_allowed, Req, Resp, R};
 use axum::http::Method;
 use elasticsearch_engine::node::Node;
 use elasticsearch_engine::error::EsError;
-use elasticsearch_engine::termvectors::{mterm_vectors, term_vectors, TvRequest};
+use elasticsearch_engine::termvectors::{mterm_vectors_with, term_vectors, TvRequest};
 use std::sync::Arc;
+
+/// The shard-level action of a multi term vectors item.
+const TV: &str = "indices:data/read/tv";
 
 pub async fn handle(node: Arc<Node>, req: Req, index: Option<String>) -> R {
     let off = if index.is_some() { 1 } else { 0 };
@@ -33,7 +36,19 @@ pub async fn handle(node: Arc<Node>, req: Req, index: Option<String>) -> R {
         .await,
         ("_mtermvectors", index) if id.is_none() => blocking(move || {
             let body = req.json()?;
-            Ok(Resp::ok(mterm_vectors(&node, index.as_deref(), &req.params, &body)?))
+            // Each document names its own index: it is authorized as the
+            // caller's term vectors read of that index (ES authorizes every
+            // shard-level item), and refused where DLS/FLS applies.
+            let authorize = |idx: &str| -> Result<(), EsError> {
+                let Some(access) = req.access.as_deref() else { return Ok(()) };
+                let names = [idx.to_string()];
+                access.authorize_names(&node, TV, &names)?;
+                if access.doc_access(idx, TV)?.is_some() {
+                    return Err(EsError::new(403, "security_exception", format!("this action is not permitted on indices [{idx}] with field or document level security")));
+                }
+                Ok(())
+            };
+            Ok(Resp::ok(mterm_vectors_with(&node, index.as_deref(), &req.params, &body, &authorize)?))
         })
         .await,
         _ => crate::not_found_handler(&req),

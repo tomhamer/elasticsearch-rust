@@ -744,7 +744,7 @@ impl DocColumns for LeafColumns<'_, '_> {
         self.leaf.u64_values(field, self.doc)
     }
     fn bools(&self, field: u16) -> Vec<bool> {
-        self.leaf.bool_value(field, self.doc).into_iter().collect()
+        self.leaf.bool_values(field, self.doc)
     }
     fn present(&self, field: u16) -> bool {
         self.leaf.has_doc_value(field, self.doc)
@@ -1827,6 +1827,129 @@ pub fn encode_ignored_source(entries: &[IgnoredEntry], format: IgnoredSourceForm
     }
 }
 
+/// The `_ignored_source` values `entries` (base64, `format`) as a caller
+/// restricted by field-level security `fa` may see them (ES
+/// `FieldSubsetReader` on `_ignored_source`): an entry whose field is not
+/// permitted is dropped; an object or array keeps only its permitted
+/// leaves (re-encoded as JSON when something was removed). A value that
+/// cannot be decoded or filtered is withheld.
+pub fn filter_ignored_source(entries: &[&str], format: IgnoredSourceFormat, fa: &crate::security::roles::FieldAccess) -> Vec<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    // One value (type byte + content) of field `name`: what may be shown.
+    let filter_value = |name: &str, value: &[u8]| -> Option<Vec<u8>> {
+        match value.first()? {
+            b'S' | b'I' | b'L' | b'i' | b'D' | b't' | b'f' | b'n' => fa.allows(name).then(|| value.to_vec()),
+            b'j' => {
+                let v: Value = serde_json::from_slice(&value[1..]).ok()?;
+                let kept = fa.filter_at(&v, name)?;
+                if kept == v {
+                    Some(value.to_vec())
+                } else {
+                    let mut out = vec![b'j'];
+                    out.extend_from_slice(kept.to_string().as_bytes());
+                    Some(out)
+                }
+            }
+            // YAML / CBOR / Smile objects, or an unknown encoding: not
+            // decodable here, so not filterable.
+            _ => None,
+        }
+    };
+    let read_vint = |b: &[u8], pos: &mut usize| -> Option<u32> {
+        let mut v = 0u32;
+        let mut shift = 0;
+        loop {
+            let x = *b.get(*pos)?;
+            *pos += 1;
+            v |= ((x & 0x7f) as u32).checked_shl(shift)?;
+            if x & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+            if shift > 28 {
+                return None;
+            }
+        }
+    };
+    let one = |e: &str| -> Option<String> {
+        let b = b64.decode(e).ok()?;
+        match format {
+            IgnoredSourceFormat::Singular => {
+                let header = u32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+                let len = (header & 0xffff) as usize;
+                let name = std::str::from_utf8(b.get(4..4 + len)?).ok()?;
+                let value = b.get(4 + len..)?;
+                let kept = filter_value(name, value)?;
+                if kept == value {
+                    return Some(e.to_string());
+                }
+                let mut out = Vec::with_capacity(4 + len + kept.len());
+                out.extend_from_slice(&b[..4 + len]);
+                out.extend_from_slice(&kept);
+                Some(base64_encode(&out))
+            }
+            IgnoredSourceFormat::Coalesced => {
+                let mut pos = 0usize;
+                let count = read_vint(&b, &mut pos)? as usize;
+                let units = read_vint(&b, &mut pos)? as usize;
+                // The name's length is in UTF-16 units; its bytes are UTF-8.
+                let rest = b.get(pos..)?;
+                let mut seen = 0usize;
+                let mut end = 0usize;
+                let text = match std::str::from_utf8(rest) {
+                    Ok(t) => t,
+                    Err(err) => std::str::from_utf8(&rest[..err.valid_up_to()]).ok()?,
+                };
+                for c in text.chars() {
+                    if seen >= units {
+                        break;
+                    }
+                    seen += c.len_utf16();
+                    end += c.len_utf8();
+                }
+                if seen != units {
+                    return None;
+                }
+                let name = &text[..end];
+                pos += end;
+                let mut vals: Vec<(u32, Vec<u8>)> = Vec::with_capacity(count);
+                let mut changed = false;
+                for _ in 0..count {
+                    let parent = read_vint(&b, &mut pos)?;
+                    let len = read_vint(&b, &mut pos)? as usize;
+                    let value = b.get(pos..pos.checked_add(len)?)?;
+                    pos += len;
+                    match filter_value(name, value) {
+                        Some(kept) => {
+                            changed |= kept != value;
+                            vals.push((parent, kept));
+                        }
+                        None => changed = true,
+                    }
+                }
+                if vals.is_empty() {
+                    return None;
+                }
+                if !changed {
+                    return Some(e.to_string());
+                }
+                let mut out = Vec::new();
+                write_vint(&mut out, vals.len() as u32);
+                write_vint(&mut out, units as u32);
+                out.extend_from_slice(name.as_bytes());
+                for (parent, v) in vals {
+                    write_vint(&mut out, parent);
+                    write_vint(&mut out, v.len() as u32);
+                    out.extend_from_slice(&v);
+                }
+                Some(base64_encode(&out))
+            }
+        }
+    };
+    entries.iter().filter_map(|e| one(e)).collect()
+}
+
 fn write_vint(buf: &mut Vec<u8>, mut v: u32) {
     while v >= 0x80 {
         buf.push((v as u8 & 0x7f) | 0x80);
@@ -2511,7 +2634,10 @@ impl<'a> Synth<'a> {
                             EsType::ScaledFloat => numeric::scaled_round_trip(x, rf.scaling_factor),
                             _ => x,
                         };
+                        // Not finite in the field's format: malformed, the
+                        // original value is kept (finding 458).
                         match rf.ty {
+                            _ if !x.is_finite() => v.clone(),
                             EsType::Float | EsType::HalfFloat => f32_value(x as f32),
                             _ => f64_value(x),
                         }
@@ -2613,7 +2739,12 @@ impl<'a> Synth<'a> {
                     return Some(vals);
                 }
                 let sub = rf.multi_fields.iter().filter_map(|n| self.lk.fields.get(n)).find(|s| s.declared == EsType::Keyword && s.doc_values && (s.normalizer.is_none() || s.normalizer_skip_store))?;
-                let vals = with_nulls(&items);
+                // The keyword child indexed a null as its own `null_value`
+                // (finding 433).
+                let vals: Vec<Value> = items.iter().filter_map(|v| match v {
+                    Value::Null => sub.null_value.clone(),
+                    x => Some((*x).clone()),
+                }).collect();
                 if sorted && self.lk.registry.created_version().on_or_after(crate::version::IndexVersion::KEYWORD_MULTI_FIELDS_NOT_STORED_WHEN_IGNORED) {
                     // The text field keeps the values its keyword multi-field
                     // ignored in its own fallback field, loaded first
@@ -2683,13 +2814,14 @@ impl<'a> Synth<'a> {
                         Value::String(s) if rf.coerce => s.trim().parse::<f64>().ok(),
                         _ => None,
                     };
-                    match r {
-                        Some(x) if x.is_finite() => dv.push(match rf.ty {
-                            EsType::Float => crate::values::to_float(x),
-                            EsType::HalfFloat => crate::values::to_half_float(x),
-                            EsType::ScaledFloat => numeric::scaled_round_trip(x, rf.scaling_factor),
-                            _ => x,
-                        }),
+                    let narrowed = r.filter(|x| x.is_finite()).map(|x| match rf.ty {
+                        EsType::Float => crate::values::to_float(x),
+                        EsType::HalfFloat => crate::values::to_half_float(x),
+                        EsType::ScaledFloat => numeric::scaled_round_trip(x, rf.scaling_factor),
+                        _ => x,
+                    });
+                    match narrowed {
+                        Some(x) if x.is_finite() => dv.push(x),
                         _ => ign.push(v),
                     }
                 }
@@ -2798,10 +2930,14 @@ impl<'a> Synth<'a> {
                 let mut ign = Vec::new();
                 let vals = items;
                 for v in vals {
-                    if v.is_null() {
-                        continue;
-                    }
-                    match crate::values::parse_geo_point(v) {
+                    // A null is indexed as the mapped `null_value` (finding 432).
+                    let v = match (v.is_null(), &rf.null_value) {
+                        (true, Some(nv)) => nv,
+                        (true, None) => continue,
+                        (false, _) => v,
+                    };
+                    let parsed = if rf.ignore_malformed { crate::values::parse_geo_point_normalized(v) } else { crate::values::parse_geo_point(v) };
+                    match parsed {
                         Some((lat, lon)) if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) => pts.push((encode_lat(lat), encode_lon(lon))),
                         _ => ign.push(v.clone()),
                     }
@@ -3224,6 +3360,67 @@ fn decode_lat(e: i32) -> f64 {
 
 fn decode_lon(e: i32) -> f64 {
     e as f64 * LON_DECODE
+}
+
+#[cfg(test)]
+mod ignored_source_fls_tests {
+    use super::*;
+    use crate::security::roles::{FieldAccess, FieldPermissions};
+
+    fn entry(name: &str, v: &Value) -> IgnoredEntry {
+        let mut value = Vec::new();
+        ignored_value(&mut value, v, None);
+        IgnoredEntry { name: name.into(), parent: 0, value }
+    }
+
+    fn decode_all(entries: &[String]) -> String {
+        use base64::Engine;
+        entries.iter().map(|e| String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(e).unwrap()).into_owned()).collect::<Vec<_>>().join("|")
+    }
+
+    #[test]
+    fn hidden_entries_are_dropped_and_objects_filtered_in_both_formats() {
+        let fa = FieldAccess::from_layer(vec![FieldPermissions { grant: vec!["open".into(), "obj.x".into(), "tags".into()], except: Vec::new() }]);
+        let doc = [
+            entry("open", &json!("open-val")),
+            entry("hidden", &json!("SENTINEL-1")),
+            entry("num", &json!(12345)),
+            entry("obj", &json!({"x": "obj-x", "y": "SENTINEL-2"})),
+            entry("whole", &json!({"a": "SENTINEL-3"})),
+            entry("tags", &json!(["t1", "t2"])),
+            entry("open", &json!("open-val-2")),
+        ];
+        for format in [IgnoredSourceFormat::Singular, IgnoredSourceFormat::Coalesced] {
+            let enc = encode_ignored_source(&doc, format);
+            let refs: Vec<&str> = enc.iter().map(String::as_str).collect();
+            let all = decode_all(&enc);
+            assert!(all.contains("SENTINEL-1") && all.contains("SENTINEL-2"), "{format:?}: {all}");
+            let out = filter_ignored_source(&refs, format, &fa);
+            let seen = decode_all(&out);
+            assert!(!seen.contains("SENTINEL"), "{format:?}: {seen}");
+            for want in ["open-val", "open-val-2", "obj-x", "t1"] {
+                assert!(seen.contains(want), "{format:?}: {want} lost: {seen}");
+            }
+            // Unchanged entries keep their exact bytes.
+            let unchanged: Vec<&String> = enc.iter().filter(|e| decode_all(&[(*e).clone()]).contains("open-val")).collect();
+            assert!(unchanged.iter().all(|e| out.contains(e)), "{format:?}");
+            // An unrestricted-for-everything access keeps the input as is.
+            let every = FieldAccess::from_layer(vec![FieldPermissions { grant: vec!["*".into()], except: Vec::new() }]);
+            assert_eq!(filter_ignored_source(&refs, format, &every), enc, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn undecodable_values_are_withheld() {
+        let fa = FieldAccess::from_layer(vec![FieldPermissions { grant: vec!["*".into()], except: vec!["z".into()] }]);
+        let mut cbor = vec![b'c'];
+        cbor.extend_from_slice(b"\xa1az\x01");
+        let doc = [IgnoredEntry { name: "obj".into(), parent: 0, value: cbor }];
+        let enc = encode_ignored_source(&doc, IgnoredSourceFormat::Singular);
+        let refs: Vec<&str> = enc.iter().map(String::as_str).collect();
+        assert!(filter_ignored_source(&refs, IgnoredSourceFormat::Singular, &fa).is_empty());
+        assert!(filter_ignored_source(&["not base64!"], IgnoredSourceFormat::Coalesced, &fa).is_empty());
+    }
 }
 
 #[cfg(test)]

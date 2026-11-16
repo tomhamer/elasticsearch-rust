@@ -136,8 +136,21 @@ const MONTHS: [&str; 12] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AU
 
 fn day_name(v: &Value) -> Result<&'static str> {
     let s = match v {
+        // ES `DayOfWeek.resolve`: 1 = Sunday .. 7 = Saturday (numbers and
+        // numeric strings alike).
+        Value::Number(n) => {
+            return match n.as_i64() {
+                Some(i @ 1..=7) => Ok(DAYS[(i - 1) as usize]),
+                _ => Err(parse_err(format!("unknown day of week [{n}]"))),
+            };
+        }
+        Value::String(s) if s.parse::<i64>().is_ok() => {
+            return match s.parse::<i64>() {
+                Ok(i @ 1..=7) => Ok(DAYS[(i - 1) as usize]),
+                _ => Err(parse_err(format!("unknown day of week [{s}]"))),
+            };
+        }
         Value::String(s) => s.to_ascii_lowercase(),
-        Value::Number(n) => return DAYS.get((n.as_i64().unwrap_or(0) % 7) as usize).copied().ok_or_else(|| parse_err("invalid day")),
         _ => return Err(parse_err("invalid day of week")),
     };
     for (i, d) in DAYS.iter().enumerate() {
@@ -342,6 +355,44 @@ mod tests {
             out.push(t);
         }
         out
+    }
+
+    /// #532: overflowing cron ranges wrap (ES `Cron.addToSet`), across
+    /// midnight, the week and the year, stepped ranges included.
+    #[test]
+    fn wrapped_cron_ranges_fire() {
+        let f = fires(&json!({"cron": "0 0 22-2 * * ?"}), "2020-01-01T00:00:00Z", "2020-01-01T21:00:00Z", 6);
+        assert_eq!(f, ["2020-01-01T22:00:00Z", "2020-01-01T23:00:00Z", "2020-01-02T00:00:00Z", "2020-01-02T01:00:00Z", "2020-01-02T02:00:00Z", "2020-01-02T22:00:00Z"].map(at).to_vec());
+        let f = fires(&json!({"cron": "0 0 22-3/2 * * ?"}), "2020-01-01T00:00:00Z", "2020-01-01T21:00:00Z", 3);
+        assert_eq!(f, ["2020-01-01T22:00:00Z", "2020-01-02T00:00:00Z", "2020-01-02T02:00:00Z"].map(at).to_vec());
+        // NOV-FEB: November through February (2020-03 skipped to November).
+        let f = fires(&json!({"cron": "0 0 0 1 NOV-FEB ?"}), "2020-01-01T00:00:00Z", "2020-01-15T00:00:00Z", 2);
+        assert_eq!(f, ["2020-02-01T00:00:00Z", "2020-11-01T00:00:00Z"].map(at).to_vec());
+        // FRI-MON: Friday, Saturday, Sunday, Monday (2020-01-01 is a Wednesday).
+        let f = fires(&json!({"cron": "0 0 0 ? * FRI-MON"}), "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", 5);
+        assert_eq!(f, ["2020-01-03T00:00:00Z", "2020-01-04T00:00:00Z", "2020-01-05T00:00:00Z", "2020-01-06T00:00:00Z", "2020-01-10T00:00:00Z"].map(at).to_vec());
+        let f = fires(&json!({"cron": "50-10/10 * * * * ?"}), "2020-01-01T00:00:00Z", "2020-01-01T00:00:45Z", 3);
+        assert_eq!(f, ["2020-01-01T00:00:50Z", "2020-01-01T00:01:00Z", "2020-01-01T00:01:10Z"].map(at).to_vec());
+        assert!(Schedule::parse(&json!({"cron": "0 0 0 * * ? 2030-2020"})).is_err());
+    }
+
+    /// #533: numeric weekly days are 1 = Sunday .. 7 = Saturday (ES
+    /// `DayOfWeek.resolve`), numbers and numeric strings alike.
+    #[test]
+    fn numeric_weekly_days_match_their_names() {
+        // 2020-01-05 is a Sunday.
+        let names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+        for (i, name) in names.iter().enumerate() {
+            let named = fires(&json!({"weekly": {"on": name, "at": "09:00"}}), "2020-01-04T00:00:00Z", "2020-01-04T10:00:00Z", 1);
+            let num = fires(&json!({"weekly": {"on": i + 1, "at": "09:00"}}), "2020-01-04T00:00:00Z", "2020-01-04T10:00:00Z", 1);
+            let numstr = fires(&json!({"weekly": {"on": (i + 1).to_string(), "at": "09:00"}}), "2020-01-04T00:00:00Z", "2020-01-04T10:00:00Z", 1);
+            assert_eq!(num, named, "{name}");
+            assert_eq!(numstr, named, "{name}");
+        }
+        assert_eq!(fires(&json!({"weekly": {"on": 2, "at": "09:00"}}), "2020-01-04T00:00:00Z", "2020-01-04T10:00:00Z", 1), vec![at("2020-01-06T09:00:00Z")]);
+        for bad in [json!(0), json!(8), json!("0")] {
+            assert!(Schedule::parse(&json!({"weekly": {"on": bad, "at": "09:00"}})).is_err(), "{bad}");
+        }
     }
 
     #[test]

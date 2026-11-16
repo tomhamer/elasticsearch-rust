@@ -47,7 +47,11 @@ fn read_native(path:&Path)->Result<Option<StoreRecord>>{
 pub(crate) fn collect(node:&crate::node::ClusterNode)->Result<StoreRecords>{elasticsearch_engine::memory::native_control(||collect_native(node))}
 fn collect_native(node:&crate::node::ClusterNode)->Result<StoreRecords>{
  let mut out=Builder::new()?;
- node.try_visit_shard_engines(|_,engine|engine.try_visit_indices(|svc|{if let Some(record)=read(svc.path())?{out.push(record)?;}Ok::<_,EsError>(())}))?;
+ // A copy whose store is marked corrupted is not offered: older masters
+ // (which do not ask ACTION_CORRUPTED_STORES) must never pick it.
+ node.try_visit_shard_engines(|_,engine|engine.try_visit_indices(|svc|{if let Some(record)=read(svc.path())?{
+  if crate::shards::store_corruption(&crate::shards::shard_path(svc,record.shard)).is_none(){out.push(record)?;}
+ }Ok::<_,EsError>(())}))?;
  out.finish().map(StoreRecords)
 }
 #[cfg(test)]mod tests{
@@ -62,7 +66,15 @@ fn collect_native(node:&crate::node::ClusterNode)->Result<StoreRecords>{
 
 /// The master cache owns its map/key allocations independently of fetch futures.
 #[derive(Default)]
-pub struct StoreCache { values:std::collections::BTreeMap<String,StoreRecords>, memory:Option<elasticsearch_engine::memory::Reservation> }
+pub struct StoreCache { values:std::collections::BTreeMap<String,StoreRecords>, memory:Option<elasticsearch_engine::memory::Reservation>,
+ /// Per node: its copies whose store is marked corrupted (`ACTION_CORRUPTED_STORES`).
+ pub(crate) corrupted:std::collections::BTreeMap<String,Vec<crate::shards::CorruptedCopy>>,
+ /// Corrupted copies learnt from shard-failed reports (node, copy), with
+ /// when: kept across a fetch that started before them (ES invalidates
+ /// its store fetch cache on a failed shard), so the copy is not chosen
+ /// again on a listing taken before its marker was written.
+ pub(crate) noted:Vec<(std::time::Instant,String,crate::shards::CorruptedCopy)>,
+}
 impl std::ops::Deref for StoreCache{type Target=std::collections::BTreeMap<String,StoreRecords>;fn deref(&self)->&Self::Target{&self.values}}
 impl StoreCache {
  pub(crate) fn try_insert(&mut self,id:&str,records:StoreRecords)->Result<()> {

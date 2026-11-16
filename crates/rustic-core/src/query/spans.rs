@@ -62,6 +62,18 @@ pub enum SpanQuery {
 }
 
 impl SpanQuery {
+    /// The shortest match (positions): a match's width is its length
+    /// beyond it (Lucene `Spans.width()`).
+    pub fn min_len(&self) -> u32 {
+        match self {
+            SpanQuery::Term(_) | SpanQuery::Prefix { .. } | SpanQuery::Wildcard { .. } => 1,
+            SpanQuery::Near { clauses, .. } => clauses.iter().map(SpanQuery::min_len).sum(),
+            SpanQuery::Or(v) => v.iter().map(SpanQuery::min_len).min().unwrap_or(0),
+            SpanQuery::First { inner, .. } => inner.min_len(),
+            SpanQuery::Not { include, .. } => include.min_len(),
+        }
+    }
+
     /// Rewrite span_multi against the whole shard dictionary, without silently
     /// truncating to the old fixed per-leaf limit.
     pub(crate) fn rewrite_bounded(&self, leaves: &[LeafReader<'_>], max: usize) -> Result<Self, ()> {
@@ -375,10 +387,19 @@ impl<F: FnMut(&[Span], DocId) -> Vec<Span> + Send> FilterSpans<F> {
     }
 
     fn confirm_from(&mut self, mut d: DocId) -> DocId {
+        let mut checked = 0u32;
         loop {
             if d == TERMINATED {
                 self.current = TERMINATED;
                 return d;
+            }
+            // Many candidate docs may fail the proximity check in one call:
+            // a cancelled search stops here as at its own checkpoints (the
+            // caller reports the cancellation).
+            checked += 1;
+            if checked % 1024 == 0 && crate::cancel::is_cancelled() {
+                self.current = TERMINATED;
+                return TERMINATED;
             }
             self.spans = (self.filter)(self.inner.spans(), d);
             if !self.spans.is_empty() {
@@ -462,10 +483,19 @@ impl NearSpans {
     }
 
     fn confirm_from(&mut self, mut d: DocId) -> DocId {
+        let mut checked = 0u32;
         loop {
             if d == TERMINATED {
                 self.current = TERMINATED;
                 return d;
+            }
+            // Many candidate docs may fail the proximity check in one call:
+            // a cancelled search stops here as at its own checkpoints (the
+            // caller reports the cancellation).
+            checked += 1;
+            if checked % 1024 == 0 && crate::cancel::is_cancelled() {
+                self.current = TERMINATED;
+                return TERMINATED;
             }
             let lists: Vec<&[Span]> = self.children.iter().map(|c| c.spans()).collect();
             self.spans = if self.in_order {
@@ -488,13 +518,33 @@ impl NearSpans {
 /// previous end; keep the combination when the summed gaps are `<= slop`.
 pub fn near_ordered(lists: &[&[Span]], slop: u32) -> Vec<Span> {
     let mut out = Vec::new();
+    // Per later clause, the earliest-ending span (ties: earliest start) of
+    // every suffix, built once: each lookup is a binary search plus O(1),
+    // never a rescan of the occurrence tail (linear-logarithmic in the
+    // occurrences of a document, not quadratic).
+    let suffix_min: Vec<Vec<Span>> = lists[1..]
+        .iter()
+        .map(|l| {
+            let mut m: Vec<Span> = vec![(0, 0); l.len()];
+            let mut best: Option<Span> = None;
+            for i in (0..l.len()).rev() {
+                let (s, e) = l[i];
+                best = Some(match best {
+                    Some((bs, be)) if (be, bs) <= (e, s) => (bs, be),
+                    _ => (s, e),
+                });
+                m[i] = best.unwrap();
+            }
+            m
+        })
+        .collect();
     'first: for &(s0, e0) in lists[0] {
         let mut prev_end = e0;
         let mut gaps = 0u64;
-        for l in &lists[1..] {
+        for (l, mins) in lists[1..].iter().zip(&suffix_min) {
             let i = l.partition_point(|&(s, _)| s < prev_end);
             // Earliest-ending span among those starting at or after prev_end.
-            let Some(&(s, e)) = l[i..].iter().min_by_key(|&&(s, e)| (e, s)) else {
+            let Some(&(s, e)) = mins.get(i) else {
                 continue 'first;
             };
             gaps += (s - prev_end) as u64;
@@ -585,17 +635,36 @@ impl Spans for NearSpans {
     }
 }
 
-/// Scores span matches: the number of spans in a doc is its frequency.
+/// Scores span matches with Lucene `SpanScorer`'s frequency: each span
+/// counts `1 / (1 + width)`, its width being its length beyond the
+/// query's shortest match, so closer matches score higher.
 pub struct SpanScorer {
     spans: Box<dyn Spans>,
     weight: Box<dyn SimWeight>,
     norms: Arc<Norms>,
+    min_len: u32,
+}
+
+/// Lucene's span frequency of `spans` with shortest match `min_len`.
+pub fn sloppy_freq(spans: &[Span], min_len: u32) -> f32 {
+    spans.iter().map(|(s, e)| 1.0 / (1.0 + (e - s).saturating_sub(min_len) as f32)).sum()
 }
 
 impl SpanScorer {
     /// Score `spans` through `weight` with field lengths from `norms`.
     pub fn new(spans: Box<dyn Spans>, weight: Box<dyn SimWeight>, norms: Arc<Norms>) -> Self {
-        Self { spans, weight, norms }
+        Self { spans, weight, norms, min_len: 1 }
+    }
+
+    /// The query's shortest match (see [`SpanQuery::min_len`]).
+    pub fn with_min_len(mut self, min_len: u32) -> Self {
+        self.min_len = min_len;
+        self
+    }
+
+    /// The current doc's fractional span frequency.
+    pub fn sloppy_freq(&self) -> f32 {
+        sloppy_freq(self.spans.spans(), self.min_len)
     }
 
     /// Span frequency of the current doc.
@@ -631,7 +700,7 @@ impl DocSet for SpanScorer {
 
 impl Scorer for SpanScorer {
     fn score(&mut self) -> f32 {
-        self.weight.score(self.freq(), self.field_len())
+        self.weight.score_freq(self.sloppy_freq(), self.field_len())
     }
 }
 
@@ -708,6 +777,58 @@ impl IntervalsRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-#173 ordered match (a rescan of every tail), as a reference.
+    fn near_ordered_rescan(lists: &[&[Span]], slop: u32) -> Vec<Span> {
+        let mut out = Vec::new();
+        'first: for &(s0, e0) in lists[0] {
+            let mut prev_end = e0;
+            let mut gaps = 0u64;
+            for l in &lists[1..] {
+                let i = l.partition_point(|&(s, _)| s < prev_end);
+                let Some(&(s, e)) = l[i..].iter().min_by_key(|&&(s, e)| (e, s)) else { continue 'first };
+                gaps += (s - prev_end) as u64;
+                prev_end = e;
+            }
+            if gaps <= slop as u64 {
+                out.push((s0, prev_end));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// #173: suffix minima give the rescan's matches (nested spans with
+    /// varying ends included) and stay fast on a repetitive document.
+    #[test]
+    fn ordered_near_matches_rescan_without_quadratic_tails() {
+        let mut seed = 3u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for _ in 0..2000 {
+            let mut lists: Vec<Vec<Span>> = (0..2 + next() % 2)
+                .map(|_| {
+                    let mut l: Vec<Span> = (0..next() % 8).map(|_| { let s = next() % 20; (s, s + 1 + next() % 4) }).collect();
+                    l.sort_unstable();
+                    l
+                })
+                .collect();
+            let refs: Vec<&[Span]> = lists.iter().map(|l| l.as_slice()).collect();
+            for slop in [0, 1, 3, 10] {
+                assert_eq!(near_ordered(&refs, slop), near_ordered_rescan(&refs, slop), "{lists:?} {slop}");
+            }
+        }
+        // `a b a b ...` 200,000 times: the rescan is ~10^10 comparisons.
+        let a: Vec<Span> = (0..200_000u32).map(|i| (2 * i, 2 * i + 1)).collect();
+        let b: Vec<Span> = (0..200_000u32).map(|i| (2 * i + 1, 2 * i + 2)).collect();
+        let started = std::time::Instant::now();
+        let m = near_ordered(&[&a, &b], 0);
+        assert_eq!(m.len(), 200_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    }
 
     #[test]
     fn ordered_and_unordered_on_lists() {

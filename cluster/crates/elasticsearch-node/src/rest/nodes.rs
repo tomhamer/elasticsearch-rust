@@ -49,6 +49,12 @@ const STATS_METRICS: &[&str] = &[
     "_all", "_none", "indices", "os", "process", "jvm", "thread_pool", "fs", "transport", "http", "breaker", "script", "discovery", "ingest", "adaptive_selection", "script_cache", "indexing_pressure", "repositories", "allocations",
 ];
 
+/// ES `CommonStatsFlags.Flag` rest names (the node stats index metrics).
+const INDEX_METRICS: &[&str] = &[
+    "store", "indexing", "get", "search", "merge", "flush", "refresh", "query_cache", "fielddata", "docs", "warmer", "completion", "segments", "translog",
+    "request_cache", "recovery", "bulk", "shard_stats", "mappings", "dense_vector", "sparse_vector",
+];
+
 pub fn register(node: &Arc<ClusterNode>) {
     crate::capacity::register(node);
     let n = node.clone();
@@ -230,7 +236,7 @@ pub async fn cluster_synonyms_reload(node: &Arc<ClusterNode>, set: &str) -> Resu
 }
 
 /// Add one node's reload details (`node_id` names its copies) into `into`.
-fn merge_reload_details(into: &mut Value, from: &Value, node_id: &str) {
+pub(crate) fn merge_reload_details(into: &mut Value, from: &Value, node_id: &str) {
     for k in ["total", "successful", "failed"] {
         let sum = into["_shards"][k].as_u64().unwrap_or(0) + from["_shards"][k].as_u64().unwrap_or(0);
         into["_shards"][k] = json!(sum);
@@ -522,16 +528,22 @@ fn patch_identity(entry: &mut Value, n: &DiscoveryNode, node: &ClusterNode, flat
         let settings = if flat { Value::Object(filtered.into_iter().collect()) } else { elasticsearch_engine::settings::unflatten(&filtered) };
         o.insert("settings".into(), settings);
     }
+    // This node's listeners are bound where it knows; a peer's are reported
+    // at its published address. Published addresses carry any
+    // `<p>.publish_port` (what a sniffing client connects to).
+    let local = n.id == node.local.id;
     if let Some(http) = o.get_mut("http").and_then(Value::as_object_mut) {
         if http.contains_key("publish_address") {
             http.insert("publish_address".into(), json!(n.http_address));
-            http.insert("bound_address".into(), json!([n.http_address]));
+            let bound: Vec<String> = if local { node.http_bound_all.iter().map(|a| a.to_string()).collect() } else { vec![n.http_address.clone()] };
+            http.insert("bound_address".into(), json!(bound));
         }
     }
     if let Some(t) = o.get_mut("transport").and_then(Value::as_object_mut) {
         if t.contains_key("publish_address") {
             t.insert("publish_address".into(), json!(n.transport_address));
-            t.insert("bound_address".into(), json!([n.transport_address]));
+            let bound: Vec<String> = if local { node.transport.bound_addresses().iter().map(|a| a.to_string()).collect() } else { vec![n.transport_address.clone()] };
+            t.insert("bound_address".into(), json!(bound));
         }
     }
 }
@@ -630,6 +642,20 @@ pub async fn handle(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
             if !bad.is_empty() {
                 let candidates: Vec<&str> = STATS_METRICS.iter().copied().filter(|c| !c.starts_with('_')).collect();
                 return RestResp::error(400, "illegal_argument_exception", &super::util::unrecognized(req.path(), &bad, &candidates, "metric"));
+            }
+            // ES `RestNodesStatsAction`: index metrics are `CommonStatsFlags`
+            // rest names (`merge`, not `merges`); an unknown one is a 400,
+            // never a response missing that section (a poll summing
+            // `merges.current` would read 0).
+            if let Some(im) = tail.split('/').nth(1).filter(|m| !m.is_empty()) {
+                let metrics: Vec<&str> = m.split(',').collect();
+                let index_metrics: Vec<String> = im.split(',').map(str::to_string).collect();
+                if metrics.contains(&"indices") && !(index_metrics.len() == 1 && index_metrics[0] == "_all") {
+                    let bad: Vec<String> = index_metrics.iter().filter(|x| !INDEX_METRICS.contains(&x.as_str())).cloned().collect();
+                    if !bad.is_empty() {
+                        return RestResp::error(400, "illegal_argument_exception", &super::util::unrecognized(req.path(), &bad, INDEX_METRICS, "index metric"));
+                    }
+                }
             }
         }
     }

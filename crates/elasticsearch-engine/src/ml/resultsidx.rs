@@ -215,7 +215,7 @@ fn exists(node: &Node, target: &str) -> bool {
     node.get_index(target).is_some() || node.write_index(target, false).is_ok()
 }
 
-fn write_to(node: &Node, target: &str, docs: Vec<(String, Value)>) -> Result<()> {
+pub(crate) fn write_to(node: &Node, target: &str, docs: Vec<(String, Value)>) -> Result<()> {
     if docs.is_empty() {
         return Ok(());
     }
@@ -245,6 +245,34 @@ pub fn write_results(node: &Node, job_id: &str, job: &Value, docs: Vec<(String, 
     }
     write_to(node, &write_alias(job_id), docs)
 }
+
+/// ES's ML audit index (`.ml-notifications-000002`).
+pub const NOTIFICATIONS_INDEX: &str = ".ml-notifications-000002";
+
+/// Write an ML audit message (ES `AbstractAuditor`): `job_type` is
+/// `anomaly_detector` or `data_frame_analytics`, `level` `info`, `warning`
+/// or `error`. Best effort, like ES's auditor.
+pub fn audit(node: &Node, job_id: &str, job_type: &str, level: &str, message: &str) {
+    if node.get_index(NOTIFICATIONS_INDEX).is_none() {
+        let body = json!({"settings": {"index": {"hidden": true, "number_of_shards": 1, "auto_expand_replicas": "0-1"}},
+            "mappings": {"dynamic": "false", "properties": {
+                "job_id": {"type": "keyword"}, "level": {"type": "keyword"}, "job_type": {"type": "keyword"}, "node_name": {"type": "keyword"},
+                "timestamp": {"type": "date"}, "message": {"type": "text", "fields": {"raw": {"type": "keyword"}}}}}});
+        let _ = match coord::current() {
+            Some(c) => c("PUT", &format!("/{NOTIFICATIONS_INDEX}"), Some(body)).map(|_| ()),
+            None => node.create_index(NOTIFICATIONS_INDEX, &body).map(|_| ()),
+        };
+    }
+    let now = crate::date::now_millis();
+    let id = format!("{job_id}-{now}-{}", AUDIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let doc = json!({"job_id": job_id, "message": message, "level": level, "timestamp": now, "node_name": node.name, "job_type": job_type});
+    if let Err(e) = write_to(node, NOTIFICATIONS_INDEX, vec![(id, doc)]) {
+        tracing::warn!(job_id, "ml audit message not written: {e}");
+    }
+    tracing::info!(job_id, level, "ml audit: {message}");
+}
+
+static AUDIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Index model state / quantiles documents.
 pub fn write_state(node: &Node, docs: Vec<(String, Value)>) -> Result<()> {
@@ -339,32 +367,51 @@ pub fn search_all(node: &Node, target: &str, query: Value, sort: Value) -> Resul
     Ok(out)
 }
 
-/// Delete every document of `target` matching `query`; the number deleted.
+/// Delete every document of `target` matching `query`; the number deleted
+/// (best effort: a failure deletes what it could, see
+/// [`try_delete_by_query`]).
 pub fn delete_by_query(node: &Node, target: &str, query: Value) -> u64 {
+    try_delete_by_query(node, target, query).unwrap_or(0)
+}
+
+/// Delete every document of `target` matching `query` (however many):
+/// the number deleted, or the first failure.
+pub fn try_delete_by_query(node: &Node, target: &str, query: Value) -> Result<u64> {
     if let Some(c) = coord::current() {
         let uri = format!("/{}/_delete_by_query?refresh=true&conflicts=proceed&ignore_unavailable=true&allow_no_indices=true&expand_wildcards=open,hidden", path_segment(target));
-        return c("POST", &uri, Some(json!({"query": query}))).ok().and_then(|r| r["deleted"].as_u64()).unwrap_or(0);
+        let resp = c("POST", &uri, Some(json!({"query": query})))?;
+        if let Some(f) = resp["failures"].as_array().and_then(|f| f.first()) {
+            return Err(EsError::new(500, "status_exception", format!("[{target}] delete by query failed: {}", f["cause"]["reason"].as_str().or_else(|| f["reason"].as_str()).unwrap_or("failure"))));
+        }
+        return Ok(resp["deleted"].as_u64().unwrap_or(0));
     }
-    let docs = match search_all(node, target, query, json!(["_doc"])) {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
     let opts = ResolveOpts { ignore_unavailable: true, allow_no_indices: true, expand_open: true, expand_closed: false, expand_hidden: true };
-    let targets = node.resolve(target, opts).unwrap_or_default();
     let mut deleted = 0;
-    let ids: std::collections::HashSet<String> = docs.into_iter().map(|(id, _)| id).collect();
-    for t in targets {
-        let reqs: Vec<WriteReq> = ids.iter().map(|id| WriteReq::Delete { id: id.clone(), routing: None, cond: WriteCond::default() }).collect();
-        for r in t.svc.write(reqs, false) {
-            if let Ok(w) = r {
-                if w.result == "deleted" {
-                    deleted += 1;
+    // `search_all` reads at most 10,000 matches: delete them, refresh, and
+    // search again until nothing matches.
+    loop {
+        let docs = search_all(node, target, query.clone(), json!(["_doc"]))?;
+        if docs.is_empty() {
+            return Ok(deleted);
+        }
+        let ids: std::collections::HashSet<String> = docs.into_iter().map(|(id, _)| id).collect();
+        let mut round = 0;
+        for t in node.resolve(target, opts)? {
+            let reqs: Vec<WriteReq> = ids.iter().map(|id| WriteReq::Delete { id: id.clone(), routing: None, cond: WriteCond::default() }).collect();
+            for r in t.svc.write(reqs, false) {
+                match r {
+                    Ok(w) if w.result == "deleted" => round += 1,
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
                 }
             }
+            t.svc.refresh()?;
         }
-        let _ = t.svc.refresh();
+        if round == 0 {
+            return Err(EsError::new(500, "status_exception", format!("[{target}] delete by query made no progress: {} matches remain", ids.len())));
+        }
+        deleted += round;
     }
-    deleted
 }
 
 /// Delete an index (a job's dedicated results index).

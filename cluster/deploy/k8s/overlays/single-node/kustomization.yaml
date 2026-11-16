@@ -1,4 +1,5 @@
 # One node, `discovery.type: single-node` (no bootstrapping, no PDB).
+#   cluster/deploy/k8s/create-secrets.sh elasticsearch    # certificates + elastic password, once
 #   kubectl apply -k cluster/deploy/k8s/overlays/single-node
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

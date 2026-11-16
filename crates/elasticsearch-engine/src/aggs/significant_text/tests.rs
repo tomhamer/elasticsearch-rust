@@ -36,7 +36,7 @@ fn mapping() -> Value {
 fn execute(f: &Fixture, spec: &Value, docs: &[DocId], visibility: Option<&[DocId]>, partial_mode: bool) -> Result<Value> {
     let leaves = f.index.leaves();
     assert_eq!(leaves.len(), 1);
-    let segs = vec![AggSeg { leaf: leaves[0], lookup: &f.lookup, index: "texts", max_regex_length: 1000, docs: docs.to_vec(), scores: docs.iter().map(|d| *d as f32).collect() }];
+    let segs = vec![AggSeg { shard: 0, leaf: leaves[0], lookup: &f.lookup, index: "texts", index_uuid: "texts", max_regex_length: 1000, docs: docs.to_vec(), scores: docs.iter().map(|d| *d as f32).collect() }];
     let fetch = |si: usize, doc: DocId, _score: f32, _spec: &Value| -> Result<Value> {
         let stored = segs[si].leaf.get_doc(doc).unwrap().expect("fixture document must be stored");
         let raw = stored.get(SOURCE_FIELD).and_then(|v| v.as_text()).expect("fixture must attach production stored _source after parsing");
@@ -55,7 +55,7 @@ fn execute(f: &Fixture, spec: &Value, docs: &[DocId], visibility: Option<&[DocId
         Ok(())
     };
     let all = |si: usize| -> Vec<DocId> { visibility.map(|ds| ds.to_vec()).unwrap_or_else(|| (0..segs[si].leaf.num_docs()).filter(|&d| !segs[si].leaf.is_deleted(d)).collect()) };
-    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65_536, fetch_hit: &fetch, fetch_source: Some(&source), all_docs: &all, background_filtered: visibility.is_some(), top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65_536, fetch_hit: &fetch, fetch_source: Some(&source), all_docs: &all, background_filtered: visibility.is_some(), top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
     if partial_mode {
         let req = partial::AggRequest { aggs: spec.clone(), typed_keys: false, max_buckets: 65_536, now: 0 };
         Ok(partial::shard_partial(spec, &segs, &env, &req, true)?.tree)

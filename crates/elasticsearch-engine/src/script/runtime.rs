@@ -31,7 +31,15 @@ pub struct FnInfo {
 }
 
 pub struct LambdaInfo {
+    /// Parameter slots (in the lambda's own frame).
     pub slots: Vec<usize>,
+    /// Outer locals the body reads, captured by value when the lambda
+    /// expression is evaluated (Painless passes captures to the lambda's
+    /// synthetic method); [`super::value::Closure::captured`] is aligned
+    /// with it.
+    pub captures: Vec<usize>,
+    /// Size of the frame each invocation gets (every slot the body uses).
+    pub frame: usize,
     pub body: ExprFn,
 }
 
@@ -79,6 +87,9 @@ impl std::fmt::Debug for Program {
 
 /// Maximum loop iterations per execution (ES `script.painless.max_loop_counter`).
 pub const MAX_LOOP: u64 = 1_000_000;
+
+/// Fuel units between two cancellation / deadline polls.
+pub const POLL_INTERVAL: u64 = 1024;
 
 /// `ScriptErr::kind` of a script stopped by its search's deadline (ES
 /// `ContextIndexSearcher.TimeExceededException`): the search reports
@@ -144,7 +155,15 @@ pub struct Rt {
     /// Explicit `_source` (painless_execute, update contexts).
     pub source_override: Option<Val>,
     pub emitted: Vec<Val>,
+    /// ES `LoopCounter` of the running function: its loop iterations (every
+    /// loop kind, including the enhanced `for`) against [`MAX_LOOP`]. Each
+    /// function and lambda invocation has its own, as in ES.
     pub loops: u64,
+    /// Execution fuel of the whole run, shared across calls and never
+    /// ES-visible: loop iterations, function and lambda entries and the work
+    /// of expensive built-ins ([`Self::charge`]). Cancellation and the
+    /// deadline are polled each time it crosses a [`POLL_INTERVAL`] boundary.
+    pub fuel: u64,
     /// Search-time cancellation check (`PainlessScript._getCancellationCheck`):
     /// when set, loops poll the request deadline instead of counting
     /// against `max_loop_counter`.
@@ -197,23 +216,47 @@ impl Rt {
     #[inline]
     pub fn tick(&mut self) -> SResult<()> {
         self.loops += 1;
+        self.fuel += 1;
         // `WriterConstants.CANCELLATION_POLL_INTERVAL`-style amortised poll
-        // on the loop counter: the deadline (which covers the task) or, with
+        // on the shared fuel: the deadline (which covers the task) or, with
         // none, the search task's cancellation.
-        if self.loops % 1024 == 0 {
-            let stop = match &self.cancel {
-                Some(c) => c.expired(),
-                None => self.task.as_ref().is_some_and(|t| t.is_cancelled()),
-            };
-            if stop {
-                return Err(ScriptErr::new(TIME_EXCEEDED, "Time exceeded"));
-            }
+        if self.fuel % POLL_INTERVAL == 0 {
+            self.poll()?;
         }
         if self.cancel.is_some() {
             return Ok(());
         }
         if self.loops >= MAX_LOOP {
             return Err(ScriptErr::new("painless_error", "The maximum number of statements that can be executed in a loop has been reached."));
+        }
+        Ok(())
+    }
+
+    /// Charge `units` of built-in work (copies, sorts, joins, bulk
+    /// collection operations) to the execution fuel; polls cancellation and
+    /// the deadline when a poll boundary is crossed. Built-in work does not
+    /// count against `max_loop_counter` (ES counts loop statements only).
+    #[inline]
+    pub fn charge(&mut self, units: u64) -> SResult<()> {
+        if units == 0 {
+            return Ok(());
+        }
+        let before = self.fuel;
+        self.fuel = self.fuel.saturating_add(units);
+        if before / POLL_INTERVAL != self.fuel / POLL_INTERVAL {
+            self.poll()?;
+        }
+        Ok(())
+    }
+
+    #[cold]
+    fn poll(&self) -> SResult<()> {
+        let stop = match &self.cancel {
+            Some(c) => c.expired(),
+            None => self.task.as_ref().is_some_and(|t| t.is_cancelled()),
+        };
+        if stop {
+            return Err(ScriptErr::new(TIME_EXCEEDED, "Time exceeded"));
         }
         Ok(())
     }
@@ -232,7 +275,7 @@ impl Rt {
         let Some(leaf) = self.doc.leaf else { return Ok(Val::Null) };
         self.source=None;
         super::allocation::Scope::collect_dead();
-        let decode=super::allocation::Allocation::new();
+        let decode=super::allocation::Allocation::scalar();
         let mut retained=0u64;
         let stored=if decode.enabled() {
             leaf.get_doc_guarded(doc,|bytes| {
@@ -263,20 +306,21 @@ impl Rt {
     /// Call a lambda / method reference with `args`.
     pub fn call_fn(&mut self, f: &Val, args: &[Val]) -> SResult<Val> {
         match f {
-            Val::Lambda(id) => {
+            Val::Lambda(c) => {
                 // SAFETY: as in `Executor::run` (`prog` is never replaced).
                 let prog: &Program = unsafe { &*Arc::as_ptr(&self.prog) };
-                let l = &prog.lambdas[*id as usize];
+                let l = &prog.lambdas[c.id as usize];
                 if l.slots.len() != args.len() {
                     return Err(illegal_arg(format!("lambda expects {} arguments, got {}", l.slots.len(), args.len())));
                 }
-                for (s, a) in l.slots.iter().zip(args) {
-                    self.set_local(*s, a.clone());
-                }
-                let saved_loops = std::mem::replace(&mut self.loops, 0);
-                let r = (l.body)(self);
-                self.loops = saved_loops;
-                r
+                // ES: a lambda is its own synthetic method with its own loop
+                // counter. Its entry is execution fuel (deadline / cancellation
+                // polling), never counted toward `max_loop_counter`.
+                self.charge(1)?;
+                let (c, args) = (c.clone(), args.to_vec());
+                // Lambdas recurse through callbacks: the same native stack
+                // guard as named functions.
+                self.stack_guard(move |rt| rt.enter_lambda(&c, args))
             }
             Val::MethodRef(r) => {
                 let (class, method) = (&r.0, &r.1);
@@ -313,12 +357,16 @@ impl Rt {
         self.invoke_fn(idx, args)
     }
 
-    pub fn invoke_fn(&mut self, idx: usize, args: Vec<Val>) -> SResult<Val> {
+    /// Run `f` (a script call: named function or lambda) within the native
+    /// stack budget: past [`SOFT_STACK`] the call continues on a dedicated
+    /// big-stack thread, past [`HARD_STACK`] there it fails with
+    /// `stack_overflow_error` (ES reports a script's `StackOverflowError`).
+    pub fn stack_guard(&mut self, f: impl FnOnce(&mut Rt) -> SResult<Val>) -> SResult<Val> {
         let used = self.stack_base.wrapping_sub(stack_pos());
         if used > SOFT_STACK && used < (1 << 40) {
             if !self.on_big_stack {
                 let me = Unsend(self as *mut Rt);
-                let args = Unsend(args);
+                let f = Unsend(f);
                 let allocations = Unsend(super::allocation::Scope::current());
                 let r = std::thread::scope(|sc| {
                     std::thread::Builder::new()
@@ -326,13 +374,13 @@ impl Rt {
                         .spawn_scoped(sc, move || {
                             let allocations = allocations;
                             let _allocations = super::allocation::Scope::install(allocations.0);
-                            let (me, args) = (me, args);
+                            let (me, f) = (me, f);
                             // SAFETY: the parent thread is blocked in `scope` until we return.
                             let rt: &mut Rt = unsafe { &mut *me.0 };
                             let old = rt.stack_base;
                             rt.stack_base = stack_pos();
                             rt.on_big_stack = true;
-                            let r = rt.invoke_fn(idx, args.0);
+                            let r = (f.0)(rt);
                             rt.on_big_stack = false;
                             rt.stack_base = old;
                             Unsend(r)
@@ -348,6 +396,43 @@ impl Rt {
                 return Err(ScriptErr::new("stack_overflow_error", ""));
             }
         }
+        f(self)
+    }
+
+    /// One lambda invocation in its own frame: the captured values and the
+    /// arguments in their slots, the body's locals beside them; the caller's
+    /// frame is untouched and restored on every exit.
+    fn enter_lambda(&mut self, c: &super::value::Closure, args: Vec<Val>) -> SResult<Val> {
+        // SAFETY: as in `Executor::run` (`prog` is never replaced).
+        let prog: &Program = unsafe { &*Arc::as_ptr(&self.prog) };
+        let l = &prog.lambdas[c.id as usize];
+        let saved = self.base;
+        let new_base = self.locals.len();
+        self.locals.resize(new_base + l.frame.max(1), Val::Null);
+        for (s, v) in l.captures.iter().zip(c.captured.iter()) {
+            self.locals[new_base + s] = v.clone();
+        }
+        for (s, a) in l.slots.iter().zip(args) {
+            self.locals[new_base + s] = a;
+        }
+        self.base = new_base;
+        let saved_loops = std::mem::replace(&mut self.loops, 0);
+        let r = (l.body)(self);
+        self.loops = saved_loops;
+        self.locals.truncate(new_base);
+        self.base = saved;
+        r
+    }
+
+    pub fn invoke_fn(&mut self, idx: usize, args: Vec<Val>) -> SResult<Val> {
+        self.stack_guard(move |rt| rt.invoke_fn_body(idx, args))
+    }
+
+    fn invoke_fn_body(&mut self, idx: usize, args: Vec<Val>) -> SResult<Val> {
+        // Function entry is execution fuel: loop-free (branching) recursion
+        // polls the deadline and cancellation, but never counts toward the
+        // ES-visible `max_loop_counter`.
+        self.charge(1)?;
         let prog = self.prog.clone();
         let f = &prog.functions[idx];
         let saved = self.base;
@@ -365,6 +450,7 @@ impl Rt {
                 }
             }
         }
+        // ES `LoopCounter`: each function invocation has its own counter.
         let saved_loops = std::mem::replace(&mut self.loops, 0);
         let r = (f.body)(self);
         self.loops = saved_loops;
@@ -388,6 +474,10 @@ impl Rt {
 /// numeric expressions).
 pub struct Executor {
     pub rt: Rt,
+    /// Breaker-backed allocation accounting of this executor's runs (outside
+    /// an enclosing scripted-metric scope). Declared after `rt`: the values
+    /// it tears down are dropped with `rt` first.
+    accounting: super::allocation::ExecutorAccounting,
 }
 
 // SAFETY: an executor's reference-counted values are created by and only
@@ -430,6 +520,7 @@ impl Executor {
                 source_override: None,
                 emitted: Vec::new(),
                 loops: 0,
+                fuel: 0,
                 cancel: None,
                 task: rustic_core::cancel::current(),
                 stack_base: 0,
@@ -438,6 +529,7 @@ impl Executor {
                 expr_binds: Vec::new(),
                 expr_linked: false,
             },
+            accounting: super::allocation::ExecutorAccounting::default(),
         }
     }
 
@@ -500,6 +592,26 @@ impl Executor {
     #[inline]
     pub fn run(&mut self) -> SResult<Val> {
         self.rt.loops = 0;
+        self.rt.fuel = 0;
+        // A walk cut off outside any run must not fail this one.
+        super::walk::take();
+        // Dependent runtime fields inherit this run's deadline (`DocCtx::runtime_values`).
+        if !self.rt.doc.rt_execs.is_empty() {
+            self.rt.doc.cancel = self.rt.cancel.clone();
+        }
+        let r = self.run_body();
+        // A native walk cut off anywhere in the run fails it (`super::walk`).
+        if super::walk::take() {
+            return Err(super::walk::overflow());
+        }
+        r
+    }
+
+    #[inline]
+    fn run_body(&mut self) -> SResult<Val> {
+        // Collection allocation admission for every script context, not
+        // only scripted metrics (which install their own scope first).
+        let _accounting = self.accounting.enter();
         if !self.rt.on_big_stack {
             self.rt.stack_base = stack_pos();
         }
@@ -640,6 +752,12 @@ pub fn binary(op: BinOp, a: &Val, b: &Val) -> SResult<Val> {
             // since two well-formed strings concatenate to a well-formed one.
             if let (Val::Str(x), Val::Str(y)) = (a, b) {
                 if !super::allocation::Scope::active() {
+                    // Doubling concatenation is admitted before a large
+                    // result is allocated (no-op below 1mb).
+                    let bytes = (x.len() as u64).saturating_add(y.len() as u64);
+                    if bytes > 1 << 20 {
+                        super::allocation::check_string_bytes(bytes)?;
+                    }
                     return Ok(Val::Str(concat_str(x, y)));
                 }
             }
@@ -845,8 +963,9 @@ pub fn coerce(t: &Ty, v: Val) -> SResult<Val> {
         },
         Ty::Double | Ty::Float => match v {
             Val::Double(d) => Ok(Val::Double(if *t == Ty::Float { d as f32 as f64 } else { d })),
-            Val::Int(i) => Ok(Val::Double(i as f64)),
-            Val::Long(l) => Ok(Val::Double(l as f64)),
+            // Java int / long to float conversion rounds once, to single precision.
+            Val::Int(i) => Ok(Val::Double(if *t == Ty::Float { i as f32 as f64 } else { i as f64 })),
+            Val::Long(l) => Ok(Val::Double(if *t == Ty::Float { l as f32 as f64 } else { l as f64 })),
             Val::Char(c) => Ok(Val::Double(c as u32 as f64)),
             Val::Null => Err(npe(format!("cannot assign null to a primitive [{}]", prim_name(t)))),
             other => Err(class_cast(format!("Cannot cast from [{}] to [{}].", java_name(&other), prim_name(t)))),
@@ -976,7 +1095,11 @@ pub fn cast(t: &Ty, v: Val) -> SResult<Val> {
         }
         Ty::Float => {
             num(&v)?;
-            Ok(Val::Double(v.as_f64().unwrap_or(0.0) as f32 as f64))
+            Ok(Val::Double(match v {
+                Val::Int(i) => i as f32 as f64,
+                Val::Long(l) => l as f32 as f64,
+                _ => v.as_f64().unwrap_or(0.0) as f32 as f64,
+            }))
         }
         Ty::Char => match v {
             Val::Str(_) | Val::Utf16(_) if v.string_units().len() == 1 => Ok(Val::Char(v.string_units()[0])),
@@ -1017,7 +1140,9 @@ pub fn iter_values(v: &Val) -> SResult<Vec<Val>> {
         Val::Array { items, .. } => items.borrow().clone(),
         Val::Map(m) => m.borrow().keys().map(Key::to_val).collect(),
         Val::DocValues(d) => d.values.clone(),
-        Val::Stream(s) => s.values.clone(),
+        // A stream with pending operations needs its terminal operation.
+        Val::Stream(s) if s.ops.is_empty() => s.values.clone(),
+        Val::Stream(_) => return Err(class_cast("Cannot cast java.util.stream.Stream to java.lang.Iterable")),
         Val::Str(s) => s.encode_utf16().map(Val::Char).collect(),
         Val::Obj(o) => match &**o {
             super::jmisc::Obj::Field { values, .. } => values.clone(),
@@ -1165,6 +1290,9 @@ pub const STATIC_CLASSES: &[&str] = &[
     "UUID", "StandardCharsets", "Normalizer", "TimeUnit",
     // org.elasticsearch.painless.api.Json (ingest / reindex / update / watcher)
     "Json",
+    // ES SQL's script helpers (`_sql/translate` script sources)
+    "InternalSqlScriptUtils",
+    "InternalQlScriptUtils",
 ];
 
 fn arg_f(args: &[Val], i: usize) -> SResult<f64> {
@@ -1179,8 +1307,28 @@ fn arg_str(args: &[Val], i: usize) -> SResult<String> {
     }
 }
 
+/// Java `Long.parseLong(s, radix)` (one optional sign; a radix outside
+/// 2..=36 is a `NumberFormatException`, never a panic).
 fn parse_int(s: &str, radix: u32) -> SResult<i64> {
-    i64::from_str_radix(s.trim_start_matches('+'), radix).map_err(|_| ScriptErr::new("number_format_exception", format!("For input string: \"{s}\"")))
+    let nfe = |msg: String| ScriptErr::new("number_format_exception", msg);
+    if radix < 2 {
+        return Err(nfe(format!("radix {radix} less than Character.MIN_RADIX")));
+    }
+    if radix > 36 {
+        return Err(nfe(format!("radix {radix} greater than Character.MAX_RADIX")));
+    }
+    let input = || nfe(if radix == 10 { format!("For input string: \"{s}\"") } else { format!("For input string: \"{s}\" under radix {radix}") });
+    let body = s.strip_prefix('+').unwrap_or(s);
+    if body.is_empty() || body.starts_with('+') || (body.len() != s.len() && body.starts_with('-')) || body == "-" {
+        return Err(input());
+    }
+    i64::from_str_radix(body, radix).map_err(|_| input())
+}
+
+/// [`parse_int`] for `Integer` (signed 32-bit range, Java `Integer.parseInt`).
+fn parse_i32(s: &str, radix: u32) -> SResult<i32> {
+    let v = parse_int(s, radix)?;
+    i32::try_from(v).map_err(|_| ScriptErr::new("number_format_exception", if radix == 10 { format!("For input string: \"{s}\"") } else { format!("For input string: \"{s}\" under radix {radix}") }))
 }
 
 /// JDK frames above the script frame for `Integer.parseInt` failures.
@@ -1247,8 +1395,26 @@ pub(super) fn character_char_arguments(method: &str, arity: usize) -> usize {
     }
 }
 
+/// Fuel a built-in spends walking `v` once ([`Rt::charge`]): its element
+/// count (or text length). O(1) to compute.
+pub(crate) fn work_units(v: &Val) -> u64 {
+    match v {
+        Val::List(l) | Val::Set(l) | Val::Array { items: l, .. } => l.borrow().len() as u64,
+        Val::Map(m) => m.borrow().len() as u64,
+        Val::Stream(s) => s.len() as u64,
+        Val::DocValues(d) => d.values.len() as u64,
+        Val::Str(s) => s.len() as u64,
+        Val::Utf16(s) => s.len() as u64,
+        Val::Builder(b) => b.try_borrow().map(|b| b.len() as u64).unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// `Class.method(args)`; `Ok(None)` when the class has no such method.
 pub fn call_static(rt: &mut Rt, class: &str, method: &str, args: Vec<Val>) -> SResult<Option<Val>> {
+    if class == "InternalSqlScriptUtils" || class == "InternalQlScriptUtils" {
+        return super::sql_utils::call(rt, method, args);
+    }
     if super::jtime::CLASSES.contains(&class) {
         if let Some(v) = super::jtime::call_static(rt, class, method, &args)? {
             return Ok(Some(v));
@@ -1259,6 +1425,9 @@ pub fn call_static(rt: &mut Rt, class: &str, method: &str, args: Vec<Val>) -> SR
     }
     if super::jmisc::CLASSES.contains(&class) {
         return super::jmisc::call_static(rt, class, method, &args);
+    }
+    if matches!(class, "Collections" | "Arrays" | "String" | "List" | "Set" | "Map" | "Stream" | "IntStream" | "LongStream" | "DoubleStream" | "Objects") {
+        rt.charge(args.iter().map(work_units).fold(0u64, u64::saturating_add))?;
     }
     let n = args.len();
     if class == "Character" {
@@ -1292,7 +1461,9 @@ pub fn call_static(rt: &mut Rt, class: &str, method: &str, args: Vec<Val>) -> SR
         }
         ("Integer", "parseInt", 2) => {
             let s = arg_str(&args, 0)?;
-            Val::Int(parse_int(&s, args[1].to_i64()? as u32).map_err(|e| e.frames(PARSE_INT_FRAMES))? as i32)
+            let radix = args[1].to_i64()?.clamp(i32::MIN as i64, i32::MAX as i64);
+            let radix = if radix < 0 { 0 } else { radix as u32 };
+            Val::Int(parse_i32(&s, radix).map_err(|e| e.frames(PARSE_INT_FRAMES))?)
         }
         ("Integer", "valueOf", 1) => cast(&Ty::Int, args[0].clone())?,
         ("String", "copyValueOf", 1 | 3) => {
@@ -1409,9 +1580,20 @@ pub fn call_static(rt: &mut Rt, class: &str, method: &str, args: Vec<Val>) -> SR
             let s = arg_str(&args, 0)?;
             let (neg, t) = match s.strip_prefix('-') { Some(r) => (true, r.to_string()), None => (false, s.trim_start_matches('+').to_string()) };
             let (radix, digits) = if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).or_else(|| t.strip_prefix('#')) { (16, r.to_string()) } else if t.len() > 1 && t.starts_with('0') { (8, t[1..].to_string()) } else { (10, t.clone()) };
-            let v = i64::from_str_radix(&digits, radix).map_err(|_| ScriptErr::new("number_format_exception", format!("For input string: \"{digits}\"")))?;
-            let v = if neg { -v } else { v };
-            if class == "Integer" { Val::Int(v as i32) } else { Val::Long(v) }
+            // Java `Integer.decode` / `Long.decode`: the sign belongs to
+            // the value (so MIN_VALUE decodes), and the result must fit
+            // the target type.
+            let bad = || ScriptErr::new("number_format_exception", if radix == 10 { format!("For input string: \"{digits}\"") } else { format!("For input string: \"{digits}\" under radix {radix}") });
+            if digits.is_empty() || digits.starts_with('+') || digits.starts_with('-') {
+                return Err(bad());
+            }
+            let signed = if neg { format!("-{digits}") } else { digits.clone() };
+            let v = i64::from_str_radix(&signed, radix).map_err(|_| bad())?;
+            if class == "Integer" {
+                Val::Int(i32::try_from(v).map_err(|_| bad())?)
+            } else {
+                Val::Long(v)
+            }
         }
         ("Integer", "hashCode", 1) => Val::Int(args[0].to_i64()? as i32),
         ("Long", "hashCode", 1) => Val::Int(Val::Long(args[0].to_i64()?).java_hash()),
@@ -1465,7 +1647,11 @@ pub fn call_static(rt: &mut Rt, class: &str, method: &str, args: Vec<Val>) -> SR
         }.to_digit(args[1].to_i64()? as u32).map(|d| d as i32).unwrap_or(-1)),
         ("Integer", "signum", 1) => Val::Int(args[0].to_i64()?.signum() as i32),
         ("Long", "parseLong", 1) | ("Long", "valueOf", 1) if matches!(args[0], Val::Str(_)) => Val::Long(parse_int(&arg_str(&args, 0)?, 10)?),
-        ("Long", "parseLong", 2) => Val::Long(parse_int(&arg_str(&args, 0)?, args[1].to_i64()? as u32)?),
+        ("Long", "parseLong", 2) => {
+            let radix = args[1].to_i64()?;
+            let radix = if radix < 0 { 0 } else { radix.min(u32::MAX as i64) as u32 };
+            Val::Long(parse_int(&arg_str(&args, 0)?, radix)?)
+        }
         ("Long", "parseUnsignedLong", 1 | 2) => {
             let s = arg_str(&args, 0)?;
             let radix = if args.len() == 2 { args[1].to_i64()? as u32 } else { 10 };
@@ -1493,6 +1679,11 @@ pub fn call_static(rt: &mut Rt, class: &str, method: &str, args: Vec<Val>) -> SR
             Val::Long(((args[0].to_i64()? as u64) % d) as i64)
         }
         ("Long", "valueOf", 1) => cast(&Ty::Long, args[0].clone())?,
+        // `Float.parseFloat` / `Float.valueOf`: one rounding to single precision.
+        ("Float", "parseFloat" | "valueOf", 1) => match &args[0] {
+            Val::Str(s) => Val::Double(s.trim().parse::<f32>().map_err(|_| ScriptErr::new("number_format_exception", format!("For input string: \"{s}\"")))? as f64),
+            other => cast(&Ty::Float, other.clone())?,
+        },
         ("Double" | "Float", "parseDouble" | "parseFloat" | "valueOf", 1) => match &args[0] {
             Val::Str(s) => Val::Double(s.trim().parse::<f64>().map_err(|_| ScriptErr::new("number_format_exception", format!("For input string: \"{s}\"")))?),
             other => cast(&Ty::Double, other.clone())?,
@@ -1710,7 +1901,14 @@ pub fn call_static(rt: &mut Rt, class: &str, method: &str, args: Vec<Val>) -> SR
             if n < 0 {
                 return Err(illegal_arg(format!("List length = {n}")));
             }
-            let allocation = super::allocation::Allocation::values(n as usize)?;
+            // `nCopies(int, T)`: Java's list is a lazy view; this one is
+            // materialised, so it is admitted (and its fill charged as work)
+            // before a single element is allocated.
+            if n > i32::MAX as i64 {
+                return Err(super::allocation::out_of_memory("Java heap space"));
+            }
+            let allocation = super::allocation::Allocation::values_checked(n as u64)?;
+            rt.charge(n as u64)?;
             Val::List(Rc::new(super::value::JList::new(super::value::CollKind::List, vec![args[1].clone(); n as usize]).immutable())).allocated(allocation)
         }
         ("Collections", "reverseOrder", 0) => super::jmisc::reverse_order(None),

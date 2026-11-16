@@ -45,6 +45,8 @@ const EXTRA_KEYS: &[&str] = &[
     "xpack.license.enable_enterprise_features",
     "node.test_modules",
     "_internal.xpack.logsdb",
+    // Opt-in stand-ins for built-in inference models (`none` | `lexical`).
+    "xpack.inference.builtin_fallback",
 ];
 
 /// TLS contexts (`<context>.<key>`), ES `SslConfigurationKeys`.
@@ -183,21 +185,42 @@ pub fn unknown_setting_message(key: &str) -> String {
     }
 }
 
-/// Validate the node settings (keys only), in key order as ES does.
+/// Validate the node settings in key order as ES does
+/// (`AbstractScopedSettings.validate(settings, true)`): each key must be
+/// registered, and a boolean setting's value must parse strictly
+/// (`Booleans.parseBoolean`: `true` / `false` only). A mistyped
+/// `xpack.security.enabled: tru` fails the start instead of reading as
+/// false (and, being set, skipping security auto-configuration).
 pub fn validate_node_settings(settings: &Settings) -> Result<(), ConfigError> {
     if settings.keys().any(|k| k.starts_with("index.") && !is_known(k)) {
         return Err(ConfigError("node settings must not contain any index level settings".into()));
     }
-    match settings.keys().find(|k| !is_known(k)) {
-        Some(key) => Err(ConfigError(unknown_setting_message(key))),
-        None => Ok(()),
+    for (key, value) in settings {
+        if !is_known(key) {
+            return Err(ConfigError(unknown_setting_message(key)));
+        }
+        check_value(key, value)?;
     }
+    Ok(())
+}
+
+/// The value checks of [`validate_node_settings`] alone, for a node started
+/// in-process (its keys are the embedder's).
+pub fn validate_node_values(settings: &Settings) -> Result<(), ConfigError> {
+    settings.iter().try_for_each(|(key, value)| check_value(key, value))
+}
+
+fn check_value(key: &str, value: &serde_json::Value) -> Result<(), ConfigError> {
+    if !value.is_null() && elasticsearch_engine::settings::is_bool_cluster_setting(key) {
+        elasticsearch_engine::settings::bool_value(value).map_err(|e| ConfigError(e.reason))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     fn s(keys: &[&str]) -> Settings {
         keys.iter().map(|k| (k.to_string(), Value::String("x".into()))).collect()
@@ -259,12 +282,44 @@ mod tests {
         for k in ok {
             assert!(is_known(k), "{k} must be accepted");
         }
-        assert!(validate_node_settings(&s(&ok)).is_ok());
+        // (Boolean settings with a boolean value.)
+        let valued: Settings = ok.iter().map(|k| (k.to_string(), Value::String(if elasticsearch_engine::settings::is_bool_cluster_setting(k) { "true" } else { "x" }.into()))).collect();
+        assert!(validate_node_settings(&valued).is_ok());
         // Patterns match whole segments only.
         assert!(!is_known("s3.client.access_key"));
         assert!(!is_known("s3.client.default.acess_key"));
         assert!(!is_known("node.attr"));
         assert!(!is_known("xpack.security.http.ssl.keyy"));
+    }
+
+    /// ES `Booleans.parseBoolean`: a boolean node setting is `true` or
+    /// `false` exactly; a typo, another case, `yes` / `1` fail the start.
+    #[test]
+    fn boolean_node_settings_parse_strictly() {
+        let with = |k: &str, v: Value| -> Settings { [(k.to_string(), v)].into_iter().collect() };
+        for key in [
+            "xpack.security.enabled", "xpack.security.http.ssl.enabled", "xpack.security.transport.ssl.enabled",
+            "xpack.security.authc.realms.file.file1.enabled", "xpack.security.authc.realms.native.native1.enabled",
+            "xpack.security.authc.token.enabled", "xpack.security.authc.api_key.enabled", "xpack.security.enrollment.enabled",
+            "xpack.security.autoconfiguration.enabled", "node.store.allow_mmap", "action.destructive_requires_name",
+            "stateless.enabled", "s3.client.default.path_style_access",
+        ] {
+            for bad in ["tru", "TRUE", "True", "yes", "1", "on", ""] {
+                let e = validate_node_settings(&with(key, Value::String(bad.into()))).unwrap_err().0;
+                assert_eq!(e, format!("Failed to parse value [{bad}] as only [true] or [false] are allowed."), "{key}={bad}");
+                assert!(validate_node_values(&with(key, Value::String(bad.into()))).is_err(), "{key}={bad}");
+            }
+            for good in [Value::String("true".into()), Value::String("false".into()), Value::Bool(true), Value::Bool(false)] {
+                assert!(validate_node_settings(&with(key, good.clone())).is_ok(), "{key}={good}");
+            }
+        }
+        // Not booleans: patterns, enums, node attributes.
+        for (k, v) in [("action.auto_create_index", "+logs*,-*"), ("vectors.indexing.use_gpu", "auto"), ("node.attr.xpack.installed", "yes")] {
+            assert!(validate_node_settings(&with(k, Value::String(v.into()))).is_ok(), "{k}={v}");
+        }
+        // Key order: the first failing key is reported.
+        let two: Settings = [("xpack.security.enabled".to_string(), json!("tru")), ("aa.unknown".to_string(), json!("x"))].into_iter().collect();
+        assert!(validate_node_settings(&two).unwrap_err().0.starts_with("unknown setting [aa.unknown]"));
     }
 
     #[test]

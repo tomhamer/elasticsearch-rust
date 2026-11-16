@@ -146,17 +146,31 @@ fn shard_failure_error(index: &str, failures: &Failures, all_failed: bool) -> (u
 
 /// Search the shards that passed the checkpoint check and report the
 /// others as failed (`allow_partial_search_results: true`).
-fn partial_search(node: &Node, body: &Value, params: &HashMap<String, String>, svc: &Arc<IndexService>, failures: &Failures) -> Result<String, EsError> {
+/// `index`: the request's index or alias; its resolved target (an alias's
+/// filter and routing) is searched on each passing shard, as the ordinary
+/// search through the alias does.
+fn partial_search(node: &Node, body: &Value, params: &HashMap<String, String>, index: &str, svc: &Arc<IndexService>, failures: &Failures, access: Option<&crate::security::access::ReadAccess>) -> Result<String, EsError> {
     let failed: Vec<u32> = failures.iter().map(|f| f.0).collect();
+    let base = node
+        .resolve(index, ResolveOpts { allow_no_indices: false, ..ResolveOpts::default() })
+        .ok()
+        .and_then(|ts| ts.into_iter().find(|t| Arc::ptr_eq(&t.svc, svc)))
+        .unwrap_or_else(|| Target::new(svc.clone()));
     let targets: Vec<Target> = (0..svc.number_of_shards())
         .filter(|n| !failed.contains(n))
         .filter_map(|n| svc.shard(n))
         .map(|s| {
-            let mut t = Target::new(svc.clone());
+            let mut t = base.clone();
             t.shard = Some(s);
+            t.snapshot = None;
             t
         })
         .collect();
+    // The caller's document- and field-level security.
+    let targets = match access {
+        Some(a) => a.apply(targets)?,
+        None => targets,
+    };
     let sreq = search::parse_request(body, params)?;
     let out = search::execute(&targets, &sreq, &ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None })?;
     let total = svc.number_of_shards() as usize;
@@ -172,7 +186,7 @@ fn partial_search(node: &Node, body: &Value, params: &HashMap<String, String>, s
 /// `rest`: on a cluster, the search runs through the coordinator (every
 /// shard from a started copy); the local engine holds only this node's.
 #[allow(clippy::too_many_arguments)]
-fn one_search(node: &Node, body: &Value, params: &HashMap<String, String>, index: &str, checkpoints: &[i64], timeout: Duration, allow_partial: bool, resolve: ResolveOpts, rest: Option<&crate::ClusterRestRaw>) -> Result<(u16, String), (u16, Value)> {
+fn one_search(node: &Node, body: &Value, params: &HashMap<String, String>, index: &str, checkpoints: &[i64], timeout: Duration, allow_partial: bool, resolve: ResolveOpts, rest: Option<&crate::ClusterRestRaw>, access: Option<&crate::security::access::ReadAccess>) -> Result<(u16, String), (u16, Value)> {
     let err = |e: EsError| (e.status, e.error_object(false));
     if !checkpoints.is_empty() {
         let (svc, failures) = check_checkpoints(node, index, checkpoints, timeout).map_err(err)?;
@@ -181,12 +195,12 @@ fn one_search(node: &Node, body: &Value, params: &HashMap<String, String>, index
             if all || !allow_partial {
                 return Err(shard_failure_error(&svc.name, &failures, all));
             }
-            return partial_search(node, body, params, &svc, &failures).map(|body| (200, body)).map_err(err);
+            return partial_search(node, body, params, index, &svc, &failures, access).map(|body| (200, body)).map_err(err);
         }
     }
     match rest {
         Some(rest) => (rest.0)("POST", &crate::search_api::coordinator_search_uri(index, params), Some(body.clone())).map_err(err),
-        None => run_search(node, body, params, Some(index), resolve, None).map(|body| (200, body)).map_err(err),
+        None => run_search(node, body, params, Some(index), resolve, access).map(|body| (200, body)).map_err(err),
     }
 }
 
@@ -209,7 +223,7 @@ fn fleet_search(node: &Node, req: &Req, index: &str) -> R {
     }
     let body = req.json()?;
     let params = search_params(req);
-    match one_search(node, &body, &params, index, &checkpoints, timeout, allow_partial, ResolveOpts::from_params(&req.params), req.extensions.get::<crate::ClusterRestRaw>()) {
+    match one_search(node, &body, &params, index, &checkpoints, timeout, allow_partial, ResolveOpts::from_params(&req.params), req.extensions.get::<crate::ClusterRestRaw>(), req.access.as_deref()) {
         Ok((status, s)) => Ok(Resp::raw(status, s)),
         Err((status, e)) => Ok(Resp::json(status, json!({"error": e, "status": status}))),
     }
@@ -270,7 +284,9 @@ fn fleet_msearch(node: &Node, req: &Req, index: Option<&str>) -> R {
         if let Some(o) = header.as_object() {
             for (k, v) in o {
                 match k.as_str() {
-                    "ignore_unavailable" | "allow_no_indices" | "expand_wildcards" => {
+                    // The item's shard selection and search options, as an
+                    // `_msearch` item keeps them (ES `MultiSearchRequest`).
+                    "ignore_unavailable" | "allow_no_indices" | "expand_wildcards" | "routing" | "preference" | "search_type" | "request_cache" | "ccs_minimize_roundtrips" => {
                         hp.insert(k.clone(), elasticsearch_engine::query::dsl::scalar_string(v));
                     }
                     "allow_partial_search_results" => {
@@ -283,7 +299,7 @@ fn fleet_msearch(node: &Node, req: &Req, index: Option<&str>) -> R {
         }
         let resolve = ResolveOpts::from_params(&hp);
         let target = idx.unwrap_or_else(|| "_all".to_string());
-        match one_search(node, &body, &hp, &target, &cps, DEFAULT_TIMEOUT, allow_partial, resolve, req.extensions.get::<crate::ClusterRestRaw>()) {
+        match one_search(node, &body, &hp, &target, &cps, DEFAULT_TIMEOUT, allow_partial, resolve, req.extensions.get::<crate::ClusterRestRaw>(), req.access.as_deref()) {
             Ok((status, s)) => {
                 let s = elasticsearch_engine::source_json::with_member(&s, "status", &status.to_string(), false)
                     .ok_or_else(|| EsError::internal("unreadable fleet search response"))?;
@@ -423,5 +439,86 @@ mod secret_cluster_tests {
         let node = Node::open(dir.path()).unwrap();
         let req = request(crate::ClusterRest(Arc::new(|_, _, _| panic!("invalid request reached cluster"))), json!({"value":42}));
         assert_eq!(post_secret(&node, &req).err().unwrap().status, 400);
+    }
+}
+
+#[cfg(test)]
+mod partial_alias_tests {
+    use super::*;
+
+    /// #392: the partial-checkpoint fallback searches the passing shards
+    /// through the alias's filter, as the ordinary search does.
+    #[test]
+    fn partial_checkpoint_search_keeps_the_alias_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let svc = node.create_index("ev", &json!({"settings": {"number_of_shards": 2, "number_of_replicas": 0},
+            "mappings": {"properties": {"status": {"type": "keyword"}}}, "aliases": {"failed": {"filter": {"term": {"status": "failed"}}}}})).unwrap();
+        let reqs = (0..40)
+            .map(|i| elasticsearch_engine::index::WriteReq::Index { id: Some(format!("d{i}")), source: json!({"status": if i % 2 == 0 { "failed" } else { "ok" }}).to_string(), routing: None, cond: Default::default() })
+            .collect();
+        for r in svc.write(reqs, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let body = json!({"query": {"match_all": {}}, "size": 100, "track_total_hits": true});
+        let failures: Failures = vec![(0, "timed out".to_string())];
+        let out: Value = serde_json::from_str(&partial_search(&node, &body, &HashMap::new(), "failed", &svc, &failures, None).unwrap()).unwrap();
+        let hits = out["hits"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{out}");
+        for h in hits {
+            let id: u32 = h["_id"].as_str().unwrap()[1..].parse().unwrap();
+            assert_eq!(id % 2, 0, "alias filter lost: {out}");
+        }
+        assert_eq!(out["_shards"]["failed"], 1);
+    }
+}
+
+#[cfg(test)]
+mod msearch_routing_tests {
+    use super::*;
+
+    /// #334: a Fleet multi-search item's `routing` and `preference` select
+    /// shards as the same search with those parameters does.
+    #[test]
+    fn items_keep_routing_and_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let svc = node.create_index("ev", &json!({"settings": {"number_of_shards": 2, "number_of_replicas": 0}})).unwrap();
+        let reqs = (0..20)
+            .map(|i| elasticsearch_engine::index::WriteReq::Index { id: Some(format!("d{i}")), source: json!({"n": i}).to_string(), routing: Some(format!("r{i}")), cond: Default::default() })
+            .collect();
+        for r in svc.write(reqs, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let ids = |v: &Value| -> Vec<String> {
+            let mut ids: Vec<String> = v["hits"]["hits"].as_array().unwrap_or_else(|| panic!("{v}")).iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect();
+            ids.sort();
+            ids
+        };
+        let body = json!({"query": {"match_all": {}}, "size": 50});
+        for (key, value) in [("routing", "r3"), ("preference", "_shards:0"), ("preference", "_shards:1")] {
+            let mut params = HashMap::new();
+            params.insert(key.to_string(), value.to_string());
+            let want: Value = serde_json::from_str(&run_search(&node, &body, &params, Some("ev"), ResolveOpts::default(), None).unwrap()).unwrap();
+            // Routing is the closure case; the single-node `run_search`
+            // ignores `_shards:` preference, so those items only check the
+            // header reaches the search unchanged.
+            if key == "routing" {
+                assert!(ids(&want).len() < 20, "{key}={value} selects a shard");
+            }
+            let ndjson = format!("{}\n{}\n", json!({"index": "ev", key: value}), body);
+            let req = Req { method: Method::POST, path: "/_fleet/_fleet_msearch".into(), segs: vec!["_fleet".into(), "_fleet_msearch".into()], params: Default::default(),
+                body: ndjson.into_bytes().into(), headers: Default::default(), access: None, extensions: axum::http::Extensions::new(), api_version: crate::RestApiVersion::V9 };
+            let resp = fleet_msearch(&node, &req, None).unwrap();
+            let text = match resp.body {
+                crate::RespBody::Json(v) => v.to_string(),
+                crate::RespBody::Raw(s) => s,
+                _ => panic!("unexpected response body"),
+            };
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(ids(&v["responses"][0]), ids(&want), "{key}={value}: {v}");
+        }
     }
 }

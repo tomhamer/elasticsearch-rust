@@ -7,7 +7,7 @@
 
 use elasticsearch_cluster::allocation::{AllocationService, ClusterInfo, FailedShard, ShardStoreInfo, StartedShard};
 use elasticsearch_cluster::coordination::{StateTask, StateUpdater};
-use elasticsearch_cluster::state::{ClusterState, DiscoveryNode, IndexState, Metadata};
+use elasticsearch_cluster::state::{ClusterState, DiscoveryNode, IndexMetadata, IndexState, Metadata};
 use crate::store_records::StoreCache;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -41,16 +41,7 @@ impl MasterCtx {
         let mut info = self.cluster_info.lock().clone();
         info.placement_memory=std::mem::take(&mut placement.values);
         info.memory_pressure=std::mem::take(&mut pressured.values);
-        let mut stores = ShardStoreInfo::from_routing(state);
-        for (node_id, copies) in self.stores.lock().iter() {
-            // Only copies of the index generation the state knows about.
-            for c in copies.iter().filter(|c| state.metadata.indices.get(c.index.as_str()).map(|m| m.uuid == c.index_uuid).unwrap_or(false)) {
-                if !state.nodes.contains_key(node_id) {
-                    continue;
-                }
-                stores.add_copy(&c.index, c.shard, node_id, Some(&c.allocation_id), c.primary);
-            }
-        }
+        let stores = self.store_info(state);
         let mut next = self.allocation.reroute(state, now_millis(), &info, &stores);
         // DiskThresholdMonitor changes belong to the same ordered publication
         // as allocation. Allocation alone only moves shards; it does not stop
@@ -64,6 +55,41 @@ impl MasterCtx {
         }
         elasticsearch_cluster::allocation::patch_versions(state, &mut next);
         next
+    }
+
+    /// What the data nodes hold (ES `GatewayAllocator`'s fetched shard
+    /// stores): the routing table's copies, the copies the last store
+    /// listing found, and the copies whose store is marked corrupted (with
+    /// their store exception).
+    pub fn store_info(&self, state: &ClusterState) -> ShardStoreInfo {
+        let mut stores = ShardStoreInfo::from_routing(state);
+        for (node_id, copies) in self.stores.lock().iter() {
+            // Only copies of the index generation the state knows about.
+            for c in copies.iter().filter(|c| state.metadata.indices.get(c.index.as_str()).map(|m| m.uuid == c.index_uuid).unwrap_or(false)) {
+                if !state.nodes.contains_key(node_id) {
+                    continue;
+                }
+                stores.add_copy(&c.index, c.shard, node_id, Some(&c.allocation_id), c.primary);
+            }
+        }
+        // Copies whose store is marked corrupted: listed with a store
+        // exception, never chosen as a primary (ES drops them from the
+        // primary candidates; a single-copy shard stays red).
+        {
+            let cache = self.stores.lock();
+            let listed = cache.corrupted.iter().flat_map(|(node, v)| v.iter().map(move |c| (node, c)));
+            for (node_id, c) in listed.chain(cache.noted.iter().map(|(_, node, c)| (node, c))) {
+                if !state.nodes.contains_key(node_id) || state.metadata.indices.get(c.index.as_str()).is_none_or(|m| m.uuid != c.index_uuid) {
+                    continue;
+                }
+                // A copy recovered there since has another allocation id.
+                if stores.copies(&c.index, c.shard).iter().any(|s| &s.node_id == node_id && s.allocation_id.as_deref() != Some(c.allocation_id.as_str())) {
+                    continue;
+                }
+                stores.add_store_exception(&c.index, c.shard, node_id, Some(&c.allocation_id), &c.reason);
+            }
+        }
+        stores
     }
 }
 
@@ -149,6 +175,21 @@ pub fn shard_failed_task(ctx: Arc<MasterCtx>, failed: FailedShard, reporter_term
     })
 }
 
+/// ES `Property.Final` on `index.number_of_shards`: a published change
+/// never alters the shard count of an existing incarnation (open or
+/// closed). Shard engines treat the shards beyond a smaller count as
+/// removed and delete their files; resizing goes through shrink / split /
+/// clone, which create a new incarnation.
+fn check_shard_count_unchanged(name: &str, cur: &IndexMetadata, next: &IndexMetadata) -> Result<(), String> {
+    if cur.uuid == next.uuid && cur.number_of_shards != next.number_of_shards {
+        return Err(format!(
+            "final index setting [index.number_of_shards], not updateable: [{name}] has [{}] shards, the change publishes [{}]",
+            cur.number_of_shards, next.number_of_shards
+        ));
+    }
+    Ok(())
+}
+
 /// Publish metadata computed by the master's engine (see `mirror::extract`)
 /// and adjust the routing table: new / deleted / opened / closed indices
 /// and replica-count changes.
@@ -166,6 +207,7 @@ pub fn metadata_task(ctx: Arc<MasterCtx>, md: Metadata) -> StateTask {
         // the master's engine was extracted against.
         for (name, im) in new_md.indices.iter_mut() {
             if let Some(cur) = s.metadata.indices.get(name).filter(|c| c.uuid == im.uuid) {
+                check_shard_count_unchanged(name, cur, im)?;
                 im.primary_terms = cur.primary_terms.clone();
                 im.in_sync_allocation_ids = cur.in_sync_allocation_ids.clone();
                 im.routing_num_shards = cur.routing_num_shards;
@@ -250,6 +292,7 @@ pub fn engine_metadata_task(ctx: Arc<MasterCtx>, delta: crate::mirror::MetadataD
                     // the state the change was computed against.
                     match s.metadata.indices.get(name).filter(|c| c.uuid == im.uuid) {
                         Some(cur) => {
+                            check_shard_count_unchanged(name, cur, &im)?;
                             im.primary_terms = cur.primary_terms.clone();
                             im.in_sync_allocation_ids = cur.in_sync_allocation_ids.clone();
                             im.routing_num_shards = cur.routing_num_shards;
@@ -348,5 +391,38 @@ mod tests {
         let next = engine_metadata_task(ctx, delta)(&base).expect("applies on its base");
         assert_eq!(next.metadata.indices["a"].mapping_version, 2);
         assert_eq!(next.metadata.version, base.metadata.version + 1);
+    }
+
+    /// Review #84: a published change never shrinks (or grows) the shard
+    /// count of an existing incarnation, closed or open: the shard engines
+    /// would delete the shards beyond the new count.
+    #[test]
+    fn a_shard_count_change_of_an_existing_index_is_never_published() {
+        let ctx = Arc::new(MasterCtx::new(Default::default()));
+        let mut base = ClusterState::empty("c");
+        let mut two = im("a", "u1");
+        two.state = IndexState::Close;
+        two.number_of_shards = 2;
+        two.primary_terms = vec![1, 1];
+        base.metadata.indices.insert("a".into(), two.clone());
+        let mut shrunk = two.clone();
+        shrunk.number_of_shards = 1;
+        shrunk.settings_version += 1;
+        let mut delta = MetadataDelta::default();
+        delta.indices.insert("a".into(), Some(shrunk.clone()));
+        delta.expect_base(&base.metadata);
+        let err = engine_metadata_task(ctx.clone(), delta)(&base).unwrap_err();
+        assert!(err.starts_with("final index setting [index.number_of_shards], not updateable"), "{err}");
+        let mut md = base.metadata.clone();
+        md.indices.insert("a".into(), shrunk);
+        let err = metadata_task(ctx.clone(), md)(&base).unwrap_err();
+        assert!(err.starts_with("final index setting [index.number_of_shards], not updateable"), "{err}");
+        // The same incarnation with its count unchanged still publishes.
+        let mut touched = two;
+        touched.settings_version += 1;
+        let mut delta = MetadataDelta::default();
+        delta.indices.insert("a".into(), Some(touched));
+        delta.expect_base(&base.metadata);
+        assert!(engine_metadata_task(ctx, delta)(&base).is_ok());
     }
 }

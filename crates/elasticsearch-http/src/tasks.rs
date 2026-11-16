@@ -12,6 +12,11 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The cluster parent task of a by-query / reindex request a cluster node
+/// runs on this engine as a child (set by the cluster only: client
+/// requests have it stripped).
+pub const CLUSTER_PARENT_HEADER: &str = "x-es-cluster-parent-task";
+
 /// Global endpoints: `/_tasks...`, `/_reindex...`, `/_update_by_query/{id}/_rethrottle`, `/_delete_by_query/{id}/_rethrottle`.
 pub async fn handle(node: Arc<Node>, req: Req) -> R {
     let a = req.seg(0).to_string();
@@ -73,7 +78,7 @@ fn opaque_headers(req: &Req) -> Map<String, Value> {
 /// ES `reindex.remote.whitelist` (a node setting: a list or a comma
 /// separated string of `host:port` patterns). `ES_REINDEX_REMOTE_WHITELIST`
 /// adds patterns too (older launchers and fixtures set it).
-fn remote_whitelist(node: &Node) -> Vec<String> {
+pub fn remote_whitelist(node: &Node) -> Vec<String> {
     let split = |s: &str| s.split(',').map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
     let mut out = match node.node_settings.read().get("reindex.remote.whitelist") {
         Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).flat_map(split).collect(),
@@ -102,6 +107,10 @@ async fn run(node: Arc<Node>, req: Req, index: Option<String>, kind: Kind) -> R 
             Some(i) => reindex::parse_by_query(kind, i, &body, &req.params).map_err(|e| elasticsearch_engine::jsonpos::resolve(e, canon.as_bytes()))?,
         };
         r.raw_script=raw.as_ref().and_then(|r|r.get("script")).cloned();
+        // Lookups inside the query read their index as the caller.
+        if let Some(access) = req.access.clone() {
+            r.lookup_access = Some(reindex::LookupAccess(std::sync::Arc::new(move |concrete: &str, requested: &str| access.lookup_access(concrete, requested))));
+        }
         if kind == Kind::DeleteByQuery && r.query.is_none() {
             return Err(EsError::action_validation(&["query is missing"]));
         }
@@ -121,7 +130,14 @@ async fn run(node: Arc<Node>, req: Req, index: Option<String>, kind: Kind) -> R 
         } else if r.source != "_all" {
             node.resolve(&r.source, r.resolve)?;
         }
-        let task = node.tasks.register(kind.action(), Some(r.description()), true, !wait, opaque_headers(&req));
+        // A child of a cluster task (a per-shard request of a by-query
+        // fan-out): registered with its parent's id, as ES creates child
+        // tasks with their parent, so the cluster links exactly its own.
+        let parent = req.headers.get(CLUSTER_PARENT_HEADER).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()).map(str::to_string);
+        // Registered under the breaker (its metadata is charged to the task).
+        let headers: Vec<(String, String)> = opaque_headers(&req).into_iter().filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string()))).collect();
+        let description = r.description();
+        let task = node.tasks.try_register_borrowed(kind.action(), Some(&description), true, !wait, &headers, parent.as_deref())?;
         task.set_rps(r.rps);
         if wait {
             let res = reindex::execute(&node, &r, &task);
@@ -130,25 +146,51 @@ async fn run(node: Arc<Node>, req: Req, index: Option<String>, kind: Kind) -> R 
             return Ok(Resp::json(status, v));
         }
         let id = task.task_id();
-        let n = node.clone();
-        std::thread::Builder::new()
-            .name("es-bulk-by-scroll".into())
-            .spawn(move || {
-                let res = reindex::execute(&n, &r, &task);
-                let outcome = match res {
-                    Ok((_, mut v)) => {
-                        reindex::with_human(&mut v);
-                        Ok(v)
-                    }
-                    Err(e) => Err(error_body(&e)),
-                };
-                n.tasks.finish(&task, outcome.clone());
-                store_task_doc(&n, &task, outcome);
-            })
-            .map_err(|e| EsError::internal(format!("failed to start task: {e}")))?;
+        // The job runs on the bounded background-job gate (ES runs it as a
+        // task on its `generic` pool), never on a thread of its own. Its
+        // owner finishes the task however the job ends: run, panicked, or
+        // dropped unrun by the gate.
+        let mut owner = JobOwner { node: node.clone(), task: task.clone(), done: false };
+        let job = Box::new(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reindex::execute(&owner.node, &r, &owner.task)));
+            let outcome = match res {
+                Ok(Ok((_, mut v))) => {
+                    reindex::with_human(&mut v);
+                    Ok(v)
+                }
+                Ok(Err(e)) => Err(error_body(&e)),
+                Err(_) => Err(error_body(&EsError::internal("the task failed unexpectedly"))),
+            };
+            owner.done = true;
+            owner.node.tasks.finish(&owner.task, outcome.clone());
+            store_task_doc(&owner.node, &owner.task, outcome);
+        });
+        if let Err(e) = crate::pools::background_jobs().submit(job) {
+            // Rejected before it started: no task stays behind (the job,
+            // dropped unrun, already took its registration back).
+            node.tasks.discard(&task);
+            return Err(e);
+        }
         Ok(Resp::ok(json!({ "task": id })))
     })
     .await
+}
+
+/// A background job's hold on its task: a job dropped without running
+/// (rejected, or stranded by an executor that refused it) takes its
+/// registration back, so no task is left running forever.
+struct JobOwner {
+    node: Arc<Node>,
+    task: Arc<Task>,
+    done: bool,
+}
+
+impl Drop for JobOwner {
+    fn drop(&mut self) {
+        if !self.done {
+            self.node.tasks.discard(&self.task);
+        }
+    }
 }
 
 /// Persist a finished `wait_for_completion=false` task in the `.tasks` index, as ES does.
@@ -165,9 +207,17 @@ fn store_task_doc(node: &Node, task: &Task, outcome: Result<Value, Value>) {
         Ok(v) => doc.insert("response".into(), v),
         Err(e) => doc.insert("error".into(), e),
     };
+    let sink = node.task_result_sink.read().clone();
+    if let Some(sink) = sink {
+        // A cluster's engine: stored cluster-wide by the cluster layer.
+        sink(task.id, Value::Object(doc));
+        return;
+    }
     let Ok(svc) = node.write_index(".tasks", true) else { return };
     let src = Value::Object(doc).to_string();
     let _ = svc.write(vec![elasticsearch_engine::index::WriteReq::Index { id: Some(task.task_id()), source: src, routing: None, cond: Default::default() }], true);
+    // As ES's `TaskResultsService` indexes it: a replicated write.
+    let _ = node.await_replicated(&svc);
 }
 
 fn error_body(e: &EsError) -> Value {
@@ -298,8 +348,18 @@ fn get(node: &Node, req: &Req, id: &str) -> R {
             };
             Ok(Resp::ok(Value::Object(m)))
         }
-        None => Err(not_stored(id)),
+        // Gone from memory (a restart): the result stored in `.tasks`
+        // (ES `TransportGetTaskAction.getFinishedTaskFromIndex`).
+        None => stored_task_doc(node, id).map(Resp::ok).ok_or_else(|| not_stored(id)),
     }
+}
+
+/// Task `id`'s document in `.tasks`, if stored.
+fn stored_task_doc(node: &Node, id: &str) -> Option<Value> {
+    let svc = node.get_index(".tasks")?;
+    let doc = svc.get(id).ok()??;
+    let v: Value = serde_json::from_str(doc.source.as_deref()?).ok()?;
+    v.is_object().then_some(v)
 }
 
 const REINDEX_ACTION: &str = "indices:data/write/reindex";

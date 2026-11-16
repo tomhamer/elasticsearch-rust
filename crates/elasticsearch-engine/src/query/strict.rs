@@ -169,7 +169,9 @@ fn typed(name: &str, k: &str, v: &Value, style: Style) -> Result<()> {
             if NUM_FIELDS.contains(&k) {
                 return Err(EsError::jackson_type(k, within, v, "not numeric, can not use numeric value accessors"));
             }
-            if BOOL_FIELDS.contains(&k) {
+            // `span_not.include` is a span query (`include` is a boolean on
+            // more_like_this only).
+            if BOOL_FIELDS.contains(&k) && !(k == "include" && name == "span_not") {
                 return Err(EsError::jackson_type(k, within, v, "not of boolean type"));
             }
             match (name, k) {

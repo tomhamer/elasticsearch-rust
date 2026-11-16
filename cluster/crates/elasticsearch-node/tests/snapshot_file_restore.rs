@@ -471,6 +471,54 @@ async fn corrupt_snapshot_files_fail_the_restore_and_no_copy_starts() {
     three.ok(0, Method::DELETE, "/c", None).await;
 }
 
+/// Production review #130: a restore planned over a closed index replaces
+/// only that incarnation, still closed. Opened and written after the plan
+/// was validated, or deleted and re-created under the name and written,
+/// the live index and its acknowledged writes stay; the restore fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_never_replaces_an_index_that_changed_after_its_plan() {
+    let _serial = SERIAL.lock().await;
+    let three = start("sfr-closed-race").await;
+    three.vector_index("cr", 1, 0).await;
+    three.bulk("cr", 0..100).await;
+    three.snapshot("snap", "cr").await;
+    for case in ["reopened", "recreated"] {
+        three.ok(0, Method::POST, "/cr/_close", None).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (e, r) = (entered.clone(), release.clone());
+        *elasticsearch_node::snapshot_api::restore::BEFORE_CLOSED_REPLACEMENT.lock() = Some(Arc::new(move || {
+            let (e, r) = (e.clone(), r.clone());
+            Box::pin(async move {
+                e.notify_one();
+                r.notified().await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        }));
+        let interfere = async {
+            tokio::time::timeout(Duration::from_secs(30), entered.notified()).await.expect("the restore reaches its replacement");
+            if case == "reopened" {
+                three.ok(0, Method::POST, "/cr/_open", None).await;
+            } else {
+                three.ok(0, Method::DELETE, "/cr", None).await;
+                three.vector_index("cr", 1, 0).await;
+            }
+            three.green("cr", 1).await;
+            three.bulk("cr", 1000..1050).await;
+            three.ok(0, Method::POST, "/cr/_refresh", None).await;
+            release.notify_one();
+        };
+        let ((st, v), ()) = tokio::join!(three.restore("snap", json!({"indices": "cr"})), interfere);
+        *elasticsearch_node::snapshot_api::restore::BEFORE_CLOSED_REPLACEMENT.lock() = None;
+        assert!(st >= 400 || v["snapshot"]["shards"]["failed"].as_u64().unwrap_or(0) > 0, "{case}: the restore must fail: {st} {v}");
+        assert!(v.to_string().contains("cr"), "{case}: {v}");
+        let v = three.ok(0, Method::GET, "/cr/_count", None).await;
+        let want = if case == "reopened" { 150 } else { 50 };
+        assert_eq!(v["count"], want, "{case}: the live index and its writes survive: {v}");
+        let v = three.ok(0, Method::GET, "/cr/_doc/d1049", None).await;
+        assert_eq!(v["found"], true, "{case}: {v}");
+    }
+}
+
 /// Restoring over a closed index replaces it with the snapshot's data: the
 /// documents written after the snapshot are gone, the index is open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -584,4 +632,139 @@ async fn recovery_apis_report_the_snapshot_restore_of_every_shard() {
         assert_eq!((row["repository"].as_str(), row["snapshot"].as_str()), (Some("repo"), Some("snap")), "{row}");
         assert_eq!((row["files_percent"].as_str(), row["bytes_percent"].as_str()), (Some("100.0%"), Some("100.0%")), "{row}");
     }
+}
+
+/// Production review #377, #378, #379 on a cluster:
+/// - a global-state restore replaces composable templates (a template
+///   created after the snapshot is gone afterwards);
+/// - a restored index is created from the snapshot's metadata only: a
+///   current template's alias and pipeline are not added;
+/// - the snapshot's ILM policies are installed before restored indices
+///   resume their lifecycle (a destination policy under the same name that
+///   would delete at once never acts on them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_uses_the_snapshot_templates_and_policies() {
+    let _serial = SERIAL.lock().await;
+    let three = start("sfr-global").await;
+    three.ok(0, Method::PUT, "/_cluster/settings", Some(json!({"persistent": {"indices.lifecycle.poll_interval": "1s"}}))).await;
+    three.ok(0, Method::PUT, "/_ilm/policy/keep", Some(json!({"policy": {"phases": {"hot": {"actions": {}}, "delete": {"min_age": "30d", "actions": {"delete": {}}}}}}))).await;
+    three.ok(0, Method::PUT, "/_index_template/tpl-a", Some(json!({"index_patterns": ["gs-*"], "priority": 10, "template": {"settings": {"number_of_replicas": 0}}}))).await;
+    three.ok(0, Method::PUT, "/orig", Some(json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.lifecycle.name": "keep"}}))).await;
+    three.green("orig", 1).await;
+    three.ndjson(format!("{}\n{}\n", json!({"index": {"_index": "orig", "_id": "1"}}), json!({"n": 1}))).await;
+    let v = three.ok(0, Method::PUT, "/_snapshot/repo/gsnap?wait_for_completion=true", Some(json!({"indices": "orig", "include_global_state": true}))).await;
+    assert_eq!(v["snapshot"]["state"], "SUCCESS", "{v}");
+    // After the snapshot: a newer template, a template for the restored
+    // name with an alias and a pipeline, and a destructive same-name policy.
+    three.ok(0, Method::PUT, "/_index_template/tpl-new", Some(json!({"index_patterns": ["gs-*"], "priority": 100, "template": {"settings": {"number_of_replicas": 0}}}))).await;
+    three.ok(0, Method::PUT, "/_ingest/pipeline/tag", Some(json!({"processors": [{"set": {"field": "tagged", "value": true}}]}))).await;
+    three.ok(0, Method::PUT, "/_index_template/live", Some(json!({"index_patterns": ["arch-*"], "priority": 50, "template": {"aliases": {"live-read": {}}, "settings": {"index.default_pipeline": "tag"}}}))).await;
+    three.ok(0, Method::PUT, "/_ilm/policy/keep", Some(json!({"policy": {"phases": {"hot": {"actions": {}}, "delete": {"min_age": "0ms", "actions": {"delete": {}}}}}}))).await;
+    three.ok(0, Method::DELETE, "/orig", None).await;
+    // #378: a renamed restore without aliases, no global state. Without
+    // the snapshot's policies the restored copy would follow the
+    // destination's `keep` (delete at 0ms, polled every second) and could be
+    // deleted while this part waits for it (a race, as in ES): its
+    // lifecycle is left out here; the global-state restore below covers it.
+    let (st, v) = three.restore("gsnap", json!({"indices": "orig", "rename_pattern": "orig", "rename_replacement": "arch-orig", "include_aliases": false, "ignore_index_settings": ["index.lifecycle.name"]})).await;
+    assert_eq!(st, 200, "{v}");
+    three.green("arch-orig", 1).await;
+    let v = three.ok(0, Method::GET, "/arch-orig", None).await;
+    assert_eq!(v["arch-orig"]["aliases"], json!({}), "no current template alias: {v}");
+    assert!(v["arch-orig"]["settings"]["index"].get("default_pipeline").is_none(), "no current template pipeline: {v}");
+    three.ok(0, Method::DELETE, "/arch-orig", None).await;
+    // #377 + #379: global-state restore.
+    let (st, v) = three.restore("gsnap", json!({"indices": "orig", "include_global_state": true})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, _) = three.call(0, Method::GET, "/_index_template/tpl-new", None).await;
+    assert_eq!(st, 404, "a template created after the snapshot is replaced away");
+    three.ok(0, Method::GET, "/_index_template/tpl-a", None).await;
+    let v = three.ok(0, Method::GET, "/_ilm/policy/keep", None).await;
+    assert_eq!(v["keep"]["policy"]["phases"]["delete"]["min_age"], json!("30d"), "{v}");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let v = three.ok(0, Method::GET, "/orig/_count", None).await;
+    assert_eq!(v["count"], 1, "the restored index was not deleted by the destination's policy: {v}");
+}
+
+/// Production review #381: a snapshot an active restore still reads cannot
+/// be deleted (SLM retention included); once the restore finished it can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_deletion_waits_for_an_active_restore() {
+    let _serial = SERIAL.lock().await;
+    let three = start("sfr-del-restore").await;
+    three.vector_index("rs", 1, 0).await;
+    three.bulk("rs", 0..50).await;
+    three.snapshot("snap", "rs").await;
+    three.ok(0, Method::DELETE, "/rs", None).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (e, r) = (entered.clone(), release.clone());
+    *elasticsearch_node::snapshot_api::restore::BEFORE_RESTORE_INDEX.lock() = Some(Arc::new(move || {
+        let (e, r) = (e.clone(), r.clone());
+        Box::pin(async move {
+            e.notify_one();
+            r.notified().await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    }));
+    let interfere = async {
+        tokio::time::timeout(Duration::from_secs(30), entered.notified()).await.expect("the restore starts");
+        let (st, v) = three.call(1, Method::DELETE, "/_snapshot/repo/snap", None).await;
+        release.notify_one();
+        (st, v)
+    };
+    let ((st, v), (dst, dv)) = tokio::join!(three.restore("snap", json!({"indices": "rs"})), interfere);
+    *elasticsearch_node::snapshot_api::restore::BEFORE_RESTORE_INDEX.lock() = None;
+    assert_eq!((dst, dv["error"]["type"].as_str()), (503, Some("concurrent_snapshot_execution_exception")), "{dv}");
+    assert_eq!(st, 200, "the restore completes: {v}");
+    three.green("rs", 1).await;
+    let v = three.ok(0, Method::GET, "/rs/_count", None).await;
+    assert_eq!(v["count"], 50, "{v}");
+    three.ok(0, Method::DELETE, "/_snapshot/repo/snap", None).await;
+}
+
+/// Production review #393: `feature_states` selects the feature's system
+/// indices into the snapshot and the restore brings them back, replacing
+/// the feature's current (open) indices as ES does; an unknown feature is
+/// rejected (400 on create, ES's restore error on restore).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn feature_state_snapshots_carry_the_system_indices() {
+    let _serial = SERIAL.lock().await;
+    let three = start("sfr-features").await;
+    three.ok(0, Method::PUT, "/.kibana_7", Some(json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.hidden": true}}))).await;
+    three.green(".kibana_7", 1).await;
+    three.ndjson(format!("{}\n{}\n", json!({"index": {"_index": ".kibana_7", "_id": "cfg"}}), json!({"n": 7}))).await;
+    three.ok(0, Method::PUT, "/plain", Some(json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}}))).await;
+    three.green("plain", 1).await;
+    let (st, v) = three.call(0, Method::PUT, "/_snapshot/repo/nope?wait_for_completion=true", Some(json!({"indices": "plain", "feature_states": ["no_such_feature"]}))).await;
+    assert_eq!((st, v["error"]["type"].as_str()), (400, Some("illegal_argument_exception")), "{v}");
+    let v = three.ok(0, Method::PUT, "/_snapshot/repo/fs?wait_for_completion=true", Some(json!({"indices": "plain", "include_global_state": false, "feature_states": ["kibana"]}))).await;
+    assert_eq!(v["snapshot"]["state"], "SUCCESS", "{v}");
+    let idx: Vec<&str> = v["snapshot"]["indices"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(idx.contains(&".kibana_7") && idx.contains(&"plain"), "the feature's index is in the snapshot: {v}");
+    let fs = &v["snapshot"]["feature_states"];
+    assert_eq!(fs[0]["feature_name"], "kibana", "{v}");
+    assert_eq!(fs[0]["indices"], json!([".kibana_7"]), "{v}");
+    // The feature's indices stay open and change after the snapshot; a
+    // newer one appears. The feature-state restore replaces them all (ES).
+    three.ndjson(format!("{}\n{}\n", json!({"index": {"_index": ".kibana_7", "_id": "later"}}), json!({"n": 8}))).await;
+    three.ok(0, Method::PUT, "/.kibana_8", Some(json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.hidden": true}}))).await;
+    three.green(".kibana_8", 1).await;
+    three.ok(0, Method::DELETE, "/plain", None).await;
+    let (st, v) = three.restore("fs", json!({"indices": "plain", "include_global_state": false})).await;
+    assert_eq!(st, 200, "no feature state requested: {v}");
+    three.ok(0, Method::DELETE, "/plain", None).await;
+    let (st, _) = three.call(0, Method::GET, "/.kibana_8", None).await;
+    assert_eq!(st, 200, "without feature states the live system indices stay");
+    let (st, v) = three.restore("fs", json!({"indices": "plain", "feature_states": ["security"]})).await;
+    assert_eq!((st, v["error"]["type"].as_str()), (500, Some("snapshot_restore_exception")), "{v}");
+    let (st, v) = three.restore("fs", json!({"indices": "plain", "feature_states": ["kibana"]})).await;
+    assert_eq!(st, 200, "{v}");
+    three.green(".kibana_7", 1).await;
+    three.ok(0, Method::POST, "/.kibana_7/_refresh", None).await;
+    let v = three.ok(0, Method::GET, "/.kibana_7/_count", None).await;
+    assert_eq!(v["count"], 1, "the feature state is restored over the open index: {v}");
+    let (st, _) = three.call(0, Method::GET, "/.kibana_7/_doc/later", None).await;
+    assert_eq!(st, 404, "the post-snapshot document is gone");
+    let (st, _) = three.call(0, Method::GET, "/.kibana_8", None).await;
+    assert_eq!(st, 404, "the feature's other current index is deleted");
 }

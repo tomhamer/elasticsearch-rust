@@ -26,7 +26,7 @@ pub use normalization::{
     ArabicNormalizationFilter, CjkWidthFilter, DecimalDigitFilter, GermanNormalizationFilter,
     GreekLowerCaseFilter, HindiNormalizationFilter, IrishLowerCaseFilter, TurkishLowerCaseFilter, IndicNormalizationFilter, PersianNormalizationFilter,
     ScandinavianFoldingFilter, ScandinavianNormalizationFilter, SerbianNormalizationFilter,
-    SoraniNormalizationFilter,
+    SoraniNormalizationFilter, BengaliNormalizationFilter,
 };
 pub use stem::{
     ArabicStemFilter, EnglishPossessiveFilter, PersianStemFilter, KStemFilter, SnowballFilter, StemmerFilter,
@@ -47,6 +47,10 @@ impl super::TokenFilter for LowerCaseFilter {
         Box::new(self.clone())
     }
 
+    fn normalizes(&self) -> bool {
+        true
+    }
+
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
         tokens
             .into_iter()
@@ -65,6 +69,10 @@ pub struct UpperCaseFilter;
 impl super::TokenFilter for UpperCaseFilter {
     fn clone_box(&self) -> Box<dyn super::TokenFilter> {
         Box::new(self.clone())
+    }
+
+    fn normalizes(&self) -> bool {
+        true
     }
 
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
@@ -249,6 +257,10 @@ impl super::TokenFilter for AsciiFoldingFilter {
         Box::new(self.clone())
     }
 
+    fn normalizes(&self) -> bool {
+        true
+    }
+
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
         tokens
             .into_iter()
@@ -404,8 +416,7 @@ impl super::TokenFilter for ShingleFilter {
                         text,
                         position: tokens[start_idx].position,
                         offset_from: tokens[start_idx].offset_from,
-                        offset_to: tokens[last_idx].offset_to,
-                    },
+                        offset_to: tokens[last_idx].offset_to, keyword: false },
                 ));
             }
         }
@@ -449,7 +460,9 @@ impl super::TokenFilter for PorterStemFilter {
         tokens
             .into_iter()
             .map(|mut t| {
-                t.text = porter_stem(&t.text);
+                if !t.keyword {
+                    t.text = porter_stem(&t.text);
+                }
                 t
             })
             .collect()
@@ -513,8 +526,7 @@ mod tests {
             text: text.to_string(),
             position,
             offset_from: 0,
-            offset_to: text.len() as u32,
-        }
+            offset_to: text.len() as u32, keyword: false }
     }
 
     fn texts(tokens: &[Token]) -> Vec<String> {
@@ -724,8 +736,8 @@ mod tests {
     fn shingle_offsets() {
         let f = ShingleFilter::new(2, 2);
         let tokens = vec![
-            Token { text: "the".into(), position: 0, offset_from: 0, offset_to: 3 },
-            Token { text: "fox".into(), position: 1, offset_from: 4, offset_to: 7 },
+            Token { text: "the".into(), position: 0, offset_from: 0, offset_to: 3, keyword: false },
+            Token { text: "fox".into(), position: 1, offset_from: 4, offset_to: 7, keyword: false },
         ];
         let out = f.filter(tokens);
         assert_eq!(out[0].offset_from, 0);

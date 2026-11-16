@@ -16,7 +16,7 @@ use elasticsearch_cluster::health::{index_health, HealthStatus};
 use elasticsearch_engine::node::ResolveOpts;
 use elasticsearch_engine::reindex::{parse_by_query, Kind};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Is this an `/{target}/_update_by_query|_delete_by_query` request?
@@ -37,43 +37,60 @@ pub(super) async fn by_query(node: &Arc<ClusterNode>, req: &RestReq, index: &str
     await_mirror(node).await;
     let engine = node.engine.clone();
     let expr = index.to_string();
-    let resolved = tokio::task::spawn_blocking(move || engine.resolve(&expr, opts).map(|ts| ts.iter().map(|t| t.svc.name.clone()).collect::<BTreeSet<_>>())).await.ok();
+    let routing = params.get("routing").cloned();
+    // Every concrete index with what the expression reached it through: the
+    // alias filter (`None` when named directly or through an unfiltered
+    // alias) and the search routing (alias `search_routing` intersected
+    // with the request's `routing`, ES `IndexNameExpressionResolver`).
+    let resolved = tokio::task::spawn_blocking(move || {
+        engine.resolve(&expr, opts).map(|ts| {
+            let any = !ts.is_empty();
+            let routed = elasticsearch_http::apply_search_routing(ts, routing.as_deref());
+            (any, routed.into_iter().map(|t| (t.svc.name.clone(), (t.alias_filter.clone(), t.routing.clone()))).collect::<BTreeMap<_, _>>())
+        })
+    })
+    .await
+    .ok();
     let names = match resolved {
-        Some(Ok(n)) if !n.is_empty() => n,
+        Some(Ok((true, n))) => n,
         // index_not_found, empty wildcard matches, ...: exactly as the
         // engine renders them (never auto-creates an index).
         _ => return local_canonical(node, req).await,
     };
-    // (index, shard) targets: every shard of a multi-shard index runs the
-    // by-query on its own primary (documents never move between shards, as
-    // the op keeps `_id` / `_routing`).
-    let targets: Vec<(String, Option<u32>)> = {
+    // (index, shard, alias filter) targets: every shard of a multi-shard
+    // index the routing selects runs the by-query on its own primary
+    // (documents never move between shards, as the op keeps `_id` /
+    // `_routing`), under the filter of the alias that selected it.
+    let targets: Vec<Target> = {
         let st = node.state();
         names
             .iter()
-            .flat_map(|n| {
+            .flat_map(|(n, (filter, routing))| {
                 let k = crate::shard_engines::shards_of(&st.metadata, n);
-                (0..k).map(move |s| (n.clone(), (k > 1).then_some(s)))
+                crate::shard_engines::search_shards(&st.metadata, n, routing.as_deref()).into_iter().map(move |s| Target { index: n.clone(), shard: (k > 1).then_some(s), filter: filter.clone() })
             })
             .collect()
     };
-    if targets.len() == 1 && names.contains(index) {
+    if targets.len() == 1 && targets[0].shard.is_none() && targets[0].filter.is_none() && names.contains_key(index) {
         return write(node, req, index).await;
     }
     let wait = params.get("wait_for_completion").map(|v| v != "false").unwrap_or(true);
     let op = req.segments()[1].clone();
     let body = req.json().or_else(||std::str::from_utf8(&req.body).ok().and_then(|text|elasticsearch_engine::source_json::update_request(text).ok()).map(|(body,_)|body));
+    let kind = if op == "_delete_by_query" { Kind::DeleteByQuery } else { Kind::UpdateByQuery };
+    // The query an alias filter is combined with (the body's, or `q`).
+    let query = parse_by_query(kind, index, body.as_ref().unwrap_or(&json!({})), &params).ok().and_then(|r| r.query);
     let body_max = body.as_ref().and_then(|b| b.get("max_docs").or_else(|| b.get("size"))).and_then(Value::as_u64);
     let remaining: Option<u64> = params.get("max_docs").and_then(|v| v.parse().ok()).or(body_max);
     let scroll_size = params.get("scroll_size").and_then(|v| v.parse::<u64>().ok()).filter(|s| *s > 0).unwrap_or(1000);
-    if !wait && targets.len() == 1 {
-        // One shard: the engine's own task on that shard's primary.
+    if !wait && targets.len() == 1 && names.len() == 1 && targets[0].shard.is_none() {
+        // One single-shard index: the engine's own task on its primary (the
+        // engine resolves the expression itself, alias filter included).
         return write(node, req, index).await;
     }
     if !wait {
         // One cluster task for the whole fan-out (ES runs a single
         // BulkByScroll task over every shard of every target).
-        let kind = if op == "_delete_by_query" { Kind::DeleteByQuery } else { Kind::UpdateByQuery };
         let parsed = parse_by_query(kind, index, body.as_ref().unwrap_or(&json!({})), &params);
         let Ok(r) = parsed else {
             // Parameter / body errors render as the engine renders them.
@@ -81,17 +98,72 @@ pub(super) async fn by_query(node: &Arc<ClusterNode>, req: &RestReq, index: &str
         };
         let base_query: Vec<String> = req.query().split('&').filter(|p| !p.is_empty() && !p.starts_with("max_docs=") && !p.starts_with("wait_for_completion=")).map(str::to_string).collect();
         let (n, sub) = (node.clone(), req.clone());
-        let work = async move { fan_out(&n, &sub, &targets, &op, body, remaining, &base_query, scroll_size).await };
+        let work = async move { fan_out(&n, &sub, &targets, &op, body, query, remaining, &base_query, scroll_size).await };
         return super::bg_task::spawn(node, req, kind.action(), r.description(), r.rps, work);
     }
     let base_query: Vec<String> = req.query().split('&').filter(|p| !p.is_empty() && !p.starts_with("max_docs=")).map(str::to_string).collect();
-    fan_out(node, req, &targets, &op, body, remaining, &base_query, scroll_size).await
+    fan_out(node, req, &targets, &op, body, query, remaining, &base_query, scroll_size).await
+}
+
+/// One shard a by-query runs on.
+pub(super) struct Target {
+    index: String,
+    /// `None`: the index's only shard.
+    shard: Option<u32>,
+    /// The filter of the alias the expression reached the index through.
+    filter: Option<Value>,
+}
+
+/// The by-query `body` restricted to `filter` (ES adds the alias filter to
+/// the search of a BulkByScroll request): the request's `query` (the body's
+/// or `q`'s, `match_all` without one) as a `bool` with the filter.
+fn filtered_body(body: Option<&Value>, query: Option<&Value>, filter: &Value) -> Value {
+    let mut out = match body {
+        Some(Value::Object(o)) => Value::Object(o.clone()),
+        _ => json!({}),
+    };
+    let q = query.cloned().unwrap_or_else(|| json!({"match_all": {}}));
+    out["query"] = json!({"bool": {"must": [q], "filter": [filter.clone()]}});
+    out
+}
+
+/// The `BulkByScrollResponse` of a by-query that ran on no shard (its
+/// routing selects none).
+fn empty_response(kind: Kind, rps: f64) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("took".into(), json!(0));
+    m.insert("timed_out".into(), json!(false));
+    m.extend(elasticsearch_engine::reindex::Stats::default().status_json(kind, rps, 0, None));
+    m.insert("failures".into(), json!([]));
+    Value::Object(m)
+}
+
+/// Is `v` a `BulkByScrollResponse` (a by-query that ran and reported its
+/// failures), rather than an error that stopped it?
+fn is_bulk_by_scroll(v: &Value) -> bool {
+    v.get("failures").is_some_and(Value::is_array) && v.get("total").is_some()
+}
+
+/// ES `ScrollableHitSource.SearchFailure` for a shard whose by-query did
+/// not run (its error response).
+fn shard_failure(index: &str, shard: Option<u32>, status: u16, v: &Value) -> (u16, Value) {
+    let reason = match v.get("error") {
+        Some(Value::Object(e)) => {
+            let mut e = e.clone();
+            e.remove("root_cause");
+            Value::Object(e)
+        }
+        Some(other) => json!({"type": "exception", "reason": other}),
+        None => json!({"type": "exception", "reason": v.to_string()}),
+    };
+    let status = v.get("status").and_then(Value::as_u64).map(|s| s as u16).unwrap_or(status).max(400);
+    (status, json!({"index": index, "shard": shard.unwrap_or(0), "node": null, "status": status, "reason": reason}))
 }
 
 /// Run the by-query on every (index, shard) target in turn, carrying the
 /// remaining `max_docs`, and merge the responses.
 #[allow(clippy::too_many_arguments)]
-async fn fan_out(node: &Arc<ClusterNode>, req: &RestReq, targets: &[(String, Option<u32>)], op: &str, mut body: Option<Value>, mut remaining: Option<u64>, base_query: &[String], scroll_size: u64) -> RestResp {
+async fn fan_out(node: &Arc<ClusterNode>, req: &RestReq, targets: &[Target], op: &str, mut body: Option<Value>, query: Option<Value>, mut remaining: Option<u64>, base_query: &[String], scroll_size: u64) -> RestResp {
     let raw_script=std::str::from_utf8(&req.body).ok().and_then(|text|elasticsearch_engine::source_json::update_request(text).ok()).and_then(|(_,raw)|raw).and_then(|raw|raw.get("script").cloned());
     if let Some(b) = body.as_mut().and_then(Value::as_object_mut) {
         if remaining.is_some() {
@@ -99,12 +171,17 @@ async fn fan_out(node: &Arc<ClusterNode>, req: &RestReq, targets: &[(String, Opt
             b.remove("size");
         }
     }
+    let quota = remaining;
     let mut parts: Vec<Value> = Vec::new();
     // Under a cluster task (`wait_for_completion=false`): stop between
     // targets once it is cancelled, and run each target as its child.
     let task = super::bg_task::current();
     let mut canceled = false;
-    for (name, shard) in targets {
+    // A shard whose by-query did not run: the run stops there, reporting it
+    // with what the shards before it did (ES fails a BulkByScroll on any
+    // search failure and never claims a complete run).
+    let mut stopped: Option<(u16, Value)> = None;
+    for Target { index: name, shard, filter } in targets {
         if remaining == Some(0) {
             break;
         }
@@ -129,7 +206,15 @@ async fn fan_out(node: &Arc<ClusterNode>, req: &RestReq, targets: &[(String, Opt
             if let Err(e)=sub.push_header(crate::rest::tasks::PARENT_HEADER,&format!("{}:{}",node.local.id,t.id)) {return RestResp::json(e.status,&e.to_json())}
         }
         if let Err(e)=sub.set_uri(&format!("/{}/{op}{}{q}", encode_component(name), if q.is_empty() { "" } else { "?" })) {return RestResp::json(e.status,&e.to_json())}
-        if let Some(b) = &body {
+        if let Some(f) = filter {
+            let b = filtered_body(body.as_ref(), query.as_ref(), f);
+            let encoded = if let Some(script)=&raw_script {
+                let mut source=elasticsearch_engine::source_json::Source::from_value(&b);
+                if let elasticsearch_engine::source_json::Source::Object(m)=&mut source {m.insert("script".into(),script.clone());}
+                source.text().into_bytes()
+            } else {serde_json::to_vec(&b).unwrap_or_default()};
+            if let Err(e)=sub.retain_headers(|(k,_)| !k.eq_ignore_ascii_case("content-type") && !k.eq_ignore_ascii_case("content-length")).and_then(|_| sub.push_header("content-type","application/json")).and_then(|_| sub.set_body(&encoded)) {return RestResp::json(e.status,&e.to_json())}
+        } else if let Some(b) = &body {
             let encoded = if let Some(script)=&raw_script {
                 let mut source=elasticsearch_engine::source_json::Source::from_value(b);
                 if let elasticsearch_engine::source_json::Source::Object(m)=&mut source {m.insert("script".into(),script.clone());}
@@ -141,28 +226,58 @@ async fn fan_out(node: &Arc<ClusterNode>, req: &RestReq, targets: &[(String, Opt
             if let Err(e)=sub.set_shard(*k) {return RestResp::json(e.status,&e.to_json())}
         }
         let r = write_send(node.clone(), sub, name.clone()).await;
-        if !r.is_success() {
-            return r;
-        }
         let v = r.body_json().unwrap_or(Value::Null);
-        if let (Some(m), Some(t)) = (remaining.as_mut(), v["total"].as_u64()) {
-            *m = m.saturating_sub(t);
+        if !r.is_success() && !is_bulk_by_scroll(&v) {
+            // Nothing ran yet: the error as the engine renders it.
+            if parts.is_empty() {
+                return r;
+            }
+            stopped = Some(shard_failure(name, *shard, r.status, &v));
+            break;
+        }
+        let stop = !r.is_success() || !v["failures"].as_array().is_none_or(Vec::is_empty) || v["timed_out"].as_bool() == Some(true);
+        // ES counts the successfully processed documents toward
+        // `max_docs` (conflicts skipped with `conflicts: proceed` and noops
+        // leave it for the next shards).
+        if let Some(m) = remaining.as_mut() {
+            let done: u64 = ["created", "updated", "deleted"].iter().filter_map(|k| v[*k].as_u64()).sum();
+            *m = m.saturating_sub(done);
         }
         if v["canceled"].is_string() {
             canceled = true;
         }
         parts.push(v);
-        if canceled {
+        // A shard that reported failures or timed out ended the run (ES
+        // stops a BulkByScroll at its first failed batch or source page).
+        if canceled || stop {
             break;
         }
     }
-    let mut out = merge(&parts, scroll_size);
+    let mut out = if parts.is_empty() && stopped.is_none() {
+        let kind = if op == "_delete_by_query" { Kind::DeleteByQuery } else { Kind::UpdateByQuery };
+        let rps = req.params().get("requests_per_second").and_then(|v| elasticsearch_engine::reindex::parse_rps(v).ok()).unwrap_or(-1.0);
+        empty_response(kind, rps)
+    } else {
+        merge(&parts, scroll_size)
+    };
     if canceled {
         if let Some(o) = out.as_object_mut() {
             o.insert("canceled".into(), json!("by user request"));
         }
     }
-    RestResp::json(200, &out)
+    // ES `total`: the matches, at most `max_docs`.
+    if let (Some(q), Some(t)) = (quota, out["total"].as_u64()) {
+        out["total"] = json!(t.min(q));
+    }
+    if let (Some((_, f)), Some(Value::Array(failures))) = (&stopped, out.get_mut("failures")) {
+        failures.push(f.clone());
+    }
+    // ES `BulkByScrollResponse` status: 408 when timed out, raised to the
+    // worst failure's.
+    let statuses: Vec<(u16, Value)> = out["failures"].as_array().into_iter().flatten()
+        .map(|f| (f["status"].as_u64().map(|s| s as u16).unwrap_or(500), Value::Null)).collect();
+    let status = elasticsearch_engine::reindex::response_status(&statuses, out["timed_out"].as_bool() == Some(true));
+    RestResp::json(status, &out)
 }
 
 /// `write` as a nameable `Send` future: `fan_out` runs inside a spawned
@@ -214,7 +329,7 @@ fn docs_stats_request(req: &RestReq, index: &str) -> elasticsearch_engine::error
     let mut out=req.clone();
     out.set_method("GET")?;
     out.set_uri(&format!("/{}/_stats/docs?level=shards",encode_component(index)))?;
-    out.retain_headers(|(key,_)| key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("es-security-runas-user") || key.eq_ignore_ascii_case(super::SYSTEM_HEADER))?;
+    out.retain_headers(|(key,_)| key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("es-security-runas-user") || key.eq_ignore_ascii_case(super::SYSTEM_HEADER) || key.eq_ignore_ascii_case(super::IDENTITY_HEADER))?;
     out.set_body(&[])?;out.set_dfs(Default::default())?;out.set_app_plan(None)?;out.hops=0;
     Ok(out)
 }
@@ -457,6 +572,37 @@ mod tests {
         assert_eq!(m["retries"]["bulk"], 1);
         assert_eq!(m["failures"], json!([]));
         assert_eq!(m["requests_per_second"], -1.0);
+    }
+
+    #[test]
+    fn alias_filter_wraps_the_request_query() {
+        let f = json!({"term": {"tag": "a"}});
+        let body = json!({"query": {"match": {"x": 1}}, "conflicts": "proceed"});
+        let q = body["query"].clone();
+        assert_eq!(filtered_body(Some(&body), Some(&q), &f), json!({"query": {"bool": {"must": [{"match": {"x": 1}}], "filter": [f.clone()]}}, "conflicts": "proceed"}));
+        // No body / no query (`_update_by_query` of everything): match_all.
+        assert_eq!(filtered_body(None, None, &f), json!({"query": {"bool": {"must": [{"match_all": {}}], "filter": [f.clone()]}}}));
+        // `q`: the parsed query_string.
+        let qs = json!({"query_string": {"query": "v:1"}});
+        assert_eq!(filtered_body(Some(&json!({})), Some(&qs), &f)["query"]["bool"]["must"][0], qs);
+    }
+
+    #[test]
+    fn a_shard_that_did_not_run_is_a_search_failure() {
+        let err = json!({"error": {"root_cause": [], "type": "unavailable_shards_exception", "reason": "[i][1] primary shard is not active"}, "status": 503});
+        let (status, f) = shard_failure("i", Some(1), 503, &err);
+        assert_eq!(status, 503);
+        assert_eq!(f, json!({"index": "i", "shard": 1, "node": null, "status": 503, "reason": {"type": "unavailable_shards_exception", "reason": "[i][1] primary shard is not active"}}));
+        assert!(is_bulk_by_scroll(&json!({"total": 1, "failures": []})));
+        assert!(!is_bulk_by_scroll(&err));
+    }
+
+    #[test]
+    fn empty_response_is_a_zero_run() {
+        let v = empty_response(Kind::DeleteByQuery, -1.0);
+        assert_eq!((v["total"].as_u64(), v["deleted"].as_u64(), v["timed_out"].as_bool()), (Some(0), Some(0), Some(false)));
+        assert_eq!(v["failures"], json!([]));
+        assert!(v.get("updated").is_none());
     }
 }
 

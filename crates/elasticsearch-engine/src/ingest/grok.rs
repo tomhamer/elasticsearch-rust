@@ -203,6 +203,26 @@ impl Grok {
         Ok(Grok { re: Regex::new("a^").expect("placeholder"), fancy: Some(f), caps })
     }
 
+    /// Each capture's field and ES|QL column type (`int` integer, `long`
+    /// long, `float` / `double` double, `boolean`, else keyword), in
+    /// pattern order, once per field.
+    pub fn esql_fields(&self) -> Vec<(String, &'static str)> {
+        let mut out: Vec<(String, &'static str)> = Vec::new();
+        for (_, field, ty) in &self.caps {
+            if out.iter().any(|(f, _)| f == field) {
+                continue;
+            }
+            out.push((field.clone(), match ty {
+                CapType::Int => "integer",
+                CapType::Long => "long",
+                CapType::Float | CapType::Double => "double",
+                CapType::Boolean => "boolean",
+                CapType::Str => "keyword",
+            }));
+        }
+        out
+    }
+
     /// Captures as ES's grok processor produces them: typed values that fail to parse are
     /// `NumberFormatException`s and a semantic name used twice collects a list.
     pub fn captures_checked(&self, s: &str) -> Result<Option<Map<String, Value>>, EsError> {
@@ -267,6 +287,31 @@ impl Grok {
             }
         }
         out
+    }
+
+    /// Each capture group's field and matched span (byte offsets) of a
+    /// match of `s`, either engine; `None` when the pattern does not match.
+    pub fn capture_spans(&self, s: &str) -> Option<Vec<(String, usize, usize)>> {
+        let mut out = Vec::new();
+        match &self.fancy {
+            Some(f) => {
+                let c = f.captures(s).ok()??;
+                for (g, field, _) in &self.caps {
+                    if let Some(m) = c.name(g) {
+                        out.push((field.clone(), m.start(), m.end()));
+                    }
+                }
+            }
+            None => {
+                let c = self.re.captures(s)?;
+                for (g, field, _) in &self.caps {
+                    if let Some(m) = c.name(g) {
+                        out.push((field.clone(), m.start(), m.end()));
+                    }
+                }
+            }
+        }
+        Some(out)
     }
 
     /// Field name a capture group (`g0`, ...) writes to.

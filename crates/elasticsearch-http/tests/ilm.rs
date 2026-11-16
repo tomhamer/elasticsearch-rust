@@ -115,13 +115,15 @@ async fn policy_crud_and_validation() {
         let (st, v) = es.put("/_ilm/policy/bad", bad.clone()).await;
         assert_eq!(st, 400, "{bad} -> {v}");
     }
-    // `searchable_snapshot` needs an enterprise license, which rustic always
-    // has (AGENTS.md "Licensing: always enterprise"): the policy is accepted.
-    let ss = json!({"policy": {"phases": {"cold": {"actions": {"searchable_snapshot": {"snapshot_repository": "r"}}}}}});
+    // The `searchable_snapshot` action is stored as ES stores it (ES 9.5.5
+    // `90_searchable_snapshot`); an index reaching it stops in ERROR (it is
+    // never executed or skipped, see the runner test).
+    let ss = json!({"policy": {"phases": {"cold": {"actions": {"searchable_snapshot": {"snapshot_repository": "r", "force_merge_on_clone": false}}}}}});
     let (st, v) = es.put("/_ilm/policy/searchable", ss).await;
     assert_eq!(st, 200, "{v}");
-    let (st, _) = es.call(Method::DELETE, "/_ilm/policy/searchable", None).await;
-    assert_eq!(st, 200);
+    let (st, v) = es.call(Method::GET, "/_ilm/policy/searchable", None).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["searchable"]["policy"]["phases"]["cold"]["actions"]["searchable_snapshot"]["force_merge_on_clone"], false, "{v}");
     let (st, v) = es.put("/_ilm/policy/bad", json!({"policy": {"phases": {"warm": {"min_age": "10s", "actions": {}}, "delete": {"min_age": "5s", "actions": {"delete": {}}}}}})).await;
     assert_eq!(st, 400);
     assert!(v["error"]["reason"].as_str().unwrap().contains("Your policy is configured to run the delete phase (min_age: 5s) before the warm phase (min_age: 10s)"), "{v}");
@@ -368,6 +370,12 @@ async fn data_stream_lifecycle_and_management() {
     )
     .await;
     es.ok(Method::PUT, "/_data_stream/managed-a", None).await;
+    // `frozen_after` is stored and reported (the conversion runs in the
+    // data stream lifecycle, `ilm::frozen`).
+    let (st, v) = es.put("/_index_template/frozen", json!({"index_patterns": ["frozen-*"], "data_stream": {}, "template": {"lifecycle": {"frozen_after": "60d"}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let v = es.ok(Method::GET, "/_index_template/frozen", None).await;
+    assert_eq!(v["index_templates"][0]["index_template"]["template"]["lifecycle"]["frozen_after"], "60d", "{v}");
     let v = es.ok(Method::GET, "/_data_stream/managed-a", None).await;
     let ds = &v["data_streams"][0];
     assert_eq!(ds["lifecycle"]["data_retention"], "30d");

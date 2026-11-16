@@ -59,6 +59,9 @@ struct Args {
     baseline: Option<PathBuf>,
     timeout: u64,
     wipe: bool,
+    /// With `--no-wipe`: still reset cluster settings after each test
+    /// (ES suites preserving indices still run `wipeClusterSettings`).
+    wipe_settings: bool,
     verbose: bool,
 }
 
@@ -75,6 +78,7 @@ fn parse_args() -> Args {
         baseline: None,
         timeout: 180,
         wipe: true,
+        wipe_settings: false,
         verbose: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -93,6 +97,7 @@ fn parse_args() -> Args {
             "--baseline" => a.baseline = next(&mut i).map(PathBuf::from),
             "--timeout" => a.timeout = next(&mut i).and_then(|s| s.parse().ok()).expect("--timeout <secs>"),
             "--no-wipe" => a.wipe = false,
+            "--wipe-settings" => a.wipe_settings = true,
             "--tests-dir" => a.tests_dir = next(&mut i).expect("--tests-dir <name under --suite>"),
             "--xpack" => a.tests_dir = "xpack-test".into(),
             "--security" => exec::SECURITY.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -113,7 +118,7 @@ fn parse_args() -> Args {
             }
             "-v" | "--verbose" => a.verbose = true,
             "-h" | "--help" => {
-                eprintln!("usage: es-cluster-yaml --url <http://host:port[,...]> [--filter <dir|path>]... [--test <substr>] [--baseline single-node.json] [--reference-url official-es-url] [--report [file]] [--json file] [--timeout secs] [--no-wipe] [--security] [--module-security-fixtures] [--no-xpack] [--xpack | --tests-dir <name>] [-v]");
+                eprintln!("usage: es-cluster-yaml --url <http://host:port[,...]> [--filter <dir|path>]... [--test <substr>] [--baseline single-node.json] [--reference-url official-es-url] [--report [file]] [--json file] [--timeout secs] [--no-wipe] [--wipe-settings] [--security] [--module-security-fixtures] [--no-xpack] [--xpack | --tests-dir <name>] [-v]");
                 std::process::exit(0);
             }
             other => {
@@ -224,6 +229,11 @@ fn main() {
                 }
                 let mut outcome = exec::run_test(&specs, &file, steps, &base, Duration::from_secs(args.timeout)).await;
                 let ran = !matches!(outcome, Outcome::Skip(_));
+                if ran && !args.wipe && args.wipe_settings {
+                    for problem in wiper.wipe_settings().await {
+                        eprintln!("  settings wipe after [{} :: {}]: {problem}", file.rel, name);
+                    }
+                }
                 if ran && args.wipe {
                     let problems = wiper.wipe().await;
                     if !problems.is_empty() {

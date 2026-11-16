@@ -38,6 +38,10 @@ const FORMAT: u32 = 1;
 /// Header flag: every doc of the part has exactly one triangle, and no
 /// triangle in another part.
 const SINGLE: u32 = 1 << 16;
+/// Header flag (with [`SINGLE`]): every triangle is a point (its box has
+/// no extent), so a doc never contains an area. Parts written before the
+/// flag existed lack it and are read as possibly having areas.
+const POINTS: u32 = 1 << 17;
 const LEAF: u32 = 1 << 31;
 const NODE_BYTES: usize = 44;
 /// Triangles per part (an `[extra]` entry holds at most `u32::MAX` bytes).
@@ -297,7 +301,10 @@ fn build_part(es: &mut [Entry], whole_docs: bool) -> Vec<u8> {
     let n_leaves = b.leaf_offsets.len() as u32 - 1;
     let mut out = Vec::with_capacity(24 + b.nodes.len() + b.leaf_offsets.len() * 8 + b.leaves.len());
     let single = whole_docs && tris == docs as u64;
-    out.extend_from_slice(&(FORMAT | if single { SINGLE } else { 0 }).to_le_bytes());
+    // One triangle per doc says nothing of its kind: an ordinary triangular
+    // polygon is one triangle too. Only boxes without extent are points.
+    let points = single && es.iter().all(|e| e.tri[0] == e.tri[2] && e.tri[1] == e.tri[3]);
+    out.extend_from_slice(&(FORMAT | if single { SINGLE } else { 0 } | if points { POINTS } else { 0 }).to_le_bytes());
     out.extend_from_slice(&n_leaves.to_le_bytes());
     out.extend_from_slice(&b.n_nodes.to_le_bytes());
     out.extend_from_slice(&tris.to_le_bytes());
@@ -322,6 +329,7 @@ pub struct ShapeBkd {
     tris: u64,
     docs: u32,
     single: bool,
+    points: bool,
     nodes_at: usize,
     offsets_at: usize,
     leaves_at: usize,
@@ -403,6 +411,7 @@ impl ShapeBkd {
             return Err(bad("format"));
         }
         let single = u32_at(0) & SINGLE != 0;
+        let points = single && u32_at(0) & POINTS != 0;
         let n_leaves = u32_at(4);
         let n_nodes = u32_at(8);
         let tris = u64::from_le_bytes(b[12..20].try_into().unwrap());
@@ -417,7 +426,7 @@ impl ShapeBkd {
         if b.len() < leaves_at + last {
             return Err(bad("truncated leaves"));
         }
-        Ok(ShapeBkd { data, n_leaves, n_nodes, tris, docs, single, nodes_at, offsets_at, leaves_at })
+        Ok(ShapeBkd { data, n_leaves, n_nodes, tris, docs, single, points, nodes_at, offsets_at, leaves_at })
     }
 
     /// Triangles in the part.
@@ -554,6 +563,12 @@ impl ShapeBkd {
     /// then nodes count their docs.
     pub fn one_triangle_per_doc(&self) -> bool {
         self.single
+    }
+
+    /// Whether every doc of the part is one point (a triangle without
+    /// extent): such a doc never contains an area.
+    pub fn one_point_per_doc(&self) -> bool {
+        self.points
     }
 
     /// The docs matching `q` when every doc has one triangle

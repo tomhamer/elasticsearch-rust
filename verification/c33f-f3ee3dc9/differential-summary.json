@@ -1,0 +1,23 @@
+{
+  "checks": [
+    {
+      "query": 0,
+      "passed": true
+    },
+    {
+      "query": 1,
+      "passed": true
+    },
+    {
+      "query": 2,
+      "passed": true
+    },
+    {
+      "query": 3,
+      "passed": true
+    }
+  ],
+  "passed": 4,
+  "failed": 0,
+  "scope": "static replicated search and aggregation oracle; fault history gate is separate"
+}

@@ -68,38 +68,58 @@ impl<'a, 'b> Ctx<'a, 'b> {
         } else {
             vec![None; docs.len()]
         };
-        let d: Docs = docs
-            .iter()
-            .enumerate()
-            .map(|(si, v)| {
-                if whole[si].is_some() {
-                    return Vec::new();
+        // SIDE 007: every child list is charged before it grows (ES charges
+        // the child doc set), so a small root set expanding into many
+        // children is refused before the memory is taken; cancellation is
+        // polled while expanding.
+        let mut d: Docs = Vec::with_capacity(docs.len());
+        for (si, v) in docs.iter().enumerate() {
+            if whole[si].is_some() {
+                d.push(Vec::new());
+                continue;
+            }
+            let leaf = &self.segs[si].leaf;
+            let Some(n) = leaf.nested_info() else { d.push(Vec::new()); continue };
+            let Some(ord) = n.path_ord(path) else { d.push(Vec::new()); continue };
+            // Live children of every parent, appended in place.
+            let deleted = leaf.deletions_only();
+            // Many root parents (a `match_all`): one forward pass over the
+            // segment's path ordinals instead of a block walk per parent
+            // (its list is allocated for every non-parent doc: charged first).
+            if v.len() as u64 * 8 >= leaf.num_docs() as u64 {
+                self.charge(name, (leaf.num_docs() as u64).saturating_sub(v.len() as u64) * 8 + 24)?;
+                if let Some(out) = root_children_scan(n, ord, leaf.num_docs(), v, deleted.as_deref()) {
+                    d.push(out);
+                    continue;
                 }
-                let leaf = &self.segs[si].leaf;
-                let Some(n) = leaf.nested_info() else { return Vec::new() };
-                let Some(ord) = n.path_ord(path) else { return Vec::new() };
-                // Live children of every parent, appended in place.
-                let deleted = leaf.deletions_only();
-                // Many root parents (a `match_all`): one forward pass over the
-                // segment's path ordinals instead of a block walk per parent.
-                if v.len() as u64 * 8 >= leaf.num_docs() as u64 {
-                    if let Some(out) = root_children_scan(n, ord, leaf.num_docs(), v, deleted.as_deref()) {
-                        return out;
+            }
+            self.charge(name, v.len() as u64 * 8 + 24)?;
+            let mut out: Vec<(DocId, f32)> = Vec::with_capacity(v.len());
+            let mut failed: Option<EsError> = None;
+            for (i, &(p, sc)) in v.iter().enumerate() {
+                if i as u64 % super::POLL_EVERY == super::POLL_EVERY - 1 {
+                    super::poll_cancelled()?;
+                }
+                n.for_each_child(p, ord, |c| {
+                    if failed.is_some() || deleted.as_ref().is_some_and(|b| b.get(c)) {
+                        return;
                     }
-                }
-                let mut out = Vec::with_capacity(v.len());
-                for &(p, sc) in v {
-                    n.for_each_child(p, ord, |c| {
-                        if deleted.as_ref().is_none_or(|b| !b.get(c)) {
-                            out.push((c, sc));
+                    if out.len() == out.capacity() {
+                        let more = out.capacity().max(64);
+                        if let Err(e) = self.charge(name, more as u64 * 8) {
+                            failed = Some(e);
+                            return;
                         }
-                    });
+                        out.reserve_exact(more);
+                    }
+                    out.push((c, sc));
+                });
+                if let Some(e) = failed.take() {
+                    return Err(e);
                 }
-                out
-            })
-            .collect();
-        // The nested docs' list (ES charges the child doc set the same way).
-        self.charge(name, d.iter().map(|v| v.len() as u64 * 8 + 24).sum())?;
+            }
+            d.push(out);
+        }
         if whole.iter().all(Option::is_none) {
             return self.single_bucket(d, sub);
         }
@@ -138,6 +158,9 @@ impl<'a, 'b> Ctx<'a, 'b> {
 
     fn reverse_nested_agg(&self, o: &Map<String, Value>, sub: Option<&Map<String, Value>>, docs: &Docs) -> Result<Value> {
         let path = o.get("path").and_then(Value::as_str).unwrap_or("");
+        // The ancestors' list (at most one per child) and its sort: charged
+        // before they are built (SIDE 007).
+        self.charge("reverse_nested", docs.iter().map(|v| v.len() as u64 * 8 + 24).sum())?;
         let d: Docs = docs
             .iter()
             .enumerate()
@@ -242,6 +265,30 @@ impl<'a, 'b> Ctx<'a, 'b> {
         }
     }
 
+    /// [`Ctx::for_each_geo_point`] with the aggregation's `missing` point
+    /// standing in for a document without one (ES `ValuesSourceConfig`).
+    fn for_each_geo_point_or(&self, name: &str, s: usize, v: &[(DocId, f32)], missing: Option<(f64, f64)>, mut f: impl FnMut(f64, f64)) {
+        let Some((mlat, mlon)) = missing else { return self.for_each_geo_point(name, s, v, f) };
+        for &(d, _) in v {
+            let pts = self.geo_points(name, s, d);
+            if pts.is_empty() {
+                f(mlat, mlon);
+            }
+            for (lat, lon) in pts {
+                f(lat, lon);
+            }
+        }
+    }
+
+    /// The doc's points, or the `missing` point when it has none.
+    fn geo_points_or(&self, name: &str, seg: usize, doc: DocId, missing: Option<(f64, f64)>) -> Vec<(f64, f64)> {
+        let pts = self.geo_points(name, seg, doc);
+        match missing {
+            Some(m) if pts.is_empty() => vec![m],
+            _ => pts,
+        }
+    }
+
     fn geo_field<'o>(&self, o: &'o Map<String, Value>, name: &str, t: &str) -> Result<&'o str> {
         let f = field_name(o, name, t)?;
         for s in self.segs {
@@ -263,6 +310,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
 
     fn geo_bounds(&self, name: &str, o: &Map<String, Value>, docs: &Docs) -> Result<Value> {
         let f = self.geo_field(o, name, "geo_bounds")?;
+        let missing = o.get("missing").and_then(values::parse_geo_point);
         let wrap = o.get("wrap_longitude").and_then(Value::as_bool).unwrap_or(true);
         if self.any_geo_shape(f) {
             return Ok(self.geo_extent(f, docs).to_json(wrap));
@@ -271,7 +319,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
         let (mut pos_left, mut pos_right) = (f64::INFINITY, f64::NEG_INFINITY);
         let (mut neg_left, mut neg_right) = (f64::INFINITY, f64::NEG_INFINITY);
         for (s, v) in docs.iter().enumerate() {
-            self.for_each_geo_point(f, s, v, |lat, lon| {
+            self.for_each_geo_point_or(f, s, v, missing, |lat, lon| {
                 top = top.max(lat);
                 bottom = bottom.min(lat);
                 if lon >= 0.0 {
@@ -314,11 +362,12 @@ impl<'a, 'b> Ctx<'a, 'b> {
         if self.any_geo_shape(f) {
             return Ok(self.geo_shape_centroid(f, docs));
         }
+        let missing = o.get("missing").and_then(values::parse_geo_point);
         // ES `GeoCentroidAggregator`: Kahan-compensated sums of the
         // decoded values in doc order, segment after segment.
         let (mut slat, mut slon, mut n) = (Kahan::default(), Kahan::default(), 0u64);
         for (s, v) in docs.iter().enumerate() {
-            self.for_each_geo_point(f, s, v, |lat, lon| {
+            self.for_each_geo_point_or(f, s, v, missing, |lat, lon| {
                 slat.add(lat);
                 slon.add(lon);
                 n += 1;
@@ -332,6 +381,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
 
     fn geo_distance_agg(&self, name: &str, o: &Map<String, Value>, sub: Option<&Map<String, Value>>, docs: &Docs) -> Result<Value> {
         let f = self.geo_field(o, name, "geo_distance")?;
+        let missing = o.get("missing").and_then(values::parse_geo_point);
         let origin = o.get("origin").ok_or_else(|| EsError::parsing_at(format!("Missing [origin] in geo_distance aggregator [{name}]"), 1, 1))?;
         let (olat, olon) = values::parse_geo_point(origin).ok_or_else(|| EsError::parsing_at(format!("failed to parse [origin] of geo_distance aggregation [{name}]"), 1, 1))?;
         let unit = o.get("unit").and_then(Value::as_str).unwrap_or("m");
@@ -362,10 +412,13 @@ impl<'a, 'b> Ctx<'a, 'b> {
                             *hit |= from.is_none_or(|v| distance >= v) && to.is_none_or(|v| distance < v);
                         }
                     };
-                    if let Some(dv) = &dv {
-                        dv.for_each(doc, &mut visit);
-                    } else {
-                        for (lat, lon) in self.geo_points(f, s, doc) { visit(lat, lon); }
+                    match (&dv, missing) {
+                        (Some(dv), None) => {
+                            dv.for_each(doc, &mut visit);
+                        }
+                        _ => {
+                            for (lat, lon) in self.geo_points_or(f, s, doc, missing) { visit(lat, lon); }
+                        }
                     }
                     for (count, hit) in counts.iter_mut().zip(&matched) { *count += u64::from(*hit); }
                 }
@@ -378,7 +431,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
             .map(|(s, v)| {
                 v.iter()
                     .map(|&(d, _)| {
-                        self.geo_points(f, s, d)
+                        self.geo_points_or(f, s, d, missing)
                             .into_iter()
                             .map(|(a, b)| if plane { geo::plane_meters(olat, olon, a, b) } else { geo::haversine_meters(olat, olon, a, b) } / scale)
                             .collect()
@@ -416,17 +469,10 @@ impl<'a, 'b> Ctx<'a, 'b> {
         let precision = grid_precision(grid, o.get("precision"))?;
         let f = self.geo_field(o, name, t)?;
         let size = o.get("size").and_then(Value::as_u64).unwrap_or(10_000) as usize;
-        let bounds = match o.get("bounds") {
-            Some(b) => {
-                let p = |k: &str| b.get(k).and_then(values::parse_geo_point);
-                match (p("top_left"), p("bottom_right")) {
-                    (Some((t0, l)), Some((b0, r))) => Some(CellPred::new(grid, precision as u32, (t0, l, b0, r))),
-                    _ => None,
-                }
-            }
-            None => None,
-        };
-        if !self.any_geo_shape(f) {
+        let parsed_bounds = grid_bounds(o, t)?;
+        let bounds = parsed_bounds.map(|b| CellPred::new(grid, precision as u32, b));
+        let missing = o.get("missing").and_then(values::parse_geo_point);
+        if !self.any_geo_shape(f) && missing.is_none() {
             if let Some(out) = self.geo_point_grid(name, grid, precision as u32, f, size, bounds.as_ref(), sub, docs)? {
                 return Ok(out);
             }
@@ -436,13 +482,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
         // (`GeoShapeCellIdSource`), points by their cell; cells as ES's
         // longs, keyed when the buckets are built.
         use super::shape_tiler::{Bounds, HashTiler, HexTiler, TileTiler, Tiler};
-        let raw_bounds = o.get("bounds").and_then(|b| {
-            let p = |k: &str| b.get(k).and_then(values::parse_geo_point);
-            match (p("top_left"), p("bottom_right")) {
-                (Some((top, left)), Some((bottom, right))) => Some(Bounds { top, left, bottom, right }),
-                _ => None,
-            }
-        });
+        let raw_bounds = parsed_bounds.map(|(top, left, bottom, right)| Bounds { top, left, bottom, right });
         let pu = precision as u32;
         let tiler = match grid {
             Grid::Tile => Tiler::Tile(TileTiler::new(pu, raw_bounds.as_ref())),
@@ -485,7 +525,20 @@ impl<'a, 'b> Ctx<'a, 'b> {
         let mut cells: HashMap<u64, Docs> = HashMap::new();
         let mut buf: Vec<u64> = Vec::new();
         let mut shape_cells = Vec::new();
+        // Shape tiling is admitted before it allocates (ES's tilers charge
+        // the request breaker as their cell arrays grow) and stops on
+        // cancellation or the search's `timeout` (the aggregation then keeps
+        // the docs grouped so far, as a timed-out collection does).
+        let cancel = rustic_core::cancel::current();
+        let deadline = crate::search::AggDeadline::current();
+        let charge_serial = |bytes: u64| self.charge(name, bytes);
+        let mut budget = super::shape_tiler::TileBudget::new(&charge_serial, cancel.clone(), deadline.clone());
+        let mut buf_charged = 0usize;
+        let mut timed_out = false;
         for (s, v) in docs.iter().enumerate() {
+            if timed_out {
+                break;
+            }
             if v.is_empty() {
                 continue;
             }
@@ -500,31 +553,53 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 if v.len() >= GRID_PAR_MIN_DOCS {
                     use rayon::prelude::*;
                     let tiler = &tiler;
-                    let chunks: Vec<(Vec<u64>, Vec<u32>)> = v
+                    // Every chunk's cells (its tiling buffer and the flat
+                    // cells it keeps until grouping) charged to one request
+                    // reservation, a batch at a time, held until they are
+                    // grouped (dropped after `chunks`).
+                    let held: parking_lot::Mutex<Option<crate::memory::Reservation>> = parking_lot::Mutex::new(None);
+                    let label = super::agg_label(name);
+                    let charge_shared = |bytes: u64| -> Result<()> {
+                        let mut h = held.lock();
+                        match h.as_mut() {
+                            Some(r) => r.grow(bytes, &label),
+                            None => {
+                                *h = Some(crate::memory::breakers().reserve(crate::memory::Kind::Request, bytes, &label)?);
+                                Ok(())
+                            }
+                        }
+                    };
+                    let (cancel, deadline) = (&cancel, &deadline);
+                    let chunks: Vec<(Vec<u64>, Vec<u32>, bool)> = v
                         .par_chunks(GRID_CHUNK_DOCS)
-                        .map(|chunk| {
+                        .map(|chunk| -> Result<(Vec<u64>, Vec<u32>, bool)> {
                             let (mut flat, mut ends, mut sc) = (Vec::new(), Vec::with_capacity(chunk.len()), Vec::new());
+                            let mut g = super::shape_tiler::TileBudget::new(&charge_shared, cancel.clone(), deadline.clone());
+                            let mut flat_charged = 0usize;
                             for &(d, _) in chunk {
                                 if let Some(sv) = col.get(d) {
                                     // Sorted and distinct.
-                                    tiler.cells(&sv, &mut sc);
+                                    if !tiler.cells_within(&sv, &mut sc, &mut g)? {
+                                        return Ok((flat, ends, false));
+                                    }
+                                    charge_growth(&mut flat, sc.len(), &mut flat_charged, &charge_shared)?;
                                     flat.extend_from_slice(&sc);
                                 }
                                 ends.push(flat.len() as u32);
                             }
-                            (flat, ends)
+                            Ok((flat, ends, true))
                         })
-                        .collect();
-                    let mut docs_iter = v.iter();
-                    for (flat, ends) in &chunks {
+                        .collect::<Result<_>>()?;
+                    for ((flat, ends, complete), docs_chunk) in chunks.iter().zip(v.chunks(GRID_CHUNK_DOCS)) {
                         let mut start = 0usize;
-                        for &end in ends {
-                            let &(d, sc) = docs_iter.next().expect("one end per doc");
+                        // A chunk stopped by the deadline: the docs it tiled.
+                        for (&end, &(d, sc)) in ends.iter().zip(docs_chunk) {
                             for &c in &flat[start..end as usize] {
                                 self.push_grouped(name, &mut cells, c, 16, docs.len(), s, (d, sc))?;
                             }
                             start = end as usize;
                         }
+                        timed_out |= !complete;
                     }
                     continue;
                 }
@@ -532,14 +607,25 @@ impl<'a, 'b> Ctx<'a, 'b> {
             for &(d, sc) in v {
                 buf.clear();
                 if points {
-                    for (lat, lon) in self.geo_points(f, s, d) {
+                    for (lat, lon) in self.geo_points_or(f, s, d, missing) {
                         if let Some(c) = point_cell(lat, lon) {
                             buf.push(c);
                         }
                     }
                 }
                 if let Some(sv) = self.read_shape(&reader, f, s, d) {
-                    tiler.cells(&sv.value(), &mut shape_cells);
+                    if !tiler.cells_within(&sv.value(), &mut shape_cells, &mut budget)? {
+                        timed_out = true;
+                        break;
+                    }
+                    if !points {
+                        // Already sorted and distinct: grouped as they are.
+                        for &c in &shape_cells {
+                            self.push_grouped(name, &mut cells, c, 16, docs.len(), s, (d, sc))?;
+                        }
+                        continue;
+                    }
+                    charge_growth(&mut buf, shape_cells.len(), &mut buf_charged, &charge_serial)?;
                     buf.extend_from_slice(&shape_cells);
                 }
                 buf.sort_unstable();
@@ -786,16 +872,8 @@ impl PointGrid {
             None => 10_000,
             Some(v) => v.as_u64()? as usize,
         };
-        let bounds = match o.get("bounds") {
-            None => None,
-            Some(b) => {
-                let p = |k: &str| b.get(k).and_then(values::parse_geo_point);
-                match (p("top_left"), p("bottom_right")) {
-                    (Some((t0, l)), Some((b0, r))) => Some(CellPred::new(grid, precision, (t0, l, b0, r))),
-                    _ => return None,
-                }
-            }
-        };
+        // Any bounds form (an invalid one: the ordinary path reports it).
+        let bounds = grid_bounds(o, "geo_grid").ok()?.map(|b| CellPred::new(grid, precision, b));
         Some(PointGrid { field: o.get("field")?.as_str()?.to_string(), grid, precision, size, bounds, verdicts: HashMap::new(), counts: HashMap::new(), hex: HashMap::new(), recent: Vec::with_capacity(RECENT_CELLS) })
     }
 
@@ -1197,11 +1275,11 @@ mod point_grid_tests {
         let leaves = index.leaves();
         let segs: Vec<AggSeg> = leaves
             .iter()
-            .map(|l| AggSeg { leaf: *l, lookup, index: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: vec![0.0; l.num_docs() as usize] })
+            .map(|l| AggSeg { shard: 0, leaf: *l, lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: vec![0.0; l.num_docs() as usize] })
             .collect();
         let fetch = |_s: usize, _d: DocId, _sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({})) };
         let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 1 << 20, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 1 << 20, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
         run_aggregations(&aggs, &segs, &env)
     }
 
@@ -1362,4 +1440,33 @@ fn whole_path_subs(sub: Option<&Map<String, Value>>) -> bool {
 /// Matching docs of a segment from which a grid over shape doc values tiles
 /// them in chunks on the pool, and the chunk size.
 const GRID_PAR_MIN_DOCS: usize = 4096;
+
+/// Make room for `extra` more cells in `buf`, charging the growth first
+/// (`charged`: the cells of `buf` charged so far), a batch at a time: at
+/// least double, at least 1024 cells.
+fn charge_growth(buf: &mut Vec<u64>, extra: usize, charged: &mut usize, charge: &dyn Fn(u64) -> Result<()>) -> Result<()> {
+    let need = buf.len() + extra;
+    if need <= *charged {
+        return Ok(());
+    }
+    let new = need.max(charged.saturating_mul(2)).max(1024);
+    charge((new - *charged) as u64 * 8)?;
+    *charged = new;
+    if buf.capacity() < new {
+        buf.try_reserve_exact(new - buf.len()).map_err(|e| EsError::new(429, "circuit_breaking_exception", format!("[request] Data too large, grid cells could not be allocated: {e}")))?;
+    }
+    Ok(())
+}
 const GRID_CHUNK_DOCS: usize = 1024;
+
+/// A geo grid aggregation's `bounds` (`GeoGridAggregationBuilder` parses
+/// them with `GeoBoundingBox.parseBoundingBox`: either corner pair, the
+/// individual sides, or WKT) as `(top, left, bottom, right)`; a malformed
+/// one is an error, never no bounds.
+fn grid_bounds(o: &serde_json::Map<String, Value>, agg: &str) -> crate::error::Result<Option<(f64, f64, f64, f64)>> {
+    match o.get("bounds") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(b)) => crate::query::geo::parse_bounding_box(b, agg, "bounds").map(Some),
+        Some(_) => Err(crate::error::EsError::parsing(format!("[{agg}] failed to parse field [bounds]"))),
+    }
+}

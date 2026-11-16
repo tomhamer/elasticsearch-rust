@@ -1,0 +1,57 @@
+# shellcheck shell=bash
+# Sourced by the image's helper scripts (es-readiness, es-prestop,
+# es-cluster-cleanup, es-healthcheck): how they reach the node's REST API.
+#
+# Env:
+#   ES_URL            base URL. Default: https://127.0.0.1:9200 when
+#                     ES_CA_CERT is set, http://127.0.0.1:9200 otherwise.
+#   ES_CA_CERT        PEM CA bundle that signed the HTTP certificate (curl
+#                     --cacert). The server name is always verified.
+#   ES_CONNECT_TO     curl --connect-to value, e.g. `::127.0.0.1:` to verify
+#                     the certificate against ES_URL's host name (the client
+#                     Service name, which every HTTP certificate carries)
+#                     while connecting to the local node.
+#   ES_USERNAME       user for basic authentication (default elastic).
+#   ES_PASSWORD       its password; else the content of ES_PASSWORD_FILE;
+#                     else ELASTIC_PASSWORD or the content of
+#                     ELASTIC_PASSWORD_FILE (the bootstrap password the node
+#                     itself uses). No password: no Authorization header.
+#
+# The password is handed to curl through a config file descriptor, never on
+# the command line (where `ps` would show it).
+
+if [[ -z "${ES_URL:-}" ]]; then
+  if [[ -n "${ES_CA_CERT:-}" ]]; then ES_URL=https://127.0.0.1:9200; else ES_URL=http://127.0.0.1:9200; fi
+fi
+
+es_password() {
+  if [[ -n "${ES_PASSWORD:-}" ]]; then
+    printf '%s' "$ES_PASSWORD"
+  elif [[ -n "${ES_PASSWORD_FILE:-}" && -r "${ES_PASSWORD_FILE}" ]]; then
+    tr -d '\r\n' < "$ES_PASSWORD_FILE"
+  elif [[ -n "${ELASTIC_PASSWORD:-}" ]]; then
+    printf '%s' "$ELASTIC_PASSWORD"
+  elif [[ -n "${ELASTIC_PASSWORD_FILE:-}" && -r "${ELASTIC_PASSWORD_FILE}" ]]; then
+    tr -d '\r\n' < "$ELASTIC_PASSWORD_FILE"
+  fi
+}
+
+# curl config-file quoting: backslash and double quote are escaped.
+es_curl_quote() {
+  local s="${1//\\/\\\\}"
+  printf '%s' "${s//\"/\\\"}"
+}
+
+# es_curl <curl args...>: curl with the TLS trust, server-name mapping and
+# credentials above. Callers pass full URLs ("${ES_URL}/path").
+es_curl() {
+  local opts=() pw
+  [[ -n "${ES_CA_CERT:-}" ]] && opts+=(--cacert "$ES_CA_CERT")
+  [[ -n "${ES_CONNECT_TO:-}" ]] && opts+=(--connect-to "$ES_CONNECT_TO")
+  pw="$(es_password)"
+  if [[ -n "$pw" ]]; then
+    curl "${opts[@]}" --config <(printf 'user = "%s:%s"\n' "$(es_curl_quote "${ES_USERNAME:-elastic}")" "$(es_curl_quote "$pw")") "$@"
+  else
+    curl "${opts[@]}" "$@"
+  fi
+}

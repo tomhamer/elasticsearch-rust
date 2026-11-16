@@ -45,6 +45,15 @@ pub struct DatafeedRt {
     pub search_count: u64,
     #[serde(default)]
     pub total_search_time_ms: f64,
+    /// While source searches of the current window fail: the last failure
+    /// and how many consecutive attempts failed (the runner retries the
+    /// same window with backoff; it never advances past it). Internal: like
+    /// ES, the API reports retries only through audit messages, never in
+    /// datafeed stats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_problem: Option<String>,
+    #[serde(default)]
+    pub consecutive_search_failures: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

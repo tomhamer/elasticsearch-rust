@@ -467,3 +467,22 @@ fn indexed_points_are_admitted_at_their_size() {
     let grown = indexed.with(1_000_000..1_000_640u64).unwrap();
     assert!(grown.reserved_bytes() <= (words + 10) * INDEXED_WORD_BYTES);
 }
+
+/// #296: a search past its deadline (or cancelled) stops before its next
+/// posting wave with an error, so the caller releases the point table; an
+/// unbounded search over the same index answers.
+#[test]
+fn stopped_search_ends_between_waves() {
+    let _fixture = crate::vector::ivf::fixture_admission_lock();
+    let mut field = Field::new(Similarity::L2, 8, IvfOptions::default());
+    field.add(test_corpus(41, 4_000, 8, 16));
+    let state = field.state.as_ref().unwrap();
+    let q = field.rows[0].clone();
+    let run = |deadline: Option<std::time::Instant>, token: Option<std::sync::Arc<crate::cancel::Token>>| {
+        crate::cancel::with_search_deadline(deadline, token, || state.search(&q, 10, 100, 1.0, 64, Some(4_000), None, false, |_| true))
+    };
+    assert!(run(None, None).is_ok());
+    assert!(run(Some(std::time::Instant::now()), None).is_err(), "past its deadline");
+    assert!(run(None, Some(crate::cancel::Token::cancelled_with("stop"))).is_err(), "cancelled");
+    assert!(run(None, None).is_ok(), "the next search is not affected");
+}

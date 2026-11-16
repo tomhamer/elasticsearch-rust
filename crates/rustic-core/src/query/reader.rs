@@ -418,6 +418,21 @@ impl<'a> LeafReader<'a> {
         }
     }
 
+    /// [`LeafReader::term_range`] one term at a time (a sealed segment's
+    /// dictionary is streamed, never copied); `f` returns `false` to stop.
+    pub fn term_range_visit(&self, field: u16, lower: Option<&[u8]>, upper: Option<&[u8]>, f: &mut dyn FnMut(&[u8], PostingsLocation) -> bool) {
+        match self {
+            LeafReader::Segment(s) => s.term_dict().range_visit(field, lower, upper, f),
+            LeafReader::Memtable(w, ..) => {
+                for (k, loc) in w.term_range(field, lower, upper) {
+                    if !f(&k, loc) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// [`LeafReader::norms`] shared: sealed segments hand out a cached `Arc`.
     pub fn norms_arc(&self, field: u16) -> Arc<Norms> {
         match self {
@@ -965,7 +980,10 @@ impl<'a> LeafReader<'a> {
             // value from its stored fields, as ES reads `_id` (a derived
             // column is only built for whole-segment uses).
             // `_id`s in an id column ([`crate::codec::uid_column`]).
-            LeafReader::Segment(s) if s.uid_column_field() == Some(field) => s.column_uid(doc),
+            // A doc with no entry (an older compact segment's keyword `_id`
+            // merged next to binary ids) keeps its stored id.
+            LeafReader::Segment(s) if s.uid_column_field() == Some(field) => s.column_uid(doc).or_else(|| s.get_doc(doc).ok().flatten()
+                .and_then(|d| d.get(field).and_then(|v| v.as_text().map(str::to_string)))),
             LeafReader::Segment(s) if s.keyword_from_postings(field) => s.get_doc(doc).ok().flatten()
                 .and_then(|d| d.get(field).and_then(|v| v.as_text().map(str::to_string))),
             LeafReader::Segment(s) => s.keyword_reader(field)?.get(doc).map(|v| v.into_owned()),
@@ -1139,12 +1157,34 @@ impl<'a> LeafReader<'a> {
         }
     }
 
-    /// Bool fast-field value of a doc.
+    /// Bool fast-field value of a doc (the first of several).
     pub fn bool_value(&self, field: u16, doc: DocId) -> Option<bool> {
-        match self {
-            LeafReader::Segment(s) => s.fast_fields().get_bool(field).filter(|c| c.has_value(doc)).map(|c| c.get(doc)),
-            LeafReader::Memtable(w, ..) => w.fast_fields().get_bool(field).filter(|c| c.has_value(doc)).map(|c| c.get(doc)),
-        }
+        self.bool_values(field, doc).into_iter().next()
+    }
+
+    /// Every boolean of a doc, in doc-value order (`false` first): the
+    /// boolean column, or the 0/1 column of a field some doc of which holds
+    /// several booleans.
+    pub fn bool_values(&self, field: u16, doc: DocId) -> Vec<bool> {
+        let raw: Vec<i64> = match self {
+            LeafReader::Segment(s) => {
+                let ff = s.fast_fields();
+                if let Some(c) = ff.get_bool(field) {
+                    return if c.has_value(doc) { vec![c.get(doc)] } else { Vec::new() };
+                }
+                ff.get_multi_i64(field).map(|c| c.values_vec(doc)).unwrap_or_default()
+            }
+            LeafReader::Memtable(w, ..) => {
+                let ff = w.fast_fields();
+                if let Some(c) = ff.get_bool(field) {
+                    return if c.has_value(doc) { vec![c.get(doc)] } else { Vec::new() };
+                }
+                ff.get_multi_i64(field).map(|c| c.values(doc).to_vec()).unwrap_or_default()
+            }
+        };
+        let mut v: Vec<bool> = raw.into_iter().map(|x| x != 0).collect();
+        v.sort_unstable();
+        v
     }
 
     /// Whether `doc` has a value of boolean `field`, when the leaf knows
@@ -1155,11 +1195,11 @@ impl<'a> LeafReader<'a> {
         match self {
             LeafReader::Segment(s) => match s.fast_fields().get_bool(field) {
                 Some(c) => c.presence_known().then(|| c.has_value(doc)),
-                None => Some(false),
+                None => Some(s.fast_fields().get_multi_i64(field).is_some_and(|c| c.count(doc) > 0)),
             },
             LeafReader::Memtable(w, ..) => match w.fast_fields().get_bool(field) {
                 Some(c) => c.presence_known().then(|| c.has_value(doc)),
-                None => Some(false),
+                None => Some(w.fast_fields().get_multi_i64(field).is_some_and(|c| !c.values(doc).is_empty())),
             },
         }
     }
@@ -1344,9 +1384,15 @@ impl<'a> LeafReader<'a> {
         boost: f32,
         postings: &dyn Fn(&Term) -> Option<PostingsReader>,
     ) -> Option<PhraseScorer> {
-        let field = positions.first()?.first()?.field;
+        // An empty position is a hole (a token the analyzer removed, e.g. a
+        // stop word): nothing is required there, but later terms keep
+        // their offsets, as Lucene's `PhraseQuery` positions do.
+        let field = positions.iter().find_map(|p| p.first())?.field;
         let mut groups = Vec::with_capacity(positions.len());
         for (i, alts) in positions.iter().enumerate() {
+            if alts.is_empty() {
+                continue;
+            }
             let readers: Vec<PostingsReader> = alts.iter().filter_map(postings).collect();
             if readers.is_empty() {
                 return None;

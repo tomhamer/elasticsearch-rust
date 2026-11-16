@@ -121,6 +121,11 @@ pub trait EsClient: Send + Sync {
     /// Empty slice clears the setting.
     async fn set_allocation_exclude_names(&self, names: &[String]) -> Result<(), EsError>;
     async fn voting_exclusions(&self) -> Result<Vec<String>, EsError>;
+    /// `metadata.cluster_coordination` of the cluster state (`None`: not
+    /// available from this client).
+    async fn coordination(&self) -> Result<Option<Value>, EsError> {
+        Ok(None)
+    }
     async fn add_voting_exclusions(&self, names: &[String]) -> Result<(), EsError>;
     async fn clear_voting_exclusions(&self) -> Result<(), EsError>;
     async fn shutdowns(&self) -> Result<Vec<ShutdownRecord>, EsError>;
@@ -137,6 +142,11 @@ pub struct EsObservation {
     pub allocation_excludes: Vec<String>,
     pub voting_exclusions: Vec<String>,
     pub shutdowns: Vec<ShutdownRecord>,
+    /// Node names in the last committed or last accepted voting
+    /// configuration (an id with no known name stays as its id); `None`
+    /// when not observed. A master is safe to remove only once it is in
+    /// neither (production review #289).
+    pub voters: Option<std::collections::BTreeSet<String>>,
 }
 
 impl EsObservation {
@@ -159,13 +169,16 @@ pub async fn observe(es: &dyn EsClient) -> Result<EsObservation, EsError> {
         Err(EsError::Status { status, .. }) if status == 503 || status == 408 => return Ok(EsObservation::default()),
         Err(e) => return Err(e),
     };
+    let nodes = es.nodes().await?;
+    let voters = es.coordination().await?.map(|c| parse_voters(&c, &nodes));
     Ok(EsObservation {
         health: Some(health),
-        nodes: es.nodes().await?,
+        nodes,
         shards: es.shards().await?,
         allocation_excludes: es.allocation_exclude_names().await?,
         voting_exclusions: es.voting_exclusions().await?,
         shutdowns: es.shutdowns().await?,
+        voters,
     })
 }
 
@@ -182,6 +195,28 @@ impl HttpEsClient {
     pub fn new(base: impl Into<String>, timeout: Duration, auth: Option<(String, String)>) -> Result<Self, EsError> {
         let http = reqwest::Client::builder().timeout(timeout).build().map_err(|e| EsError::Unreachable(e.to_string()))?;
         Ok(HttpEsClient { base: base.into().trim_end_matches('/').to_string(), http, auth })
+    }
+
+    /// HTTPS client for a managed cluster: trusts only the cluster's CA
+    /// bundle (or, without one, the platform roots), verifies the server
+    /// name, authenticates with basic auth. Refuses plain-text URLs.
+    pub fn connect(conn: &crate::security::EsConnection, timeout: Duration) -> Result<Self, EsError> {
+        if !conn.url.starts_with("https://") {
+            return Err(EsError::Unreachable(format!("refusing plain-text URL [{}]", conn.url)));
+        }
+        let mut b = reqwest::Client::builder().timeout(timeout).https_only(true);
+        if let Some(pem) = &conn.ca_pem {
+            let certs = reqwest::Certificate::from_pem_bundle(pem).map_err(|e| EsError::Unreachable(format!("cluster CA: {e}")))?;
+            if certs.is_empty() {
+                return Err(EsError::Unreachable("cluster CA bundle holds no certificate".into()));
+            }
+            b = b.tls_built_in_root_certs(false);
+            for c in certs {
+                b = b.add_root_certificate(c);
+            }
+        }
+        let http = b.build().map_err(|e| EsError::Unreachable(e.to_string()))?;
+        Ok(HttpEsClient { base: conn.url.trim_end_matches('/').to_string(), http, auth: Some((conn.username.clone(), conn.password.clone())) })
     }
 
     async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, EsError> {
@@ -275,6 +310,20 @@ pub fn parse_exclude_names(v: &Value) -> Vec<String> {
     Vec::new()
 }
 
+/// The node names of `cluster_coordination`'s last committed and last
+/// accepted voting configurations (names from `nodes`, else from the
+/// exclusions; an unknown id stays as is).
+pub fn parse_voters(coord: &Value, nodes: &[EsNode]) -> std::collections::BTreeSet<String> {
+    let excl: Vec<(String, String)> = coord["voting_config_exclusions"].as_array().into_iter().flatten().map(|e| (s(e, "node_id"), s(e, "node_name"))).collect();
+    ["last_committed_config", "last_accepted_config"].iter()
+        .flat_map(|k| coord[*k].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .map(|id| nodes.iter().find(|n| n.id == id).map(|n| n.name.clone())
+            .or_else(|| excl.iter().find(|(eid, _)| *eid == id).map(|(_, n)| n.clone()))
+            .unwrap_or(id))
+        .collect()
+}
+
 pub fn parse_voting_exclusions(v: &Value) -> Vec<String> {
     v.pointer("/metadata/cluster_coordination/voting_config_exclusions")
         .and_then(Value::as_array)
@@ -336,6 +385,11 @@ impl EsClient for HttpEsClient {
 
     async fn voting_exclusions(&self) -> Result<Vec<String>, EsError> {
         Ok(parse_voting_exclusions(&self.get("/_cluster/state/metadata?filter_path=metadata.cluster_coordination.voting_config_exclusions").await?))
+    }
+
+    async fn coordination(&self) -> Result<Option<Value>, EsError> {
+        let v = self.get("/_cluster/state/metadata?filter_path=metadata.cluster_coordination").await?;
+        Ok(v.pointer("/metadata/cluster_coordination").cloned())
     }
 
     async fn add_voting_exclusions(&self, names: &[String]) -> Result<(), EsError> {

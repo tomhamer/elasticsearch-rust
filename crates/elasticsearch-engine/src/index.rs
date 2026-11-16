@@ -98,6 +98,33 @@ pub fn current_mapping_authz() -> Option<MappingUpdateAuthz> {
     MAPPING_AUTHZ.with(|c| c.borrow().clone())
 }
 
+thread_local! {
+    static RESTORE_WRITES: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous restore-writes incarnation when dropped.
+pub struct RestoreWritesGuard(Option<String>);
+
+impl Drop for RestoreWritesGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        RESTORE_WRITES.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Writes on this thread (until the guard drops) are a snapshot restore's
+/// own document replay into the index named `index` (the cluster checked
+/// the incarnation): they pass its `index.blocks.write`, which keeps every
+/// other writer out until the restore publishes the index (ES: a restoring
+/// shard takes no writes until it has started). No other block is passed.
+pub fn enter_restore_writes(index: Option<String>) -> RestoreWritesGuard {
+    RestoreWritesGuard(RESTORE_WRITES.with(|c| c.replace(index)))
+}
+
+pub fn current_restore_writes() -> Option<String> {
+    RESTORE_WRITES.with(|c| c.borrow().clone())
+}
+
 pub trait MappingUpdateHook: Send + Sync {
     /// `mappings` is the index's complete mapping (ES JSON, as `GET
     /// _mapping` renders it) including the dynamic update. Return `Ok` once
@@ -193,8 +220,11 @@ pub struct IndexCore {
     /// replication requests) keeps an older one from overwriting a newer.
     mapping_version: AtomicU64,
     /// The host's id of this copy's index incarnation (a cluster's index
-    /// uuid), set once.
+    /// uuid), set once and persisted in the index metadata file, so that the
+    /// copy's identity survives the loss of any host-side map.
     cluster_uuid: std::sync::OnceLock<String>,
+    /// [`Self::cluster_uuid`] is durable in the index metadata file.
+    cluster_uuid_durable: AtomicBool,
     mapping_hook: RwLock<Option<Arc<dyn MappingUpdateHook>>>,
     /// Created sparse (cluster-managed copies): whole-index conveniences
     /// (write / get / update / search over "the index") act on the copies
@@ -450,7 +480,14 @@ pub(crate) fn registry_for_in(flat: &FlatSettings, data: Option<&Path>, load_set
         .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
         .map(|v| v as usize)
         .or(if logsdb { Some(8191) } else { None });
-    reg.default_ignore_malformed = flat.get("index.mapping.ignore_malformed").map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true"))).unwrap_or(false);
+    // `FieldMapper.IGNORE_MALFORMED_SETTING`: true by default for logsdb
+    // indices created at or after `ENABLE_IGNORE_MALFORMED_LOGSDB`, so a
+    // log event with an occasional malformed value is kept (that field
+    // ignored) instead of rejected. An explicit setting always wins.
+    let created = flat.get("index.version.created").map(|v| crate::version::IndexVersion::from_setting(Some(v))).unwrap_or(crate::version::IndexVersion::CURRENT);
+    let logsdb_default = logsdb && created >= crate::version::IndexVersion::ENABLE_IGNORE_MALFORMED_LOGSDB;
+    reg.default_ignore_malformed = flat.get("index.mapping.ignore_malformed").map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true"))).unwrap_or(logsdb_default);
+    reg.default_no_coerce = flat.get("index.mapping.coerce").map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true"))) == Some(false);
     reg.downsample_interval = flat.get("index.downsample.interval").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
     reg.index_mode = flat.get("index.mode").and_then(Value::as_str).map(str::to_string);
     reg.created = flat.get("index.version.created").map(|v| crate::version::IndexVersion::from_setting(Some(v)));
@@ -524,8 +561,25 @@ thread_local! {
 }
 
 fn finish_parsed(pd: &mut crate::document::ParsedDoc, v: &Value, m: &Mappings, lk: &FieldLookup, settings: &FlatSettings) -> Result<()> {
-    crate::stored::attach(&mut pd.doc, v, lk);
-    let synthetic = crate::synthetic::source_mode(settings::get_str(settings, "index.mapping.source.mode"), m, settings::get_str(settings, "index.mode")) == crate::synthetic::SourceMode::Synthetic;
+    crate::stored::attach_with(&mut pd.doc, v, lk, &pd.script_values);
+    let mode = crate::synthetic::source_mode(settings::get_str(settings, "index.mapping.source.mode"), m, settings::get_str(settings, "index.mode"));
+    let synthetic = mode == crate::synthetic::SourceMode::Synthetic;
+    // `_source` disabled: nothing is stored (the callers store an empty
+    // `_source`), so ES's `_recovery_source` keeps the original for
+    // rebuilding the document from the copy's documents. Without the
+    // indexed dense vectors: a rebuild takes those from the vector store
+    // (`vector_source::with_rebuilt_vectors`), never from a second copy.
+    if mode == crate::synthetic::SourceMode::Disabled {
+        // Stored term vectors outlive the `_source` they are rebuilt from.
+        crate::stored::attach_term_vector_values(&mut pd.doc, v, None, lk);
+        if let Some(id) = lk.recovery_source_id {
+            let rest = crate::vector_source::without_rebuildable_vectors(v, lk, &pd.doc);
+            if rest.as_object().is_none_or(|o| !o.is_empty()) {
+                let text = rest.to_string();
+                pd.doc.fields.push((id, rustic_core::types::FieldValue::Keyword(text)));
+            }
+        }
+    }
     // `exclude_source_vectors`: store the source ES would load back (the
     // vectors in their indexed form, patched in at the end of their object).
     let patched = if !synthetic && crate::vector_source::has_synthetic_vectors(lk) && crate::vector_source::excludes_in(settings) { crate::vector_source::rehydrate(v, lk) } else { None };
@@ -564,11 +618,17 @@ fn finish_parsed(pd: &mut crate::document::ParsedDoc, v: &Value, m: &Mappings, l
         // is stored as two bytes.
         let compact = rustic_core::codec::write_version() >= rustic_core::codec::EMPTY_RESIDUAL_SINCE;
         if let Some((full, residual)) = plain {
-            pd.source = Some(full);
-            if let Some(residual) = residual {
-                let residual = if compact { crate::synthetic::compact_residual(residual, lk, &pd.doc) } else { residual };
-                pd.doc.fields.push((crate::mapping::SOURCE_FIELD, rustic_core::types::FieldValue::Keyword(residual)));
+            match residual {
+                Some(residual) => {
+                    let residual = if compact { crate::synthetic::compact_residual(residual, lk, &pd.doc) } else { residual };
+                    pd.doc.fields.push((crate::mapping::SOURCE_FIELD, rustic_core::types::FieldValue::Keyword(residual)));
+                }
+                None => pd.doc.fields.push((crate::mapping::SOURCE_FIELD, rustic_core::types::FieldValue::Keyword(full))),
             }
+            // The operation (translog, replication, recovery) keeps the
+            // input as indexed, not the canonical form, which may sort and
+            // deduplicate indexed text (finding 434).
+            pd.source = None;
             return Ok(());
         }
         let (synth, mut ignored) = crate::synthetic::synthesize(v, m, lk, keep)?;
@@ -617,8 +677,12 @@ fn finish_parsed(pd: &mut crate::document::ParsedDoc, v: &Value, m: &Mappings, l
             // stays whole.
             let stored = crate::synthetic::fold_ignored(stored, &synth, lk, &mut ignored);
             pd.doc.fields.push((crate::mapping::SOURCE_FIELD, rustic_core::types::FieldValue::Keyword(stored)));
+        } else {
+            pd.doc.fields.push((crate::mapping::SOURCE_FIELD, rustic_core::types::FieldValue::Keyword(full.clone())));
         }
-        pd.source = Some(full);
+        // The operation keeps the input as indexed (finding 434).
+        let _ = &full;
+        pd.source = None;
         if let Some(entries) = ignored {
             let created = match settings.get("index.version.created") {
                 None => crate::version::IndexVersion::CURRENT,
@@ -634,9 +698,32 @@ fn finish_parsed(pd: &mut crate::document::ParsedDoc, v: &Value, m: &Mappings, l
             }
         }
     } else if let Some(src) = m.source.as_ref().filter(|s| s.get("includes").is_some() || s.get("excludes").is_some()) {
-        // Mapping-level `_source.includes` / `excludes` filter what is stored.
+        // Mapping-level `_source.includes` / `excludes` filter what is
+        // stored, never what is indexed: the filtered form becomes the
+        // stored `_source` while the operation (translog, replication,
+        // crash replay) keeps the complete input (`pd.source` unchanged),
+        // as ES's translog keeps the original source. A replica or replay
+        // re-parses that input into the same documents.
         let list = |k: &str| -> Vec<String> { src.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default() };
-        pd.source = Some(crate::search::filter_source(v, &list("includes"), &list("excludes")).to_string());
+        let filtered = crate::search::filter_source(v, &list("includes"), &list("excludes"));
+        // Stored term vectors of fields the filter drops from `_source`.
+        crate::stored::attach_term_vector_values(&mut pd.doc, v, Some(&filtered), lk);
+        if filtered != *v {
+            // ES `SourceFieldMapper`: a source the stored form changed keeps
+            // `_recovery_source` for document-based recovery, unless all the
+            // filter dropped is indexed dense vectors (the common
+            // `excludes: [<vector>]`): a rebuild takes those back from the
+            // vector store, so nothing more is kept. Otherwise it keeps the
+            // input without those vectors.
+            let recovery = lk.recovery_source_id.and_then(|id| {
+                let rest = crate::vector_source::without_rebuildable_vectors(v, lk, &pd.doc);
+                (rest != crate::vector_source::without_rebuildable_vectors(&filtered, lk, &pd.doc)).then(|| (id, rest.to_string()))
+            });
+            pd.doc.fields.push((crate::mapping::SOURCE_FIELD, rustic_core::types::FieldValue::Keyword(filtered.to_string())));
+            if let Some((id, text)) = recovery {
+                pd.doc.fields.push((id, rustic_core::types::FieldValue::Keyword(text)));
+            }
+        }
     } else if settings::get_str(settings, "index.mapping.semantic_text.use_legacy_format") == Some("true") {
         // Legacy semantic_text format: the inference results live in `_source`.
         if let Some(src) = crate::inference::semantic::legacy_source(v, lk, &pd.doc) {
@@ -657,6 +744,11 @@ fn finish_parsed(pd: &mut crate::document::ParsedDoc, v: &Value, m: &Mappings, l
     }
     Ok(())
 }
+
+/// Test seam: runs in field-id adoption right before the copies are
+/// checked empty (production review #493).
+#[cfg(test)]
+static ADOPT_AFTER_EMPTY_CHECK: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = parking_lot::Mutex::new(None);
 
 impl IndexService {
     /// Default settings ES reports for every index.
@@ -680,7 +772,7 @@ impl IndexService {
     /// = a random one).
     pub fn create_with_uuid(path: &Path, name: &str, uuid: Option<&str>, settings_in: FlatSettings, mappings_json: &Value, aliases: BTreeMap<String, Value>) -> Result<IndexService> {
         settings::validate(&settings_in)?;
-        crate::fielddata_cache::clear_index(name);
+        // Fielddata bookkeeping is per index uuid: a new index starts empty.
         if settings_in.get("index.number_of_shards").and_then(Value::as_str).map(|s| s != "1").unwrap_or(false) {
             // Single-shard node: accept the setting (clients pass it) but run one shard.
         }
@@ -780,6 +872,10 @@ impl IndexService {
             registry,
         );
         core.metadata_version.store(raw["metadata_version"].as_u64().unwrap_or(0), Ordering::Relaxed);
+        if let Some(c) = raw.get("cluster_uuid").and_then(Value::as_str) {
+            let _ = core.cluster_uuid.set(c.to_string());
+            core.cluster_uuid_durable.store(true, Ordering::Release);
+        }
         let sparse = raw["sparse"].as_bool().unwrap_or(false);
         core.sparse.store(sparse, Ordering::Relaxed);
         let svc = IndexService { core: Arc::new(core), shards: RwLock::new(vec![None; n as usize]), preparation_epochs: (0..n).map(|_| AtomicU64::new(0)).collect(), view: false };
@@ -793,9 +889,15 @@ impl IndexService {
         // A migration interrupted by a crash restarts from shard-0 (still
         // complete: it is only trimmed after the other shards committed).
         let marker = path.join(MIGRATION_MARKER);
-        let legacy = n > 1 && (marker.exists() || (1..n).all(|i| !path.join(format!("shard-{i}")).exists()));
+        // The marker's phase: `trimming` once every destination committed
+        // its documents and shard-0 may already be trimmed. Then the
+        // destinations hold the only copies of their documents and are kept
+        // (production review #410: a restart deleted them and rebuilt them
+        // from the trimmed source); only the trim is redone.
+        let trimming = n > 1 && std::fs::read(&marker).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some_and(|v| v["phase"] == "trimming");
+        let legacy = n > 1 && !trimming && (marker.exists() || (1..n).all(|i| !path.join(format!("shard-{i}")).exists()));
         if legacy {
-            crate::hooks::write_durable(&marker, b"{}")?;
+            crate::hooks::write_durable(&marker, br#"{"phase":"copying"}"#)?;
             for i in 1..n {
                 let _ = std::fs::remove_dir_all(path.join(format!("shard-{i}")));
             }
@@ -817,6 +919,8 @@ impl IndexService {
         }
         if legacy && svc.failed.read().is_empty() {
             svc.migrate_emulated_layout()?;
+        } else if trimming && svc.failed.read().is_empty() {
+            svc.finish_emulated_trim()?;
         }
         Ok(svc)
     }
@@ -832,14 +936,38 @@ impl IndexService {
             dst.copy_docs_from(&src, &|doc_id, routing| self.route(doc_id, routing).map(|s| s == id).unwrap_or(false))?;
             dst.shard.flush()?;
         }
+        // Every destination is committed: from here the source is trimmed,
+        // and a restart must keep the destinations.
+        crate::hooks::write_durable(&self.path().join(MIGRATION_MARKER), br#"{"phase":"trimming"}"#)?;
+        self.finish_emulated_trim()
+    }
+
+    /// The trimming phase of [`Self::migrate_emulated_layout`] (idempotent):
+    /// drop from shard-0 what routes elsewhere, commit, then remove the
+    /// marker durably.
+    fn finish_emulated_trim(&self) -> Result<()> {
+        let shards = self.local_shards();
+        let src = shards[0].clone();
         src.retain_docs(&|doc_id, routing| self.route(doc_id, routing).map(|s| s == 0).unwrap_or(true))?;
         src.shard.flush()?;
-        let _ = std::fs::remove_file(self.path().join(MIGRATION_MARKER));
+        std::fs::remove_file(self.path().join(MIGRATION_MARKER))?;
+        crate::hooks::sync_dir(Some(self.path()));
         Ok(())
     }
 }
 
 /// `index.number_of_shards` of a settings map (1 when absent / invalid).
+/// The routing table parameters of an index with `settings` (shards,
+/// routing shards, partition size), as `elasticsearch-routing` computes
+/// shard ids.
+pub(crate) fn index_routing_of(settings: &FlatSettings) -> elasticsearch_routing::IndexRouting {
+    let n = shard_count(settings);
+    let rns = settings.get("index.number_of_routing_shards").and_then(as_u32).filter(|x| *x > 0).unwrap_or_else(|| elasticsearch_routing::calculate_num_routing_shards(n));
+    let ps = settings.get("index.routing_partition_size").and_then(as_u32).unwrap_or(1);
+    let created = crate::version::IndexVersion::from_setting(settings.get("index.version.created"));
+    elasticsearch_routing::IndexRouting::new(n, rns, ps).with_modulo(created.on_or_after(crate::version::IndexVersion::MOD_ROUTING_FUNCTION))
+}
+
 pub(crate) fn shard_count(s: &FlatSettings) -> u32 {
     s.get("index.number_of_shards")
         .and_then(|v| v.as_str().and_then(|x| x.parse().ok()).or_else(|| v.as_u64().map(|x| x as u32)))
@@ -863,6 +991,7 @@ impl IndexCore {
             metadata_version: AtomicU64::new(0),
             mapping_version: AtomicU64::new(0),
             cluster_uuid: std::sync::OnceLock::new(),
+            cluster_uuid_durable: AtomicBool::new(false),
             mapping_hook: RwLock::new(None),
             sparse: AtomicBool::new(false),
             failed: RwLock::new(BTreeMap::new()),
@@ -892,9 +1021,22 @@ impl IndexCore {
         self.metadata_version.load(Ordering::Acquire)
     }
 
-    /// Record the host's id of this copy's incarnation (first call wins).
-    pub fn set_cluster_uuid(&self, uuid: &str) {
+    /// Record the host's id of this copy's incarnation (first call wins)
+    /// and make it durable in the index metadata file. An error means it is
+    /// recorded in memory only; a later call persists it again.
+    pub fn set_cluster_uuid(&self, uuid: &str) -> Result<()> {
         let _ = self.cluster_uuid.set(uuid.to_string());
+        if self.cluster_uuid_durable.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.persist()
+    }
+
+    /// The incarnation id recorded in the metadata file at `index_path`
+    /// (an index directory), without opening the index.
+    pub fn persisted_cluster_uuid(index_path: &Path) -> Option<String> {
+        let raw: Value = serde_json::from_slice(&std::fs::read(index_path.join(META_FILE)).ok()?).ok()?;
+        raw.get("cluster_uuid").and_then(Value::as_str).map(str::to_string)
     }
 
     /// The host's id of this copy's incarnation, if recorded.
@@ -940,12 +1082,28 @@ impl IndexCore {
         if self.metadata_version() > 0 {
             v["metadata_version"] = json!(self.metadata_version());
         }
+        let cluster_uuid = self.cluster_uuid.get();
+        if let Some(c) = cluster_uuid {
+            v["cluster_uuid"] = json!(c);
+        }
         crate::hooks::write_durable(&self.path.join(META_FILE), &serde_json::to_vec_pretty(&v)?)?;
+        if cluster_uuid.is_some() {
+            self.cluster_uuid_durable.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
     pub fn meta(&self) -> IndexMeta {
         self.meta.read().clone()
+    }
+
+    /// The mapping's runtime field names, read under the lock ([`Self::meta`]
+    /// clones every mapping: too much for a per-search question).
+    pub fn runtime_field_names(&self) -> Vec<String> {
+        match &self.meta.read().mappings.runtime {
+            Some(Value::Object(m)) => m.keys().cloned().collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// Whether `_source` is stored as sent (no `_source` settings beyond
@@ -966,6 +1124,12 @@ impl IndexCore {
             fields.iter().all(|(name, value)| (name == "mode" && value.as_str() == Some("stored"))
                 || (name == "enabled" && value.as_bool() == Some(true)))))
             && matches!(m.mappings.effective_source_mode(), None | Some(crate::synthetic::SourceMode::Stored))
+    }
+
+    /// The mapping's `_source` section (`includes` / `excludes` / `mode`),
+    /// without cloning the rest of the metadata (every ES|QL request asks).
+    pub fn mapping_source(&self) -> Option<Value> {
+        self.meta.read().mappings.source.clone()
     }
 
     /// The mapping's `runtime` section, without cloning the rest of the
@@ -1110,18 +1274,21 @@ impl IndexCore {
         EsError::new(status, "cluster_block_exception", format!("index [{}] blocked by: [{id}];", self.name))
     }
 
-    /// Write blocks (`index.blocks.*`, ES `ClusterBlockLevel.WRITE`);
-    /// `read_only_allow_delete` lets deletes through.
-    fn blocked_writes(&self, is_delete: bool) -> Result<()> {
+    /// Write blocks (`index.blocks.*`, ES `ClusterBlockLevel.WRITE`) for
+    /// every document write. `read_only_allow_delete` blocks document deletes
+    /// too: ES's exception is deleting the whole index (its block allows
+    /// releasing resources), never deleting documents, which still append
+    /// to the translog.
+    fn blocked_writes(&self) -> Result<()> {
         let m = self.meta.read();
         let b = |k: &str| settings::get_bool(&m.settings, k, false);
         if b("index.blocks.read_only") {
             return Err(self.block_err(403, "FORBIDDEN/5/index read-only (api)"));
         }
-        if b("index.blocks.write") {
+        if b("index.blocks.write") && !RESTORE_WRITES.with(|c| c.borrow().as_deref() == Some(self.name.as_str())) {
             return Err(self.block_err(403, "FORBIDDEN/8/index write (api)"));
         }
-        if !is_delete && b("index.blocks.read_only_allow_delete") {
+        if b("index.blocks.read_only_allow_delete") {
             return Err(self.block_err(429, "TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark, index has read-only-allow-delete block"));
         }
         // A CCR follower only takes the leader's operations (`FollowingEngine`).
@@ -1490,6 +1657,14 @@ impl IndexService {
         self.put_settings_impl(flat, preserve_existing, reopen, false)
     }
 
+    /// Set the private `index.downsample.status` (the downsample task's
+    /// own transition, `started` → `success`), open or not.
+    pub fn set_downsample_status(&self, status: &str) -> Result<()> {
+        let mut flat = FlatSettings::new();
+        flat.insert(settings::DOWNSAMPLE_STATUS.into(), serde_json::json!(status));
+        self.put_settings_impl(flat, false, false, true)
+    }
+
     /// Apply a committed cluster metadata delta. Archived values are inert
     /// persisted metadata, not user-writable settings. Public APIs must use
     /// `put_settings` so they cannot manufacture archived values.
@@ -1512,7 +1687,7 @@ impl IndexService {
         };
         let checked: FlatSettings = flat.iter().filter(|(key, _)| !committed || !key.starts_with("archived.")).map(|(key, value)| (key.clone(), value.clone())).collect();
         settings::validate(&checked)?;
-        const FINAL: &[&str] = &["index.number_of_shards", "index.number_of_routing_shards", "index.uuid", "index.creation_date", "index.version.created", "index.mapping.source.mode"];
+        const FINAL: &[&str] = &["index.number_of_shards", "index.number_of_routing_shards", "index.uuid", "index.creation_date", "index.version.created", "index.mapping.source.mode", "index.routing_partition_size", "index.mapping.exclude_source_vectors"];
         if reopen && self.is_open() && flat.keys().any(|k| !settings::is_dynamic(k)) && !flat.keys().any(|k| FINAL.contains(&k.as_str())) {
             self.set_open(false)?;
             let r = self.put_settings_impl(flat, preserve_existing, false, committed);
@@ -1534,10 +1709,32 @@ impl IndexService {
             self.check_metadata_block(true)?;
         }
         let open = self.is_open();
+        // ES `Property.Final` / private settings: never updateable, closed
+        // or not (an open index rejects them as non-dynamic below). A
+        // closed index's shard count changes only through shrink / split /
+        // clone; changing it in place would drop the shards beyond the new
+        // count. (A committed delta is the master's, which never publishes
+        // a shard count change of an existing incarnation.)
+        if !open && !committed {
+            for k in flat.keys() {
+                match k.as_str() {
+                    // ES `Property.Final`: where documents route and how
+                    // stored vectors are read are fixed at creation
+                    // (production review #193: a reopen reinterpreted them).
+                    "index.number_of_shards" | "index.number_of_routing_shards" | "index.routing_partition_size" | "index.mapping.exclude_source_vectors" => {
+                        return Err(EsError::illegal_argument(format!("final index setting [{k}], not updateable")));
+                    }
+                    "index.uuid" | "index.creation_date" | "index.version.created" => {
+                        return Err(EsError::illegal_argument(format!("can not update private setting [{k}]; this setting is managed by Elasticsearch")));
+                    }
+                    _ => {}
+                }
+            }
+        }
         crate::tsdb::validate_put_settings(&self.meta.read().settings, &flat, open, &self.name)?;
         let mut bad = Vec::new();
         for k in flat.keys() {
-            if !settings::is_dynamic(k) && open {
+            if !settings::is_dynamic(k) && !(committed && settings::is_private_dynamic(k)) && open {
                 bad.push(k.clone());
             }
         }
@@ -1789,12 +1986,7 @@ impl IndexService {
     /// The index's routing table parameters (shards, routing shards,
     /// partition size), as `elasticsearch-routing` computes shard ids.
     pub fn index_routing(&self) -> elasticsearch_routing::IndexRouting {
-        let m = self.meta.read();
-        let n = shard_count(&m.settings);
-        let rns = m.settings.get("index.number_of_routing_shards").and_then(as_u32).filter(|x| *x > 0).unwrap_or_else(|| elasticsearch_routing::calculate_num_routing_shards(n));
-        let ps = m.settings.get("index.routing_partition_size").and_then(as_u32).unwrap_or(1);
-        let created = crate::version::IndexVersion::from_setting(m.settings.get("index.version.created"));
-        elasticsearch_routing::IndexRouting::new(n, rns, ps).with_modulo(created.on_or_after(crate::version::IndexVersion::MOD_ROUTING_FUNCTION))
+        index_routing_of(&self.meta.read().settings)
     }
 
     /// The shard a single-document operation on `id` (with `routing`)
@@ -2067,6 +2259,24 @@ impl IndexService {
     /// the old files aside to reuse the ones identical to the source's
     /// (ES `Store.MetadataSnapshot.recoveryDiff`). `false` when there was no
     /// data.
+    /// Undo [`Self::set_aside_shard_store`]: close any copy of `n` open
+    /// here (a recovery placeholder) and put the store at `from` back as
+    /// shard `n`'s. `false` when nothing was set aside.
+    pub fn restore_shard_store(&self, n: u32, from: &Path) -> Result<bool> {
+        let open = {
+            let mut slots = self.shards.write();
+            if let Some(epoch) = self.preparation_epochs.get(n as usize) {
+                epoch.fetch_add(1, Ordering::Relaxed);
+            }
+            self.cancel_openings(Some(n));
+            slots.get_mut(n as usize).and_then(Option::take)
+        };
+        if let Some(s) = open {
+            s.close()?;
+        }
+        IndexShard::restore_store(&self.core, n, from)
+    }
+
     pub fn set_aside_shard_store(&self, n: u32, dest: &Path) -> Result<bool> {
         let open = {
             let mut slots = self.shards.write();
@@ -2116,6 +2326,11 @@ impl IndexService {
     /// already open here must hold no operation: it is reopened empty with
     /// the new ids (the other shards of a full-open index); one that holds
     /// any refuses the change. Returns whether the ids changed.
+    #[cfg(test)]
+    pub(crate) fn adopt_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *ADOPT_AFTER_EMPTY_CHECK.lock() = hook;
+    }
+
     pub fn adopt_core_ids(&self, ids: &BTreeMap<String, u16>) -> Result<bool> {
         // Commits written before the stored-fields block's field was named
         // by its key call it `_stored_fields`: the same field.
@@ -2126,20 +2341,49 @@ impl IndexService {
         } else {
             ids
         };
+        if ids.iter().all(|(k, id)| self.meta.read().mappings.core_ids.get(k) == Some(id)) {
+            return Ok(false);
+        }
+        // Every local copy is fenced and drained before it is found empty,
+        // and stays fenced until it is reopened under the new ids: a write
+        // acknowledged after the emptiness check would be deleted with the
+        // store (production review #493). New writes fail with the copy's
+        // closed error meanwhile (retried by the cluster). Drained before
+        // the mapping lock: an in-flight write may be waiting for it.
+        let fenced = self.local_shards();
+        for c in &fenced {
+            c.fence_and_drain();
+        }
+        let unfence = |copies: &[Arc<IndexShard>]| {
+            for c in copies {
+                c.unfence();
+            }
+        };
         let reopen = {
             let _g = self.mapping_lock.lock();
             let mut m = self.meta.read().mappings.clone();
             if ids.iter().all(|(k, id)| m.core_ids.get(k) == Some(id)) {
+                unfence(&fenced);
                 return Ok(false);
             }
             let mut used = std::collections::BTreeSet::new();
             for id in ids.values() {
                 if *id < crate::mapping::FIRST_USER_FIELD || !used.insert(*id) {
+                    unfence(&fenced);
                     return Err(EsError::new(500, "corrupt_index_exception", format!("invalid field id [{id}] in the schema of the files adopted by [{}]", self.name)));
                 }
             }
             let copies = self.local_shards();
+            if copies.len() != fenced.len() || copies.iter().zip(&fenced).any(|(a, b)| !Arc::ptr_eq(a, b)) {
+                unfence(&fenced);
+                return Err(EsError::new(500, "illegal_state_exception", format!("cannot change the field ids of [{}]: its copies changed while adopting", self.name)));
+            }
+            #[cfg(test)]
+            if let Some(hook) = ADOPT_AFTER_EMPTY_CHECK.lock().clone() {
+                hook();
+            }
             if let Some(busy) = copies.iter().find(|c| c.shard.max_seq_no() >= 0 || c.doc_count_realtime() != (0, 0)) {
+                unfence(&fenced);
                 return Err(EsError::new(500, "illegal_state_exception", format!("cannot change the field ids of [{}]: its copy of shard [{}] holds operations", self.name, busy.id)));
             }
             let above = |v: Option<&u16>| v.map_or(0, |m| m + 1);
@@ -2317,12 +2561,15 @@ impl IndexService {
             }
         }
         let authz = current_mapping_authz();
+        let restore = current_restore_writes();
         let run = |(sn, (pos, batch)): (usize, (Vec<usize>, Vec<WriteReq>))| -> Vec<(usize, Result<WriteResult>)> {
             if batch.is_empty() {
                 return Vec::new();
             }
-            // (rayon workers: carry the request's mapping authorizer over)
+            // (rayon workers: carry the request's mapping authorizer and
+            // restore replay over)
             let _authz = enter_mapping_authz(authz.clone());
+            let _restore = enter_restore_writes(restore.clone());
             let res = match &slots[sn] {
                 Some(s) => s.write(batch, sync),
                 None => batch.iter().map(|_| Err(self.missing_copy(sn as u32))).collect(),
@@ -2351,11 +2598,13 @@ impl IndexService {
     /// `routing_path` dimensions); shard 0 when the source cannot be
     /// routed (the shard reports the parse error).
     fn tsdb_route_source(&self, source: &str) -> u32 {
-        let id = serde_json::from_str::<Value>(source).ok().and_then(|v| {
+        // The routing path values of the source, mapped or not yet mapped
+        // (a dynamic dimension is learned only on the shard).
+        let hash = serde_json::from_str::<Value>(source).ok().and_then(|v| {
             let meta = self.meta.read();
-            self.lookup().tsdb_fields.build_ids(&meta.mappings, &meta.settings, &v).ok().map(|ids| ids.id)
+            self.lookup().tsdb_fields.routing_hash(&meta.mappings, &meta.settings, &v).ok()
         });
-        id.and_then(|id| tsdb_routing_hash(&id)).map(|h| self.index_routing().hash_to_shard(h)).unwrap_or(0)
+        hash.map(|h| self.index_routing().hash_to_shard(h)).unwrap_or(0)
     }
 
     /// Realtime get of `id` on the shard it routes to (by `_id`).
@@ -2554,10 +2803,13 @@ impl IndexService {
     pub fn counters(&self) -> crate::shard::Counters {
         let shards = self.local_shards();
         let c = crate::shard::Counters::sum(shards.iter().map(|s| &s.shard.counters));
-        // `merges.current` counts merges the policy wants but has not
-        // started too: a wait for it to reach 0 (Rally's
-        // wait-until-merges-finish) then really waits for the merges.
-        let queued: u64 = shards.iter().map(|s| s.shard.queued_merges()).sum();
+        // `merges.current` counts running merges (ES), plus one for a copy
+        // whose policy wants merges none of which runs yet: a wait for it
+        // to reach 0 (Rally's wait-until-merges-finish) then really waits
+        // for the merges, and it never reports queued merges as running.
+        let queued: u64 = shards.iter()
+            .filter(|s| crate::shard::Counters::get(&s.shard.counters.merge_current) == 0 && s.shard.queued_merges() > 0)
+            .count() as u64;
         c.merge_current.fetch_add(queued, std::sync::atomic::Ordering::Relaxed);
         c
     }
@@ -2677,6 +2929,50 @@ mod tests {
         let s = IndexService::open(tmp.path()).unwrap();
         assert_eq!(s.setting("index.similarity.my.b").as_deref(), Some("0.5"));
         assert!(s.is_open());
+    }
+
+    /// Review #84: a closed index rejects a shard count change (ES: final
+    /// setting; resizing goes through shrink / split / clone) and keeps
+    /// every document; the private per-copy settings are refused too.
+    #[test]
+    fn closed_index_rejects_shard_count_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let flat = |v: Value| settings::normalize_index_settings(&v);
+        let s = IndexService::create(tmp.path(), "two", flat(json!({"index": {"number_of_shards": 2, "number_of_replicas": 0}})), &json!({}), BTreeMap::new()).unwrap();
+        for i in 0..10 {
+            let r = s.write(vec![WriteReq::Index { id: Some(i.to_string()), source: format!(r#"{{"n": {i}}}"#), routing: None, cond: WriteCond::default() }], true);
+            assert!(r[0].is_ok(), "{:?}", r[0]);
+        }
+        s.flush().unwrap();
+        s.set_open(false).unwrap();
+        let before = s.meta.read().settings.clone();
+        for (k, v, reason) in [
+            ("index.number_of_shards", json!("1"), "final index setting [index.number_of_shards], not updateable"),
+            ("index.number_of_routing_shards", json!("4"), "final index setting [index.number_of_routing_shards], not updateable"),
+            ("index.uuid", json!("other"), "can not update private setting [index.uuid]; this setting is managed by Elasticsearch"),
+        ] {
+            let mut f = FlatSettings::new();
+            f.insert(k.into(), v);
+            for reopen in [false, true] {
+                let e = s.put_settings_reopen(f.clone(), false, reopen).unwrap_err();
+                assert_eq!((e.status, e.kind.as_str(), e.reason.as_str()), (400, "illegal_argument_exception", reason));
+            }
+        }
+        assert_eq!(s.meta.read().settings, before);
+        // Other settings still apply to the closed index.
+        s.put_settings(flat(json!({"index": {"refresh_interval": "2s"}})), false).unwrap();
+        s.set_open(true).unwrap();
+        assert_eq!(s.setting("index.number_of_shards").as_deref(), Some("2"));
+        s.refresh().unwrap();
+        for i in 0..10 {
+            assert!(s.get(&i.to_string()).unwrap().is_some(), "doc {i} lost");
+        }
+        drop(s);
+        let s = IndexService::open(tmp.path()).unwrap();
+        assert_eq!(s.setting("index.number_of_shards").as_deref(), Some("2"));
+        for i in 0..10 {
+            assert!(s.get(&i.to_string()).unwrap().is_some(), "doc {i} lost after reopening from disk");
+        }
     }
 
     /// An index an older build created with BM25 parameters out of

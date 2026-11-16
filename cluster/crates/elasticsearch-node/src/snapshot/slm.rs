@@ -280,7 +280,7 @@ pub async fn execute_policy(node: &Arc<ClusterNode>, id: &str) -> Result<String,
             Ok(Err(e)) => Some(e.to_json()["error"].to_string()),
             Err(e) => Some(json!({"type": "exception", "reason": e.to_string()}).to_string()),
         };
-        state_of(&node2).slm_running.lock().remove(&id2);
+        let last = finish_running(&state_of(&node2).slm_running, &id2);
         let r = mutate(&node2, move |m| {
             if let Some(p) = m.policies.get_mut(&id2) {
                 match &failure {
@@ -292,7 +292,9 @@ pub async fn execute_policy(node: &Arc<ClusterNode>, id: &str) -> Result<String,
                 None => m.stats.snapshot_taken(&id2),
                 Some(_) => m.stats.snapshot_failed(&id2),
             }
-            if m.mode == OperationMode::Stopping {
+            // STOPPED only once no other policy's snapshot is still
+            // running (#587): the last completion stops SLM.
+            if m.mode == OperationMode::Stopping && last {
                 m.mode = OperationMode::Stopped;
             }
             Ok(true)
@@ -303,6 +305,31 @@ pub async fn execute_policy(node: &Arc<ClusterNode>, id: &str) -> Result<String,
         }
     });
     Ok(name)
+}
+
+/// Retire policy `id`'s running snapshot; whether it was the last one
+/// running (an SLM that is STOPPING may become STOPPED).
+fn finish_running(running: &parking_lot::Mutex<std::collections::BTreeMap<String, (String, String, i64)>>, id: &str) -> bool {
+    let mut r = running.lock();
+    r.remove(id);
+    r.is_empty()
+}
+
+#[cfg(test)]
+mod stop_tests {
+    /// #587: with two policies' snapshots running, the first completion
+    /// leaves SLM STOPPING; only the last (in either order) stops it.
+    #[test]
+    fn only_the_last_running_snapshot_stops_slm() {
+        for order in [["a", "b"], ["b", "a"]] {
+            let running = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+            for id in ["a", "b"] {
+                running.lock().insert(id.to_string(), (format!("snap-{id}"), String::new(), 0i64));
+            }
+            assert!(!super::finish_running(&running, order[0]), "{order:?}: one still running");
+            assert!(super::finish_running(&running, order[1]), "{order:?}: the last one");
+        }
+    }
 }
 
 /// Delete the snapshots retention selects, for every policy.

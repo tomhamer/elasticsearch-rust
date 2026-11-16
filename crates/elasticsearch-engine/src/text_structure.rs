@@ -244,19 +244,38 @@ fn day_variants(base: &str) -> Vec<String> {
     vec![base.to_string(), base.replacen("dd", " d", 1), base.replacen("dd", "d", 1)]
 }
 
+/// The numeric date at the start of an indeterminate (`DATE` /
+/// `DATESTAMP`) example: its two leading numbers and their digit counts.
+fn indeterminate_parts(example: &str) -> Option<(u32, u32)> {
+    let re = Regex::new(r"^(\d{1,2})[/.-](\d{1,2})[/.-](?:\d{4}|\d{2})(?:\D|$)").unwrap();
+    let c = re.captures(example)?;
+    Some((c[1].parse().ok()?, c[2].parse().ok()?))
+}
+
+/// The format of an indeterminate example. `day_first`: the order the
+/// whole sample settled on (`None`: decide from this example alone, ES's
+/// day-first default when it is ambiguous).
 fn indeterminate(example: &str, with_time: bool) -> Vec<String> {
-    let re = Regex::new(r"^(\d{1,2})([/.-])(\d{1,2})[/.-](\d{2}|\d{4})").unwrap();
+    indeterminate_ordered(example, with_time, None)
+}
+
+fn indeterminate_ordered(example: &str, with_time: bool, day_first: Option<bool>) -> Vec<String> {
+    // The year is captured whole (four digits before two), so `2026` is
+    // never read as `20` followed by a separator `2` (#540).
+    let re = Regex::new(r"^(\d{1,2})([/.-])(\d{1,2})[/.-](\d{4}|\d{2})(?:\D|$)").unwrap();
     let Some(c) = re.captures(example) else { return vec![] };
     let a: u32 = c[1].parse().unwrap_or(0);
     let b: u32 = c[3].parse().unwrap_or(0);
     let sep = &c[2];
     let year = if c[4].len() == 4 { "yyyy" } else { "yy" };
-    let (f1, f2) = if a > 12 && b <= 12 { ("dd", "MM") } else if b > 12 && a <= 12 { ("MM", "dd") } else { ("dd", "MM") };
+    let day_first = day_first.unwrap_or(!(b > 12 && a <= 12));
+    let (f1, f2) = if day_first { ("dd", "MM") } else { ("MM", "dd") };
     let f1 = if c[1].len() == 1 { &f1[..1] } else { f1 };
     let f2 = if c[3].len() == 1 { &f2[..1] } else { f2 };
     let mut f = format!("{f1}{sep}{f2}{sep}{year}");
     if with_time {
-        let tsep = example.chars().nth(c[0].chars().count()).unwrap_or(' ');
+        let date_len = c[1].len() + 1 + c[3].len() + 1 + c[4].len();
+        let tsep = example[date_len..].chars().next().unwrap_or(' ');
         f.push(tsep);
         f.push_str("HH:mm:ss");
     }
@@ -299,8 +318,61 @@ fn make_format(c: &Candidate, example: &str) -> TsFormat {
         13 => (vec!["ISO8601".into()], true),
         _ => (vec!["MMM d, yyyy @ HH:mm:ss.SSS".into()], true),
     };
-    let nanos = java.iter().any(|f| f.contains("SSSSSSS"));
+    let nanos = java.iter().any(|f| f.contains("SSSS")) || sub_millisecond(example);
     TsFormat { java, grok: c.grok.to_string(), custom: c.custom.map(str::to_string), simple: c.simple.to_string(), tz_dependent: tz, nanos }
+}
+
+/// The value carries a fraction of a second finer than milliseconds (more
+/// than three fractional digits): a `date` would collapse distinct
+/// instants, so the field needs `date_nanos` (ES
+/// `TimestampFormatFinder.needNanosecondPrecision`, #539).
+fn sub_millisecond(v: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?:\d{2}:\d{2}:\d{2}[.,:]|^\d{10}\.)(\d{4,})").unwrap()).is_match(v)
+}
+
+/// Reconcile one field's (or one log's) timestamp format over every sample
+/// value (#539 / #541, ES `TimestampFormatFinder` determinization):
+/// sub-millisecond precision seen in any sample, time zone dependence, and
+/// for numeric dates the day/month order the whole sample proves. Every
+/// emitted format must parse every value; `None` when no consistent
+/// interpretation exists (one sample day-first, another month-first).
+fn reconcile(values: &[&str], first: &TsFormat) -> Option<TsFormat> {
+    let mut out = first.clone();
+    for v in values {
+        out.nanos |= sub_millisecond(v);
+    }
+    let with_time = match first.grok.as_str() {
+        "DATESTAMP" => true,
+        "DATE" => false,
+        _ => return Some(out),
+    };
+    let (mut day_first, mut month_first) = (false, false);
+    for v in values {
+        let (a, b) = indeterminate_parts(v)?;
+        day_first |= a > 12;
+        month_first |= b > 12;
+    }
+    if day_first && month_first {
+        return None;
+    }
+    let order = if month_first { false } else { true };
+    let mut java: Vec<String> = Vec::new();
+    for v in values {
+        for f in indeterminate_ordered(v, with_time, Some(order)) {
+            if !java.contains(&f) {
+                java.push(f);
+            }
+        }
+    }
+    // Each value parses with one of the formats (a generated mapping or
+    // date processor must accept the sample it came from).
+    let parsers: Vec<_> = java.iter().filter_map(|f| crate::date::DateFormatter::new(f).ok()).collect();
+    if !values.iter().all(|v| parsers.iter().any(|p| p.parse(v).is_ok())) {
+        return None;
+    }
+    out.java = java;
+    Some(out)
 }
 
 /// A user-supplied `timestamp_format` turned into a candidate.
@@ -380,14 +452,19 @@ fn override_format(fmt: &str) -> std::result::Result<(Regex, Regex, TsFormat), S
     let full = Regex::new(&format!("^(?:{re})$")).map_err(|e| e.to_string())?;
     let search = Regex::new(&format!(r"\b(?:{re})")).map_err(|e| e.to_string())?;
     let simple = format!(r"\b{re}");
-    let f = TsFormat { java: vec![fmt.to_string()], grok: "CUSTOM_TIMESTAMP".into(), custom: Some(gk), simple, tz_dependent: !zone, nanos: fmt.contains("SSSSSSS") };
+    let f = TsFormat { java: vec![fmt.to_string()], grok: "CUSTOM_TIMESTAMP".into(), custom: Some(gk), simple, tz_dependent: !zone, nanos: fmt.contains("SSSS") };
     Ok((full, search, f))
 }
 
 /// Full-match timestamp format of a field value.
 fn value_format(v: &str, ov: &Overrides) -> Result<Option<TsFormat>> {
     if let Some(f) = &ov.timestamp_format {
-        let (full, _, tf) = override_format(f).map_err(ia)?;
+        // `"null"`: the sample has no timestamp; no value is one.
+        if f == "null" {
+            return Ok(None);
+        }
+        let (full, _, mut tf) = override_format(f).map_err(ia)?;
+        tf.nanos |= sub_millisecond(v);
         return Ok(if full.is_match(v) { Some(tf) } else { None });
     }
     for (c, cc) in CANDIDATES.iter().zip(compiled()) {
@@ -406,10 +483,7 @@ fn timestamp_mapping(values: &[String], ov: &Overrides) -> Result<Option<(TsForm
             None => return Ok(None),
             Some(f) => match &first {
                 None => first = Some(f),
-                Some(p) if p.grok == f.grok && p.java.len() == f.java.len() => {
-                    if p.java != f.java && p.grok != "SYSLOGTIMESTAMP" && p.grok != "CISCOTIMESTAMP" {
-                        // e.g. ISO8601 vs explicit pattern: merge by keeping the first
-                    }
+                Some(p) if p.grok == f.grok => {
                     if f.tz_dependent && !p.tz_dependent {
                         first = Some(TsFormat { tz_dependent: true, ..p.clone() });
                     }
@@ -418,7 +492,9 @@ fn timestamp_mapping(values: &[String], ov: &Overrides) -> Result<Option<(TsForm
             },
         }
     }
-    Ok(first.map(|f| {
+    let Some(first) = first else { return Ok(None) };
+    let vals: Vec<&str> = values.iter().map(String::as_str).collect();
+    Ok(reconcile(&vals, &first).map(|f| {
         let m = f.mapping_with_format();
         (f, m)
     }))
@@ -627,19 +703,23 @@ fn mappings_and_stats(records: &[Record], ov: &Overrides) -> Result<(BTreeMap<St
         if vals.is_empty() {
             continue;
         }
-        if vals.iter().any(|v| v.is_object()) {
-            if vals.iter().all(|v| v.is_object()) {
-                mappings.insert(name.clone(), json!({"type": "object"}));
-                continue;
-            }
-            return Err(ia(format!("Field [{name}] has both object and non-object values - this is not supported by Elasticsearch")));
-        }
+        // Arrays are flattened before the values are classified (ES
+        // `TextStructureUtils.guessMappingsAndCalculateFieldStats`): an
+        // array of objects is an object field, singletons and arrays of
+        // objects mix freely (#558).
         let mut flat = Vec::new();
         for v in vals {
             flatten_values(v, &mut flat);
         }
         if flat.is_empty() {
             continue;
+        }
+        if flat.iter().any(|v| v.is_object()) {
+            if flat.iter().all(|v| v.is_object()) {
+                mappings.insert(name.clone(), json!({"type": "object"}));
+                continue;
+            }
+            return Err(ia(format!("Field [{name}] has both object and non-object values - this is not supported by Elasticsearch")));
         }
         let strs: Vec<String> = flat.iter().map(java_string).collect();
         let mapping = guess_scalar(&strs, ov)?;
@@ -677,6 +757,7 @@ fn guess_timestamp_field(records: &[Record], ov: &Overrides, explanation: &mut V
     }
     'cand: for (k, f) in candidates {
         let mut fmt = f.clone();
+        let mut seen: Vec<String> = vec![java_string(first.iter().find(|(n, _)| n == &k).map(|(_, v)| v).unwrap())];
         for r in &records[1..] {
             let Some(v) = r.iter().find(|(n, v)| n == &k && !v.is_null()).map(|(_, v)| v) else {
                 if ov.timestamp_field.is_some() {
@@ -690,6 +771,7 @@ fn guess_timestamp_field(records: &[Record], ov: &Overrides, explanation: &mut V
                     if g.tz_dependent {
                         fmt.tz_dependent = true;
                     }
+                    seen.push(java_string(v));
                 }
                 _ => {
                     if let Some(tf) = &ov.timestamp_format {
@@ -700,6 +782,12 @@ fn guess_timestamp_field(records: &[Record], ov: &Overrides, explanation: &mut V
                 }
             }
         }
+        let vals: Vec<&str> = seen.iter().map(String::as_str).collect();
+        let Some(f) = reconcile(&vals, &fmt) else {
+            explanation.push(format!("First sample match [{}] ruled out because the sample values have no consistent interpretation", fmt.java.join(", ")));
+            continue 'cand;
+        };
+        let fmt = f;
         explanation.push(format!(
             "{} field is [{k}] with format [{}]",
             if ov.timestamp_field.is_none() { "Guessing timestamp" } else { "Timestamp" },
@@ -1513,6 +1601,24 @@ fn add_intermediate(out: &mut String, snippets: &[String]) -> usize {
 
 /// Full-message Grok patterns tried before building one from examples
 /// (`(pattern, time field)`).
+/// `ecs_compatibility: v1` selects ES's ECS pattern bank for discovery,
+/// as the generated grok processor (and `test_grok_pattern`) run with it:
+/// mappings are inferred from the captures the pipeline will actually
+/// emit (#557).
+fn ecs_v1(ecs: Option<&str>) -> bool {
+    ecs == Some("v1")
+}
+
+/// The discovery pattern bank: ES's ECS bank under `v1`, else the legacy one.
+fn discovery_bank(ecs: Option<&str>) -> &'static BTreeMap<String, String> {
+    if ecs_v1(ecs) { grok::bank_es(true) } else { grok::bank() }
+}
+
+fn is_es_bank(defs: &BTreeMap<String, String>) -> bool {
+    // The ECS bank's apache pattern names ECS fields.
+    defs.get("HTTPD_COMMONLOG").is_some_and(|p| p.contains("source.address"))
+}
+
 const FULL_MATCH: &[(&str, &str)] = &[
     ("CATALINALOG", "timestamp"),
     ("COMBINEDAPACHELOG", "timestamp"),
@@ -1526,7 +1632,8 @@ const FULL_MATCH: &[(&str, &str)] = &[
 
 /// Captured values per field of `pattern` over every message (`None`: some message does not match).
 fn grok_values(pattern: &str, defs: &BTreeMap<String, String>, messages: &[String]) -> Result<Option<BTreeMap<String, Vec<String>>>> {
-    let g = Grok::compile(pattern, defs)?;
+    // ES's real banks (the ECS one) need the full regex dialect.
+    let g = if is_es_bank(defs) { Grok::compile_es(pattern, defs)? } else { Grok::compile(pattern, defs)? };
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for m in messages {
         let Some(c) = g.captures(m) else { return Ok(None) };
@@ -1542,7 +1649,11 @@ fn grok_values(pattern: &str, defs: &BTreeMap<String, String>, messages: &[Strin
 fn search_format(line: &str, ov: &Overrides) -> Result<Option<(String, TsFormat, usize)>> {
     if let Some(f) = &ov.timestamp_format {
         let (_, search, tf) = override_format(f).map_err(ia)?;
-        return Ok(search.find(line).map(|m| (line[..m.start()].to_string(), tf, 0)));
+        return Ok(search.find(line).map(|m| {
+            let mut tf = tf;
+            tf.nanos |= sub_millisecond(m.as_str());
+            (line[..m.start()].to_string(), tf, 0)
+        }));
     }
     let mut best: Option<(usize, String, TsFormat, usize)> = None;
     for (i, (c, cc)) in CANDIDATES.iter().zip(compiled()).enumerate() {
@@ -1576,7 +1687,7 @@ fn log_text(lines: Option<&[&str]>, messages_in: Option<&[String]>, st: &mut Str
         let custom = BTreeMap::new();
         let grok_pattern = match &ov.grok_pattern {
             Some(g) => {
-                let vals = grok_values(g, grok::bank(), &source)
+                let vals = grok_values(g, discovery_bank(ov.ecs_compatibility.as_deref()), &source)
                     .map_err(|_| ia(format!("Supplied Grok pattern [{g}] cannot be converted to a valid regex")))?
                     .ok_or_else(|| ia(format!("Supplied Grok pattern [{g}] does not match sample messages")))?;
                 for (k, v) in vals {
@@ -1604,7 +1715,8 @@ fn log_text(lines: Option<&[&str]>, messages_in: Option<&[String]>, st: &mut Str
     for l in &source {
         let f = search_format(l, ov)?;
         if let Some((_, tf, ci)) = &f {
-            match counts.iter_mut().find(|c| c.0.grok == tf.grok && c.0.java == tf.java) {
+            let same = |c: &TsFormat| c.grok == tf.grok && (c.java == tf.java || matches!(tf.grok.as_str(), "DATE" | "DATESTAMP"));
+            match counts.iter_mut().find(|c| same(&c.0)) {
                 Some(c) => c.1 += 1,
                 None => counts.push((tf.clone(), 1, *ci)),
             }
@@ -1619,7 +1731,7 @@ fn log_text(lines: Option<&[&str]>, messages_in: Option<&[String]>, st: &mut Str
     let prefaces: Vec<String> = found
         .iter()
         .flatten()
-        .filter(|(_, f)| f.grok == best.grok && f.java == best.java)
+        .filter(|(_, f)| f.grok == best.grok && (f.java == best.java || matches!(best.grok.as_str(), "DATE" | "DATESTAMP")))
         .map(|(p, f)| {
             tz_dep |= f.tz_dependent;
             p.clone()
@@ -1627,6 +1739,30 @@ fn log_text(lines: Option<&[&str]>, messages_in: Option<&[String]>, st: &mut Str
         .collect();
     let mut best = best;
     best.tz_dependent = tz_dep;
+    // Every line's timestamp (of the chosen family) decides precision and
+    // the day/month order (#539 / #541).
+    let stamps: Vec<String> = source
+        .iter()
+        .zip(&found)
+        .filter_map(|(l, f)| {
+            let (p, tf) = f.as_ref()?;
+            if tf.grok != best.grok {
+                return None;
+            }
+            let rest = &l[p.len()..];
+            let idx = CANDIDATES.iter().position(|c| c.grok == best.grok && c.custom.as_deref() == best.custom.as_deref())?;
+            compiled()[idx].search.find(rest).map(|m| m.as_str().to_string())
+        })
+        .collect();
+    if ov.timestamp_format.is_none() && !stamps.is_empty() {
+        let vals: Vec<&str> = stamps.iter().map(String::as_str).collect();
+        match reconcile(&vals, &best) {
+            Some(f) => best = TsFormat { tz_dependent: tz_dep, ..f },
+            None => return Err(ia(format!("Could not find a consistent interpretation of the timestamps in the sample for format [{}]", best.java.join(", ")))),
+        }
+    } else {
+        best.nanos |= stamps.iter().any(|s| sub_millisecond(s));
+    }
     let mut ml = String::from("^");
     let complexity = add_intermediate(&mut ml, &prefaces);
     ml.push_str(&best.simple);
@@ -1688,7 +1824,7 @@ fn log_text(lines: Option<&[&str]>, messages_in: Option<&[String]>, st: &mut Str
     if let Some(c) = &best.custom {
         custom.insert("CUSTOM_TIMESTAMP".into(), c.clone());
     }
-    let mut defs = grok::bank().clone();
+    let mut defs = discovery_bank(ov.ecs_compatibility.as_deref()).clone();
     defs.extend(custom.clone());
     let mut ts_field = ov.timestamp_field.clone();
     let grok_pattern = match &ov.grok_pattern {
@@ -1906,18 +2042,18 @@ pub fn test_grok_pattern(body: &Value, ecs: Option<&str>) -> Result<Value> {
     }
     let pattern = body.get("grok_pattern").and_then(Value::as_str).ok_or_else(|| EsError::action_validation(&["[grok_pattern] is required"]))?;
     let texts = body.get("text").and_then(Value::as_array).ok_or_else(|| EsError::action_validation(&["[text] is required"]))?;
-    let g = Grok::compile(pattern, grok::bank())?;
-    let names: Vec<(String, String)> = g.re.capture_names().flatten().map(|n| (n.to_string(), g.field_of(n))).collect();
+    let g = if ecs_v1(ecs) { Grok::compile_es(pattern, grok::bank_es(true))? } else { Grok::compile(pattern, grok::bank())? };
     let mut out = Vec::new();
     for t in texts {
         let t = t.as_str().unwrap_or("");
-        match g.re.captures(t) {
+        match g.capture_spans(t) {
             None => out.push(json!({"matched": false})),
-            Some(c) => {
+            Some(spans) => {
                 let mut fields: Map<String, Value> = Map::new();
-                for (gname, field) in &names {
-                    if let Some(m) = c.name(gname) {
-                        let entry = json!({"match": m.as_str(), "offset": utf16_len(&t[..m.start()]), "length": utf16_len(m.as_str())});
+                for (field, start, end) in &spans {
+                    {
+                        let m = &t[*start..*end];
+                        let entry = json!({"match": m, "offset": utf16_len(&t[..*start]), "length": utf16_len(m)});
                         match fields.get_mut(field) {
                             Some(Value::Array(a)) => a.push(entry),
                             _ => {
@@ -1952,6 +2088,133 @@ mod tests {
         assert_eq!(v["mappings"]["properties"]["responsetime"]["type"], json!("double"));
         assert_eq!(v["field_stats"]["responsetime"]["median_value"], json!(134.2046));
         assert_eq!(v["field_stats"]["airline"]["cardinality"], json!(2));
+    }
+
+    fn ndjson_lines(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// #539: sub-millisecond samples (ISO, fractional epoch seconds, a
+    /// custom micro-second format) map as `date_nanos`, and the generated
+    /// date processor keeps nine fraction digits.
+    #[test]
+    fn sub_millisecond_timestamps_map_as_date_nanos() {
+        let s = ndjson_lines(&[r#"{"t": "2026-11-09T10:00:00.123456789Z", "a": 1}"#, r#"{"t": "2026-11-09T10:00:00.123456790Z", "a": 2}"#]);
+        let v = find_structure(s.as_bytes(), &ov()).unwrap();
+        assert_eq!(v["mappings"]["properties"]["@timestamp"]["type"], "date_nanos", "{v}");
+        assert_eq!(v["ingest_pipeline"]["processors"][0]["date"]["output_format"], "yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX", "{v}");
+        let s = ndjson_lines(&[r#"{"t": "1762682400.123456", "a": 1}"#, r#"{"t": "1762682400.123457", "a": 2}"#]);
+        let v = find_structure(s.as_bytes(), &ov()).unwrap();
+        assert_eq!(v["mappings"]["properties"]["@timestamp"]["type"], "date_nanos", "{v}");
+        // Millisecond samples stay `date`; a finer later sample decides.
+        let s = ndjson_lines(&[r#"{"t": "2026-11-09T10:00:00.123Z", "a": 1}"#, r#"{"t": "2026-11-09T10:00:00.1234Z", "a": 2}"#]);
+        let v = find_structure(s.as_bytes(), &ov()).unwrap();
+        assert_eq!(v["mappings"]["properties"]["@timestamp"]["type"], "date_nanos", "{v}");
+        let s = ndjson_lines(&[r#"{"t": "2026-11-09T10:00:00.123Z", "a": 1}"#, r#"{"t": "2026-11-09T10:00:00.124Z", "a": 2}"#]);
+        let v = find_structure(s.as_bytes(), &ov()).unwrap();
+        assert_eq!(v["mappings"]["properties"]["@timestamp"]["type"], "date", "{v}");
+        let o = Overrides { timestamp_format: Some("yyyy-MM-dd HH:mm:ss.SSSSSS".into()), ..ov() };
+        let s = ndjson_lines(&[r#"{"t": "2026-11-09 10:00:00.123456", "a": 1}"#, r#"{"t": "2026-11-09 10:00:00.123457", "a": 2}"#]);
+        let v = find_structure(s.as_bytes(), &o).unwrap();
+        assert_eq!(v["mappings"]["properties"]["@timestamp"]["type"], "date_nanos", "{v}");
+    }
+
+    fn parses_all(formats: &Value, values: &[&str]) {
+        let fs: Vec<_> = formats.as_array().unwrap().iter().map(|f| crate::date::DateFormatter::new(f.as_str().unwrap()).unwrap()).collect();
+        for v in values {
+            assert!(fs.iter().any(|f| f.parse(v).is_ok()), "{v} with {formats}");
+        }
+    }
+
+    /// #540: four-digit years are captured whole (yyyy, never yy) and the
+    /// time separator is the one after the year; each generated format
+    /// parses the sample.
+    #[test]
+    fn four_digit_years_generate_yyyy_formats() {
+        for (vals, want) in [
+            (vec!["01/31/2026", "02/01/2026"], "MM/dd/yyyy"),
+            (vec!["31.01.2026", "01.02.2026"], "dd.MM.yyyy"),
+            (vec!["01/31/26", "02/01/26"], "MM/dd/yy"),
+            (vec!["01/31/2026 10:00:00", "02/01/2026 11:00:00"], "MM/dd/yyyy HH:mm:ss"),
+            (vec!["31-01-2026-10:00:00", "01-02-2026-11:00:00"], "dd-MM-yyyy-HH:mm:ss"),
+        ] {
+            let lines: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(r#"{{"when": "{v}", "n": {i}}}"#)).collect();
+            let s: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            let v = find_structure(s.as_bytes(), &ov()).unwrap();
+            assert_eq!(v["java_timestamp_formats"][0], want, "{v}");
+            parses_all(&v["java_timestamp_formats"], &vals);
+        }
+    }
+
+    /// #541: a later sample that proves month-first overrides the
+    /// ambiguous first one (in either order); contradicting samples have no
+    /// timestamp.
+    #[test]
+    fn later_samples_decide_day_month_order() {
+        for vals in [vec!["03/04/26", "03/15/26"], vec!["03/15/26", "03/04/26"]] {
+            let s: String = vals.iter().enumerate().map(|(i, v)| format!("{{\"when\": \"{v}\", \"n\": {i}}}\n")).collect();
+            let v = find_structure(s.as_bytes(), &ov()).unwrap();
+            assert_eq!(v["java_timestamp_formats"][0], "MM/dd/yy", "{v}");
+            parses_all(&v["java_timestamp_formats"], &vals);
+        }
+        let s = "{\"when\": \"15/03/26\", \"n\": 1}\n{\"when\": \"03/04/26\", \"n\": 2}\n";
+        let v = find_structure(s.as_bytes(), &ov()).unwrap();
+        assert_eq!(v["java_timestamp_formats"][0], "dd/MM/yy", "{v}");
+        let s = "{\"when\": \"15/03/26\", \"n\": 1}\n{\"when\": \"03/15/26\", \"n\": 2}\n";
+        let v = find_structure(s.as_bytes(), &ov()).unwrap();
+        assert!(v.get("timestamp_field").is_none(), "{v}");
+        // Text logs reconcile across lines too.
+        let msgs: Vec<String> = ["03/04/2026 10:00:00 first", "03/15/2026 10:00:01 second"].iter().map(|s| s.to_string()).collect();
+        let v = find_message_structure(&msgs, &ov()).unwrap();
+        assert_eq!(v["java_timestamp_formats"][0], "MM/dd/yyyy HH:mm:ss", "{v}");
+    }
+
+    /// #557: under `ecs_compatibility: v1` discovery, mappings and the grok
+    /// test use ES's ECS bank: the apache fields are the ones the ECS grok
+    /// processor emits.
+    #[test]
+    fn ecs_discovery_uses_the_ecs_bank() {
+        let msgs: Vec<String> = [
+            r#"192.168.1.1 - - [09/Nov/2026:10:00:00 +0000] "GET /a HTTP/1.1" 200 512 "-" "curl/8""#,
+            r#"192.168.1.2 - - [09/Nov/2026:10:00:01 +0000] "POST /b HTTP/1.1" 404 128 "-" "curl/8""#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let o = Overrides { ecs_compatibility: Some("v1".into()), ..ov() };
+        let v = find_message_structure(&msgs, &o).unwrap();
+        let props = &v["mappings"]["properties"];
+        assert!(props.get("source.address").is_some() && props.get("clientip").is_none(), "{v}");
+        assert!(props.get("http.request.method").is_some() && props.get("verb").is_none(), "{v}");
+        assert_eq!(v["ingest_pipeline"]["processors"][0]["grok"]["ecs_compatibility"], "v1");
+        // The pipeline's grok (ECS bank) emits exactly those fields.
+        let g = crate::ingest::grok::Grok::compile_es(v["grok_pattern"].as_str().unwrap(), crate::ingest::grok::bank_es(true)).unwrap();
+        let caps = g.captures(&msgs[0]).unwrap();
+        assert!(caps.contains_key("source.address") && caps.contains_key("http.request.method"), "{caps:?}");
+        let legacy = find_message_structure(&msgs, &ov()).unwrap();
+        assert!(legacy["mappings"]["properties"].get("clientip").is_some(), "{legacy}");
+        let t = test_grok_pattern(&json!({"grok_pattern": "%{COMMONAPACHELOG}", "text": [msgs[0]]}), Some("v1")).unwrap();
+        assert!(t["matches"][0]["fields"].get("source.address").is_some(), "{t}");
+    }
+
+    /// #558: arrays of objects (alone or mixed with singleton objects) map
+    /// as objects, and the analyzed records index with the mapping.
+    #[test]
+    fn object_arrays_map_as_objects_and_index() {
+        let recs = [r#"{"tags": [{"name": "blue"}], "n": 1}"#, r#"{"tags": {"name": "red"}, "n": 2}"#, r#"{"tags": [], "n": 3}"#, r#"{"tags": [[{"name": "x"}]], "n": 4}"#];
+        let s = ndjson_lines(&recs);
+        let o = Overrides { timestamp_format: Some("null".into()), ..ov() };
+        let v = find_structure(s.as_bytes(), &o).unwrap();
+        assert_eq!(v["mappings"]["properties"]["tags"], json!({"type": "object"}), "{v}");
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("onboard", &json!({"mappings": v["mappings"]})).unwrap();
+        let w: Vec<_> = recs.iter().map(|r| crate::index::WriteReq::Index { id: None, source: r.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        let s = ndjson_lines(&[r#"{"tags": [{"name": "blue"}], "n": 1}"#, r#"{"tags": "plain", "n": 2}"#]);
+        assert!(find_structure(s.as_bytes(), &o).is_err());
     }
 
     #[test]

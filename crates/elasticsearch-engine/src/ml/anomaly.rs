@@ -247,7 +247,7 @@ fn job_stats_entry(node: &Node, st: &State, id: &str) -> Value {
             o.insert("node".into(), node_desc(node, true));
             o.insert("assignment_explanation".into(), json!(""));
         } else {
-            o.insert("assignment_explanation".into(), json!(lazy_explanation(node, &st.jobs[id])));
+            o.insert("assignment_explanation".into(), json!(lazy_explanation(node, &st.jobs[id], assigned_memory(&st, id))));
         }
         let secs = ((now - rt.open_time.unwrap_or(now)) / 1000).max(0);
         o.insert("open_time".into(), json!(format!("{secs}s")));
@@ -296,14 +296,22 @@ fn render_model_size(id: &str, m: &Value, mml_bytes: u64) -> Value {
     Value::Object(o)
 }
 
-fn lazy_explanation(node: &Node, job: &Value) -> String {
+/// ML memory the jobs assigned to this node (other than `id`) reserve:
+/// each its model memory limit plus the per-job overhead.
+fn assigned_memory(st: &State, id: &str) -> u64 {
+    st.job_rt.iter().filter(|(other, rt)| other.as_str() != id && rt.assigned && matches!(rt.state.as_str(), "opened" | "opening" | "closing"))
+        .filter_map(|(other, _)| st.jobs.get(other)).map(|o| job::mml_bytes(o) + 30 * MB).sum()
+}
+
+fn lazy_explanation(node: &Node, job: &Value, used: u64) -> String {
     let need = job::mml_bytes(job) + 30 * MB;
     format!(
-        "Not opening job [{}] on node [{{{}}}{{ml.machine_memory={}}}{{node.ml=true}}], because this node has insufficient available memory. Available memory for ML [{}], memory required by existing jobs [0], estimated memory required for this job [{}]",
+        "Not opening job [{}] on node [{{{}}}{{ml.machine_memory={}}}{{node.ml=true}}], because this node has insufficient available memory. Available memory for ML [{}], memory required by existing jobs [{}], estimated memory required for this job [{}]",
         job["job_id"].as_str().unwrap_or(""),
         node.name,
         machine_memory(),
         ml_max_memory(node),
+        used,
         need
     )
 }
@@ -367,7 +375,7 @@ pub fn delete_job(node: &Node, id: &str, force: bool) -> Result<Value> {
     })?;
     svc.sync_tasks(node);
     super::feed::stop(node, id);
-    process::delete_job_data(node, id, &removed);
+    process::delete_job_data(node, id, &removed)?;
     resultsidx::remove_aliases(node, id, &removed);
     // A custom results index no other job uses goes with the job.
     let index = resultsidx::results_index(&removed);
@@ -402,15 +410,23 @@ pub fn open_job(node: &Node, id: &str) -> Result<Value> {
             return Err(EsError::new(409, "status_exception", format!("Cannot open job [{id}] because it is executing [{b}]")));
         }
         let state = st.job_state(id).to_string();
-        if matches!(state.as_str(), "opened" | "opening") {
+        if state == "opened" {
             let rt = st.job_rt.get(id).cloned().unwrap_or_default();
             return Ok(rt.assigned);
         }
+        if state == "opening" {
+            // A lazily opened job waiting for capacity: a retried open is
+            // assigned once the job fits (#621), see `assign_pending_jobs`.
+            return Ok(false);
+        }
+        // The node's ML memory is shared: the jobs already assigned to it
+        // hold their model memory limits.
         let need = job::mml_bytes(&j) + 30 * MB;
-        let fits = need <= max_mem;
+        let used = assigned_memory(st, id);
+        let fits = used + need <= max_mem;
         let lazy = j["allow_lazy_open"].as_bool().unwrap_or(false);
         if !fits && !lazy {
-            return Err(EsError::new(429, "status_exception", "Could not open job because no ML nodes with sufficient capacity were found").caused_by(EsError::new(500, "illegal_state_exception", lazy_explanation(node, &j))));
+            return Err(EsError::new(429, "status_exception", "Could not open job because no ML nodes with sufficient capacity were found").caused_by(EsError::new(500, "illegal_state_exception", lazy_explanation(node, &j, used))));
         }
         if let Some(o) = j.as_object_mut() {
             o.remove("finished_time");
@@ -436,7 +452,79 @@ pub fn open_job(node: &Node, id: &str) -> Result<Value> {
             return Err(e);
         }
     }
+    if !assigned && assign_pending_jobs(node).iter().any(|j| j == id) {
+        return Ok(json!({"opened": true, "node": NODE_ID}));
+    }
     Ok(json!({"opened": true, "node": if assigned { NODE_ID } else { "" }}))
+}
+
+/// Assign the lazily opened jobs (`allow_lazy_open`, state `opening`) that
+/// now fit the node's ML memory (#621): each becomes `opened` with a
+/// process, and its started datafeeds are queued for their workers (the
+/// node's datafeed resume loop launches each once). Called on an open
+/// retry, a cluster settings change and the periodic resume check.
+/// Returns the jobs assigned.
+pub fn assign_pending_jobs(node: &Node) -> Vec<String> {
+    let svc = service(node);
+    if svc.upgrade_mode() {
+        return Vec::new();
+    }
+    let max_mem = ml_max_memory(node);
+    // Nothing waiting that fits: no state write.
+    let any = svc.with(|st| st.job_rt.iter().any(|(id, rt)| rt.state == "opening" && !rt.assigned && st.jobs.get(id).is_some_and(|j| assigned_memory(st, id) + job::mml_bytes(j) + 30 * MB <= max_mem)));
+    if !any {
+        return Vec::new();
+    }
+    let assigned: Vec<String> = match svc.mutate(|st| {
+        let pending: Vec<String> = st.job_rt.iter().filter(|(id, rt)| rt.state == "opening" && !rt.assigned && st.jobs.contains_key(*id)).map(|(id, _)| id.clone()).collect();
+        let mut out = Vec::new();
+        for id in pending {
+            let need = job::mml_bytes(&st.jobs[&id]) + 30 * MB;
+            if assigned_memory(st, &id) + need <= max_mem {
+                if let Some(rt) = st.job_rt.get_mut(&id) {
+                    rt.state = "opened".into();
+                    rt.assigned = true;
+                }
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }) {
+        Ok(a) => a,
+        Err(_) => return Vec::new(),
+    };
+    if assigned.is_empty() {
+        return assigned;
+    }
+    svc.sync_tasks(node);
+    let mut ok = Vec::new();
+    for id in assigned {
+        if let Err(e) = process::open(node, &id) {
+            resultsidx::audit(node, &id, "anomaly_detector", "error", &format!("Job could not be assigned: {}", e.reason));
+            let _ = svc.mutate(|st| {
+                if let Some(rt) = st.job_rt.get_mut(&id) {
+                    rt.state = "opening".into();
+                    rt.assigned = false;
+                }
+                Ok(())
+            });
+            continue;
+        }
+        ok.push(id);
+    }
+    // Their started datafeeds get a worker from the resume loop.
+    let feeds: Vec<(String, u32)> = {
+        let st = svc.read();
+        st.datafeeds.iter().filter(|(fid, df)| df["job_id"].as_str().is_some_and(|j| ok.iter().any(|x| x == j)) && st.datafeed_state(fid) == "started").map(|(fid, _)| (fid.clone(), 0)).collect()
+    };
+    if let Some(q) = resume_queue().lock().get_mut(&node.data) {
+        for f in feeds {
+            if !q.iter().any(|(x, _)| *x == f.0) {
+                q.push(f);
+            }
+        }
+    }
+    ok
 }
 
 /// `POST _ml/anomaly_detectors/{expr}/_close`.
@@ -465,16 +553,32 @@ pub fn close_job(node: &Node, expr: &str, allow_no_match: bool, force: bool) -> 
         }
         out
     };
+    // A job is recorded closed only once its model and results are
+    // durable; a failed persist leaves it open (and retryable) and fails
+    // the close.
     let mut snapshots: Map<String, Value> = Map::new();
+    let mut closed = Vec::new();
+    let mut failure = None;
     for id in &closing {
         if force {
             process::drop_process(node, id);
-        } else if let Ok(Some(sid)) = process::close(node, id) {
-            snapshots.insert(id.clone(), json!(sid));
+            closed.push(id.clone());
+            continue;
+        }
+        match process::close(node, id) {
+            Ok(sid) => {
+                if let Some(sid) = sid {
+                    snapshots.insert(id.clone(), json!(sid));
+                }
+                closed.push(id.clone());
+            }
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
         }
     }
     svc.mutate(|st| {
-        let ids = closing.clone();
+        let ids = closed.clone();
         let now = crate::date::now_millis();
         for id in &ids {
             if st.job_state(id) == "closed" {
@@ -511,6 +615,9 @@ pub fn close_job(node: &Node, expr: &str, allow_no_match: bool, force: bool) -> 
         Ok(())
     })?;
     svc.sync_tasks(node);
+    if let Some(e) = failure {
+        return Err(e);
+    }
     Ok(json!({"closed": true}))
 }
 
@@ -546,11 +653,11 @@ pub fn post_data(node: &Node, id: &str, body: &[u8]) -> Result<Value> {
 }
 
 /// `POST _ml/anomaly_detectors/{id}/_forecast`.
-pub fn forecast(node: &Node, id: &str, duration_ms: i64, expires_in_ms: i64) -> Result<Value> {
+pub fn forecast(node: &Node, id: &str, duration_ms: i64, expires_in_ms: i64, max_model_memory: Option<u64>) -> Result<Value> {
     let st = service(node).read();
     require_open(&st, id)?;
     drop(st);
-    process::forecast(node, id, duration_ms, expires_in_ms)
+    process::forecast(node, id, duration_ms, expires_in_ms, max_model_memory)
 }
 
 #[derive(Default)]
@@ -580,7 +687,7 @@ pub fn reset_job(node: &Node, id: &str) -> Result<Value> {
         }
         Ok(j.clone())
     })
-    .map(|j| process::delete_job_data(node, id, &j))?;
+    .and_then(|j| process::delete_job_data(node, id, &j))?;
     Ok(json!({"acknowledged": true}))
 }
 
@@ -694,6 +801,16 @@ pub fn datafeed_stats(node: &Node, expr: Option<&str>, allow_no_match: bool) -> 
 /// `DELETE _ml/datafeeds/{id}`.
 pub fn delete_datafeed(node: &Node, id: &str, force: bool) -> Result<Value> {
     let svc = service(node);
+    if force {
+        // The worker is stopped and fenced before the datafeed's identity
+        // goes: once this returns it posts nothing more.
+        let st = svc.read();
+        if !st.datafeeds.contains_key(id) {
+            return Err(not_found_datafeed(id));
+        }
+        drop(st);
+        super::feed::fence(node, id);
+    }
     svc.mutate(|st| {
         if !st.datafeeds.contains_key(id) {
             return Err(not_found_datafeed(id));
@@ -857,13 +974,26 @@ pub fn start_datafeed(node: &Arc<Node>, id: &str, start: Option<&str>, end: Opti
             format!("Could not start datafeed [{id}], allocation explanation [no persistent task assignments are allowed due to cluster settings]"),
         ));
     }
+    // The stopped -> started transition is claimed atomically (#599): a
+    // concurrent start that validated meanwhile finds it started.
     svc.mutate(|st| {
+        if st.datafeed_state(id) != "stopped" {
+            return Err(EsError::new(409, "status_exception", format!("cannot start datafeed [{id}] because it has already been started")));
+        }
         st.datafeed_rt.insert(id.to_string(), DatafeedRt { state: "started".into(), start: Some(start_ms.unwrap_or(0)), end: end_ms, ..Default::default() });
         Ok(())
     })?;
     svc.sync_tasks(node);
     if js == "opened" {
         let _ = process::open(node, &job_id);
+        // ES resumes after the job's latest processed record (#598): a
+        // default or earlier start never replays records the job has.
+        let latest = process::latest_record_time(node, &job_id)
+            .or_else(|| super::results::stored_data_counts(node, &job_id).and_then(|d| d.get("latest_record_timestamp").and_then(resultsidx::ts_millis)));
+        let start_ms = match latest {
+            Some(latest) => Some(start_ms.unwrap_or(0).max(latest + 1)),
+            None => start_ms,
+        };
         super::feed::start(node.clone(), id.to_string(), df, job, start_ms, end_ms);
     }
     Ok(json!({"started": true, "node": NODE_ID}))
@@ -882,20 +1012,125 @@ impl WrapValidation for EsError {
 /// `POST _ml/datafeeds/{expr}/_stop`.
 pub fn stop_datafeed(node: &Node, expr: &str, allow_no_match: bool, _force: bool) -> Result<Value> {
     let svc = service(node);
-    svc.mutate(|st| {
+    let stopped = svc.mutate(|st| {
         let ids = expand_datafeeds(st, Some(expr), allow_no_match)?;
-        for id in ids {
-            super::feed::stop(node, &id);
-            if let Some(rt) = st.datafeed_rt.get_mut(&id) {
+        for id in &ids {
+            super::feed::stop(node, id);
+            if let Some(rt) = st.datafeed_rt.get_mut(id) {
                 rt.state = "stopped".into();
                 rt.start = None;
                 rt.end = None;
             }
         }
-        Ok(())
+        Ok(ids)
     })?;
     svc.sync_tasks(node);
+    // Stopped: no post of the workers after this returns.
+    for id in &stopped {
+        super::feed::fence(node, id);
+    }
     Ok(json!({"stopped": true}))
+}
+
+/// Datafeeds to resume after this process started, per node (`None`
+/// until the first scan): (id, attempts).
+fn resume_queue() -> &'static parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<(String, u32)>>> {
+    static Q: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<(String, u32)>>>> = std::sync::OnceLock::new();
+    Q.get_or_init(Default::default)
+}
+
+/// Attempts (one per call, the node calls every second) to resume a
+/// datafeed after a restart before it is stopped with an error.
+const RESUME_ATTEMPTS: u32 = 300;
+
+/// Are started datafeeds waiting for their worker (after a restart)?
+pub fn has_datafeeds_to_resume(node: &Node) -> bool {
+    // Lazily opened jobs that fit now are assigned first (#621).
+    assign_pending_jobs(node);
+    let mut q = resume_queue().lock();
+    if let Some(pending) = q.get(&node.data) {
+        return !pending.is_empty();
+    }
+    // First call in this process: every datafeed recorded as started has
+    // no worker yet.
+    let st = service(node).read();
+    let started: Vec<(String, u32)> = st.datafeed_rt.iter().filter(|(id, rt)| rt.state == "started" && st.datafeeds.contains_key(*id)).map(|(id, _)| (id.clone(), 0)).collect();
+    let any = !started.is_empty();
+    q.insert(node.data.clone(), started);
+    any
+}
+
+/// Relaunch the workers of datafeeds that were started when this node
+/// restarted (ES reassigns their persistent tasks), from the job's latest
+/// record: their state is `started`, so the explicit start would refuse.
+/// A datafeed whose job cannot be restored yet is tried again on the next
+/// call; after [`RESUME_ATTEMPTS`] it is stopped with an error audit (the
+/// state never claims a worker that is not running). Returns the ids
+/// resumed.
+pub fn resume_datafeeds(node: &Arc<Node>) -> Vec<String> {
+    // Upgrade mode keeps them halted (they are queued again when it ends).
+    if !has_datafeeds_to_resume(node) || service(node).upgrade_mode() {
+        return Vec::new();
+    }
+    let pending = std::mem::take(resume_queue().lock().get_mut(&node.data).expect("scanned"));
+    let mut resumed = Vec::new();
+    let mut retry = Vec::new();
+    for (id, attempts) in pending {
+        match resume_datafeed(node, &id) {
+            Ok(true) => resumed.push(id),
+            Ok(false) => {}
+            Err(e) if attempts + 1 < RESUME_ATTEMPTS => {
+                tracing::debug!(id, "datafeed resume deferred: {e}");
+                retry.push((id, attempts + 1));
+            }
+            Err(e) => {
+                let job_id = service(node).read().datafeeds.get(&id).and_then(|d| d["job_id"].as_str().map(str::to_string)).unwrap_or_default();
+                resultsidx::audit(node, &job_id, "anomaly_detector", "error", &format!("Datafeed [{id}] could not be resumed after a node restart and was stopped: {}", e.reason));
+                let _ = stop_datafeed(node, &id, true, true);
+            }
+        }
+    }
+    resume_queue().lock().entry(node.data.clone()).or_default().extend(retry);
+    resumed
+}
+
+/// Ok(false): nothing to resume (deleted, stopped meanwhile, or running).
+fn resume_datafeed(node: &Arc<Node>, id: &str) -> Result<bool> {
+    let st = service(node).read();
+    let Some(df) = st.datafeeds.get(id).cloned() else { return Ok(false) };
+    let Some(rt) = st.datafeed_rt.get(id).cloned() else { return Ok(false) };
+    if rt.state != "started" || super::feed::running(node, id) {
+        return Ok(false);
+    }
+    let job_id = df["job_id"].as_str().unwrap_or("").to_string();
+    let job = st.jobs.get(&job_id).cloned().ok_or_else(|| not_found_job(&job_id))?;
+    if st.job_state(&job_id) != "opened" {
+        return Err(EsError::new(409, "status_exception", format!("cannot resume datafeed [{id}] because job [{job_id}] is {}", st.job_state(&job_id))));
+    }
+    drop(st);
+    process::open(node, &job_id)?;
+    // From the job's latest record (`DatafeedJob`: latest record time + 1).
+    let latest = super::results::stored_data_counts(node, &job_id).and_then(|d| d.get("latest_record_timestamp").and_then(resultsidx::ts_millis));
+    let start = latest.map(|t| t + 1).into_iter().chain(rt.start).max();
+    if let (Some(s), Some(e)) = (start, rt.end) {
+        if s >= e {
+            // The lookback had sent everything: finish it as the worker would.
+            let _ = stop_datafeed(node, id, true, false);
+            return Ok(false);
+        }
+    }
+    super::feed::start(node.clone(), id.to_string(), df, job, start, rt.end);
+    Ok(true)
+}
+
+/// Test builds: forget this node's in-process ML runtime (processes,
+/// datafeed workers' registrations, the resume scan), as a process
+/// restart does.
+#[cfg(test)]
+pub(crate) fn forget_runtime(node: &Node) {
+    process::forget_node(node);
+    super::feed::forget_node(node);
+    resume_queue().lock().remove(&node.data);
 }
 
 // ---------------------------------------------------------------------------
@@ -903,14 +1138,81 @@ pub fn stop_datafeed(node: &Node, expr: &str, allow_no_match: bool, _force: bool
 // ---------------------------------------------------------------------------
 
 /// `POST _ml/set_upgrade_mode?enabled=`.
+///
+/// Enabling halts every job and datafeed task (ES unassigns them) before it
+/// is acknowledged: the datafeed workers are stopped and waited for (no
+/// search or post after), then each open job's model and results are persisted as a model
+/// snapshot and its process released; input, flushes and forecasts are
+/// refused meanwhile. Disabling resumes them: the datafeeds from their
+/// job's latest record (the node's tick, [`resume_datafeeds`]), the jobs
+/// from their new snapshot on first use.
 pub fn set_upgrade_mode(node: &Node, enabled: bool) -> Result<Value> {
     let svc = service(node);
+    let was = svc.upgrade_mode();
     svc.mutate(|st| {
         st.upgrade_mode = enabled;
         Ok(())
     })?;
     svc.sync_tasks(node);
+    if enabled && !was {
+        let st = svc.read();
+        for (id, rt) in &st.datafeed_rt {
+            if rt.state == "started" {
+                // Its last search and post are over before the acknowledgement.
+                super::feed::stop_and_wait(node, id, std::time::Duration::from_secs(60))?;
+            }
+        }
+        for (id, rt) in &st.job_rt {
+            if rt.state != "opened" || !process::is_live(node, id) {
+                continue;
+            }
+            if let Some(sid) = process::close(node, id)? {
+                svc.mutate(|st| {
+                    if let Some(o) = st.jobs.get_mut(id).and_then(Value::as_object_mut) {
+                        set_snapshot_id(o, &sid);
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+    } else if !enabled && was {
+        let st = svc.read();
+        let started: Vec<(String, u32)> = st.datafeed_rt.iter().filter(|(id, rt)| rt.state == "started" && st.datafeeds.contains_key(*id)).map(|(id, _)| (id.clone(), 0)).collect();
+        resume_queue().lock().entry(node.data.clone()).or_default().extend(started);
+    }
     Ok(json!({"acknowledged": true}))
+}
+
+/// Record `sid` as the job's `model_snapshot_id` (a background persist of
+/// a running job: a lost process reopens from it).
+pub(crate) fn record_snapshot(node: &Node, job_id: &str, sid: &str) -> Result<()> {
+    service(node).mutate(|st| {
+        if let Some(o) = st.jobs.get_mut(job_id).and_then(Value::as_object_mut) {
+            set_snapshot_id(o, sid);
+        }
+        Ok(())
+    })
+}
+
+/// Record the job's `model_snapshot_id` (after `create_time`, as ES
+/// renders it).
+fn set_snapshot_id(o: &mut Map<String, Value>, sid: &str) {
+    if o.contains_key("model_snapshot_id") {
+        o.insert("model_snapshot_id".into(), json!(sid));
+        return;
+    }
+    let mut m = Map::new();
+    for (k, v) in std::mem::take(o) {
+        let after = k == "create_time";
+        m.insert(k, v);
+        if after {
+            m.insert("model_snapshot_id".into(), json!(sid));
+        }
+    }
+    if !m.contains_key("model_snapshot_id") {
+        m.insert("model_snapshot_id".into(), json!(sid));
+    }
+    *o = m;
 }
 
 /// `DELETE _ml/_delete_expired_data[/{job_id}]`. 7b: results / snapshots
@@ -921,17 +1223,84 @@ pub fn delete_expired_data(node: &Node, job_expr: Option<&str>) -> Result<Value>
     let now = crate::date::now_millis();
     for id in ids {
         let job = &st.jobs[id.as_str()];
+        let alias = resultsidx::read_alias(&id);
         if let Some(days) = job["results_retention_days"].as_i64() {
-            let cutoff = now - days * 86_400_000;
-            resultsidx::delete_by_query(
-                node,
-                &resultsidx::read_alias(&id),
-                json!({"bool": {"filter": [{"terms": {"result_type": ["bucket", "record", "influencer", "bucket_influencer", "model_plot"]}}, {"range": {"timestamp": {"lt": cutoff}}}]}}),
-            );
+            // Retention counts back from the job's latest bucket (not the
+            // wall clock): a historical or paused job keeps its last
+            // `days` of results. No latest bucket known: nothing is deleted.
+            let latest = resultsidx::search(node, &alias, &json!({"size": 1, "_source": ["timestamp"], "query": {"term": {"result_type": "bucket"}}, "sort": [{"timestamp": "desc"}]}))
+                .and_then(|r| { super::require_complete(&r)?; Ok(r) })?;
+            if let Some(latest) = resultsidx::hits(&latest).first().and_then(|(_, d)| d.get("timestamp").and_then(resultsidx::ts_millis)) {
+                let cutoff = latest - days * 86_400_000;
+                resultsidx::try_delete_by_query(
+                    node,
+                    &alias,
+                    json!({"bool": {"filter": [{"terms": {"result_type": ["bucket", "record", "influencer", "bucket_influencer", "model_plot"]}}, {"range": {"timestamp": {"lt": cutoff}}}]}}),
+                )?;
+            }
         }
-        resultsidx::delete_by_query(node, &resultsidx::read_alias(&id), json!({"bool": {"filter": [{"term": {"result_type": "model_forecast_request_stats"}}, {"range": {"forecast_expiry_timestamp": {"lt": now}}}]}}));
+        expire_model_snapshots(node, &id, job)?;
+        // Expired forecasts: every document of each (its points first, its
+        // descriptor last, so an interrupted cleanup is found again).
+        let expired = resultsidx::search_all(node, &alias, json!({"bool": {"filter": [{"term": {"result_type": "model_forecast_request_stats"}}, {"range": {"forecast_expiry_timestamp": {"lt": now}}}]}}), json!(["_doc"]))?;
+        let fids: Vec<String> = expired.iter().filter_map(|(_, d)| d["forecast_id"].as_str().map(str::to_string)).collect();
+        if !fids.is_empty() {
+            resultsidx::try_delete_by_query(node, &alias, json!({"bool": {"filter": [{"terms": {"forecast_id": fids}}], "must_not": [{"term": {"result_type": "model_forecast_request_stats"}}]}}))?;
+            resultsidx::try_delete_by_query(node, &alias, json!({"bool": {"filter": [{"terms": {"forecast_id": fids}}]}}))?;
+        }
     }
     Ok(json!({"deleted": true}))
+}
+
+/// ES `ExpiredModelSnapshotsRemover` (#620), relative to the job's newest
+/// snapshot: snapshots older than `model_snapshot_retention_days` are
+/// deleted; older than `daily_model_snapshot_retention_after_days`, only the
+/// first of each day is kept. A `retain: true` snapshot and the job's
+/// active one are never removed; a removed snapshot's model state goes
+/// with it, and a failed deletion fails the request.
+/// Model state documents of one snapshot (`<job>_model_state_<id>#<n>`)
+/// a cleanup removes (`_id` takes no prefix queries).
+const STATE_DOC_PARTS: usize = 16;
+
+fn expire_model_snapshots(node: &Node, job_id: &str, job: &Value) -> Result<()> {
+    const DAY: i64 = 86_400_000;
+    let retention = job["model_snapshot_retention_days"].as_i64().unwrap_or(10);
+    let daily_after = job["daily_model_snapshot_retention_after_days"].as_i64().unwrap_or_else(|| retention.min(1));
+    let alias = resultsidx::read_alias(job_id);
+    let snaps = resultsidx::search_all(node, &alias, json!({"bool": {"filter": [{"term": {"job_id": job_id}}, {"exists": {"field": "snapshot_doc_count"}}]}}), json!([{"timestamp": "asc"}, "_doc"]))?;
+    let Some(newest) = snaps.iter().filter_map(|(_, d)| d.get("timestamp").and_then(resultsidx::ts_millis)).max() else { return Ok(()) };
+    let delete_before = newest - retention * DAY;
+    let thin_before = newest - daily_after * DAY;
+    let active = job["model_snapshot_id"].as_str();
+    let mut kept_day: Option<i64> = None;
+    let mut doomed: Vec<(String, String)> = Vec::new();
+    for (doc_id, d) in &snaps {
+        let Some(ts) = d.get("timestamp").and_then(resultsidx::ts_millis) else { continue };
+        let sid = d["snapshot_id"].as_str().unwrap_or_default().to_string();
+        if d["retain"].as_bool() == Some(true) || Some(sid.as_str()) == active {
+            continue;
+        }
+        if ts < delete_before {
+            doomed.push((doc_id.clone(), sid));
+        } else if ts < thin_before {
+            let day = ts.div_euclid(DAY);
+            if kept_day == Some(day) {
+                doomed.push((doc_id.clone(), sid));
+            } else {
+                kept_day = Some(day);
+            }
+        }
+    }
+    if doomed.is_empty() {
+        return Ok(());
+    }
+    // State first: a descriptor never points at deleted state.
+    for (_, sid) in &doomed {
+        let ids: Vec<String> = (1..=STATE_DOC_PARTS).map(|n| format!("{job_id}_model_state_{sid}#{n}")).collect();
+        resultsidx::try_delete_by_query(node, resultsidx::STATE_PATTERN, json!({"ids": {"values": ids}}))?;
+    }
+    let ids: Vec<String> = doomed.into_iter().map(|(id, _)| id).collect();
+    resultsidx::delete_results(node, job_id, job, &ids)
 }
 
 /// `(anomaly_detectors_in_bytes)` of `_ml/memory/_stats`: open jobs'
@@ -939,6 +1308,17 @@ pub fn delete_expired_data(node: &Node, job_expr: Option<&str>) -> Result<Value>
 /// process running that is 0.
 pub fn anomaly_detector_memory(node: &Node) -> u64 {
     process::live_model_bytes(node)
+}
+
+/// Each open anomaly detection job's model memory limit and whether a node
+/// holds it (`false`: lazily opened, waiting for capacity). For the
+/// autoscaling ML decider (which adds ES's process overhead).
+pub fn open_job_memory(node: &Node) -> Vec<(u64, bool)> {
+    service(node).with(|st| {
+        st.jobs.iter().filter(|(id, _)| matches!(st.job_state(id), "opened" | "opening"))
+            .map(|(id, j)| (job::mml_bytes(j), st.job_rt.get(id).is_some_and(|rt| rt.assigned)))
+            .collect()
+    })
 }
 
 /// Rows for `_cat/ml/anomaly_detectors`: (stats entry, config).

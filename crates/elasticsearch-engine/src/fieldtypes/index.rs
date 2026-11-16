@@ -261,14 +261,20 @@ pub fn emit(f: &ResolvedField, v: &Value, e: &mut Emit) -> Result<Vec<Value>> {
                     },
                     other => {
                         let Some(s) = scalar_str(other) else { continue };
-                        let toks = match f.ext.as_ref().and_then(|x| x.analyzer.clone()) {
-                            Some(a) => a.analyze(&s),
-                            None => rustic_core::analysis::Analyzer::standard().analyze(&s),
+                        let (toks, end) = match f.ext.as_ref().and_then(|x| x.analyzer.clone()) {
+                            Some(a) => a.analyze_with_end(&s),
+                            None => rustic_core::analysis::Analyzer::standard().analyze_with_end(&s),
                         };
+                        // ES `TokenCountFieldMapper.countPositions` (finding 430):
+                        // the sum of position increments, including the final
+                        // one (trailing removed tokens); without increments,
+                        // one per token that advances the position, so
+                        // stacked alternatives (synonyms) add nothing.
                         if ext_bool(f, "enable_position_increments", true) {
-                            toks.last().map(|t| t.position as i64 + 1).unwrap_or(0)
+                            toks.iter().map(|t| t.position + 1).max().unwrap_or(0).max(end) as i64
                         } else {
-                            toks.len() as i64
+                            let mut prev: Option<u32> = None;
+                            toks.iter().filter(|t| std::mem::replace(&mut prev, Some(t.position)) != Some(t.position)).count() as i64
                         }
                     }
                 };
@@ -292,14 +298,12 @@ pub fn emit(f: &ResolvedField, v: &Value, e: &mut Emit) -> Result<Vec<Value>> {
             let mut out = Vec::new();
             for x in vals {
                 let Some(s) = scalar_str(&x) else { continue };
-                let (plain, annotations) = parse_annotated(&s);
+                let (plain, spans) = parse_annotated_spans(&s);
                 let toks = match f.ext.as_ref().and_then(|x| x.analyzer.clone()) {
                     Some(a) => a.analyze(&plain),
                     None => rustic_core::analysis::Analyzer::standard().analyze(&plain),
                 };
-                let mut text: Vec<String> = toks.into_iter().map(|t| t.text.replace(' ', super::TOKEN_JOIN)).collect();
-                text.extend(annotations.into_iter().map(|a| a.replace(' ', super::TOKEN_JOIN)));
-                e.push(f.core_id, FieldValue::Text(text.join(" ")));
+                e.push(f.core_id, FieldValue::Text(annotated_token_stream(&toks, &spans)));
                 out.push(Value::String(plain));
             }
             Ok(out)
@@ -457,7 +461,13 @@ pub fn emit(f: &ResolvedField, v: &Value, e: &mut Emit) -> Result<Vec<Value>> {
                             Err(msg) => malformed(f, e, &x, EsError::illegal_argument(msg))?,
                         }
                     }
-                    Ok(g) => e.push(f.core_id, FieldValue::Keyword(g.encode())),
+                    // Cartesian `point` / `shape`: the raw coordinates are kept
+                    // (centroids sum them, as ES's centroid calculator does); a
+                    // coordinate beyond the float range ES indexes is refused.
+                    Ok(g) => match g.to_xy_float() {
+                        Ok(_) => e.push(f.core_id, FieldValue::Keyword(g.encode())),
+                        Err(msg) => malformed(f, e, &x, EsError::illegal_argument(msg))?,
+                    },
                     Err(c) => malformed(f, e, &x, c)?,
                 }
             }
@@ -745,7 +755,21 @@ fn flattened_emit(f: &ResolvedField, v: &Value, e: &mut Emit) -> Result<()> {
 
 /// Epoch nanos of a `date_nanos` value.
 pub fn parse_nanos(f: &ResolvedField, v: &Value) -> std::result::Result<i64, EsError> {
+    let exact = |text: &str, unit: i64| -> std::result::Result<i64, (numeric::NanosError, String)> {
+        match crate::date::epoch_text_nanos(text, unit) {
+            Some(n) if n < 0 => Err((numeric::NanosError::BeforeEpoch, text.to_string())),
+            Some(n) => i64::try_from(n).map_err(|_| (numeric::NanosError::AfterMax, text.to_string())),
+            None => Err((numeric::NanosError::AfterMax, text.to_string())),
+        }
+    };
     let (nanos, shown) = match v {
+        // Epoch input keeps its unit and whole decimal fraction (#468).
+        Value::Number(n) if f.date_format.epoch_unit_nanos().is_some() && crate::date::epoch_text_nanos(&n.to_string(), 1).is_some() => {
+            (exact(&n.to_string(), f.date_format.epoch_unit_nanos().unwrap_or(1_000_000)), n.to_string())
+        }
+        Value::String(s) if f.date_format.epoch_first() && crate::date::epoch_text_nanos(s, 1).is_some() => {
+            (exact(s, f.date_format.epoch_unit_nanos().unwrap_or(1_000_000)), s.clone())
+        }
         Value::String(s) => {
             let ms = f.date_format.parse(s).map_err(|_| EsError::illegal_argument(format!("failed to parse date field [{s}] with format [{}]", f.date_format.spec)))?;
             let n = match numeric::fraction_nanos(s) {
@@ -771,6 +795,50 @@ pub fn parse_nanos(f: &ResolvedField, v: &Value) -> std::result::Result<i64, EsE
 
 /// `[text](value&value2)` markup → (plain text, annotation values).
 pub fn parse_annotated(s: &str) -> (String, Vec<String>) {
+    let (plain, spans) = parse_annotated_spans(s);
+    (plain, spans.into_iter().flat_map(|(_, _, v)| v).collect())
+}
+
+/// The `_pretokenized` stream of an annotated value (finding 352, ES
+/// `AnnotatedTextFieldMapper.AnnotationsInjector`): the analyzed plain
+/// tokens at their own positions, and each annotation value, verbatim, at
+/// the position of the first token its annotated text produced (the next
+/// token when it produced none), so entity proximity and exact entity
+/// terms keep their place in the text.
+pub fn annotated_token_stream(toks: &[rustic_core::analysis::Token], spans: &[(usize, usize, Vec<String>)]) -> String {
+    let mut out: Vec<(u32, &str)> = Vec::with_capacity(toks.len() + spans.len());
+    let mut spans = spans.iter().peekable();
+    let next_pos = toks.last().map_or(0, |t| t.position + 1);
+    for t in toks {
+        while let Some((from, to, vals)) = spans.peek() {
+            let at = (t.offset_from as usize) < *to && (t.offset_to as usize) > *from || (t.offset_from as usize) >= *to;
+            if !at {
+                break;
+            }
+            out.extend(vals.iter().map(|v| (t.position, v.as_str())));
+            spans.next();
+        }
+        out.push((t.position, t.text.as_str()));
+    }
+    for (_, _, vals) in spans {
+        out.extend(vals.iter().map(|v| (next_pos, v.as_str())));
+    }
+    out.sort_by_key(|(p, _)| *p);
+    let mut s = String::new();
+    for (i, (p, text)) in out.iter().enumerate() {
+        if i > 0 {
+            s.push('\u{2}');
+        }
+        s.push_str(&p.to_string());
+        s.push('\u{1}');
+        s.extend(text.chars().filter(|c| *c != '\u{1}' && *c != '\u{2}'));
+    }
+    s
+}
+
+/// [`parse_annotated`] keeping where each annotation applies: the byte
+/// range of its annotated text in the plain text.
+pub fn parse_annotated_spans(s: &str) -> (String, Vec<(usize, usize, Vec<String>)>) {
     let mut plain = String::with_capacity(s.len());
     let mut ann = Vec::new();
     let b = s.as_bytes();
@@ -783,12 +851,11 @@ pub fn parse_annotated(s: &str) -> (String, Vec<String>) {
                     let text = &s[i + 1..text_end];
                     let vals = &s[text_end + 2..text_end + 2 + paren];
                     if !text.contains('[') {
+                        let from = plain.len();
                         plain.push_str(text);
-                        for v in vals.split('&') {
-                            let d = url_decode(v);
-                            if !d.is_empty() {
-                                ann.push(d);
-                            }
+                        let decoded: Vec<String> = vals.split('&').map(url_decode).filter(|d| !d.is_empty()).collect();
+                        if !decoded.is_empty() {
+                            ann.push((from, plain.len(), decoded));
                         }
                         i = text_end + 2 + paren + 1;
                         continue;
@@ -886,6 +953,25 @@ pub fn parse_range_value(f: &ResolvedField, kind: rng::RangeKind, v: &Value, now
         }
     }
     let o = v.as_object().ok_or_else(|| EsError::illegal_argument(format!("error parsing field [{}], expected an object but got {}", f.name, token_name(v))))?;
+    // Indexed integral bounds are parsed as numbers of the field's type
+    // (ES `RangeType.INTEGER/LONG.parseFrom`): a fractional value is
+    // truncated when coercing, refused otherwise; query rounding does not
+    // apply to stored bounds (finding 448).
+    let integral = |x: &Value| -> std::result::Result<Value, EsError> {
+        if !matches!(kind, K::Integer | K::Long) {
+            return Ok(x.clone());
+        }
+        let frac = match x {
+            Value::Number(n) if !n.is_i64() && !n.is_u64() => n.as_f64(),
+            Value::String(s) if s.trim().parse::<i64>().is_err() => s.trim().parse::<f64>().ok(),
+            _ => None,
+        };
+        match frac {
+            Some(d) if d.fract() != 0.0 && !f.coerce => Err(EsError::illegal_argument(format!("Value [{}] has a decimal part", x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())))),
+            Some(d) if d.is_finite() => Ok(Value::from(d.trunc() as i64)),
+            _ => Ok(x.clone()),
+        }
+    };
     let mut lo: Option<(u128, bool)> = None;
     let mut hi: Option<(u128, bool)> = None;
     let mut inc_lo = true;
@@ -895,7 +981,7 @@ pub fn parse_range_value(f: &ResolvedField, kind: rng::RangeKind, v: &Value, now
             "gte" | "gt" | "from" => {
                 if !x.is_null() {
                     // `gt` rounds a partial date up (`gt: 2017-09-01` starts after the whole day).
-                    lo = Some((range_key(f, kind, x, k == "gt", now)?, k == "gt"));
+                    lo = Some((range_key(f, kind, &integral(x)?, k == "gt", now)?, k == "gt"));
                 } else if k == "gt" {
                     // `gt: null` is an exclusive unbounded bound (8.15 off-by-one fix).
                     lo = Some((kind.min_key(), true));
@@ -903,7 +989,7 @@ pub fn parse_range_value(f: &ResolvedField, kind: rng::RangeKind, v: &Value, now
             }
             "lte" | "lt" | "to" => {
                 if !x.is_null() {
-                    hi = Some((range_key(f, kind, x, k != "lt", now)?, k == "lt"));
+                    hi = Some((range_key(f, kind, &integral(x)?, k != "lt", now)?, k == "lt"));
                 } else if k == "lt" {
                     hi = Some((kind.max_key(), true));
                 }
@@ -994,7 +1080,9 @@ fn parse_shape(f: &ResolvedField, v: &Value) -> std::result::Result<shape::Geome
     if f.declared == EsType::Point {
         return parse_xy_point(v, &opts).map(shape::Geometry::Point).map_err(EsError::illegal_argument);
     }
-    shape::parse(v, &opts).map_err(EsError::illegal_argument)
+    // The mapping's `orientation` is GeoJSON polygons' default.
+    let right = f.ext.as_ref().and_then(|e| e.str("orientation")).map(|o| shape::orientation_right(o).unwrap_or(true)).unwrap_or(true);
+    shape::parse_oriented(v, &opts, right).map_err(EsError::illegal_argument)
 }
 
 /// Cartesian `point` input forms: `{x,y}`, `[x,y]`, `"x,y"`, WKT, GeoJSON.

@@ -28,6 +28,7 @@ pub mod frequent_items;
 mod ml_pipelines;
 #[path = "time_series.rs"]
 mod time_series;
+pub use time_series::reduce_counter_rates;
 
 /// Bucket / metric aggregations implemented here.
 pub(super) const AGGS: &[&str] = &["matrix_stats", "counted_terms", "random_sampler", "time_series", "frequent_item_sets", "frequent_items", "categorize_text"];
@@ -442,16 +443,21 @@ impl<'a, 'b> Ctx<'a, 'b> {
         // A shard response ships a digest's centroids (weights are whole
         // counts) instead of every distinct value once there are many: ES
         // merges the shards' digests too.
+        // The reduce of an HDR payload reads only its HDR state (and that
+        // the payload is non-empty): ship the total alone, no digest.
         let mut v: Vec<(f64, u64)> = pairs.values().copied().collect();
         if crate::search::aggregation_shard_response() && v.len() as f64 > 20.0 * comp {
-            let mut td = super::sketch::TDigest::new(comp);
-            for (x, c) in &v {
-                for _ in 0..*c {
-                    td.add(*x);
-                }
+            if hdr.is_some() {
+                let total = v.iter().fold(0u64, |a, p| a.saturating_add(p.1));
+                v = vec![(v[0].0, total)];
+            } else {
+                // Weighted bins feed the digest as centroids: work follows
+                // the number of distinct values, never the sum of counts.
+                let mut td = super::sketch::TDigest::new(comp);
+                td.add_weighted(&v);
+                let st = td.state();
+                v = st.means.iter().zip(&st.weights).map(|(m, w)| (*m, w.round() as u64)).collect();
             }
-            let st = td.state();
-            v = st.means.iter().zip(&st.weights).map(|(m, w)| (*m, w.round() as u64)).collect();
         }
         Ok(json!({
             "v": v.iter().map(|(v, c)| json!([v, c])).collect::<Vec<_>>(),
@@ -611,7 +617,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
     // matrix_stats
 
     fn matrix_stats(&self, name: &str, o: &Map<String, Value>, docs: &Docs) -> Result<Value> {
-        let fields: Vec<String> = match o.get("fields") {
+        let mut fields: Vec<String> = match o.get("fields") {
             Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
             Some(Value::String(s)) => vec![s.clone()],
             _ => Vec::new(),
@@ -619,6 +625,11 @@ impl<'a, 'b> Ctx<'a, 'b> {
         if fields.is_empty() {
             return Err(EsError::illegal_argument(format!("Required [fields] for [matrix_stats] aggregation [{name}]")));
         }
+        // ES `ArrayValuesSourceAggregationBuilder.resolveConfig` keys the
+        // fields by name, so a repeated field is one field (first position).
+        let mut seen = std::collections::HashSet::with_capacity(fields.len());
+        fields.retain(|f| seen.insert(f.clone()));
+        drop(seen);
         // ES: every field must be mapped in every searched index.
         let mapping_context: Vec<_> = if self.env.mapping_context.is_empty() {
             self.segs.iter().map(|s|(s.index,s.lookup)).collect()
@@ -663,11 +674,20 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 _ => vs.iter().sum::<f64>() / vs.len() as f64,
             }
         };
-        // Rows: docs with a value for every field.
-        let mut rows: Vec<Vec<f64>> = Vec::new();
+        // Admit the dense moments (a k x k co-moment matrix) and the
+        // rendered k x k covariance/correlation maps before allocating them.
+        self.mem.charge(matrix_stats_bytes(&fields), &super::agg_label(name))?;
+        // Rows (docs with a value for every field) stream into the moments.
+        let mut m = Moments::new(fields.len());
+        let mut row = Vec::with_capacity(refs.len());
+        let mut seen_docs = 0u64;
         for (s, v) in docs.iter().enumerate() {
             'doc: for &(d, _) in v {
-                let mut row = Vec::with_capacity(refs.len());
+                seen_docs += 1;
+                if seen_docs % super::POLL_EVERY == 0 {
+                    super::poll_cancelled()?;
+                }
+                row.clear();
                 for (f, m) in &refs {
                     let vs: Vec<f64> = self.values_or(f, s, d, m).iter().filter_map(Key::as_f64).collect();
                     if vs.is_empty() {
@@ -675,12 +695,8 @@ impl<'a, 'b> Ctx<'a, 'b> {
                     }
                     row.push(reduce(&vs));
                 }
-                rows.push(row);
+                m.add(&row);
             }
-        }
-        let mut m = Moments::new(fields.len());
-        for row in &rows {
-            m.add(row);
         }
         let mut v = render_matrix_stats(&fields, &m);
         // A coordinator reduce follows: ship the moments (ES `RunningStats`).
@@ -720,6 +736,17 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 let hit = (self.env.fetch_hit)(s, d, sc, &spec)?;
                 let mut vals = Vec::new();
                 collect_strings(source_path(hit.get("_source"), field), &mut vals);
+                // The multiplicities are read from `_source`: a document
+                // whose indexed values are not there (source excluded,
+                // disabled or pruned) would silently count nothing.
+                if vals.is_empty() {
+                    let indexed = self.segs[s].lookup.get(field).and_then(|f| f.core_id).is_some_and(|id| !self.segs[s].leaf.keyword_values(id, d).is_empty());
+                    if indexed {
+                        return Err(EsError::illegal_argument(format!(
+                            "[counted_terms] aggregation [{name}] cannot count field [{field}]: its values are not kept in [_source] (excluded or disabled), where their multiplicities are read"
+                        )));
+                    }
+                }
                 for t in vals {
                     let e = groups.entry(t).or_insert_with(|| (0, vec![Vec::new(); docs.len()]));
                     e.0 += 1;
@@ -812,7 +839,9 @@ fn scale_sampled(out: &mut Map<String, Value>, spec: &Map<String, Value>, f: f64
         let subspec = defo.get("aggs").or(defo.get("aggregations")).and_then(Value::as_object);
         let Some(Value::Object(r)) = out.get_mut(name) else { continue };
         match t.as_str() {
-            "value_count" | "cardinality" => {
+            // ES `finalizeSampling`: `cardinality` is never scaled (unique
+            // counts do not extrapolate); counts and sums are.
+            "value_count" => {
                 if let Some(v) = r.get_mut("value") {
                     scale_u(v);
                 }
@@ -828,6 +857,12 @@ fn scale_sampled(out: &mut Map<String, Value>, spec: &Map<String, Value>, f: f64
                 }
                 if let Some(x) = r.get("sum").and_then(Value::as_f64) {
                     r.insert("sum".into(), fnum(x * f));
+                }
+                // `InternalExtendedStats.finalizeSampling` scales the sum of
+                // squares with them (the variance is unchanged), so a reduce
+                // of these statistics stays coherent.
+                if let Some(x) = r.get("sum_of_squares").and_then(Value::as_f64) {
+                    r.insert("sum_of_squares".into(), fnum(x * f));
                 }
             }
             _ => {}
@@ -969,7 +1004,9 @@ pub(super) fn parent_pipeline(name: &str, t: &str, body: &Value, buckets: &mut [
     match t {
         "normalize" => {
             let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-            let vals: Vec<f64> = buckets.iter().map(|b| resolve_path(b, &path).unwrap_or(f64::NAN)).collect();
+            // ES `NormalizePipelineAggregator`: values resolved with `SKIP`
+            // (an empty bucket is no observation, `_count` excepted).
+            let vals: Vec<f64> = buckets.iter().map(|b| gap_value(b, &path, GapPolicy::Skip)).collect();
             let fin: Vec<f64> = vals.iter().copied().filter(|v| !v.is_nan()).collect();
             let n = fin.len() as f64;
             let min = fin.iter().copied().fold(f64::INFINITY, f64::min);
@@ -1274,6 +1311,20 @@ pub(super) fn sibling_pipeline(name: &str, t: &str, body: &Value, results: &Hash
 #[allow(dead_code)]
 fn key_value(k: &Key) -> Value {
     key_json(k)
+}
+
+/// Bytes `matrix_stats` over `fields` (distinct) holds at its peak: the
+/// moments (four vectors, a k x k co-moment matrix, the per-doc row and
+/// deltas) and the rendered k x k covariance and correlation maps.
+/// Saturating, so an absurd k asks for more than any breaker allows.
+pub(super) fn matrix_stats_bytes(fields: &[String]) -> u64 {
+    let k = fields.len() as u64;
+    let names: u64 = fields.iter().map(|f| f.len() as u64).sum();
+    // Per rendered map entry: key string, map slot and number (json_bytes).
+    let entry = |name_len: u64| 48 + name_len + 32;
+    let moments = k.saturating_mul(k).saturating_mul(8).saturating_add(k.saturating_mul(8 * 8 + 24));
+    let rendered = k.saturating_mul(k.saturating_mul(entry(0)).saturating_add(names)).saturating_mul(2);
+    moments.saturating_add(rendered)
 }
 
 /// `matrix_stats` online moments (ES `RunningStats`: Welford / Terriberry),

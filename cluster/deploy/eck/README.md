@@ -67,7 +67,7 @@ version the engine implements, `9.5.5`; ECK chooses its behaviour from it
 | ECK expects | Provided by |
 |---|---|
 | `/usr/share/elasticsearch/{bin,config,plugins,data,logs}`, uid 1000 gid 0, `bash`, coreutils | the image |
-| `LICENSE.txt` with one of Elastic's distribution license headings (else the init container exits 42, `unsupported_distribution`) | not in the image yet (pending a licensing decision): without it ECK cannot start the pods |
+| `/usr/share/elasticsearch/LICENSE.txt` with exactly one line reading `ELASTIC LICENSE AGREEMENT` or `Elastic License 2.0` (ECK's `prepare-fs.sh`: `grep -Exc "ELASTIC LICENSE AGREEMENT\|Elastic License 2.0"` must print 1, else the init container exits 42, `unsupported_distribution`) | the image's `LICENSE.txt` (`cluster/deploy/docker/LICENSE.txt`): the project's Apache-2.0 licence plus a section explaining that the `Elastic License 2.0` line is only the marker ECK looks for; the software is not under that licence |
 | `nc` for the readiness probe (`nc -z 127.0.0.1 8080`) | `netcat-openbsd` in the image |
 | `curl`, `date --iso-8601`, `mktemp`, `grep`, `cut` for the pre-stop hook | the image |
 | `bin/elasticsearch-keystore create` / `add-file` (with `secureSettings`) | the keystore CLI |
@@ -89,8 +89,13 @@ version the engine implements, `9.5.5`; ECK chooses its behaviour from it
 * File-based settings (`config/operator/settings.json`, used by ECK's
   enterprise `StackConfigPolicy`) are not applied; ECK's default empty
   file is harmless. Readiness therefore does not wait for it.
-* Remote clusters through ECK (`remoteClusters`, `remoteClusterServer`) and
-  CCR are not covered by the end-to-end test.
+* Remote clusters: ECK's certificate-based `remoteClusters` (ECK sets
+  `cluster.remote.<name>.seeds` to the other cluster's transport Service and
+  adds its CA to the transport trust) work as with Elasticsearch, for
+  cross-cluster search and CCR. The API key based model
+  (`remoteClusterServer`, `remoteClusters[].apiKey`, port 9443,
+  `cluster.remote.<name>.credentials`) is not supported. Neither is covered
+  by the end-to-end test.
 * Kibana from ECK (`Kibana` with `elasticsearchRef`, the `elastic/kibana`
   service account token ECK writes to `service_tokens`) reaches `green`;
   its `kibana_system` privileges follow ES 9.5.5.

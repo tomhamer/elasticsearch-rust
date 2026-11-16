@@ -29,6 +29,9 @@ pub struct ParsedDoc {
     /// The `_source` to store when it differs from the one received: the
     /// canonical form of a synthetic-source index (see [`crate::synthetic`]).
     pub source: Option<String>,
+    /// The values index-time field scripts emitted, by field (stored for
+    /// their `store: true` fields: they are not in `_source`).
+    pub script_values: Vec<(String, Vec<Value>)>,
 }
 
 struct Ctx<'a> {
@@ -42,10 +45,18 @@ struct Ctx<'a> {
     pending_paths: HashSet<String>,
     /// Emitting a `copy_to` target (copy_to is not followed recursively).
     copying: bool,
+    /// While a nested object is parsed: the documents of the enclosing
+    /// scopes, outermost (the root document) first; `doc` is the innermost.
+    ancestors: Vec<Document>,
+    /// The nested path of each document below the root (`scopes[k]`: the
+    /// document at depth `k + 1`; the last one is `doc`'s).
+    scopes: Vec<String>,
     /// Dynamic fields dropped by `ignore_dynamic_beyond_limit` (`_ignored`).
     skip: Option<&'a HashSet<String>>,
     /// Indexing the values an index-time script emitted.
     scripting: bool,
+    /// The values index-time scripts emitted ([`ParsedDoc::script_values`]).
+    script_values: Vec<(String, Vec<Value>)>,
     /// Objects parsed inside arrays so far (`index.mapping.array_objects.limit`).
     array_objects: usize,
     /// `doc_values.multi_value: false` fields that got a value.
@@ -154,7 +165,7 @@ pub fn parse_document_skip(source: &Value, id: &str, mappings: &Mappings, lookup
 
 fn parse_document_skip_with_regex_limit(source: &Value, id: &str, mappings: &Mappings, lookup: &FieldLookup, skip: Option<&HashSet<String>>, max_regex_length: usize) -> Result<ParseOutcome> {
     let obj = source.as_object().ok_or_else(|| EsError::document_parsing("[1:1] failed to parse: Root document must be an object"))?;
-    let mut ctx = Ctx { id, max_regex_length, mappings, lookup, doc: Document::new(), ignored: Vec::new(), pending: Vec::new(), pending_paths: HashSet::new(), copying: false, skip, scripting: false, array_objects: 0, single_seen: HashSet::new(), satisfied: HashSet::new() };
+    let mut ctx = Ctx { id, max_regex_length, mappings, lookup, doc: Document::new(), ignored: Vec::new(), pending: Vec::new(), pending_paths: HashSet::new(), copying: false, ancestors: Vec::new(), scopes: Vec::new(), skip, scripting: false, script_values: Vec::new(), array_objects: 0, single_seen: HashSet::new(), satisfied: HashSet::new() };
     if lookup.root_enabled {
         let root_dyn = lookup.root_dynamic.unwrap_or(Dynamic::True);
         // `_inference_fields`: semantic_text inference results the document carries.
@@ -188,7 +199,7 @@ fn parse_document_skip_with_regex_limit(source: &Value, id: &str, mappings: &Map
     // A bulk parses all of its documents before any is staged: return each
     // one's unclaimed admission chunk now, not when it is staged.
     ctx.doc.settle_allocation();
-    Ok(ParseOutcome::Doc(ParsedDoc { doc: ctx.doc, ignored: ctx.ignored, source: None }))
+    Ok(ParseOutcome::Doc(ParsedDoc { doc: ctx.doc, ignored: ctx.ignored, source: None, script_values: ctx.script_values }))
 }
 
 /// Pending-mapping marker: the index needs its `_doc_count` column.
@@ -201,6 +212,145 @@ thread_local! {
     static IN_INDEX_SCRIPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Compiled index-time scripts, by field and context, with their spec.
     static INDEX_SCRIPTS: std::cell::RefCell<std::collections::HashMap<(String, &'static str), (Value, std::sync::Arc<crate::script::CompiledScript>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The one-document memory index an index-time script reads `doc[...]`
+/// from, and the address of the root document in it (nested children are
+/// written first, so the root is the last document of its block).
+struct ScriptReader {
+    mem: rustic_core::Index,
+    root: rustic_core::types::DocId,
+}
+
+fn index_script_reader(lookup: &FieldLookup, source: &Value) -> Result<ScriptReader> {
+    IN_INDEX_SCRIPT.with(|c| c.set(true));
+    let r = crate::script::execute_api::build_memory_index_root(lookup, source, false);
+    IN_INDEX_SCRIPT.with(|c| c.set(false));
+    let (mem, root) = r?;
+    Ok(ScriptReader { mem, root })
+}
+
+/// The index-time scripts of one document ([`Ctx::run_index_scripts`]).
+struct IndexScripts<'s> {
+    /// Scripted fields, by name.
+    fields: Vec<ResolvedField>,
+    compiled: Vec<std::sync::Arc<crate::script::CompiledScript>>,
+    /// The scripted fields (indices into `fields`) each script reads.
+    deps: Vec<Vec<usize>>,
+    /// Scripts already run (ES runs each once per document).
+    done: Vec<bool>,
+    lookup: std::sync::Arc<FieldLookup>,
+    source: &'s Value,
+    src_val: crate::script::Val,
+    /// The document as received.
+    base: ScriptReader,
+    /// The document with the values emitted so far (and how many entries
+    /// of `emitted` it holds): what a script reading a scripted field sees.
+    augmented: Option<(usize, ScriptReader)>,
+    /// Values emitted so far, by field.
+    emitted: Vec<(String, Vec<Value>)>,
+}
+
+impl IndexScripts<'_> {
+    /// Run the scripted fields script `i` reads (and theirs) first.
+    /// `path`: the fields being resolved (`DocumentLeafReader` field path).
+    fn ensure(&mut self, ctx: &mut Ctx<'_>, i: usize, path: &mut Vec<usize>) -> Result<()> {
+        for k in 0..self.deps[i].len() {
+            let d = self.deps[i][k];
+            if self.done[d] {
+                continue;
+            }
+            if path.contains(&d) {
+                let chain: Vec<&str> = path.iter().chain(std::iter::once(&d)).map(|&x| self.fields[x].name.as_str()).collect();
+                return Err(EsError::illegal_argument(format!("Loop in field resolution detected: {}", chain.join("->"))));
+            }
+            path.push(d);
+            self.ensure(ctx, d, path).map_err(|e| {
+                EsError::document_parsing(format!("[1:1] Error executing script on field [{}]", self.fields[d].name)).caused_by(e)
+            })?;
+            self.run(ctx, d)?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    /// Bring the reader with the emitted values up to date.
+    fn refresh_augmented(&mut self) -> Result<()> {
+        if self.augmented.as_ref().is_some_and(|(n, _)| *n == self.emitted.len()) {
+            return Ok(());
+        }
+        // Scripted fields take no value from the source, so the emitted
+        // values are added as the field's own (dotted) key.
+        self.augmented = None;
+        let mut src = self.source.clone();
+        if let Some(o) = src.as_object_mut() {
+            for (name, vals) in &self.emitted {
+                o.insert(name.clone(), Value::Array(vals.clone()));
+            }
+        }
+        let reader = index_script_reader(&self.lookup, &src)?;
+        self.augmented = Some((self.emitted.len(), reader));
+        Ok(())
+    }
+
+    /// Run script `i` and index the values it emits.
+    fn run(&mut self, ctx: &mut Ctx<'_>, i: usize) -> Result<()> {
+        self.done[i] = true;
+        let reads_scripted = self.deps[i].iter().any(|&d| self.emitted.iter().any(|(n, _)| *n == self.fields[d].name));
+        if reads_scripted {
+            self.refresh_augmented()?;
+        }
+        let cs = self.compiled[i].clone();
+        let out = {
+            let reader = match (&self.augmented, reads_scripted) {
+                (Some((_, r)), true) => r,
+                _ => &self.base,
+            };
+            let leaves = reader.mem.leaves();
+            let mut exec = cs.executor(Some(self.lookup.clone()), None);
+            exec.rt.doc.source_json = Some(self.source.clone());
+            exec.set_source(Some(self.src_val.clone()));
+            if let Some(leaf) = leaves.first() {
+                // SAFETY: `reader.mem` outlives `exec`, dropped at the end of this block.
+                unsafe { exec.bind_leaf(leaf) };
+                exec.set_doc(reader.root);
+            }
+            let context = match self.fields[i].declared {
+                EsType::Keyword => "keyword_field",
+                EsType::Boolean => "boolean_field",
+                EsType::Date | EsType::DateNanos => "date_field",
+                EsType::Double | EsType::Float | EsType::HalfFloat | EsType::ScaledFloat => "double_field",
+                EsType::Ip => "ip_field",
+                EsType::GeoPoint => "geo_point_field",
+                _ => "long_field",
+            };
+            exec.run().map_err(|e| cs.error(&e)).and_then(|_| crate::script::execute_api::emitted_result(context, exec.take_emitted()).map_err(|e| cs.error(&e)))
+        };
+        let f = &self.fields[i];
+        let vals = match out {
+            Ok(v) => v,
+            Err(_) if f.script_error_continue => {
+                ctx.ignored.push(f.name.clone());
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(EsError::document_parsing(format!("[1:1] Error executing script on field [{}]", f.name)).caused_by(e));
+            }
+        };
+        let vals = match vals {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        ctx.scripting = true;
+        let r = vals.iter().try_for_each(|v| ctx.emit_field(f, v));
+        ctx.scripting = false;
+        r?;
+        if !vals.is_empty() {
+            let name = f.name.clone();
+            self.emitted.push((name, vals));
+        }
+        Ok(())
+    }
 }
 
 impl<'a> Ctx<'a> {
@@ -288,17 +438,15 @@ impl<'a> Ctx<'a> {
     /// Fields with an index-time `script` (`FieldMapper` `executeScript`):
     /// run each against the document (`params._source`, and `doc[...]` of
     /// a one-document index of it) and index the values it emits.
+    ///
+    /// As ES `DocumentParser.executeIndexTimeScripts`: a script reading
+    /// another scripted field through `doc` runs that field's script first
+    /// (once per document) and reads its values; a loop is an error.
     fn run_index_scripts(&mut self, source: &Value) -> Result<()> {
         let mut fields: Vec<ResolvedField> = self.lookup.fields.values().filter(|f| f.script.is_some()).map(|f| (**f).clone()).collect();
         fields.sort_by(|a, b| a.name.cmp(&b.name));
-        let lookup = std::sync::Arc::new(self.lookup.clone());
-        IN_INDEX_SCRIPT.with(|c| c.set(true));
-        let mem = crate::script::execute_api::build_memory_index_sealed(self.lookup, source, false);
-        IN_INDEX_SCRIPT.with(|c| c.set(false));
-        let mem = mem?;
-        let leaves = mem.leaves();
-        let src_val = crate::script::Val::from_json(source);
-        for f in fields {
+        let mut compiled = Vec::with_capacity(fields.len());
+        for f in &fields {
             let spec = f.script.clone().unwrap_or(Value::Null);
             let context = match f.ty { crate::mapping::EsType::Double => crate::script::ScriptContext::RuntimeDouble, _ => crate::script::ScriptContext::RuntimeLong };
             // Cached per field name and context, checked against the spec:
@@ -313,40 +461,44 @@ impl<'a> Ctx<'a> {
                     cs
                 }
             };
-            let mut exec = cs.executor(Some(lookup.clone()), None);
-            exec.rt.doc.source_json = Some(source.clone());
-            exec.set_source(Some(src_val.clone()));
-            if let Some(leaf) = leaves.first() {
-                // SAFETY: `mem` outlives `exec`, dropped at the end of this iteration.
-                unsafe { exec.bind_leaf(leaf) };
-                exec.set_doc(0);
+            compiled.push(cs);
+        }
+        // The scripted fields each script reads through `doc['...']`.
+        let deps: Vec<Vec<usize>> = compiled
+            .iter()
+            .map(|cs| cs.program.doc_fields.iter().filter_map(|n| fields.iter().position(|f| f.name == *n)).collect())
+            .collect();
+        let base = index_script_reader(self.lookup, source)?;
+        let n = fields.len();
+        let mut run = IndexScripts {
+            fields,
+            compiled,
+            deps,
+            done: vec![false; n],
+            lookup: std::sync::Arc::new(self.lookup.clone()),
+            source,
+            src_val: crate::script::Val::from_json(source),
+            base,
+            augmented: None,
+            emitted: Vec::new(),
+        };
+        for i in 0..n {
+            if run.done[i] {
+                continue;
             }
-            let context = match f.declared {
-                EsType::Keyword => "keyword_field",
-                EsType::Boolean => "boolean_field",
-                EsType::Date | EsType::DateNanos => "date_field",
-                EsType::Double | EsType::Float | EsType::HalfFloat | EsType::ScaledFloat => "double_field",
-                EsType::Ip => "ip_field",
-                EsType::GeoPoint => "geo_point_field",
-                _ => "long_field",
-            };
-            let out = exec.run().map_err(|e| cs.error(&e)).and_then(|_| crate::script::execute_api::emitted_result(context, exec.take_emitted()).map_err(|e| cs.error(&e)));
-            let vals = match out {
-                Ok(v) => v,
-                Err(e) if f.script_error_continue => {
-                    let _ = e;
+            let mut path = Vec::new();
+            if let Err(e) = run.ensure(self, i, &mut path) {
+                let f = &run.fields[i];
+                if f.script_error_continue {
                     self.ignored.push(f.name.clone());
+                    run.done[i] = true;
                     continue;
                 }
-                Err(e) => {
-                    return Err(EsError::document_parsing(format!("[1:1] Error executing script on field [{}]", f.name)).caused_by(e));
-                }
-            };
-            self.scripting = true;
-            let r = vals.as_array().cloned().unwrap_or_default().iter().try_for_each(|v| self.emit_field(&f, v));
-            self.scripting = false;
-            r?;
+                return Err(EsError::document_parsing(format!("[1:1] Error executing script on field [{}]", f.name)).caused_by(e));
+            }
+            run.run(self, i)?;
         }
+        self.script_values = std::mem::take(&mut run.emitted);
         Ok(())
     }
 
@@ -356,7 +508,7 @@ impl<'a> Ctx<'a> {
                 return Err(EsError::document_parsing("[1:1] failed to parse: field name cannot be an empty string")
                     .caused_by(EsError::illegal_argument("field name cannot be an empty string")));
             }
-            if k.starts_with('_') && path.is_empty() && matches!(k.as_str(), "_id" | "_index" | "_routing" | "_source" | "_version" | "_seq_no" | "_primary_term" | "_ignored" | "_field_names") {
+            if k.starts_with('_') && path.is_empty() && matches!(k.as_str(), "_id" | "_index" | "_routing" | "_source" | "_version" | "_seq_no" | "_primary_term" | "_ignored" | "_field_names" | crate::tsdb::TSID_FIELD | crate::tsdb::ROUTING_HASH_FIELD) {
                 return Err(EsError::document_parsing(format!(
                     "[1:1] Field [{k}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
                 )));
@@ -414,6 +566,14 @@ impl<'a> Ctx<'a> {
         // directly instead of cloning the field's Arc (two atomic RMWs per
         // field of every document).
         let lookup: &'a FieldLookup = self.lookup;
+        // A dotted key below a `nested` or `enabled: false` object enters
+        // that object's scope, exactly as the object-shaped input would
+        // (ES expands dotted keys into objects before parsing them).
+        if lookup.has_scoped_objects {
+            if let Some(r) = self.dotted_into_scope(full, parent, v, dynamic) {
+                return r;
+            }
+        }
         if let Some(f) = lookup.get(full) {
             return self.emit_field(f, v);
         }
@@ -477,6 +637,41 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// [`Self::value`] for a dotted key (`full`, relative to `parent`) one of
+    /// whose intermediate objects is `nested` or disabled: the key is
+    /// expanded from the outermost such object (`{"items.name": v}` is
+    /// `{"items": {"name": v}}`). `None`: no such object.
+    fn dotted_into_scope(&mut self, full: &str, parent: &str, v: &Value, dynamic: Dynamic) -> Option<Result<()>> {
+        if !parent.is_empty() && !(full.starts_with(parent) && full.as_bytes().get(parent.len()) == Some(&b'.')) {
+            return None;
+        }
+        let start = if parent.is_empty() { 0 } else { parent.len() + 1 };
+        if full.len() <= start || !full[start..].contains('.') {
+            return None;
+        }
+        let mut from = start;
+        while let Some(i) = full[from..].find('.') {
+            let end = from + i;
+            let p = &full[..end];
+            if let Some(info) = self.lookup.objects.get(p).copied() {
+                if !info.enabled {
+                    return Some(Ok(()));
+                }
+                if info.nested {
+                    let rest = &full[end + 1..];
+                    let mut o = Map::new();
+                    o.insert(rest.to_string(), v.clone());
+                    let obj = Value::Object(o);
+                    let name = p.rsplit('.').next().unwrap_or(p);
+                    let pp = p.rsplit_once('.').map(|(a, _)| a).unwrap_or("");
+                    return Some(self.value(p, name, pp, &obj, dynamic));
+                }
+            }
+            from = end + 1;
+        }
+        None
+    }
+
     /// A `nested` object (or array of them): every object becomes a child
     /// document of the current one (indexed as one block with it, children
     /// first); its fields are not indexed into the parent unless
@@ -494,13 +689,27 @@ impl<'a> Ctx<'a> {
             }
             Value::Object(m) => {
                 let parent = std::mem::take(&mut self.doc);
+                self.ancestors.push(parent);
+                self.scopes.push(full.to_string());
                 let parent_satisfied = std::mem::take(&mut self.satisfied);
                 let r = self.walk_object(m, full, info.dynamic).and_then(|_| self.enforce_required(Some(full)));
                 self.satisfied = parent_satisfied;
+                self.scopes.pop();
+                let parent = self.ancestors.pop().unwrap_or_default();
                 let child = std::mem::replace(&mut self.doc, parent);
                 r?;
-                if info.include_in_parent || info.include_in_root {
+                // ES `DocumentParser.nested`: `include_in_parent` adds the
+                // child's fields to its parent, `include_in_root` to the
+                // root document (once, when the parent is the root).
+                if info.include_in_parent {
                     self.doc.try_extend_fields_from(&child)?;
+                }
+                if info.include_in_root {
+                    match self.ancestors.first_mut() {
+                        Some(root) => root.try_extend_fields_from(&child)?,
+                        None if !info.include_in_parent => self.doc.try_extend_fields_from(&child)?,
+                        None => {}
+                    }
                 }
                 let mut child = child;
                 crate::stored::attach_nested(&mut child, m, full, self.lookup);
@@ -828,6 +1037,18 @@ impl<'a> Ctx<'a> {
                 if let Some(nv) = f.null_value.clone() {
                     return self.emit_scalar(f, &nv);
                 }
+                // The parent indexes nothing, but each multi-field still
+                // parses the null under its own `null_value` (ES
+                // `FieldMapper.parse` runs the multi-fields regardless,
+                // finding 433).
+                let lookup: &'a FieldLookup = self.lookup;
+                for sub in &f.multi_fields {
+                    if let Some(sf) = lookup.fields.get(sub) {
+                        if sf.null_value.is_some() {
+                            self.emit_field(sf, &Value::Null)?;
+                        }
+                    }
+                }
                 return Ok(());
             }
             (t, Value::Object(_)) if t != EsType::GeoPoint && t != EsType::Flattened => {
@@ -1017,7 +1238,10 @@ impl<'a> Ctx<'a> {
         let unmapped_ids = f.core_id.is_none() && f.lat_id.is_none() && f.geo_id.is_none();
         // Text / keyword record `_field_names` only when they omit norms
         // (`TextFieldMapper` / `KeywordFieldMapper.parseCreateField`).
-        let unindexed = f.core_id.is_some() && !f.indexed && !f.doc_values && !matches!(f.ty, EsType::DenseVector) && !(matches!(f.ty, EsType::Text | EsType::Keyword) && f.norms);
+        // Only a stored value of a field with neither postings nor doc
+        // values is recorded (ES `addToFieldNames` under `indexed || stored`):
+        // a source-only field has no indexed value for `exists` to find.
+        let unindexed = f.core_id.is_some() && !f.indexed && !f.doc_values && f.stored && !matches!(f.ty, EsType::DenseVector) && !(matches!(f.ty, EsType::Text | EsType::Keyword) && f.norms);
         if (unmapped_ids || unindexed) && !matches!(f.ty, EsType::DenseVector) && !v.is_null() {
             // Neither postings nor doc values (`index: false` text, ...).
             self.mark_present(&f.name.clone())?;
@@ -1169,6 +1393,13 @@ impl<'a> Ctx<'a> {
                             EsType::ScaledFloat => rustic_core::fieldtypes::numeric::scaled_round_trip(x, f.scaling_factor),
                             _ => x,
                         };
+                        // Finite in the field's own format (ES
+                        // `validateFiniteValue` on the parsed float):
+                        // `1e40` is not a float (finding 458).
+                        if !x.is_finite() {
+                            let shown = if x > 0.0 { "Infinity" } else { "-Infinity" };
+                            return self.malformed(f, v, EsError::illegal_argument(format!("[{}] supports only finite values, but got [{shown}]", f.ty.name())));
+                        }
                         if let Some(id) = f.core_id {
                             self.doc.try_push_field((id, FieldValue::F64(x)))?;
                         }
@@ -1236,7 +1467,7 @@ impl<'a> Ctx<'a> {
                     None => self.malformed(f, v, EsError::illegal_argument(format!("'{}' is not an IP string literal.", preview(v)))),
                 }
             }
-            EsType::GeoPoint => match values::parse_geo_point(v) {
+            EsType::GeoPoint => match if f.ignore_malformed { values::parse_geo_point_normalized(v) } else { values::parse_geo_point(v) } {
                 Some((lat, lon)) => {
                     if let (Some(a), Some(b)) = (f.lat_id, f.lon_id) {
                         self.doc.try_push_field((a, FieldValue::F64(lat)))?;
@@ -1269,6 +1500,19 @@ impl<'a> Ctx<'a> {
         self.copy_out(f, v)
     }
 
+    /// The depth of the document a `copy_to` target belongs to (ES
+    /// `parseCopyFields`: the innermost document, the current one first,
+    /// whose nested path prefixes the target; 0 = the root document).
+    fn copy_target_depth(&self, target: &str) -> usize {
+        for k in (1..=self.scopes.len()).rev() {
+            let p = self.scopes[k - 1].as_str();
+            if target.len() > p.len() && target.starts_with(p) && target.as_bytes()[p.len()] == b'.' {
+                return k;
+            }
+        }
+        0
+    }
+
     /// `copy_to` targets of `f` receive `v` (not recursively: a copied value
     /// does not follow the target's own `copy_to`).
     fn copy_out(&mut self, f: &ResolvedField, v: &Value) -> Result<()> {
@@ -1279,7 +1523,17 @@ impl<'a> Ctx<'a> {
         for target in &f.copy_to {
             self.copying = true;
             let r = match lookup.get(target) {
-                Some(tf) => self.emit_scalar(tf, v),
+                Some(tf) => match self.copy_target_depth(&tf.name) {
+                    // The target belongs to an enclosing document (the root
+                    // or an ancestor nested object).
+                    depth if depth < self.scopes.len() => {
+                        std::mem::swap(&mut self.doc, &mut self.ancestors[depth]);
+                        let r = self.emit_scalar(tf, v);
+                        std::mem::swap(&mut self.doc, &mut self.ancestors[depth]);
+                        r
+                    }
+                    _ => self.emit_scalar(tf, v),
+                },
                 None => {
                     let leaf = target.rsplit('.').next().unwrap_or(target).to_string();
                     self.dynamic(target, &leaf, v, Dynamic::True)
@@ -1611,7 +1865,7 @@ mod tests {
         let (mappings, lookup) = setup(json!({}));
         let mut ctx = Ctx { id: "1", max_regex_length: 1000, mappings: &mappings, lookup: &lookup,
             doc: Document::new(), ignored: Vec::new(), pending: Vec::new(), pending_paths: HashSet::new(),
-            copying: false, skip: None, scripting: false, array_objects: 0, single_seen: HashSet::new(), satisfied: HashSet::new() };
+            copying: false, ancestors: Vec::new(), scopes: Vec::new(), skip: None, scripting: false, script_values: Vec::new(), array_objects: 0, single_seen: HashSet::new(), satisfied: HashSet::new() };
         ctx.flattened_leaves(&json!(["abc", {"nested": [12, true, null]}]), Some(1), Some((2, "key"))).unwrap();
         let actual: Vec<_> = ctx.doc.fields.iter().map(|(id, value)| (*id, value.as_text().unwrap())).collect();
         assert_eq!(actual, vec![(1,"abc"),(2,"key\0abc"),(1,"12"),(2,"key\012"),(1,"true"),(2,"key\0true")]);

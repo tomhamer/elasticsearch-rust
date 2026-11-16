@@ -885,3 +885,66 @@ async fn create_recover_delete_loop_under_stats_polling() {
     assert!(panics.is_empty(), "panics: {:?}", panics);
     eprintln!("{iterations} create/recover/delete iterations, {polls} stats requests, {:?}", started.elapsed());
 }
+
+/// A replica of a shard no operation was ever committed to copies no file
+/// (ES copies only the empty commit point, `segments_N`): the operations
+/// indexed before and during its recovery are replayed onto it, and both
+/// copies agree. A replica of a flushed shard still copies the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_never_committed_shard_recovers_without_copying_files() {
+    let _serial = SERIAL.lock().await;
+    let three = start_two("fr-empty-commit").await;
+    let green = |index: &'static str| {
+        let three = &three;
+        async move {
+            for i in 0..2 {
+                let v = three.ok(i, Method::GET, &format!("/_cluster/health/{index}?wait_for_status=green&wait_for_active_shards=2&wait_for_no_initializing_shards=true&timeout=120s"), None).await;
+                assert!(v["status"] == "green" && v["active_shards"] == 2 && v["timed_out"] == false, "n{i}: {v}");
+            }
+        }
+    };
+    let agree = |index: &'static str, docs: u64| {
+        let three = &three;
+        async move {
+            three.ok(0, Method::POST, &format!("/{index}/_refresh"), None).await;
+            let (p, r) = (three.copy_node(index, true), three.copy_node(index, false));
+            let (ps, rs) = (three.shard_stats(index, p).await, three.shard_stats(index, r).await);
+            for key in ["max_seq_no", "local_checkpoint"] {
+                assert_eq!(ps["seq_no"][key], rs["seq_no"][key], "{key}: primary {ps} replica {rs}");
+            }
+            for node in [p, r] {
+                let v = three.ok(0, Method::POST, &format!("/{index}/_count?preference=_only_nodes:n{node}"), None).await;
+                assert_eq!(v["count"], docs, "{index} on n{node}: {v}");
+            }
+            three.recovery_on(index, r).await
+        }
+    };
+    let index_settings = |replicas: u32| json!({"settings": {"number_of_shards": 1, "number_of_replicas": replicas, "index.routing.allocation.include._name": "n0,n1"}});
+    // The replica recovers as the index is created, before any operation.
+    three.ok(0, Method::PUT, "/fresh", Some(index_settings(1))).await;
+    green("fresh").await;
+    three.ok(0, Method::PUT, "/fresh/_doc/1?refresh=true", Some(json!({"foo": "bar"}))).await;
+    let rec = agree("fresh", 1).await;
+    assert_eq!(rec["type"], "PEER", "{rec}");
+    assert_eq!((rec["index"]["files"]["total"].as_u64(), rec["index"]["size"]["total_in_bytes"].as_u64()), (Some(0), Some(0)), "{rec}");
+    // Operations indexed (not flushed) before the replica is added.
+    three.ok(0, Method::PUT, "/later", Some(index_settings(0))).await;
+    let mut nd = String::new();
+    for i in 0..300 {
+        nd.push_str(&format!("{}\n{}\n", json!({"index": {"_index": "later", "_id": format!("d{i}")}}), json!({"n": i, "tag": format!("t{}", i % 7)})));
+    }
+    let v: Value = three.c.post(format!("http://127.0.0.1:{}/_bulk?refresh=true", three.http[0])).header("content-type", "application/x-ndjson").body(nd).send().await.unwrap().json().await.unwrap();
+    assert_eq!(v["errors"], false, "{v}");
+    three.ok(0, Method::PUT, "/later/_settings", Some(json!({"index": {"number_of_replicas": 1}}))).await;
+    green("later").await;
+    let rec = agree("later", 300).await;
+    assert_eq!(rec["index"]["files"]["total"], 0, "nothing copied: {rec}");
+    assert_eq!(rec["translog"]["recovered"], 300, "every operation replayed: {rec}");
+    // Once flushed, a new replica copies the commit.
+    three.ok(0, Method::PUT, "/later/_settings", Some(json!({"index": {"number_of_replicas": 0}}))).await;
+    three.ok(0, Method::POST, "/later/_flush", None).await;
+    three.ok(0, Method::PUT, "/later/_settings", Some(json!({"index": {"number_of_replicas": 1}}))).await;
+    green("later").await;
+    let rec = agree("later", 300).await;
+    assert!(rec["index"]["files"]["total"].as_u64().unwrap() > 0, "recovered from files: {rec}");
+}

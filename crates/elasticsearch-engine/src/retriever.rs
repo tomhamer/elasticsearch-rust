@@ -980,6 +980,10 @@ struct RankDoc {
     ti: usize,
     index: String,
     id: String,
+    /// The doc's custom routing (`_routing`): with the index and `_id` it
+    /// names one document, on the one shard it routes to. Two docs may
+    /// share an `_id` under different routings on different shards.
+    routing: Option<String>,
     score: f32,
     /// `(leaf, doc)` of the search that produced it (tie-break order).
     leaf: usize,
@@ -991,9 +995,12 @@ struct RankDoc {
     expl: Option<Explanation>,
 }
 
+/// A rank doc's identity: target, `_id` and routing ([`RankDoc::routing`]).
+type DocKey = (usize, String, Option<String>);
+
 impl RankDoc {
-    fn key(&self) -> (usize, String) {
-        (self.ti, self.id.clone())
+    fn key(&self) -> DocKey {
+        (self.ti, self.id.clone(), self.routing.clone())
     }
 }
 
@@ -1006,18 +1013,20 @@ struct RankList {
 
 /// One rank doc of a [`RankPlan`]: `(_id, score, rank (1-based), pinned,
 /// explanation)`.
-type PlanDoc = (String, f32, usize, Option<bool>, Option<Explanation>);
+type PlanDoc = (String, f32, usize, Option<bool>, Option<Explanation>, Option<String>);
 
 /// The rank docs of a compound retriever, handed to the final search.
 #[derive(Debug)]
 pub struct RankPlan {
-    /// index name → (`_id`, score, rank (1-based), pinned, explanation).
+    /// index name → (`_id`, score, rank (1-based), pinned, explanation,
+    /// routing).
     docs: HashMap<String, Vec<PlanDoc>>,
     /// Union of the children's queries (aggregations, total hits).
     union: Value,
-    /// (index, `_id`) → position in the fused ranking (ES sorts the final
-    /// hits by rank: `RankDocsSortBuilder`, so score ties keep fused order).
-    order: HashMap<(String, String), usize>,
+    /// (index, `_id`, routing) → position in the fused ranking (ES sorts the
+    /// final hits by rank: `RankDocsSortBuilder`, so score ties keep fused
+    /// order).
+    order: HashMap<(String, String, Option<String>), usize>,
 }
 
 /// `SearchRequest.rank_plan` holder (Clone + Debug for the request).
@@ -1203,7 +1212,8 @@ fn remote_hits(cx: &Ctx, v: &Value) -> Vec<RankDoc> {
             let ti = cx.targets.iter().position(|t| t.svc.name == index).unwrap_or(0);
             let score = h["_score"].as_f64().map(|x| x as f32).unwrap_or(f32::NAN);
             let expl = h.get("_explanation").map(expl_from_json);
-            RankDoc { ti, index, id: h["_id"].as_str().unwrap_or_default().to_string(), score, leaf: 0, doc: i as DocId, pinned: None, expl }
+            let routing = h["_routing"].as_str().map(str::to_string);
+            RankDoc { ti, index, id: h["_id"].as_str().unwrap_or_default().to_string(), routing, score, leaf: 0, doc: i as DocId, pinned: None, expl }
         })
         .collect()
 }
@@ -1293,9 +1303,11 @@ fn read_hits(cx: &Ctx, out: &SearchOutput) -> Result<Vec<RankDoc>> {
     for (i, h) in hits.iter().enumerate() {
         let (ti, leaf, doc, score) = out.page.get(i).copied().unwrap_or((0, 0, 0, 0.0));
         let index = h["_index"].as_str().unwrap_or_default().to_string();
-        let ti = cx.targets.iter().position(|t| t.svc.name == index).unwrap_or(ti);
+        // The target (shard) that found it, when it is one of this index's.
+        let ti = if cx.targets.get(ti).is_some_and(|t| t.svc.name == index) { ti } else { cx.targets.iter().position(|t| t.svc.name == index).unwrap_or(ti) };
         let expl = h.get("_explanation").map(expl_from_json);
-        docs.push(RankDoc { ti, index, id: h["_id"].as_str().unwrap_or_default().to_string(), score, leaf, doc, pinned: None, expl });
+        let routing = h["_routing"].as_str().map(str::to_string);
+        docs.push(RankDoc { ti, index, id: h["_id"].as_str().unwrap_or_default().to_string(), routing, score, leaf, doc, pinned: None, expl });
     }
     Ok(docs)
 }
@@ -1379,7 +1391,7 @@ fn run_child_sorted(cx: &Ctx, req: &SearchRequest, sort: Option<&Value>) -> Resu
 }
 
 fn cmp_ranked(a: &RankDoc, b: &RankDoc) -> std::cmp::Ordering {
-    b.score.total_cmp(&a.score).then(a.ti.cmp(&b.ti)).then(a.leaf.cmp(&b.leaf)).then(a.doc.cmp(&b.doc)).then(a.id.cmp(&b.id))
+    b.score.total_cmp(&a.score).then(a.ti.cmp(&b.ti)).then(a.leaf.cmp(&b.leaf)).then(a.doc.cmp(&b.doc)).then(a.id.cmp(&b.id)).then(a.routing.cmp(&b.routing))
 }
 
 fn union_of(parts: Vec<Value>) -> Value {
@@ -1405,15 +1417,15 @@ fn eval(r: &Retriever, cx: &Ctx, inherited: &[Value], window: usize) -> Result<R
         Retriever::Rrf { children, window: w, rank_constant, .. } => {
             let mut lists = Vec::with_capacity(children.len());
             let mut unions = Vec::with_capacity(children.len());
-            let mut by_key: HashMap<(usize, String), RankDoc> = HashMap::new();
+            let mut by_key: HashMap<DocKey, RankDoc> = HashMap::new();
             let mut weights = Vec::with_capacity(children.len());
-            let mut ranked: Vec<HashMap<(usize, String), (usize, Option<Explanation>)>> = Vec::new();
+            let mut ranked: Vec<HashMap<DocKey, (usize, Option<Explanation>)>> = Vec::new();
             let kids: Vec<&Retriever> = children.iter().map(|(c, _)| c).collect();
             let mut pre = remote_leaves(&kids, cx, &filters, *w).map(Vec::into_iter);
             for (child, weight) in children {
                 let l = match pre.as_mut().and_then(Iterator::next) { Some(l) => l, None => eval(child, cx, &filters, *w) }.map_err(|e| child_failure("rrf", child.name(), e))?;
                 unions.push(l.union);
-                let list: Vec<((usize, String), f32)> = l.docs.iter().map(|d| (d.key(), d.score)).collect();
+                let list: Vec<(DocKey, f32)> = l.docs.iter().map(|d| (d.key(), d.score)).collect();
                 if cx.base.explain {
                     ranked.push(l.docs.iter().take(*w).enumerate().map(|(i, d)| (d.key(), (i + 1, d.expl.clone()))).collect());
                 }
@@ -1423,10 +1435,10 @@ fn eval(r: &Retriever, cx: &Ctx, inherited: &[Value], window: usize) -> Result<R
                 lists.push(list);
                 weights.push(*weight);
             }
-            let fused: Vec<((usize, String), f32)> = if weights.iter().all(|w| *w == 1.0) {
+            let fused: Vec<(DocKey, f32)> = if weights.iter().all(|w| *w == 1.0) {
                 fusion::rrf(&lists, *rank_constant, *w)
             } else {
-                let mut acc: HashMap<(usize, String), f32> = HashMap::new();
+                let mut acc: HashMap<DocKey, f32> = HashMap::new();
                 for (list, wt) in lists.iter().zip(&weights) {
                     for (rank, (k, _)) in list.iter().take(*w).enumerate() {
                         *acc.entry(k.clone()).or_insert(0.0) += wt / (rank_constant + rank as f32 + 1.0);
@@ -1439,7 +1451,7 @@ fn eval(r: &Retriever, cx: &Ctx, inherited: &[Value], window: usize) -> Result<R
                 // `RRFQueryPhaseRankCoordinatorContext`: ties go to the doc
                 // with the larger score in the first query that tells them
                 // apart (a doc a query found beats one it did not).
-                let per: Vec<HashMap<&(usize, String), f32>> = lists.iter().map(|l| l.iter().take(*w).map(|(k, s)| (k, *s)).collect()).collect();
+                let per: Vec<HashMap<&DocKey, f32>> = lists.iter().map(|l| l.iter().take(*w).map(|(k, s)| (k, *s)).collect()).collect();
                 docs.sort_by(|a, b| {
                     b.score.total_cmp(&a.score).then_with(|| {
                         let (ka, kb) = (a.key(), b.key());
@@ -1473,16 +1485,16 @@ fn eval(r: &Retriever, cx: &Ctx, inherited: &[Value], window: usize) -> Result<R
             Ok(RankList { docs, union })
         }
         Retriever::Linear { children, window: w, .. } => {
-            let mut acc: HashMap<(usize, String), f32> = HashMap::new();
+            let mut acc: HashMap<DocKey, f32> = HashMap::new();
             let mut unions = Vec::with_capacity(children.len());
-            let mut by_key: HashMap<(usize, String), RankDoc> = HashMap::new();
-            let mut normed: Vec<HashMap<(usize, String), (f32, Option<Explanation>)>> = Vec::new();
+            let mut by_key: HashMap<DocKey, RankDoc> = HashMap::new();
+            let mut normed: Vec<HashMap<DocKey, (f32, Option<Explanation>)>> = Vec::new();
             let kids: Vec<&Retriever> = children.iter().map(|(c, _, _)| c).collect();
             let mut pre = remote_leaves(&kids, cx, &filters, *w).map(Vec::into_iter);
             for (child, weight, norm) in children {
                 let l = match pre.as_mut().and_then(Iterator::next) { Some(l) => l, None => eval(child, cx, &filters, *w) }.map_err(|e| child_failure("linear", child.name(), e))?;
                 unions.push(l.union);
-                let list: Vec<((usize, String), f32)> = l.docs.iter().take(*w).map(|d| (d.key(), if d.score.is_finite() { d.score } else { 0.0 })).collect();
+                let list: Vec<(DocKey, f32)> = l.docs.iter().take(*w).map(|d| (d.key(), if d.score.is_finite() { d.score } else { 0.0 })).collect();
                 let mut m = HashMap::new();
                 for (k, s) in fusion::linear(std::slice::from_ref(&list), &[1.0], norm.core()) {
                     *acc.entry(k.clone()).or_insert(0.0) += *weight * s;
@@ -1558,7 +1570,7 @@ fn eval(r: &Retriever, cx: &Ctx, inherited: &[Value], window: usize) -> Result<R
             req.source = SourceFilter::Filter { includes: vec![field.clone()], excludes: vec![] };
             req.fields = vec![(field.clone(), None)];
             let v = exec_json(cx, cx.targets, &req)?;
-            let mut texts: HashMap<(String, String), String> = HashMap::new();
+            let mut texts: HashMap<(String, String, Option<String>), String> = HashMap::new();
             for h in v["hits"]["hits"].as_array().into_iter().flatten() {
                 let from_fields = h["fields"][field.as_str()].as_array().and_then(|a| a.first()).cloned();
                 let value = from_fields.or_else(|| {
@@ -1577,14 +1589,14 @@ fn eval(r: &Retriever, cx: &Ctx, inherited: &[Value], window: usize) -> Result<R
                     Value::String(s) => s,
                     other => other.to_string(),
                 };
-                texts.insert((h["_index"].as_str().unwrap_or_default().to_string(), h["_id"].as_str().unwrap_or_default().to_string()), t);
+                texts.insert((h["_index"].as_str().unwrap_or_default().to_string(), h["_id"].as_str().unwrap_or_default().to_string(), h["_routing"].as_str().map(str::to_string)), t);
             }
             let svc = crate::inference::current();
             let ep = svc.as_ref().and_then(|s| s.get_endpoint(inference_id));
             // Per doc: the texts sent to the reranker (`featureData`).
             let mut feature_docs: Vec<(usize, Vec<String>)> = Vec::new();
             for (i, d) in docs.iter().enumerate() {
-                let Some(t) = texts.get(&(d.index.clone(), d.id.clone())) else { continue };
+                let Some(t) = texts.get(&(d.index.clone(), d.id.clone(), d.routing.clone())) else { continue };
                 let feats = match chunk {
                     None => vec![t.clone()],
                     Some((size, settings)) => {
@@ -1774,7 +1786,7 @@ fn eval(r: &Retriever, cx: &Ctx, inherited: &[Value], window: usize) -> Result<R
                 let mut req = child_request(cx.base, *w);
                 req.query = Some(bool_filter(Some(q), &filters));
                 req.explain = true;
-                let explained: HashMap<(usize, String), Explanation> = run_child(cx, &req)?.into_iter().filter_map(|d| d.expl.clone().map(|e| (d.key(), e))).collect();
+                let explained: HashMap<DocKey, Explanation> = run_child(cx, &req)?.into_iter().filter_map(|d| d.expl.clone().map(|e| (d.key(), e))).collect();
                 let desc = format!("query rules evaluated rules from rulesets [{}] and match criteria {}", rulesets.join(", "), java_string(criteria));
                 for (i, d) in out.iter_mut().enumerate() {
                     let gdoc = cx.targets.get(d.ti).map(|t| search::global_doc(t, d.leaf, d.doc)).unwrap_or(d.doc as u64);
@@ -1851,7 +1863,8 @@ fn diversify_vectors(cx: &Ctx, docs: &[RankDoc], field: &str, qv: Option<&Vector
                 continue;
             }
             let id = h["_id"].as_str().unwrap_or_default();
-            let Some(&pos) = positions.iter().find(|i| docs[**i].id == id) else { continue };
+            let routing = h["_routing"].as_str();
+            let Some(&pos) = positions.iter().find(|i| docs[**i].id == id && docs[**i].routing.as_deref() == routing) else { continue };
             if semantic {
                 let chunks = &h["_source"]["_inference_fields"][field]["inference"]["chunks"];
                 let embeddings: Vec<Vector> = chunks.as_object().into_iter().flat_map(|m| m.values()).flat_map(|a| a.as_array().into_iter().flatten()).filter_map(|c| vector_of(&c["embeddings"])).collect();
@@ -2007,7 +2020,7 @@ fn ids_union(docs: &[RankDoc]) -> Value {
 
 /// Fused `(key, score)` → ranked docs: ES order (score desc, then doc order),
 /// `min_score`, window.
-fn finish(fused: Vec<((usize, String), f32)>, by_key: &HashMap<(usize, String), RankDoc>, min_score: Option<f32>, window: usize) -> Vec<RankDoc> {
+fn finish(fused: Vec<(DocKey, f32)>, by_key: &HashMap<DocKey, RankDoc>, min_score: Option<f32>, window: usize) -> Vec<RankDoc> {
     let mut docs: Vec<RankDoc> = fused
         .into_iter()
         .filter_map(|(k, s)| {
@@ -2028,9 +2041,9 @@ fn finish(fused: Vec<((usize, String), f32)>, by_key: &HashMap<(usize, String), 
 fn plan_of(l: &RankList) -> RankPlan {
     let mut docs: HashMap<String, Vec<PlanDoc>> = HashMap::new();
     for (i, d) in l.docs.iter().enumerate() {
-        docs.entry(d.index.clone()).or_default().push((d.id.clone(), d.score, i + 1, d.pinned, d.expl.clone()));
+        docs.entry(d.index.clone()).or_default().push((d.id.clone(), d.score, i + 1, d.pinned, d.expl.clone(), d.routing.clone()));
     }
-    let order = l.docs.iter().enumerate().map(|(i, d)| ((d.index.clone(), d.id.clone()), i)).collect();
+    let order = l.docs.iter().enumerate().map(|(i, d)| ((d.index.clone(), d.id.clone(), d.routing.clone()), i)).collect();
     RankPlan { docs, union: l.union.clone(), order }
 }
 
@@ -2387,9 +2400,19 @@ pub fn execute(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Resu
             search::execute(targets, &base, opts)
         }
         _ => {
+            // Every child search and the final fetch read one view per
+            // shard (ES: an internal point in time shared by the
+            // sub-retrievers), so a document changed between them is never
+            // fetched with another version's rank.
+            let pinned = pin_views(targets)?;
+            let targets = &pinned[..];
             let cx = Ctx { targets, opts, base: &base, remote: None };
             let window = root.window().unwrap_or(DEFAULT_RANK_WINDOW_SIZE);
             let list = eval(&root, &cx, &[], window)?;
+            #[cfg(test)]
+            if let Some(hook) = BETWEEN_PHASES.lock().as_ref() {
+                hook();
+            }
             if !req.size_explicit && req.rank.is_none() {
                 base.size = window;
             }
@@ -2403,6 +2426,20 @@ pub fn execute(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Resu
         }
     }
 }
+
+/// `targets` expanded per shard, each reading the shard's current view
+/// (kept for the request) unless it already has one (a PIT, a scroll).
+fn pin_views(targets: &[Target]) -> Result<Vec<Target>> {
+    Ok(search::expand_targets(targets)?.into_iter().map(|t| {
+        let view = t.snapshot.clone().unwrap_or_else(|| search::target_view(&t));
+        Target { snapshot: Some(view), ..t }
+    }).collect())
+}
+
+/// Test builds: runs between a compound retriever's child searches and its
+/// final fetch.
+#[cfg(test)]
+pub(crate) static BETWEEN_PHASES: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>> = parking_lot::Mutex::new(None);
 
 // ---------------------------------------------------------------------------
 // The final search's queries.
@@ -2461,7 +2498,7 @@ impl CustomQuery for RankDocsQuery {
     /// (`rrf`, `linear`, rerankers) carry their own per-doc explanation.
     fn explain(&self, leaf: &LeafReader<'_>, _ctx: &SearchContext, doc: DocId, score: f32) -> Explanation {
         let id = leaf.keyword_value(ID_FIELD, doc).unwrap_or_default();
-        let Some((_, s, rank, pinned, expl)) = self.docs.iter().find(|d| d.0 == id) else {
+        let Some((_, s, rank, pinned, expl, _)) = self.docs.iter().find(|d| d.0 == id) else {
             return Explanation::leaf(score, "rank doc: score of the compound retriever".to_string());
         };
         let rank_doc = |score: f32| {
@@ -2487,8 +2524,18 @@ impl CustomQuery for RankDocsQuery {
 /// window (eight shards rendered up to `size` hits each, `_id` reads
 /// included, of which the merge kept `size`). The union for totals and
 /// aggregations keeps every rank doc.
-pub fn plan_queries(plan: &RankPlan, index: &str, union: Query, page: Option<usize>) -> (Query, Query) {
-    let docs = plan.docs.get(index).cloned().unwrap_or_default();
+///
+/// `shard`: the shard of `index` searched (its number and the index, which
+/// routes): only the rank docs that route there are looked up, so a doc
+/// selected on one shard never matches another document with its `_id`
+/// (and another routing) on another shard.
+pub fn plan_queries(plan: &RankPlan, index: &str, union: Query, page: Option<usize>, shard: Option<(u32, &crate::index::IndexService)>) -> (Query, Query) {
+    let mut docs = plan.docs.get(index).cloned().unwrap_or_default();
+    if let Some((n, svc)) = shard {
+        // A doc whose shard cannot be computed (a routing the index now
+        // requires) stays: it is looked up as before.
+        docs.retain(|d| svc.route(&d.0, d.5.as_deref()).map_or(true, |s| s == n));
+    }
     let every = Query::Custom(Arc::new(RankDocsQuery::new(docs.clone())));
     let top = match page {
         Some(page) if docs.iter().any(|d| d.2 > page) => Query::Custom(Arc::new(RankDocsQuery::new(docs.into_iter().filter(|d| d.2 <= page).collect()))),
@@ -2511,13 +2558,16 @@ impl RankPlan {
             .docs
             .iter()
             .map(|(index, list)| {
-                let l: Vec<Value> = list.iter().map(|(id, score, rank, pinned, expl)| json!([id, score, rank, pinned, expl.as_ref().map(crate::explain_fmt::to_json)])).collect();
+                let l: Vec<Value> = list.iter().map(|(id, score, rank, pinned, expl, routing)| json!([id, score, rank, pinned, expl.as_ref().map(crate::explain_fmt::to_json), routing])).collect();
                 (index.clone(), Value::Array(l))
             })
             .collect();
-        let mut order: Vec<(&(String, String), &usize)> = self.order.iter().collect();
+        let mut order: Vec<(&(String, String, Option<String>), &usize)> = self.order.iter().collect();
         order.sort_by_key(|(_, pos)| **pos);
-        let order: Vec<Value> = order.into_iter().map(|((index, id), _)| json!([index, id])).collect();
+        let order: Vec<Value> = order.into_iter().map(|((index, id, routing), _)| match routing {
+            Some(r) => json!([index, id, r]),
+            None => json!([index, id]),
+        }).collect();
         json!({ "docs": docs, "union": self.union, "order": order })
     }
 
@@ -2533,13 +2583,14 @@ impl RankPlan {
                 let rank = d[2].as_u64().ok_or_else(bad)? as usize;
                 let pinned = d[3].as_bool();
                 let expl = d.get(4).filter(|e| e.is_object()).map(expl_from_json);
-                out.push((id, score, rank, pinned, expl));
+                let routing = d.get(5).and_then(Value::as_str).map(str::to_string);
+                out.push((id, score, rank, pinned, expl, routing));
             }
             docs.insert(index.clone(), out);
         }
         let mut order = HashMap::new();
         for (pos, e) in v["order"].as_array().ok_or_else(bad)?.iter().enumerate() {
-            order.insert((e[0].as_str().ok_or_else(bad)?.to_string(), e[1].as_str().ok_or_else(bad)?.to_string()), pos);
+            order.insert((e[0].as_str().ok_or_else(bad)?.to_string(), e[1].as_str().ok_or_else(bad)?.to_string(), e.get(2).and_then(Value::as_str).map(str::to_string)), pos);
         }
         Ok(RankPlan { docs, union: v["union"].clone(), order })
     }
@@ -2555,8 +2606,14 @@ impl RankPlan {
         self.order.is_empty()
     }
     /// Fused rank of a doc (`usize::MAX` when not a rank doc).
-    pub fn rank_of(&self, index: &str, id: &str) -> usize {
-        self.order.get(&(index.to_string(), id.to_string())).copied().unwrap_or(usize::MAX)
+    pub fn rank_of(&self, index: &str, id: &str, routing: Option<&str>) -> usize {
+        self.order.get(&(index.to_string(), id.to_string(), routing.map(str::to_string))).copied().unwrap_or(usize::MAX)
+    }
+
+    /// Whether any rank doc has a custom routing (only then does a hit's
+    /// rank depend on its routing).
+    pub fn has_routing(&self) -> bool {
+        self.order.keys().any(|k| k.2.is_some())
     }
 }
 
@@ -2686,12 +2743,15 @@ mod cluster_plan_tests {
     #[test]
     fn rank_plan_json_round_trip() {
         let mut docs = HashMap::new();
-        docs.insert("i".to_string(), vec![("a".to_string(), 0.5f32, 1usize, None, Some(Explanation::leaf(0.5, "x"))), ("b".to_string(), 0.25f32, 2usize, Some(true), None)]);
-        let order = [(("i".to_string(), "a".to_string()), 0usize), (("i".to_string(), "b".to_string()), 1usize)].into_iter().collect();
+        docs.insert("i".to_string(), vec![("a".to_string(), 0.5f32, 1usize, None, Some(Explanation::leaf(0.5, "x")), None), ("b".to_string(), 0.25f32, 2usize, Some(true), None, Some("r1".to_string()))]);
+        let order = [(("i".to_string(), "a".to_string(), None), 0usize), (("i".to_string(), "b".to_string(), Some("r1".to_string())), 1usize)].into_iter().collect();
         let p = RankPlan { docs, union: json!({"match_all": {}}), order };
         let back = RankPlan::from_json(&p.to_json()).unwrap();
-        assert_eq!(back.rank_of("i", "a"), 0);
-        assert_eq!(back.rank_of("i", "b"), 1);
+        assert_eq!(back.rank_of("i", "a", None), 0);
+        assert_eq!(back.rank_of("i", "b", Some("r1")), 1);
+        assert_eq!(back.rank_of("i", "b", None), usize::MAX, "another routing is another doc");
+        assert!(back.has_routing());
+        assert_eq!(back.docs["i"][1].5.as_deref(), Some("r1"));
         assert_eq!(back.union(), &json!({"match_all": {}}));
         let d = &back.docs["i"];
         assert_eq!((d[0].1, d[0].2, d[0].3), (0.5, 1, None));
@@ -2724,7 +2784,7 @@ mod cluster_plan_tests {
     /// are made once.
     #[test]
     fn final_hits_read_the_page_of_rank_docs() {
-        let docs: Vec<PlanDoc> = (1..=5).map(|r| (format!("d{r}"), 1.0 / r as f32, r, None, None)).collect();
+        let docs: Vec<PlanDoc> = (1..=5).map(|r| (format!("d{r}"), 1.0 / r as f32, r, None, None, None)).collect();
         let plan = RankPlan { docs: HashMap::from([("i".to_string(), docs)]), union: json!({"match_all": {}}), order: HashMap::new() };
         // The rank docs a query holds, read off its debug form.
         let ranks = |q: &Query| -> Vec<usize> {
@@ -2732,11 +2792,11 @@ mod cluster_plan_tests {
             let shown = format!("{c:?}");
             (1..=5).filter(|r| shown.contains(&format!("\"d{r}\""))).collect()
         };
-        let (all, top) = plan_queries(&plan, "i", Query::MatchAll, Some(2));
+        let (all, top) = plan_queries(&plan, "i", Query::MatchAll, Some(2), None);
         assert_eq!(ranks(&top), vec![1, 2]);
         let Query::Bool { should, .. } = &all else { panic!("union expected") };
         assert_eq!(ranks(&should[0]), vec![1, 2, 3, 4, 5]);
-        let (_, top) = plan_queries(&plan, "i", Query::MatchAll, None);
+        let (_, top) = plan_queries(&plan, "i", Query::MatchAll, None, None);
         assert_eq!(ranks(&top), vec![1, 2, 3, 4, 5]);
     }
 

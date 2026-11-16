@@ -56,6 +56,9 @@ pub struct TransportConfig {
     pub local_node: DiscoveryNode,
     /// `transport.host` / `transport.port`; port 0 picks a free port.
     pub bind_addr: SocketAddr,
+    /// Further addresses to listen on, on `bind_addr`'s (bound) port: ES
+    /// binds every address a list-valued `transport.bind_host` resolves to.
+    pub extra_bind_addrs: Vec<std::net::IpAddr>,
     /// `transport.publish_host`/`publish_port`; defaults to the bound address.
     pub publish_addr: Option<SocketAddr>,
     pub settings: TransportSettings,
@@ -69,6 +72,7 @@ impl TransportConfig {
             cluster_name: cluster_name.into(),
             local_node,
             bind_addr,
+            extra_bind_addrs: Vec::new(),
             publish_addr: None,
             settings: TransportSettings::default(),
             tls: None,
@@ -137,6 +141,35 @@ pub struct TlsConfig {
     /// also carry a trusted name (ES `RestrictedTrustConfig`).
     #[cfg(feature = "tls")]
     pub trust_restrictions: Option<elasticsearch_ssl::TrustRestrictionsConfig>,
+    /// `.supported_protocols` (`TLSv1.3`, `TLSv1.2`); empty: both.
+    pub supported_protocols: Vec<String>,
+    /// `.cipher_suites` (Java / IANA names); empty: the defaults.
+    pub cipher_suites: Vec<String>,
+    /// No key pair (`certificate` / `key` unset where they are optional,
+    /// ES `remote_cluster_client.ssl`): client side only, presenting no
+    /// certificate; peers are verified against `certificate_authorities`,
+    /// or the default (public) CAs when there are none.
+    pub client_only: bool,
+}
+
+/// Defaults of one TLS context's settings (ES: each `*.ssl` prefix has its own).
+#[derive(Clone, Copy, Debug)]
+pub struct TlsDefaults {
+    /// `.enabled` when unset.
+    pub enabled: bool,
+    /// `.client_authentication` when unset.
+    pub client_authentication: ClientAuthentication,
+    /// `.certificate` / `.key` are required (a server context).
+    pub key_pair_required: bool,
+}
+
+impl TlsDefaults {
+    /// `xpack.security.transport.ssl`: off unless enabled, mutual TLS.
+    pub const TRANSPORT: TlsDefaults = TlsDefaults { enabled: false, client_authentication: ClientAuthentication::Required, key_pair_required: true };
+    /// `xpack.security.remote_cluster_server.ssl`: on, no client certificates.
+    pub const REMOTE_CLUSTER_SERVER: TlsDefaults = TlsDefaults { enabled: true, client_authentication: ClientAuthentication::None, key_pair_required: true };
+    /// `xpack.security.remote_cluster_client.ssl`: on, key pair optional.
+    pub const REMOTE_CLUSTER_CLIENT: TlsDefaults = TlsDefaults { enabled: true, client_authentication: ClientAuthentication::None, key_pair_required: false };
 }
 
 /// Prefix of the transport TLS settings.
@@ -147,9 +180,18 @@ impl TlsConfig {
     /// scalar, `get_list` a list setting), relative paths resolved against
     /// the config directory. `Ok(None)` when transport TLS is disabled.
     pub fn from_settings(get: &dyn Fn(&str) -> Option<String>, get_list: &dyn Fn(&str) -> Vec<String>, conf_dir: &std::path::Path) -> Result<Option<TlsConfig>, String> {
+        Self::from_settings_with(get, get_list, conf_dir, TlsDefaults::TRANSPORT)
+    }
+
+    /// [`TlsConfig::from_settings`] with a context's own defaults.
+    pub fn from_settings_with(get: &dyn Fn(&str) -> Option<String>, get_list: &dyn Fn(&str) -> Vec<String>, conf_dir: &std::path::Path, defaults: TlsDefaults) -> Result<Option<TlsConfig>, String> {
         let key = |k: &str| format!("{TRANSPORT_SSL}{k}");
         let s = |k: &str| get(&key(k)).filter(|v| !v.is_empty());
-        if s("enabled").as_deref() != Some("true") {
+        let enabled = match s("enabled").as_deref() {
+            None => defaults.enabled,
+            Some(v) => v == "true",
+        };
+        if !enabled {
             return Ok(None);
         }
         let path = |p: String| -> PemSource {
@@ -161,8 +203,15 @@ impl TlsConfig {
                 return Err(format!("[{}] is not supported: configure PEM files with [{}] and [{}]", key(unsupported), key("certificate"), key("key")));
             }
         }
-        let certificate = s("certificate").ok_or_else(|| format!("[{}] is required when [{}] is true", key("certificate"), key("enabled")))?;
-        let private_key = s("key").ok_or_else(|| format!("[{}] is required when [{}] is true", key("key"), key("enabled")))?;
+        let client_only = !defaults.key_pair_required && s("certificate").is_none() && s("key").is_none();
+        let (certificate, private_key) = if client_only {
+            (String::new(), String::new())
+        } else {
+            (
+                s("certificate").ok_or_else(|| format!("[{}] is required when [{}] is true", key("certificate"), key("enabled")))?,
+                s("key").ok_or_else(|| format!("[{}] is required when [{}] is true", key("key"), key("enabled")))?,
+            )
+        };
         let verification_mode = match s("verification_mode").as_deref().map(str::to_ascii_lowercase).as_deref() {
             None | Some("full") => VerificationMode::Full,
             Some("certificate") => VerificationMode::Certificate,
@@ -170,7 +219,8 @@ impl TlsConfig {
             Some(o) => return Err(format!("could not resolve ssl client authentication, unknown value [{o}] for [{}]", key("verification_mode"))),
         };
         let client_authentication = match s("client_authentication").as_deref().map(str::to_ascii_lowercase).as_deref() {
-            None | Some("required") => ClientAuthentication::Required,
+            None => defaults.client_authentication,
+            Some("required") => ClientAuthentication::Required,
             Some("optional") => ClientAuthentication::Optional,
             Some("none") => ClientAuthentication::None,
             Some(o) => return Err(format!("could not resolve ssl client authentication, unknown value [{o}] for [{}]", key("client_authentication"))),
@@ -179,9 +229,22 @@ impl TlsConfig {
             (Some(_), Some(_)) => return Err(format!("cannot specify both [{}] and [{}]", key("secure_key_passphrase"), key("key_passphrase"))),
             (a, b) => a.or(b),
         };
+        // Both lists constrain negotiation (production review #291: they
+        // were accepted and ignored); validated now so a node never starts
+        // with a policy it cannot apply.
+        let supported_protocols = get_list(&key("supported_protocols"));
+        let cipher_suites = get_list(&key("cipher_suites"));
+        #[cfg(feature = "tls")]
+        {
+            elasticsearch_ssl::parse_supported_protocols(&supported_protocols, &key("supported_protocols"))?;
+            elasticsearch_ssl::parse_cipher_suites(&cipher_suites, &key("cipher_suites"))?;
+        }
         Ok(Some(TlsConfig {
-            certificate: path(certificate),
-            key: path(private_key),
+            supported_protocols,
+            cipher_suites,
+            certificate: if client_only { PemSource::Inline(certificate) } else { path(certificate) },
+            key: if client_only { PemSource::Inline(private_key) } else { path(private_key) },
+            client_only,
             key_passphrase,
             certificate_authorities: get_list(&key("certificate_authorities")).into_iter().map(path).collect(),
             verification_mode,

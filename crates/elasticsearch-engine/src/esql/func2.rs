@@ -56,6 +56,10 @@ fn is_empty(g: &Geometry) -> bool {
     p.is_empty()
 }
 
+/// Marker argument of a bound `ST_ENVELOPE` / `ST_XMIN`.. over a
+/// geographic geometry: its envelope may wrap at the dateline.
+pub const GEO_ENVELOPE: &str = "\u{0}geo-envelope";
+
 /// `(min_x, max_x, min_y, max_y)`.
 fn bounds(g: &Geometry) -> Option<(f64, f64, f64, f64)> {
     let mut p = Vec::new();
@@ -64,6 +68,51 @@ fn bounds(g: &Geometry) -> Option<(f64, f64, f64, f64)> {
         return None;
     }
     Some(p.iter().fold((f64::MAX, f64::MIN, f64::MAX, f64::MIN), |(a, b, c, d), (x, y)| (a.min(*x), b.max(*x), c.min(*y), d.max(*y))))
+}
+
+/// ES `SpatialEnvelopeVisitor.GeoPointVisitor` with `WrapLongitude.WRAP`:
+/// the narrower of the envelope through Greenwich and the one across the
+/// dateline (`min_x > max_x` then), as `(min_x, max_x, min_y, max_y)`.
+fn geo_bounds(g: &Geometry) -> Option<(f64, f64, f64, f64)> {
+    let mut p = Vec::new();
+    points(g, &mut p);
+    if p.is_empty() {
+        return None;
+    }
+    let (mut min_neg, mut max_neg, mut min_pos, mut max_pos) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (x, y) in &p {
+        if *x < 0.0 {
+            min_neg = min_neg.min(*x);
+            max_neg = max_neg.max(*x);
+        } else {
+            min_pos = min_pos.min(*x);
+            max_pos = max_pos.max(*x);
+        }
+        min_y = min_y.min(*y);
+        max_y = max_y.max(*y);
+    }
+    let (min_x, max_x) = if min_neg.is_infinite() {
+        (min_pos, max_pos)
+    } else if min_pos.is_infinite() {
+        (min_neg, max_neg)
+    } else {
+        let unwrapped = max_pos - min_neg;
+        let wrapped = (180.0 - min_pos) + (max_neg + 180.0);
+        if unwrapped <= wrapped { (min_neg, max_pos) } else { (min_pos, max_neg) }
+    };
+    Some((min_x, max_x, min_y, max_y))
+}
+
+/// The envelope of a bound spatial argument (`args[1]`: the geographic
+/// marker, if any).
+fn envelope_of(a0: &Val, args: &[Val]) -> Option<(f64, f64, f64, f64)> {
+    let g = geometry(a0)?;
+    if matches!(args.get(1), Some(Val::Str(m)) if m == GEO_ENVELOPE) {
+        geo_bounds(&g)
+    } else {
+        bounds(&g)
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -387,12 +436,10 @@ pub fn call(name: &str, args: &[Val], _ctx: &FnCtx) -> Option<Result<Val>> {
         // `StSimplify`: Douglas-Peucker with a constant, non-negative
         // tolerance (checked when binding); a multi-value is one collection.
         "ST_SIMPLIFY" => st_simplify(&a0, &a1),
-        "ST_ENVELOPE" => geometry(&a0)
-            .and_then(|g| bounds(&g))
+        "ST_ENVELOPE" => envelope_of(&a0, args)
             .map(|(a, b, c, d)| Val::Str(super::spatial::to_wkt(&Geometry::Envelope { min_x: a, max_x: b, max_y: d, min_y: c })))
             .unwrap_or(Val::Null),
-        "ST_XMIN" | "ST_XMAX" | "ST_YMIN" | "ST_YMAX" => geometry(&a0)
-            .and_then(|g| bounds(&g))
+        "ST_XMIN" | "ST_XMAX" | "ST_YMIN" | "ST_YMAX" => envelope_of(&a0, args)
             .map(|(a, b, c, d)| Val::Double(match name {
                 "ST_XMIN" => a,
                 "ST_XMAX" => b,
@@ -402,15 +449,39 @@ pub fn call(name: &str, args: &[Val], _ctx: &FnCtx) -> Option<Result<Val>> {
             .unwrap_or(Val::Null),
         "ST_GEOHASH" | "ST_GEOTILE" | "ST_GEOHEX" => {
             let Some(p) = a1.as_i64() else { return Some(Ok(Val::Null)) };
+            // The optional bounds (`StGeotile` etc. `fromBounds`): a cell not
+            // intersecting them is null; null bounds give null.
+            let grid = match name {
+                "ST_GEOHASH" => crate::aggs::geo_shape::Grid::Hash,
+                "ST_GEOTILE" => crate::aggs::geo_shape::Grid::Tile,
+                _ => crate::aggs::geo_shape::Grid::Hex,
+            };
+            let precision = match grid {
+                crate::aggs::geo_shape::Grid::Hash => p.clamp(1, 12),
+                crate::aggs::geo_shape::Grid::Tile => p.clamp(0, 29),
+                crate::aggs::geo_shape::Grid::Hex => p.clamp(0, 15),
+            } as u32;
+            let bounded = match args.get(2) {
+                None => None,
+                Some(Val::Null) => return Some(Ok(Val::Null)),
+                Some(b) => match geometry(b).and_then(|g| geo_bounds(&g)) {
+                    Some((min_x, max_x, min_y, max_y)) => Some(crate::aggs::geo_shape::CellPred::new(grid, precision, (max_y, min_x, min_y, max_x))),
+                    None => return Some(Ok(Val::Null)),
+                },
+            };
             let cell = |point: &Val| -> Val {
                 let Some((x, y)) = s(point).and_then(|w| super::spatial::point_xy(&w)) else { return Val::Null };
-                match name {
+                let out = match name {
                     "ST_GEOHASH" => Val::Str(rustic_core::geo::geohash(y, x, p.clamp(1, 12) as usize)),
                     "ST_GEOTILE" => {
                         let (tx, ty) = rustic_core::geo::geotile(y, x, p.clamp(0, 29) as u32);
                         Val::Str(format!("{p}/{tx}/{ty}"))
                     }
                     _ => crate::aggs::geo_hex::point_cell(y, x, p.clamp(0, 15) as u32).map(Val::Str).unwrap_or(Val::Null),
+                };
+                match (&bounded, &out) {
+                    (Some(pred), Val::Str(key)) if !pred.key(key, precision) => Val::Null,
+                    _ => out,
                 }
             };
             match &a0 {
@@ -557,7 +628,10 @@ pub fn call(name: &str, args: &[Val], _ctx: &FnCtx) -> Option<Result<Val>> {
                 "V_DOT_PRODUCT" => dot,
                 "V_COSINE" => {
                     let (nx, ny) = (x.iter().map(|a| a * a).sum::<f32>(), y.iter().map(|a| a * a).sum::<f32>());
-                    if nx == 0.0 || ny == 0.0 { return Some(Ok(Val::Null)) } else { dot / (nx * ny).sqrt() }
+                    // Lucene `DefaultVectorUtilSupport.cosine`: the norm
+                    // product in double (#592), so large and small vectors
+                    // neither overflow nor underflow it.
+                    if nx == 0.0 || ny == 0.0 { return Some(Ok(Val::Null)) } else { (f64::from(dot) / (f64::from(nx) * f64::from(ny)).sqrt()) as f32 }
                 }
                 "V_L1_NORM" => x.iter().zip(&y).map(|(a, b)| (a - b).abs()).sum(),
                 "V_L2_NORM" => x.iter().zip(&y).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt(),
@@ -565,7 +639,23 @@ pub fn call(name: &str, args: &[Val], _ctx: &FnCtx) -> Option<Result<Val>> {
             } as f64)
         }
         "TO_DENSE_VECTOR" => {
-            let v: Vec<Val> = mv(&a0).into_iter().filter_map(|x| x.as_f64()).map(Val::Double).collect();
+            // Numbers are the components; a string is a hexadecimal byte
+            // vector (#593), each two digits one signed byte ('ff01' ->
+            // [-1, 1]).
+            let mut v: Vec<Val> = Vec::new();
+            for x in mv(&a0) {
+                match x {
+                    Val::Str(h) => match hex_bytes(&h) {
+                        Some(bytes) => v.extend(bytes.into_iter().map(|b| Val::Double(f64::from(b)))),
+                        None => return Some(Err(super::func::eval_warning(format!("java.lang.IllegalArgumentException: [{h}] is not a valid hexadecimal dense vector")))),
+                    },
+                    other => {
+                        if let Some(f) = other.as_f64() {
+                            v.push(Val::Double(f));
+                        }
+                    }
+                }
+            }
             Val::from_list(v)
         }
         "JSON_EXTRACT" | "FIELD_EXTRACT" => match (&a0, &a1) {
@@ -590,6 +680,42 @@ pub fn call(name: &str, args: &[Val], _ctx: &FnCtx) -> Option<Result<Val>> {
         _ => return None,
     };
     Some(Ok(r))
+}
+
+/// The signed bytes of a hexadecimal string (an even number of hex digits).
+fn hex_bytes(h: &str) -> Option<Vec<i8>> {
+    let h = h.trim();
+    if h.is_empty() || h.len() % 2 != 0 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|b| b as i8)).collect()
+}
+
+#[cfg(test)]
+mod vector_b7_tests {
+    use super::*;
+
+    /// #592 / #593: V_COSINE keeps scale invariance at large and small
+    /// magnitudes; TO_DENSE_VECTOR decodes hexadecimal strings into signed
+    /// bytes and rejects malformed ones.
+    #[test]
+    fn cosine_norms_in_double_and_hex_vectors() {
+        let cos = |x: f64| {
+            let v = Val::Multi(vec![Val::Double(x), Val::Double(x)]);
+            match call("V_COSINE", &[v.clone(), v], &Default::default()) {
+                Some(Ok(Val::Double(d))) => d,
+                other => panic!("{other:?}"),
+            }
+        };
+        for x in [1e10, 1e-12, 1.0] {
+            assert!((cos(x) - 1.0).abs() < 1e-6, "{x}: {}", cos(x));
+        }
+        let hex = |h: &str| call("TO_DENSE_VECTOR", &[Val::Str(h.into())], &Default::default());
+        assert!(matches!(hex("ff01"), Some(Ok(Val::Multi(ref v))) if *v == vec![Val::Double(-1.0), Val::Double(1.0)]), "{:?}", hex("ff01"));
+        assert!(matches!(hex("0102"), Some(Ok(Val::Multi(ref v))) if *v == vec![Val::Double(1.0), Val::Double(2.0)]));
+        assert!(matches!(hex("0g"), Some(Err(_))));
+        assert!(matches!(hex("abc"), Some(Err(_))));
+    }
 }
 
 // ---------------------------------------------------------------- JSON_EXTRACT / FIELD_EXTRACT

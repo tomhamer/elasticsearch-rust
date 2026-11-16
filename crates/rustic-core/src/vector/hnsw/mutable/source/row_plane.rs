@@ -73,7 +73,7 @@ struct Chunk {
     bytes: *mut u8,
     /// Owns `bytes` (huge pages when large).
     _block: ZeroedBlock,
-    _memory: crate::admission::Reservation,
+    _memory: Option<crate::admission::Reservation>,
     /// Node memory stats: source rows, as the row store charges them.
     _charge: crate::accounting::Charge,
 }
@@ -189,12 +189,12 @@ impl RowPlane {
         let current = slot.load(Ordering::Acquire);
         if !current.is_null() { return Ok(current); }
         let bytes = chunk_slots(k) * self.stride;
-        let memory = crate::admission::shared().reserve(bytes as u64, "mutable row plane")?;
         // Zeroed memory is a valid `AtomicU32` array and an entry that is
-        // never read before it is written.
-        let block = ZeroedBlock::new(bytes).ok_or_else(|| super::failure("row plane allocation"))?;
+        // never read before it is written. Past the budget's spill
+        // threshold, a spill file (see `huge::plane_chunk`).
+        let (block, memory) = super::super::huge::plane_chunk(bytes, "mutable row plane")?;
         let raw = block.ptr();
-        let charge = crate::accounting::Charge::new(crate::accounting::Category::VectorRows, bytes as u64);
+        let charge = crate::accounting::Charge::new(crate::accounting::Category::VectorRows, if memory.is_some() { bytes as u64 } else { 0 });
         let chunk = Box::into_raw(Box::new(Chunk { bytes: raw, _block: block, _memory: memory, _charge: charge }));
         slot.store(chunk, Ordering::Release);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);

@@ -232,24 +232,14 @@ const COMMON: &[&str] = &["validation_method", "ignore_unmapped", "boost", "_nam
 // ---------------------------------------------------------------------------
 // geo_bounding_box.
 
-pub fn geo_bounding_box(body: &Value, ctx: &QueryContext) -> Result<Query> {
-    let q = "geo_bounding_box";
-    let o = body.as_object().ok_or_else(|| EsError::parsing("[geo_bounding_box] query malformed, no start_object after query name"))?;
+/// ES `GeoBoundingBox.parseBoundingBox` (`BoundingBox.BoundingBoxParser`):
+/// `top_left` / `bottom_right`, `top_right` / `bottom_left`, the
+/// individual `top` / `left` / `bottom` / `right`, or `wkt`, as
+/// `(top, left, bottom, right)`. `q`: the query or aggregation naming it in
+/// errors. Shared by `geo_bounding_box` and the geo grid aggregations'
+/// `bounds`.
+pub fn parse_bounding_box(so: &serde_json::Map<String, Value>, q: &str, field: &str) -> Result<(f64, f64, f64, f64)> {
     let unexpected = |k: &str| EsError::parsing(format!("failed to parse [{q}] query. unexpected field [{k}]"));
-    let mut validation = Validation::Strict;
-    let mut ignore_unmapped = false;
-    let mut spec: Option<(&String, &Value)> = None;
-    for (k, v) in o {
-        match k.as_str() {
-            "validation_method" => validation = validation_of(v)?,
-            "ignore_unmapped" => ignore_unmapped = v.as_bool().unwrap_or(false),
-            "boost" | "_name" => {}
-            "type" | "ignore_malformed" | "coerce" => return Err(unexpected(k)),
-            _ => spec = Some((k, v)),
-        }
-    }
-    let (field, spec) = spec.ok_or_else(|| EsError::parsing(format!("failed to parse [{q}] query. bounding box not provided")))?;
-    let so = spec.as_object().ok_or_else(|| EsError::parsing(format!("failed to parse [{q}] query. unexpected token [{}]", "VALUE")))?;
     let (mut top, mut left, mut bottom, mut right) = (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
     let wrap = |e: EsError| parse_exc(format!("failed to parse [{q}] query. [{}]", e.reason));
     for (k, v) in so {
@@ -310,6 +300,29 @@ pub fn geo_bounding_box(body: &Value, ctx: &QueryContext) -> Result<Query> {
     if top < bottom {
         return Err(EsError::illegal_argument(format!("top is below bottom corner: {} vs. {}", jd(top), jd(bottom))));
     }
+    Ok((top, left, bottom, right))
+}
+
+
+pub fn geo_bounding_box(body: &Value, ctx: &QueryContext) -> Result<Query> {
+    let q = "geo_bounding_box";
+    let o = body.as_object().ok_or_else(|| EsError::parsing("[geo_bounding_box] query malformed, no start_object after query name"))?;
+    let unexpected = |k: &str| EsError::parsing(format!("failed to parse [{q}] query. unexpected field [{k}]"));
+    let mut validation = Validation::Strict;
+    let mut ignore_unmapped = false;
+    let mut spec: Option<(&String, &Value)> = None;
+    for (k, v) in o {
+        match k.as_str() {
+            "validation_method" => validation = validation_of(v)?,
+            "ignore_unmapped" => ignore_unmapped = v.as_bool().unwrap_or(false),
+            "boost" | "_name" => {}
+            "type" | "ignore_malformed" | "coerce" => return Err(unexpected(k)),
+            _ => spec = Some((k, v)),
+        }
+    }
+    let (field, spec) = spec.ok_or_else(|| EsError::parsing(format!("failed to parse [{q}] query. bounding box not provided")))?;
+    let so = spec.as_object().ok_or_else(|| EsError::parsing(format!("failed to parse [{q}] query. unexpected token [{}]", "VALUE")))?;
+    let (mut top, mut left, mut bottom, mut right) = parse_bounding_box(so, q, field)?;
     let envelope = json!({"type": "envelope", "coordinates": [[left, top], [right, bottom]]});
     if let Some(q) = crate::script::search::runtime_geo_query(field, &envelope, ctx)? {
         return Ok(boost_q(q, o));
@@ -325,8 +338,16 @@ pub fn geo_bounding_box(body: &Value, ctx: &QueryContext) -> Result<Query> {
             }
         }
         Validation::Coerce => {
+            // ES `GeoBoundingBoxQueryBuilder.doToQuery`: a right edge a
+            // positive multiple of 360 degrees past the left one asks for
+            // every longitude; only the latitudes are normalized, and the
+            // longitudes become -180..180.
+            let complete_lon_range = (right - left) % 360.0 == 0.0 && right > left;
             (top, left) = normalize_point(top, left);
             (bottom, right) = normalize_point(bottom, right);
+            if complete_lon_range {
+                (left, right) = (-180.0, 180.0);
+            }
         }
         Validation::IgnoreMalformed => {
             for lat in [top, bottom] {
@@ -380,6 +401,12 @@ fn java_double(s: &str) -> Result<f64> {
 
 /// `100km`, `5 mi`, `1.5e2m`, `100` into meters (ES `DistanceUnit.parse`).
 pub(crate) fn parse_distance_es(s: &str) -> Result<f64> {
+    parse_distance_with_default(s, 1.0)
+}
+
+/// [`parse_distance_es`] with a unitless number in `default_meters` per
+/// unit (ES `DistanceUnit.parse(value, unit, defaultUnit)`).
+fn parse_distance_with_default(s: &str, default_meters: f64) -> Result<f64> {
     for (names, f) in UNITS {
         for n in *names {
             if let Some(num) = s.strip_suffix(n) {
@@ -387,7 +414,12 @@ pub(crate) fn parse_distance_es(s: &str) -> Result<f64> {
             }
         }
     }
-    java_double(s)
+    java_double(s).map(|x| x * default_meters)
+}
+
+/// Meters per `unit` (ES `DistanceUnit.fromString`).
+fn unit_meters(unit: &str) -> Result<f64> {
+    UNITS.iter().find(|(names, _)| names.contains(&unit)).map(|(_, f)| *f).ok_or_else(|| EsError::illegal_argument(format!("No distance unit match [{unit}]")))
 }
 
 pub fn geo_distance(body: &Value, ctx: &QueryContext) -> Result<Query> {
@@ -395,17 +427,20 @@ pub fn geo_distance(body: &Value, ctx: &QueryContext) -> Result<Query> {
     let o = body.as_object().ok_or_else(|| EsError::parsing("[geo_distance] query malformed, no start_object after query name"))?;
     let mut validation = Validation::Strict;
     let mut ignore_unmapped = false;
-    let mut distance: Option<f64> = None;
+    let mut distance: Option<&Value> = None;
+    let mut unit = 1.0;
     let mut spec: Option<(&String, &Value)> = None;
     for (k, v) in o {
         match k.as_str() {
             "validation_method" => validation = validation_of(v)?,
             "ignore_unmapped" => ignore_unmapped = v.as_bool().unwrap_or(false),
-            "boost" | "_name" | "unit" => {}
+            "boost" | "_name" => {}
+            // ES `GeoDistanceQueryBuilder.fromXContent`: `unit` applies to a
+            // numeric or unitless distance; a suffix on the string wins.
+            "unit" => unit = unit_meters(v.as_str().unwrap_or(""))?,
             "distance" => {
                 distance = match v {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => Some(parse_distance_es(s)?),
+                    Value::Number(_) | Value::String(_) => Some(v),
                     Value::Null => None,
                     other => return Err(EsError::x_content_parse(format!("Current token ({}) not numeric, can not use numeric value accessors", if other.is_boolean() { "VALUE_TRUE" } else { "START_OBJECT" }))),
                 }
@@ -419,7 +454,11 @@ pub fn geo_distance(body: &Value, ctx: &QueryContext) -> Result<Query> {
             _ => spec = Some((k, v)),
         }
     }
-    let dist = distance.ok_or_else(|| EsError::parsing("geo_distance requires 'distance' to be specified"))?;
+    let dist = match distance.ok_or_else(|| EsError::parsing("geo_distance requires 'distance' to be specified"))? {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0) * unit,
+        Value::String(s) => parse_distance_with_default(s, unit)?,
+        _ => unreachable!("validated above"),
+    };
     let (field, spec) = spec.ok_or_else(|| EsError::illegal_argument("fieldName must not be null or empty"))?;
     if dist <= 0.0 {
         return Err(EsError::illegal_argument("distance must be greater than zero"));

@@ -83,7 +83,7 @@ impl Budget {
         self.add(bytes,label)?;
         let owner=OWNER.with(|slot|slot.borrow().clone());
         if let Some(owner)=&owner {if let Err(e)=owner.add(bytes,category){self.used.fetch_sub(bytes,Ordering::AcqRel);return Err(e);}}
-        Ok(Reservation{budget:self.clone(),bytes,owner,category,lease:None,background:false})
+        Ok(Reservation{budget:self.clone(),bytes,owner,category,lease:None,background:false,slot:labelled(label,bytes)})
     }
     /// Background maintenance (segment merges): its own working memory is
     /// admitted against the background share (`limit - limit /
@@ -110,7 +110,7 @@ impl Budget {
                 Ok(()) => {
                     let owner=OWNER.with(|slot|slot.borrow().clone());
                     if let Some(owner)=&owner {if let Err(e)=owner.add(bytes,Category::Core){self.sub_background(bytes);return Err(e);}}
-                    return Ok(Reservation{budget:self.clone(),bytes,owner,category:Category::Core,lease:None,background:true});
+                    return Ok(Reservation{budget:self.clone(),bytes,owner,category:Category::Core,lease:None,background:true,slot:labelled(label,bytes)});
                 }
                 Err(error) if bytes>self.background_limit() => return Err(error),
                 Err(error) => {
@@ -144,14 +144,17 @@ pub const BACKGROUND_HEADROOM_DIVISOR:u64=4;
 #[derive(Debug)]
 pub struct Reservation {budget:Arc<Budget>,bytes:u64,owner:Option<Arc<Owner>>,category:Category,lease:Option<LeaseBinding>,
     /// Admitted by [`Budget::reserve_background`] (counted in its share).
-    background:bool}
+    background:bool,
+    /// Its label's slot in the label breakdown ([`label_report`]; `NO_LABEL`
+    /// unless `RUSTIC_ADMISSION_LABELS=1`).
+    slot:u16}
 impl Reservation {
     pub fn bytes(&self)->u64 {self.bytes}
     /// Transfer already admitted bytes, preserving category and lease.
     pub fn split(&mut self,bytes:u64)->Option<Self>{
         if bytes>self.bytes{return None;}
         self.bytes-=bytes;
-        Some(Self{budget:self.budget.clone(),bytes,owner:self.owner.clone(),category:self.category,lease:self.lease.as_ref().map(|binding|LeaseBinding{lease:binding.lease.clone(),completed:binding.completed.clone()}),background:self.background})
+        Some(Self{budget:self.budget.clone(),bytes,owner:self.owner.clone(),category:self.category,lease:self.lease.as_ref().map(|binding|LeaseBinding{lease:binding.lease.clone(),completed:binding.completed.clone()}),background:self.background,slot:self.slot})
     }
     /// Independently owned allocation charged to the same budget.
     pub fn reserve_related(&self, bytes:u64, label:&str)->Result<Reservation> {
@@ -165,7 +168,7 @@ impl Reservation {
         }
         self.budget.add(bytes,label)?;
         if let Some(owner)=&self.owner {if let Err(e)=owner.add(bytes,self.category){self.budget.used.fetch_sub(bytes,Ordering::AcqRel);return Err(e);}}
-        Ok(Reservation{budget:self.budget.clone(),bytes,owner:self.owner.clone(),category:self.category,lease:None,background:false})
+        Ok(Reservation{budget:self.budget.clone(),bytes,owner:self.owner.clone(),category:self.category,lease:None,background:false,slot:labelled(label,bytes)})
     }
     pub fn grow(&mut self,more:u64,label:&str)->Result<()> {
         let next=self.bytes.checked_add(more).ok_or_else(||RusticError::Memory("reservation size overflow".into()))?;
@@ -174,20 +177,20 @@ impl Reservation {
             // the separately admitted bytes, including their owner charge.
             let mut additional=self.reserve_related(more,label)?;
             additional.bytes=0;
-            self.bytes=next;return Ok(());
+            label_add(self.slot,more);self.bytes=next;return Ok(());
         }
         if self.background {
             // Background work grows within the background share.
             self.budget.add_background(more,label)?;
             if let Some(owner)=&self.owner {if let Err(e)=owner.add(more,self.category){self.budget.sub_background(more);return Err(e);}}
-            self.bytes=next;return Ok(());
+            label_add(self.slot,more);self.bytes=next;return Ok(());
         }
         // Ordinary admission: exactly `reserve_related` + transfer, without
         // the temporary guard (its Arc clones, and its zero-byte release of
         // the owner and budget counters, were ~9 atomic RMWs per growth).
         self.budget.add(more,label)?;
         if let Some(owner)=&self.owner {if let Err(e)=owner.add(more,self.category){self.budget.used.fetch_sub(more,Ordering::AcqRel);return Err(e);}}
-        self.bytes=next;Ok(())
+        label_add(self.slot,more);self.bytes=next;Ok(())
     }
     fn release(&mut self,bytes:u64) {
         let bytes=bytes.min(self.bytes);
@@ -195,6 +198,7 @@ impl Reservation {
         // update below would add 0. Skip their atomics and the lease lock.
         if bytes==0 {return;}
         self.bytes-=bytes;
+        label_sub(self.slot,bytes);
         if let Some(owner)=&self.owner{owner.sub(bytes,self.category);}
         if let Some(lease)=self.lease.as_ref().and_then(|binding|binding.lease.upgrade()) {
             let mut state=lease.state.lock().unwrap_or_else(|e|e.into_inner());
@@ -261,14 +265,14 @@ impl Lease {
                 drop(state);
                 self.budget.add(bytes,label)?;
                 if let Some(owner)=&owner {if let Err(e)=owner.add(bytes,category){self.budget.used.fetch_sub(bytes,Ordering::AcqRel);return Err(e);}}
-                return Ok(Reservation{budget:self.budget.clone(),bytes,owner,category,lease:None,background:false});
+                return Ok(Reservation{budget:self.budget.clone(),bytes,owner,category,lease:None,background:false,slot:labelled(label,bytes)});
             }
             return Err(RusticError::Memory(format!("[core] [{label}] recovery lease has insufficient or expired credits")));
         }
         if let Some(owner)=&owner {owner.add(bytes,category)?;}
         state.available-=bytes;
         if bytes!=0 {state.last_allocation=std::time::Instant::now();}
-        Ok(Reservation{budget:self.budget.clone(),bytes,owner,category,lease:Some(LeaseBinding{lease:Arc::downgrade(self),completed:self.completed.clone()}),background:false})
+        Ok(Reservation{budget:self.budget.clone(),bytes,owner,category,lease:Some(LeaseBinding{lease:Arc::downgrade(self),completed:self.completed.clone()}),background:false,slot:labelled(label,bytes)})
     }
 }
 impl Drop for Lease {fn drop(&mut self){self.expire();}}
@@ -350,6 +354,14 @@ pub struct PrivateShared {previous:Option<Arc<Budget>>,_thread:std::marker::Phan
 #[doc(hidden)]
 pub fn private_shared(limit:u64)->PrivateShared {
     let previous=TEST_SHARED.with(|slot|slot.replace(Some(Budget::new(limit))));
+    PrivateShared{previous,_thread:std::marker::PhantomData}
+}
+/// Until dropped, [`shared`] on this thread is `budget` (test builds only:
+/// threads sharing one private budget).
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn private_shared_budget(budget:Arc<Budget>)->PrivateShared {
+    let previous=TEST_SHARED.with(|slot|slot.replace(Some(budget)));
     PrivateShared{previous,_thread:std::marker::PhantomData}
 }
 #[cfg(any(test, feature = "test-seams"))]
@@ -595,3 +607,54 @@ mod tests {
 }
 
 impl<T> std::ops::DerefMut for Allocation<T> { fn deref_mut(&mut self)->&mut T { &mut self.value } }
+
+/// Admission held per reservation label (`RUSTIC_ADMISSION_LABELS=1`): which
+/// allocations fill the budget, for [`label_report`]. Off by default: then
+/// every reservation's slot is `NO_LABEL` and nothing is counted.
+const NO_LABEL:u16=u16::MAX;
+const LABEL_SLOTS:usize=2048;
+struct Labels {names:Mutex<(std::collections::HashMap<String,u16>,Vec<String>)>,bytes:Vec<AtomicU64>}
+fn labels()->Option<&'static Labels> {
+    static LABELS:std::sync::OnceLock<Option<Labels>>=std::sync::OnceLock::new();
+    LABELS.get_or_init(||std::env::var("RUSTIC_ADMISSION_LABELS").is_ok_and(|v|v=="1").then(||Labels{
+        names:Mutex::new((std::collections::HashMap::new(),Vec::new())),bytes:(0..LABEL_SLOTS).map(|_|AtomicU64::new(0)).collect()})).as_ref()
+}
+thread_local! {
+    /// Slots of labels this thread already resolved, by the label's address
+    /// and length (labels are mostly literals): no global lock per
+    /// reservation once warm.
+    static LABEL_CACHE:std::cell::RefCell<std::collections::HashMap<(usize,usize),u16>>=std::cell::RefCell::new(std::collections::HashMap::new());
+}
+fn labelled(label:&str,bytes:u64)->u16 {
+    let Some(labels)=labels() else {return NO_LABEL};
+    let key=(label.as_ptr() as usize,label.len());
+    if let Some(slot)=LABEL_CACHE.with(|cache|cache.borrow().get(&key).copied()) {label_add(slot,bytes);return slot;}
+    let slot=labelled_slow(labels,label,bytes);
+    LABEL_CACHE.with(|cache|{let mut cache=cache.borrow_mut();if cache.len()<4096{cache.insert(key,slot);}});
+    slot
+}
+fn labelled_slow(labels:&Labels,label:&str,bytes:u64)->u16 {
+    // Labels are short static names, sometimes with a bracketed detail.
+    let name=label.split(['[','(']).next().unwrap_or(label).trim();
+    let slot={
+        let mut names=labels.names.lock().unwrap_or_else(|e|e.into_inner());
+        match names.0.get(name) {
+            Some(&slot)=>slot,
+            None if names.1.len()<LABEL_SLOTS-1=>{let slot=names.1.len() as u16;names.1.push(name.to_string());names.0.insert(name.to_string(),slot);slot}
+            None=>(LABEL_SLOTS-1) as u16,
+        }
+    };
+    label_add(slot,bytes);
+    slot
+}
+fn label_add(slot:u16,bytes:u64){if slot!=NO_LABEL{if let Some(l)=labels(){l.bytes[slot as usize].fetch_add(bytes,Ordering::Relaxed);}}}
+fn label_sub(slot:u16,bytes:u64){if slot!=NO_LABEL{if let Some(l)=labels(){l.bytes[slot as usize].fetch_sub(bytes,Ordering::Relaxed);}}}
+/// The labels holding the most admitted bytes now (`RUSTIC_ADMISSION_LABELS=1`;
+/// empty otherwise): `label=bytes` pairs, largest first.
+pub fn label_report(top:usize)->String {
+    let Some(labels)=labels() else {return String::new()};
+    let names=labels.names.lock().unwrap_or_else(|e|e.into_inner()).1.clone();
+    let mut held:Vec<(u64,&str)>=names.iter().enumerate().map(|(i,n)|(labels.bytes[i].load(Ordering::Relaxed),n.as_str())).filter(|(b,_)|*b>0).collect();
+    held.sort_unstable_by(|a,b|b.0.cmp(&a.0));
+    held.iter().take(top).map(|(b,n)|format!("{n}={b}")).collect::<Vec<_>>().join(" ")
+}

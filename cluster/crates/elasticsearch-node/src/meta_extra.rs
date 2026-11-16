@@ -29,11 +29,19 @@ pub const ENRICH_CUSTOM: &str = "_enrich_policies";
 /// `{"endpoints": [...], "secrets": {...}}` (ES `.inference` system index).
 pub const INFERENCE_CUSTOM: &str = "_inference_endpoints";
 pub const STORED_SCRIPTS_CUSTOM: &str = "_stored_scripts";
+/// Trained model deployments and model aliases, `{"deployment:<id>": ..,
+/// "alias:<name>": model_id}` (ES `TrainedModelAssignmentMetadata`,
+/// `ModelAliasMetadata`). Configs and definitions live in the
+/// `.ml-inference-*` indices.
+pub const TRAINED_MODELS_CUSTOM: &str = "_trained_models";
 pub const ESQL_VIEWS_CUSTOM: &str = "_esql_views";
 /// Internal persisted license state, including whether the trial was used.
 pub const LICENSE_CUSTOM: &str = "_license_state";
 /// Native authentication state, hidden from the public metadata API.
 pub const SECURITY_CUSTOM: &str = "_security_state";
+/// `{"manually_stopped": bool}` (ES `WatcherMetadata`): `_watcher/_stop`
+/// and `_start` act on every node's scheduler. Absent until the first stop.
+pub const WATCHER_CUSTOM: &str = "watcher";
 
 /// The customs [`apply`] / [`apply_changed`] write into an engine. Any other
 /// custom (data streams, persistent tasks, ...) is never held back for an
@@ -46,7 +54,7 @@ pub const ENGINE_APPLIED_CUSTOMS: &[&str] = &[
 /// The customs [`extract_only`] can read back from an engine.
 pub fn is_extractable_custom(key: &str) -> bool {
     matches!(key, STORED_SCRIPTS_CUSTOM | SECURITY_CUSTOM | LICENSE_CUSTOM | ILM_CUSTOM | INGEST_CUSTOM | SYNONYMS_CUSTOM
-        | RULESETS_CUSTOM | SEARCH_APPS_CUSTOM | ENRICH_CUSTOM | INFERENCE_CUSTOM | ESQL_VIEWS_CUSTOM)
+        | RULESETS_CUSTOM | SEARCH_APPS_CUSTOM | ENRICH_CUSTOM | INFERENCE_CUSTOM | ESQL_VIEWS_CUSTOM | TRAINED_MODELS_CUSTOM | WATCHER_CUSTOM)
 }
 
 /// Whether `engine` already holds custom `key` exactly as `md` has it (an
@@ -60,12 +68,62 @@ pub fn engine_holds_custom(engine: &Engine, md: &Metadata, key: &str) -> bool {
     same_custom(key, own.customs.get(key), md.customs.get(key))
 }
 
+/// Whether engine 0 already holds the change of custom `key` from `prev`
+/// to `md`: every entry that differs between them is in engine 0 as `md`
+/// has it (entries the change did not touch may differ, e.g. built-in
+/// lifecycle policies engine 0 installed itself and the published custom
+/// lacks). A kept job's own publication of a lifecycle policy, for one, is
+/// held by engine 0 even though the committed lifecycle custom as a whole
+/// is not engine 0's: it is never deferred behind an engine API in flight,
+/// which blocked every later application until the API finished (the
+/// registry pass of a new master's first metadata job raced engine APIs
+/// this way).
+pub fn engine_holds_change(engine: &Engine, prev: Option<&Metadata>, md: &Metadata, key: &str) -> bool {
+    if !is_extractable_custom(key) {
+        return false;
+    }
+    let mut own = Metadata::default();
+    extract_only(engine, &mut own, Some(key));
+    let (o, p, s) = (own.customs.get(key), prev.and_then(|p| p.customs.get(key)), md.customs.get(key));
+    if same_custom(key, o, s) {
+        return true;
+    }
+    if key == INGEST_CUSTOM || key == WATCHER_CUSTOM {
+        return false;
+    }
+    holds_change(o, p, s)
+}
+
+fn holds_change(own: Option<&Value>, prev: Option<&Value>, state: Option<&Value>) -> bool {
+    if prev == state {
+        return true;
+    }
+    fn obj(v: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
+        v.and_then(Value::as_object)
+    }
+    match (obj(prev).or_else(|| prev.is_none().then_some(&*EMPTY_OBJECT)), obj(state)) {
+        (Some(p), Some(s)) => {
+            let empty = serde_json::Map::new();
+            let o = obj(own).unwrap_or(&empty);
+            p.keys().chain(s.keys()).filter(|k| p.get(*k) != s.get(*k)).all(|k| holds_change(o.get(k), p.get(k), s.get(k)))
+        }
+        _ => own == state,
+    }
+}
+
+static EMPTY_OBJECT: std::sync::LazyLock<serde_json::Map<String, Value>> = std::sync::LazyLock::new(serde_json::Map::new);
+
 /// Whether two forms of custom `key` say the same thing: pipelines are
 /// compared by id (a kept job appends a new one where the engine lists it
 /// in id order). Anything else compares exactly.
 pub fn same_custom(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
     if a == b {
         return true;
+    }
+    if key == WATCHER_CUSTOM {
+        // Absent is "not stopped".
+        let stopped = |v: Option<&Value>| v.and_then(|w| w["manually_stopped"].as_bool()).unwrap_or(false);
+        return stopped(a) == stopped(b);
     }
     if key == INGEST_CUSTOM {
         let by_id = |v: Option<&Value>| -> Option<BTreeMap<String, Value>> {
@@ -79,7 +137,8 @@ pub fn same_custom(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
 /// Customs that have no counterpart under `metadata` in ES's
 /// `GET _cluster/state`.
 pub fn is_internal_custom(key: &str) -> bool {
-    matches!(key, SYNONYMS_CUSTOM | RULESETS_CUSTOM | SEARCH_APPS_CUSTOM | LICENSE_CUSTOM | SECURITY_CUSTOM | ENRICH_CUSTOM | INFERENCE_CUSTOM | ESQL_VIEWS_CUSTOM | STORED_SCRIPTS_CUSTOM)
+    matches!(key, SYNONYMS_CUSTOM | RULESETS_CUSTOM | SEARCH_APPS_CUSTOM | LICENSE_CUSTOM | SECURITY_CUSTOM | ENRICH_CUSTOM | INFERENCE_CUSTOM | ESQL_VIEWS_CUSTOM | STORED_SCRIPTS_CUSTOM | TRAINED_MODELS_CUSTOM)
+        || key == crate::ccr::CCR_CUSTOM
 }
 
 fn set_custom(md: &mut Metadata, key: &str, v: Value, empty: bool) {
@@ -98,6 +157,11 @@ pub fn extract(engine: &Engine, md: &mut Metadata) {
 /// [`extract`] of one custom family (`Some(key)`), or of all (`None`).
 pub fn extract_only(engine: &Engine, md: &mut Metadata, only: Option<&str>) {
     let want = |key: &str| only.is_none_or(|o| o == key);
+    if want(WATCHER_CUSTOM) {
+        let stopped = elasticsearch_engine::watcher::service(engine).manually_stopped();
+        let present = md.customs.contains_key(WATCHER_CUSTOM);
+        set_custom(md, WATCHER_CUSTOM, json!({"manually_stopped": stopped}), !stopped && !present);
+    }
     if want(STORED_SCRIPTS_CUSTOM) {
         set_custom(md, STORED_SCRIPTS_CUSTOM, elasticsearch_engine::script::stored::for_data_dir(&engine.data).cluster_state(), false);
     }
@@ -145,6 +209,10 @@ pub fn extract_only(engine: &Engine, md: &mut Metadata, only: Option<&str>) {
     if want(INFERENCE_CUSTOM) {
         set_custom(md, INFERENCE_CUSTOM, elasticsearch_engine::inference::service_for(&engine.data).cluster_state(), false);
     }
+    // Kept when empty, so stopping the last deployment reaches every node.
+    if want(TRAINED_MODELS_CUSTOM) {
+        set_custom(md, TRAINED_MODELS_CUSTOM, elasticsearch_engine::inference::models::cluster_state(&engine.data.join("_state")), false);
+    }
     // Kept when empty, so deleting the last view reaches every node.
     if want(ESQL_VIEWS_CUSTOM) {
         set_custom(md, ESQL_VIEWS_CUSTOM, elasticsearch_engine::esql::views::store(engine).cluster_state(), false);
@@ -164,6 +232,7 @@ pub fn custom_family_of_api(first_segment: &str) -> Option<&'static str> {
         "_query_rules" => Some(RULESETS_CUSTOM),
         "_application" => Some(SEARCH_APPS_CUSTOM),
         "_enrich" => Some(ENRICH_CUSTOM),
+        "_watcher" => Some(WATCHER_CUSTOM),
         "_inference" => Some(INFERENCE_CUSTOM),
         // Only `_query/view` mutates (`POST /_query` is a read and never
         // takes a kept job).
@@ -186,6 +255,22 @@ pub fn apply_esql_views(engine: &Engine, md: &Metadata) -> Option<String> {
     elasticsearch_engine::esql::views::store(engine).restore_cluster_state(views).err().map(|e| e.reason)
 }
 
+/// Replicate the cluster's SLM metadata into what ILM reads (policy
+/// existence and each policy's last success: `wait_for_snapshot`), and the
+/// SLM health inputs.
+fn apply_slm(engine: &Engine, md: &Metadata) {
+    let slm = crate::snapshot_api::slm::SlmModel::from_value(md.customs.get("snapshot_lifecycle"));
+    let policies = slm
+        .policies
+        .iter()
+        .map(|(id, p)| {
+            let last = p.last_success.as_ref().map(|r| elasticsearch_engine::ilm::SlmSuccess { repository: p.policy.repository.clone(), snapshot_name: r.snapshot_name.clone(), start_time: r.start_time.unwrap_or(r.time) });
+            (id.clone(), last)
+        })
+        .collect();
+    engine.ilm.restore_cluster_slm(elasticsearch_engine::ilm::ClusterSlm { mode: slm.mode.as_str().to_string(), policies });
+}
+
 /// Make the local engine's extra metadata match `md`. Returns
 /// `(resource, error)` pairs for anything that could not be applied.
 pub fn apply(engine: &Engine, md: &Metadata) -> Vec<(String, String)> {
@@ -205,8 +290,7 @@ pub fn apply(engine: &Engine, md: &Metadata) -> Vec<(String, String)> {
             errors.push(("license".into(), error.reason));
         }
     }
-    let slm = crate::snapshot_api::slm::SlmModel::from_value(md.customs.get("snapshot_lifecycle"));
-    engine.ilm.restore_cluster_slm_health(slm.mode.as_str().to_string(), slm.policies.len());
+    apply_slm(engine, md);
     apply_ilm(engine, None, md, &mut errors);
     apply_ingest(engine, None, md, &mut errors);
     apply_ext(engine, None, md, &mut errors);
@@ -243,8 +327,7 @@ pub fn apply_changed(engine: &Engine, prev: &Metadata, md: &Metadata) -> Vec<(St
         }
     }
     if changed("snapshot_lifecycle") {
-        let slm = crate::snapshot_api::slm::SlmModel::from_value(md.customs.get("snapshot_lifecycle"));
-        engine.ilm.restore_cluster_slm_health(slm.mode.as_str().to_string(), slm.policies.len());
+        apply_slm(engine, md);
     }
     if changed(ILM_CUSTOM) {
         apply_ilm(engine, Some(prev), md, &mut errors);
@@ -515,6 +598,7 @@ pub fn apply_for_validation(engine: &Engine, md: &Metadata) -> Vec<(String, Stri
             errors.push(("license".into(), error.reason));
         }
     }
+    apply_slm(engine, md);
     apply_ilm(engine, None, md, &mut errors);
     apply_ingest(engine, None, md, &mut errors);
     apply_ext(engine, None, md, &mut errors);
@@ -527,6 +611,24 @@ pub fn apply_for_validation(engine: &Engine, md: &Metadata) -> Vec<(String, Stri
 pub fn apply_inference(engine: &Engine, md: &Metadata) -> Option<String> {
     let endpoints = md.customs.get(INFERENCE_CUSTOM)?;
     elasticsearch_engine::inference::service_for(&engine.data).restore_cluster_state(endpoints).err().map(|e| e.reason)
+}
+
+/// Make an engine's trained model deployments and aliases the published
+/// ones: every engine but the master's own (which owns them); a node
+/// elected master later starts from them.
+pub fn apply_trained_models(engine: &Engine, md: &Metadata) -> Option<String> {
+    let state = md.customs.get(TRAINED_MODELS_CUSTOM)?;
+    elasticsearch_engine::inference::models::restore_cluster_state(&engine.data.join("_state"), state).err().map(|e| e.reason)
+}
+
+/// Make a non-master node's watcher service follow the published
+/// `manually_stopped` (its scheduler then fires nothing while stopped).
+pub fn apply_watcher(engine: &Engine, md: &Metadata) {
+    let stopped = md.customs.get(WATCHER_CUSTOM).and_then(|w| w["manually_stopped"].as_bool()).unwrap_or(false);
+    let svc = elasticsearch_engine::watcher::service(engine);
+    if svc.manually_stopped() != stopped {
+        svc.set_stopped(stopped);
+    }
 }
 
 /// Make a non-master node's enrich policies the published ones. The master
@@ -779,6 +881,58 @@ mod tests {
         assert_eq!(preserved.indices, vec![".ds-metrics-000001"]);
         assert_eq!(preserved.failure_indices, vec![".fs-metrics-000002"]);
         assert!(!preserved.failure_needs_rollover());
+    }
+
+    /// The race the watcher registry exposed: a kept job's lifecycle policy
+    /// publication (one entry merged onto an absent committed custom) is
+    /// held by engine 0, though engine 0's whole lifecycle custom (with its
+    /// built-in policies) differs from the published one; a change engine 0
+    /// does not hold is not.
+    #[test]
+    fn engine_holds_a_kept_lifecycle_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let policy = json!({"phases": {"hot": {"min_age": "0ms", "actions": {"rollover": {"max_age": "3d"}}}}});
+        let parsed = elasticsearch_engine::ilm::policy::parse_put_body(&json!({"policy": policy})).unwrap();
+        engine.ilm.put_policy(&engine, "mine", parsed).unwrap();
+        let mut full = Metadata::default();
+        extract_only(&engine, &mut full, Some(ILM_CUSTOM));
+        let entry = full.customs[ILM_CUSTOM]["policies"]["mine"].clone();
+        let mut published = Metadata::default();
+        published.customs.insert(ILM_CUSTOM.into(), merge_custom_change(ILM_CUSTOM, None, Some(&json!({"policies": {}})), Some(&json!({"policies": {"mine": entry.clone()}}))).unwrap());
+        assert!(!engine_holds_custom(&engine, &published, ILM_CUSTOM), "the custom as a whole differs (built-ins)");
+        assert!(engine_holds_change(&engine, None, &published, ILM_CUSTOM));
+        let mut other = Metadata::default();
+        let mut foreign = entry.clone();
+        foreign["version"] = json!(9);
+        other.customs.insert(ILM_CUSTOM.into(), json!({"policies": {"mine": entry, "theirs": foreign}}));
+        assert!(!engine_holds_change(&engine, Some(&published), &other, ILM_CUSTOM), "a policy engine 0 lacks");
+    }
+
+    #[test]
+    fn watcher_stop_is_published_and_followed() {
+        let master_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let master = Engine::open(master_dir.path()).unwrap();
+        let peer = Engine::open(peer_dir.path()).unwrap();
+        let mut md = Metadata::default();
+        // Never stopped: nothing published (ES has no WatcherMetadata yet).
+        extract_only(&master, &mut md, Some(WATCHER_CUSTOM));
+        assert!(md.customs.get(WATCHER_CUSTOM).is_none());
+        assert_eq!(custom_family_of_api("_watcher"), Some(WATCHER_CUSTOM));
+        elasticsearch_engine::watcher::service(&master).set_stopped(true);
+        extract_only(&master, &mut md, Some(WATCHER_CUSTOM));
+        assert_eq!(md.customs[WATCHER_CUSTOM], json!({"manually_stopped": true}));
+        apply_watcher(&peer, &md);
+        assert!(elasticsearch_engine::watcher::service(&peer).manually_stopped());
+        assert!(engine_holds_custom(&master, &md, WATCHER_CUSTOM));
+        // Started again: published as such and followed.
+        elasticsearch_engine::watcher::service(&master).set_stopped(false);
+        extract_only(&master, &mut md, Some(WATCHER_CUSTOM));
+        assert_eq!(md.customs[WATCHER_CUSTOM], json!({"manually_stopped": false}));
+        apply_watcher(&peer, &md);
+        assert!(!elasticsearch_engine::watcher::service(&peer).manually_stopped());
+        assert!(engine_holds_custom(&master, &md, WATCHER_CUSTOM));
     }
 
     #[test]

@@ -322,6 +322,7 @@ fn tick() {
         // Dynamic merge settings, about once a second.
         if TICKS.load(Ordering::Relaxed) % 50 == 0 {
             s.sync_merge_config();
+            s.sync_gc_deletes();
         }
         dispatch_background(&s);
         // `refresh=wait_for` listeners waiting past their limit get a
@@ -570,6 +571,77 @@ mod tests {
         assert_eq!(copy.shard.reader_view().num_live_docs(), 20, "a search-idle copy was refreshed by the scheduler");
         copy.shard.before_search();
         assert_eq!(copy.shard.reader_view().num_live_docs(), 40, "the search did not refresh the stale copy first");
+    }
+
+    /// Waits (bounded) until the scheduler marks `copy` search-idle.
+    fn wait_search_idle(copy: &Arc<IndexShard>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !copy.shard.sched.idle.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the copy never went search-idle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// ES `awaitShardSearchActive` (c32y github_archive: the first `_count`
+    /// after a search-idle bulk load read an hours-old reader, 775k of 1.5B
+    /// docs): writes indexed while the copy is search-idle are not refreshed
+    /// by the scheduler, and the first `_count` waits for the refresh and
+    /// sees them all, even while bulk write batches hold the core well past
+    /// the old 100 ms bound. Concurrent first counts share one refresh; with
+    /// nothing pending, a count refreshes nothing.
+    #[test]
+    fn the_first_count_on_a_search_idle_copy_sees_every_pending_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("idle-count", &serde_json::json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.search.idle.after": "200ms"}})).unwrap();
+        let copy = svc.shard(0).unwrap();
+        let count = || crate::search::count(&[crate::search::Target::new(svc.clone())], None, None).unwrap();
+        write_docs(&svc, 0..50);
+        copy.shard.refresh().unwrap();
+        assert_eq!(count(), 50);
+        wait_search_idle(&copy);
+        write_docs(&svc, 50..300);
+        // Past the 1 s interval: the scheduler skips the idle copy.
+        std::thread::sleep(Duration::from_millis(1300));
+        assert_eq!(copy.shard.reader_view().num_live_docs(), 50, "the scheduler refreshed a search-idle copy");
+        let refreshes = copy.shard.counters.refresh_total.load(Ordering::Relaxed);
+        // Write batches hold the core when the counts arrive.
+        let holder = { let copy = copy.clone(); std::thread::spawn(move || { let _held = copy.shard.core.write(); std::thread::sleep(Duration::from_millis(600)); }) };
+        std::thread::sleep(Duration::from_millis(50));
+        let counts: Vec<_> = (0..4).map(|_| { let svc = svc.clone(); std::thread::spawn(move || crate::search::count(&[crate::search::Target::new(svc)], None, None).unwrap()) }).collect();
+        let seen: Vec<u64> = counts.into_iter().map(|t| t.join().unwrap()).collect();
+        holder.join().unwrap();
+        assert!(seen.iter().all(|n| *n == 300), "a first count read the stale reader: {seen:?}");
+        assert_eq!(copy.shard.counters.refresh_total.load(Ordering::Relaxed) - refreshes, 1, "the first counts shared one refresh");
+        // Idle again with nothing pending: a count refreshes nothing.
+        wait_search_idle(&copy);
+        let before = copy.shard.counters.refresh_total.load(Ordering::Relaxed);
+        let pending = copy.shard.sched.is_dirty() || copy.shard.reader_stale();
+        assert_eq!(count(), 300);
+        if !pending {
+            assert_eq!(copy.shard.counters.refresh_total.load(Ordering::Relaxed), before, "a refresh with nothing pending");
+        }
+    }
+
+    /// Control: an explicit `refresh_interval: -1` is never search-idle and
+    /// never refreshed automatically, by the scheduler or by a search (ES).
+    #[test]
+    fn an_explicit_disabled_refresh_interval_is_not_refreshed_by_a_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("idle-disabled", &serde_json::json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "refresh_interval": "-1", "index.search.idle.after": "200ms"}})).unwrap();
+        let copy = svc.shard(0).unwrap();
+        let count = || crate::search::count(&[crate::search::Target::new(svc.clone())], None, None).unwrap();
+        write_docs(&svc, 0..50);
+        copy.shard.refresh().unwrap();
+        assert_eq!(count(), 50);
+        std::thread::sleep(Duration::from_millis(600));
+        write_docs(&svc, 50..100);
+        std::thread::sleep(Duration::from_millis(1300));
+        assert!(!copy.shard.sched.idle.load(Ordering::SeqCst), "an explicit refresh interval went search-idle");
+        assert_eq!(count(), 50, "a count refreshed a copy with refresh_interval -1");
+        copy.shard.refresh().unwrap();
+        assert_eq!(count(), 100);
     }
 
     /// R1: a refresh clears the dirty flag only for the writes it covers: a

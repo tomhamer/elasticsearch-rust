@@ -14,7 +14,9 @@ pub enum Source {
 /// A single-pass reader of JSON text serde has already validated, building
 /// the same tree as [`Source::from_raw`] (objects keep the last of duplicate
 /// keys, scalars keep their exact text). `None`: defer to `from_raw`.
-struct Scan<'a> { b: &'a [u8], at: usize }
+/// `max`: the nesting the scan descends to (`too_deep` when the text goes
+/// deeper; the caller then takes the deep route).
+struct Scan<'a> { b: &'a [u8], at: usize, max: usize, too_deep: bool }
 
 /// A scalar's text, already validated JSON, as a raw value (no re-parse:
 /// `RawValue::from_string` validates again).
@@ -77,7 +79,7 @@ impl<'a> Scan<'a> {
         Some((unsafe { std::str::from_utf8_unchecked(&self.b[start..i + 1]) }, esc))
     }
     fn value(&mut self, depth: usize) -> Option<Source> {
-        if depth > 128 { return None; }
+        if depth > self.max { self.too_deep = true; return None; }
         self.ws();
         match *self.b.get(self.at)? {
             b'{' => {
@@ -167,19 +169,47 @@ impl Source {
         // serde accepts, such as a surrogate escape, it leaves to serde);
         // anything else takes serde's validation and the per-level route,
         // which report it exactly (an error, a key that fails to decode, a
-        // number to range-check, the nesting limit).
-        let mut scan = Scan { b: raw.as_bytes(), at: 0 };
+        // number to range-check, the nesting limit). The common case nests
+        // within serde's 128 levels and costs this one pass.
+        let mut scan = Scan { b: raw.as_bytes(), at: 0, max: crate::jsonpos::SERDE_DEPTH, too_deep: false };
         if let Some(src) = scan.value(0) {
             scan.ws();
             if scan.at == scan.b.len() {
                 return Ok(src);
             }
         }
+        if scan.too_deep {
+            return Self::parse_deep(raw);
+        }
+        Self::parse_serde(raw)
+    }
+
+    /// A document nested deeper than 128 levels: ES's 1000-level limit
+    /// (Jackson) refuses it past that; otherwise it parses on the guarded
+    /// stack. Only such documents pay the extra depth pass.
+    fn parse_deep(raw: &str) -> serde_json::Result<Self> {
+        let (depth, beyond) = crate::jsonpos::nesting(raw.as_bytes(), crate::jsonpos::MAX_NESTING_DEPTH);
+        if let Some((line, col)) = beyond {
+            return Err(<serde_json::Error as serde::de::Error>::custom(crate::jsonpos::nesting_error(depth, line, col).reason));
+        }
+        crate::parse_depth::guarded(|| {
+            let mut scan = Scan { b: raw.as_bytes(), at: 0, max: crate::jsonpos::MAX_NESTING_DEPTH, too_deep: false };
+            if let Some(src) = scan.value(0) {
+                scan.ws();
+                if scan.at == scan.b.len() {
+                    return Ok(src);
+                }
+            }
+            Self::parse_serde(raw)
+        })
+    }
+
+    fn parse_serde(raw: &str) -> serde_json::Result<Self> {
         let raw: Box<RawValue> = serde_json::from_str(raw)?;
         Self::from_raw(raw,0)
     }
     fn from_raw(raw: Box<RawValue>,depth:usize) -> serde_json::Result<Self> {
-        if depth>128 {return Err(<serde_json::Error as serde::de::Error>::custom("source nesting limit exceeded"));}
+        if depth>crate::jsonpos::MAX_NESTING_DEPTH {return Err(<serde_json::Error as serde::de::Error>::custom("source nesting limit exceeded"));}
         Ok(match raw.get().as_bytes().first() {
             Some(b'{') => {
                 let children: BTreeMap<String, Box<RawValue>> = serde_json::from_str(raw.get())?;
@@ -237,27 +267,31 @@ impl Source {
         fn selected(path: &str, patterns: &[String]) -> bool {
             patterns.iter().any(|p| crate::mapping::wildcard_match(p,path) || path.starts_with(&format!("{p}.")))
         }
-        fn walk(v: &Source, path: &str, inc: &[String], exc: &[String]) -> Option<Source> {
+        // As `search::filter_source`: an include match is carried into the
+        // matched object, and arrays are filtered at every depth (finding 431).
+        fn walk(v: &Source, path: &str, included: bool, inc: &[String], exc: &[String]) -> Option<Source> {
             if !path.is_empty() && selected(path, exc) { return None; }
-            let included = inc.is_empty() || selected(path, inc);
+            let here = included || inc.is_empty() || (!path.is_empty() && inc.iter().any(|p| crate::mapping::wildcard_match(p,path)));
             match v {
                 Source::Object(m) => {
                     let out: BTreeMap<_,_> = m.iter().filter_map(|(k,c)| {
                         let child = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
-                        walk(c,&child,inc,exc).map(|v|(k.clone(),v))
+                        walk(c,&child,here,inc,exc).map(|v|(k.clone(),v))
                     }).collect();
-                    if out.is_empty() && !included && !path.is_empty() { None } else { Some(Source::Object(out)) }
+                    if out.is_empty() && !here && !path.is_empty() { None } else { Some(Source::Object(out)) }
                 }
-                Source::Array(a) if a.iter().any(|v|matches!(v,Source::Object(_))) => {
-                    let a: Vec<_> = a.iter().filter_map(|v| {
-                        if matches!(v,Source::Object(_)) { walk(v,path,inc,exc) } else { included.then(||v.clone()) }
-                    }).filter(|v| !matches!(v,Source::Object(m) if m.is_empty()) || inc.is_empty()).collect();
+                Source::Array(a) if a.iter().any(|v|matches!(v,Source::Object(_)|Source::Array(_))) => {
+                    let a: Vec<_> = a.iter().filter_map(|v| match v {
+                        Source::Object(_) => walk(v,path,included,inc,exc).filter(|r| inc.is_empty() || !matches!(r,Source::Object(m) if m.is_empty())),
+                        Source::Array(_) => walk(v,path,included,inc,exc).filter(|r| !matches!(r,Source::Array(x) if x.is_empty())),
+                        _ => here.then(||v.clone()),
+                    }).collect();
                     (!a.is_empty()).then_some(Source::Array(a))
                 }
-                _ => included.then(||v.clone()),
+                _ => here.then(||v.clone()),
             }
         }
-        walk(self,"",includes,excludes).unwrap_or_else(||Self::Object(BTreeMap::new()))
+        walk(self,"",false,includes,excludes).unwrap_or_else(||Self::Object(BTreeMap::new()))
     }
 }
 
@@ -493,7 +527,17 @@ impl ResponseSources {
     }
     pub fn parse(&mut self,bytes:&[u8])->serde_json::Result<Value>{
         if let Ok(v)=serde_json::from_slice(bytes){return Ok(v);}
-        let raw:Box<RawValue>=serde_json::from_slice(bytes)?;
+        // Documents may nest up to 1000 levels (beyond serde's default).
+        let raw:Box<RawValue>=if crate::jsonpos::nesting(bytes,crate::jsonpos::MAX_NESTING_DEPTH).0>crate::jsonpos::SERDE_DEPTH {
+            crate::parse_depth::guarded(|| {
+                use serde::Deserialize;
+                let mut de=serde_json::Deserializer::from_slice(bytes);
+                de.disable_recursion_limit();
+                let raw=Box::<RawValue>::deserialize(&mut de)?;
+                de.end()?;
+                Ok::<_,serde_json::Error>(raw)
+            })?
+        } else { serde_json::from_slice(bytes)? };
         let mut root=Source::parse(raw.get())?;
         self.tree=true;
         fn take(node:&mut Source,sources:&mut Vec<Source>,base:u64,at:At){

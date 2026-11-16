@@ -14,7 +14,7 @@ Its crates are members of the root cargo workspace, and the root binary
 | Crate | Owns | I/O? |
 |---|---|---|
 | `elasticsearch-cluster` | `state` (model), `coordination` (Zen2 election + publication state machine), `allocation` (deciders, balancer, routing-table transitions, explain, reroute), `routing` (ES-compatible Murmur3 shard routing), `health` | none — pure, deterministic, simulation-tested |
-| `elasticsearch-transport` | framed TCP RPC between nodes: handshake, request/response, typed action handlers, connection manager, timeouts, mutual TLS | tokio |
+| `elasticsearch-transport` | framed TCP RPC between nodes: handshake, request/response, typed action handlers, connection manager, timeouts, mutual TLS; remote-cluster connections (a separate pool and handshake, allow-listed actions) | tokio |
 | `elasticsearch-snapshots` | blob stores (`fs`, `s3`, `url`), repository format, incremental shard snapshots, restore, SLM scheduling logic | tokio + object stores |
 | `elasticsearch-node` | the cluster-aware server: config (`elasticsearch.yml`, `-E`, env), discovery, drives coordination over transport, applies cluster states to local shards, replication + recovery (`replication/`), distributed request routing, cluster REST APIs, the `elasticsearch` binary | everything |
 | `elasticsearch-operator` | Kubernetes operator (CRD `Elasticsearch`, StatefulSets per nodeSet, rolling restarts, scale-down with voting exclusions + shard draining) | kube API |
@@ -148,7 +148,7 @@ node and per index, ES's default weights 0.45/0.55) + delayed allocation on
 node left (`index.unassigned.node_left.delayed_timeout` 1m). Primary failover
 promotes an in-sync replica and bumps the primary term.
 
-## Snapshots, resize and remote clusters
+## Snapshots and resize
 
 Snapshot restore runs on the elected master: each restored primary's node
 downloads, verifies and adopts the shard's files from the snapshot, and
@@ -158,7 +158,122 @@ replicas then recover from it by file-based peer recovery
 Shrink, split and `_clone` in cluster mode copy documents into the target
 index through scroll + `_bulk` (`elasticsearch-node/src/resize.rs`).
 
-Cross-cluster replication is deliberately out of scope: each cluster is
-self-contained, with in-cluster replicas and snapshots for durability and
-recovery. Requests that need a leader cluster are rejected with
-`connect_transport_exception`.
+## Remote clusters and cross-cluster search
+
+**Connections** (`remote_cluster.rs`, ES `RemoteClusterService`). Every node
+with the `remote_cluster_client` role keeps connections to the clusters its
+`cluster.remote.<alias>.*` settings enable (cluster settings over node
+settings; validated as ES's `RemoteClusterSettings`). They are the
+transport's *remote-cluster connections*: a separate pool whose handshake
+(`internal:tcp/handshake/remote_cluster`) does not require the local
+cluster name, and whose acceptor serves only the actions registered with
+`allow_remote_action` (anything else is a 403 `security_exception`); a
+handler sees the calling cluster through `inbound_remote_peer()`.
+Transport TLS applies as to any connection. Sniff mode tries the seeds in
+order, asks a seed for its cluster's nodes (`cluster:internal/remote/cluster_info`)
+and connects to up to `node_connections` gateway nodes (not dedicated
+masters; `cluster.remote.node.attr`); proxy mode opens
+`proxy_socket_connections` sockets to `proxy_address`. The first remote
+cluster name learned is required from then on. A reconcile loop follows
+settings changes (removed aliases close, changed transport/mode/address
+settings reconnect, `skip_unavailable` updates in place) and reconnects
+lost connections with exponential backoff (100ms to 30s); a request that
+must not skip the remote connects at once. `_remote/info` reports the live
+state through the engine hook `ccr::remote::RemoteConnections`.
+
+**API key based remote clusters** (ES RCS 2.0). With
+`remote_cluster_server.enabled` a node also listens on the remote cluster
+server port (`remote_cluster.host` / `remote_cluster.port`, 9443; TLS by
+default: `xpack.security.remote_cluster_server.ssl.*`, no client
+certificates). An alias whose keystore holds
+`cluster.remote.<alias>.credentials` (a cross-cluster API key) connects to
+that port (client TLS on by default: `xpack.security.remote_cluster_client.ssl.*`,
+key pair optional, public CAs when no `certificate_authorities`); sniff
+asks the seed for every node's remote cluster server address
+(`cluster:internal/remote_cluster/server_address`, as ES's
+`RemoteClusterNodesAction`). The port accepts only callers presenting a
+valid cross-cluster key; each request runs as the local user's
+`remote_indices` grant for the alias, limited by the key's access
+(`Principal::CrossCluster`).
+
+**Remote-side requests.** A remote cluster runs read APIs here through
+`internal:remote_cluster/rest` (an allow-list of read endpoints: search,
+count, field caps, terms enum, resolve index/cluster, scroll, PIT, EQL,
+ES|QL, SQL, cluster stats). The request carries the calling user's name
+and role names (`StoredAuthn`); it runs through this cluster's own
+validation and security pipeline (`front::authorized_frontend`) as that
+user, so this cluster's definitions of those role names authorize it (ES's
+certificate-based remote cluster security; API key and service account
+callers are refused on this path; they use API key based remote
+clusters).
+
+**CCS** (`front/ccs.rs`). `alias:index` expressions are grouped per cluster
+(`groupClusterIndices`). A search sends one request per remote cluster with
+the shard body (`fanout::node_body`); each cluster, this one included, runs
+it through its own per-shard fan-out and answers the *unmerged* shard
+results (`x-rustic-internal-ccs-parts`), which the coordinating node merges
+in one final reduce (hits, totals, aggregations with their sketch states,
+suggest, profile), labelling remote hits `alias:index` and reporting
+`_clusters` as ES does. `skip_unavailable` (default `true`) turns a
+remote's failure into a `skipped` cluster; otherwise the request fails
+with the remote's error. `_count` and `_terms_enum` merge the clusters'
+answers; `_field_caps` per-index answers; `_resolve/index` prefixes remote
+names; async search runs the cross-cluster search in the background;
+scroll merges each cluster's own scroll in sort order on the coordinating
+node; a cross-cluster point in time holds each cluster's own. EQL searches
+remote parts through the cluster. `dfs_query_then_fetch` runs a DFS round
+across every cluster first (`x-rustic-internal-ccs-dfs`: `collect`, then
+`use:` the merged term statistics). Retrievers and `rank` plan on the
+coordinating node (remote parts kept) and apply per cluster. A
+cross-cluster point in time searches each cluster's own PIT in parts
+mode, aggregations included. With `ccs_minimize_roundtrips=false` every
+part runs can_match (ES's `search_shards`). ES|QL `FROM alias:index`
+(and SQL over the same executor) reads each remote cluster's mappings for
+the schema and its shards there (`indices:data/read/esql/cluster_fetch`);
+`include_ccs_metadata` reports `_clusters`, and a skipped
+`skip_unavailable` remote makes the answer `is_partial`.
+`collapse.inner_hits` (ES's expand phase) and kNN needing DFS (the global
+top k of each clause, folded into the query by `_index`) run their extra
+rounds as cross-cluster searches; `_index` term queries match each
+shard's cluster-qualified name (`alias:index` on a remote), as in ES.
+
+## Cross-cluster replication
+
+`crate::ccr` (`cluster/crates/elasticsearch-node/src/ccr/`), reusing the
+engine's CCR pieces (`elasticsearch_engine::ccr`: parameter parsing and
+validation, settings filters, auto-follow matching, follow-task status,
+retry rules).
+
+* **State** is the internal metadata custom `_ccr_state` (auto-follow
+  patterns, followed leader uuids, follower metadata with the following
+  user's identity and the follow parameters while following), changed only
+  by the master and persisted with the cluster state, so follow tasks
+  resume after a full-cluster restart.
+* **Leader side** (served to remote clusters, routed inside the leader
+  cluster): leader index metadata, `indices:data/read/xpack/ccr/shard_changes`
+  (on the primary; long poll until the global checkpoint passes `from`),
+  retention lease add/renew/remove (on every active copy: leases are per
+  copy), and restore sessions (`internal:admin/ccr/restore/session/put`,
+  `file_chunk/get`, `session/clear`; the primary pins its last commit).
+  Each request is authorized as the following user by the leader's roles.
+* **Put follow** creates the follower on the follower master as a restore
+  from repository `_ccr_<alias>`, snapshot `_latest_` (ES's model): each
+  follower primary fetches the leader primary's files, verified by length
+  and CRC, and adopts them as a snapshot restore does; replicas peer-recover
+  from it.
+* **Shard follow tasks** run on the node holding each follower primary:
+  renew the leader lease (`index.ccr.retention_lease.renew_interval`, 30s),
+  read operations from local checkpoint + 1, sync mapping/settings/aliases
+  through the master when the leader's versions move, apply the operations
+  with the leader's seq_no/version under the primary's write gate
+  (`apply_replica_ops`) and replicate them; retryable failures back off,
+  others are fatal and reported in `_ccr/stats`. The follower rejects
+  client writes (403 `status_exception`) until unfollowed.
+* **Auto-follow** runs on the elected master, polling each remote with
+  active patterns.
+* **ILM `unfollow`** (also implied before rollover, shrink and
+  searchable_snapshot, as in ES): a follower waits for the leader's
+  `index.lifecycle.indexing_complete` and for every follow task's global
+  checkpoint to reach the leader's, then is paused, closed, unfollowed
+  and reopened (`lifecycle_steps::unfollow_step`); a non-follower skips
+  the action.

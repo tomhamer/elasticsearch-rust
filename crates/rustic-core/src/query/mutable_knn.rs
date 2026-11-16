@@ -150,7 +150,23 @@ pub(crate) fn search(leaves: &[LeafReader<'_>], field: u16, vector: &[f32], k: u
     // search over the view's own vectors (correct, only slower).
     let exact_scan = || -> Result<Option<Hits>> {
         let similarity = query_field.similarity();
-        let mut hits = Vec::new();
+        // The best k only: a bounded heap, admitted, whatever the corpus.
+        #[derive(PartialEq)]
+        struct Ranked(f32, usize, DocId);
+        impl Eq for Ranked {}
+        impl PartialOrd for Ranked {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+        }
+        impl Ord for Ranked {
+            // Greater = better: higher score, then earlier leaf and doc.
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0.total_cmp(&other.0).then(other.1.cmp(&self.1)).then(other.2.cmp(&self.2))
+            }
+        }
+        let _heap_memory = crate::admission::shared().reserve((k as u64).saturating_add(1).saturating_mul(std::mem::size_of::<Ranked>() as u64 + 8), "released capture exact top k")?;
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<Ranked>> = std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
+        #[cfg(test)]
+        EXACT_SCAN_PEAK.with(|p| p.set(0));
         let mut ops = 0u64;
         for (li, leaf) in leaves.iter().enumerate() {
             for doc in 0..leaf.num_docs() {
@@ -161,13 +177,22 @@ pub(crate) fn search(leaves: &[LeafReader<'_>], field: u16, vector: &[f32], k: u
                     .is_some_and(|word| word & (1u64 << (doc % 64)) != 0));
                 if !accepted { continue; }
                 if let Some(score) = leaf.with_vector(field, doc, |row| similarity.score(vector, row)) {
-                    hits.push((score, li, doc));
                     ops += 1;
+                    if k == 0 { continue; }
+                    let hit = Ranked(score, li, doc);
+                    if heap.len() < k {
+                        heap.push(std::cmp::Reverse(hit));
+                    } else if heap.peek().is_some_and(|worst| hit > worst.0) {
+                        heap.pop();
+                        heap.push(std::cmp::Reverse(hit));
+                    }
+                    #[cfg(test)]
+                    EXACT_SCAN_PEAK.with(|p| p.set(p.get().max(heap.len())));
                 }
             }
         }
+        let mut hits: Vec<(f32, usize, DocId)> = heap.into_iter().map(|std::cmp::Reverse(Ranked(s, l, d))| (s, l, d)).collect();
         hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-        hits.truncate(k);
         Ok(Some((hits, SearchStats { exact_segments: leaves.len(), vector_ops: ops, ..Default::default() })))
     };
     if query_field.is_released() {
@@ -767,4 +792,10 @@ mod tests {
         assert_eq!(rescore_budget(12_000, false, Some(2.0), int8).unwrap(), (12_000, true));
         assert_eq!(rescore_budget(7, false, Some(1.5), int8).unwrap(), (11, true), "ceil(k * oversample)");
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most hits a released-capture exact scan held at once (tests).
+    pub(crate) static EXACT_SCAN_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

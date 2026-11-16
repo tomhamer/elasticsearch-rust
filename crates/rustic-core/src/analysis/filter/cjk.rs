@@ -112,7 +112,7 @@ impl CjkBigramFilter {
             let mut off = t.offset_from;
             for (k, c) in t.text.chars().enumerate() {
                 let len = c.len_utf8() as u32;
-                out.push(Token { text: c.to_string(), position: t.position + shift + k as u32, offset_from: off, offset_to: off + len });
+                out.push(Token { text: c.to_string(), position: t.position + shift + k as u32, offset_from: off, offset_to: off + len, keyword: false });
                 off += len;
             }
             shift += t.text.chars().count() as u32 - 1;
@@ -148,9 +148,13 @@ impl TokenFilter for CjkBigramFilter {
             // Collect a run of consecutive bigrammable tokens.
             let start = i;
             let mut end = i + 1;
+            // Lucene `CJKBigramFilter` also ends a run at an offset
+            // discontinuity: characters separated by whitespace or
+            // punctuation (`中 国`, `中、国`) never form a bigram (SIDE 011).
             while end < n
                 && self.is_bigrammable(&tokens[end])
                 && tokens[end].position == tokens[end - 1].position + 1
+                && tokens[end].offset_from == tokens[end - 1].offset_to
             {
                 end += 1;
             }
@@ -168,8 +172,7 @@ impl TokenFilter for CjkBigramFilter {
                             text: format!("{}{}", t.text, next.text),
                             position: t.position,
                             offset_from: t.offset_from,
-                            offset_to: next.offset_to,
-                        });
+                            offset_to: next.offset_to, keyword: false });
                     }
                 }
             }
@@ -190,6 +193,23 @@ mod tests {
     }
     fn positions(t: &[Token]) -> Vec<u32> {
         t.iter().map(|t| t.position).collect()
+    }
+
+    /// SIDE 011: whitespace, punctuation and newlines between CJK
+    /// characters end the run (Lucene resets on an offset gap); contiguous
+    /// runs still bigram, mixed with Latin and Hangul.
+    #[test]
+    fn separated_characters_never_bigram() {
+        let a = crate::analysis::Analyzer::language("cjk").unwrap();
+        let t = |s: &str| a.analyze(s).into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(t("中 国"), ["中", "国"]);
+        assert_eq!(t("中、国"), ["中", "国"]);
+        assert_eq!(t("中\n国"), ["中", "国"]);
+        assert_eq!(t("中国"), ["中国"]);
+        assert_eq!(t("中国 人民"), ["中国", "人民"]);
+        assert_eq!(t("abc中国def"), ["abc", "中国", "def"]);
+        assert_eq!(t("한국 어"), ["한국", "어"]);
+        assert_eq!(t("中国人"), ["中国", "国人"]);
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! inference dispatch to local models ([`local`]) or hosted providers
 //! ([`providers`]).
 
+pub mod backend;
 pub mod local;
 pub mod mock;
+pub mod model_store;
 pub mod models;
 pub mod providers;
 pub mod real;
@@ -16,6 +18,7 @@ pub mod semantic_query;
 pub mod chunk_query;
 pub mod highlight;
 pub mod torch;
+pub mod tree_infer;
 
 use crate::error::{EsError, Result};
 use parking_lot::RwLock;
@@ -68,7 +71,9 @@ impl Endpoint {
         m.insert("inference_id".into(), json!(self.inference_id));
         m.insert("task_type".into(), json!(self.task_type.name()));
         m.insert("service".into(), json!(self.service));
-        let ss = if mock::is_mock(&self.service) { mock::filtered_settings(self) } else { self.service_settings.clone() };
+        let mut ss = if mock::is_mock(&self.service) { mock::filtered_settings(self) } else { self.service_settings.clone() };
+        // Internal: whether `dimensions` is the user's (ES does not render it).
+        ss.shift_remove("dimensions_set_by_user");
         m.insert("service_settings".into(), Value::Object(ss));
         if let Some(c) = &self.chunking_settings {
             m.insert("chunking_settings".into(), c.clone());
@@ -277,6 +282,13 @@ pub enum Embedded {
 pub struct InferenceService {
     dir: PathBuf,
     eps: RwLock<BTreeMap<String, Endpoint>>,
+    backend: Arc<backend::NodeState>,
+}
+
+/// Apply the node settings the inference service reads
+/// (`xpack.inference.builtin_fallback`) to the service of `data`.
+pub fn configure(data: &Path, settings: &Map<String, Value>) {
+    service_for(data).configure(settings);
 }
 
 fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<InferenceService>>> {
@@ -354,6 +366,46 @@ impl InferenceService {
         &self.dir
     }
 
+    /// Apply the node settings this service reads ([`backend::FALLBACK_SETTING`]).
+    pub fn configure(&self, settings: &Map<String, Value>) {
+        backend::configure_node(&self.backend, settings);
+    }
+
+    /// Enable or disable the built-in model stand-ins on this node.
+    pub fn set_builtin_fallback(&self, enabled: bool) {
+        backend::set_fallback(&self.dir, enabled);
+    }
+
+    /// The implementation serving a local endpoint's built-in model, or why
+    /// none can (`None` for other endpoints).
+    pub fn implementation(&self, ep: &Endpoint) -> Option<std::result::Result<backend::Implementation, String>> {
+        if !ep.is_local() {
+            return None;
+        }
+        backend::Builtin::of(ep.model_id()).map(|b| backend::resolve(&self.dir, b))
+    }
+
+    /// The response warning for a call to `id` when a stand-in serves it.
+    pub fn fallback_warning(&self, id: &str) -> Option<String> {
+        let ep = self.get_endpoint(id)?;
+        match self.implementation(&ep)? {
+            Ok(imp) if imp.is_fallback() => Some(backend::warning(ep.model_id(), imp)),
+            _ => None,
+        }
+    }
+
+    /// `GET` rendering of an endpoint: with the stand-ins enabled, built-in
+    /// endpoints name the implementation that serves them.
+    fn render(&self, e: &Endpoint) -> Value {
+        let mut v = e.to_json();
+        if backend::fallback_enabled(&self.dir) {
+            if let Some(Ok(imp)) = self.implementation(e) {
+                v["implementation"] = json!(imp.name());
+            }
+        }
+        v
+    }
+
     pub fn open(data: &Path) -> InferenceService {
         let dir = data.join("_state");
         let _ = std::fs::create_dir_all(&dir);
@@ -370,7 +422,8 @@ impl InferenceService {
                 }
             }
         }
-        InferenceService { dir, eps: RwLock::new(eps) }
+        let backend = backend::node(&dir);
+        InferenceService { dir, eps: RwLock::new(eps), backend }
     }
 
     fn decode(e: &Value, secrets: &Value) -> Option<Endpoint> {
@@ -443,6 +496,7 @@ impl InferenceService {
     /// Reset stored endpoints and secrets while preserving configured defaults.
     pub fn reset(&self) -> Result<()> {
         self.eps.write().retain(|_, endpoint| endpoint.preconfigured);
+        backend::clear_pins(&self.dir);
         self.persist()
     }
 
@@ -517,14 +571,14 @@ impl InferenceService {
         let task = task.map(Self::parse_task).transpose()?;
         let eps = self.eps.read();
         match id {
-            None | Some("_all") | Some("*") => Ok(json!({"endpoints": eps.values().filter(|e| task.is_none_or(|t| e.task_type == t)).map(Endpoint::to_json).collect::<Vec<_>>()})),
+            None | Some("_all") | Some("*") => Ok(json!({"endpoints": eps.values().filter(|e| task.is_none_or(|t| e.task_type == t)).map(|e| self.render(e)).collect::<Vec<_>>()})),
             Some(id) if id.contains('*') => {
                 let re = id.replace('*', "");
-                let hits: Vec<Value> = eps.values().filter(|e| task.is_none_or(|t| e.task_type == t) && (e.inference_id.starts_with(&re) || e.inference_id.contains(&re))).map(Endpoint::to_json).collect();
+                let hits: Vec<Value> = eps.values().filter(|e| task.is_none_or(|t| e.task_type == t) && (e.inference_id.starts_with(&re) || e.inference_id.contains(&re))).map(|e| self.render(e)).collect();
                 Ok(json!({"endpoints": hits}))
             }
             Some(id) => match eps.get(id) {
-                Some(e) if task.is_none_or(|t| e.task_type == t) => Ok(json!({"endpoints": [e.to_json()]})),
+                Some(e) if task.is_none_or(|t| e.task_type == t) => Ok(json!({"endpoints": [self.render(e)]})),
                 Some(e) => Err(status_ex(400, format!("Requested task type [{}] does not match the inference endpoint's task type [{}]", task.unwrap().name(), e.task_type.name()))),
                 None => Err(EsError::resource_not_found(format!("Inference endpoint not found [{id}]"))),
             },
@@ -627,6 +681,12 @@ impl InferenceService {
                 return Err(EsError::new(400, "validation_exception", "Validation Failed: 1: [chunking_settings] does not contain the required setting [overlap];"));
             }
         }
+        // ES builds endpoint chunking with the same `ChunkingSettingsBuilder`
+        // validators as a field's (finding 126: word overlap at most half the
+        // chunk size, size bounds, known strategy and keys).
+        if let Some(c) = chunking.as_ref() {
+            semantic_map::chunking_settings(c)?;
+        }
         let mut service_out = service.to_string();
         if local {
             service_out = "elasticsearch".into();
@@ -655,11 +715,40 @@ impl InferenceService {
         if !local {
             // Validation call: embeds a probe string; learns dimensions.
             let probe = vec!["how big".to_string()];
-            let c = Call { service: &ep.service, task: ep.task_type, service_settings: &ep.service_settings, secrets: &ep.secrets, task_settings: ep.task_settings.clone(), input: &probe, query: Some("query") };
+            // A width the user configured is requested from the provider
+            // and must be what it returns (finding 356); a learned width
+            // is not requested later.
+            let user_dims = ep.service_settings.get("dimensions").and_then(Value::as_u64);
+            if task.is_dense() {
+                ep.service_settings.insert("dimensions_set_by_user".into(), json!(user_dims.is_some()));
+            }
+            // ES validates with an internal ingest-type call.
+            let probe_type = task.is_dense().then_some("internal_ingest");
+            let c = Call { service: &ep.service, task: ep.task_type, service_settings: &ep.service_settings, secrets: &ep.secrets, task_settings: ep.task_settings.clone(), input: &probe, query: Some("query"), input_type: probe_type };
             match providers::execute(&c, Duration::from_secs(30)) {
                 Ok(res) => {
                     let dims = res["text_embedding"][0]["embedding"].as_array().map(Vec::len);
+                    // Services that request the configured width must
+                    // get it; for the others the provider's width is the
+                    // endpoint's (ES `updateModelWithEmbeddingDetails`).
+                    let honours_dims = matches!(ep.service.as_str(), "openai" | "azureopenai" | "voyageai" | "jinaai");
+                    if !honours_dims && dims.is_some() {
+                        ep.service_settings.shift_remove("dimensions");
+                        ep.service_settings.insert("dimensions_set_by_user".into(), json!(false));
+                    }
+                    if let (true, Some(want), Some(got)) = (honours_dims, user_dims, dims) {
+                        if want as usize != got {
+                            return Err(status_ex(
+                                400,
+                                format!("The retrieved embeddings size [{got}] does not match the size specified in the settings [{want}]. Please recreate the [{id}] configuration with the correct dimensions"),
+                            ));
+                        }
+                    }
+                    let set_by_user = ep.service_settings.shift_remove("dimensions_set_by_user");
                     ep.service_settings = canonical_settings(&ep.service, task, std::mem::take(&mut ep.service_settings), dims);
+                    if let Some(v) = set_by_user {
+                        ep.service_settings.insert("dimensions_set_by_user".into(), v);
+                    }
                 }
                 Err((status, msg)) => {
                     let msg = if msg.starts_with("Error message: [") { provider_error_text(status, id, &msg) } else { msg };
@@ -754,40 +843,50 @@ impl InferenceService {
                 ep.task_type.name()
             )));
         }
-        if mock::is_mock(&ep.service) {
-            if let Some(k) = o.get("service_settings").and_then(|v| v.get("api_key")) {
-                ep.secrets.insert("api_key".into(), k.clone());
+        // ES's v9 update contract (`TransportUpdateInferenceModelAction`):
+        // each service's update parser takes the secrets, the settings it
+        // may change (rate limit, max input tokens, organization) and, for
+        // the in-cluster services, the allocation counts; any key left over
+        // fails the request (`validateConsumedUpdateSettings`). The model,
+        // URL, dimensions and the rest are the endpoint's identity: changing
+        // them would mix embeddings of different models under one inference
+        // id. Everything is validated on a copy and installed only when the
+        // whole update is valid.
+        let mock = mock::is_mock(&ep.service);
+        let sp = if mock { None } else { Some(spec(&ep.service).ok_or_else(|| status_ex(400, format!("Unknown service [{}]", ep.service)))?) };
+        let secret = |k: &str| if mock { k == "api_key" } else { sp.as_ref().is_some_and(|sp| sp.secrets.contains(&k)) };
+        let updatable = |k: &str| {
+            if ep.is_local() {
+                matches!(k, "num_allocations" | "adaptive_allocations")
+            } else {
+                !mock && matches!(k, "rate_limit" | "max_input_tokens" | "organization_id") && sp.as_ref().is_some_and(|sp| sp.settings.contains(&k))
             }
-            if let Some(ts) = o.get("task_settings").and_then(Value::as_object) {
-                for (k, v) in ts {
-                    ep.task_settings.insert(k.clone(), v.clone());
-                }
-            }
-            let out = ep.to_json();
-            drop(eps);
-            self.persist()?;
-            return Ok(out);
-        }
-        let Some(sp) = spec(&ep.service) else { return Err(status_ex(400, format!("Unknown service [{}]", ep.service))) };
+        };
+        let mut next = ep.clone();
+        let mut leftover = Map::new();
         if let Some(ss) = o.get("service_settings").and_then(Value::as_object) {
             for (k, v) in ss {
-                if sp.secrets.contains(&k.as_str()) {
-                    ep.secrets.insert(k.clone(), v.clone());
-                } else if ep.is_local() || sp.settings.contains(&k.as_str()) {
-                    ep.service_settings.insert(k.clone(), v.clone());
+                if secret(k) {
+                    next.secrets.insert(k.clone(), v.clone());
+                } else if updatable(k) {
+                    next.service_settings.insert(k.clone(), v.clone());
                 } else {
-                    return Err(status_ex(400, format!("Configuration contains settings [{}] unknown to the [{}] service", java_map(&Map::from_iter([(k.clone(), v.clone())])), ep.service)));
+                    leftover.insert(k.clone(), v.clone());
                 }
             }
+        }
+        if !leftover.is_empty() {
+            return Err(status_ex(400, format!("Configuration contains settings [{}] unknown to the [{}] service", java_map(&leftover), ep.service)));
         }
         if let Some(ts) = o.get("task_settings").and_then(Value::as_object) {
             for (k, v) in ts {
-                if !ep.is_local() && !sp.task_settings.contains(&k.as_str()) {
+                if !mock && !ep.is_local() && !sp.as_ref().is_some_and(|sp| sp.task_settings.contains(&k.as_str())) {
                     return Err(status_ex(400, format!("Configuration contains settings [{}] unknown to the [{}] service", java_map(&Map::from_iter([(k.clone(), v.clone())])), ep.service)));
                 }
-                ep.task_settings.insert(k.clone(), v.clone());
+                next.task_settings.insert(k.clone(), v.clone());
             }
         }
+        *ep = next;
         let out = ep.to_json();
         drop(eps);
         self.persist()?;
@@ -852,31 +951,65 @@ impl InferenceService {
         }
         if ep.is_local() {
             let kind = o.get("input_type").and_then(Value::as_str).unwrap_or("");
-            return Ok(self.infer_local(&ep, &input, query, &ts, kind));
+            return self.infer_local(&ep, &input, query, &ts, kind);
         }
         if mock::is_mock(&ep.service) {
             let over = o.get("task_settings").and_then(Value::as_object).cloned().unwrap_or_default();
             return mock::infer(&ep, &input, &over);
         }
         let timeout = o.get("timeout").and_then(Value::as_str).and_then(crate::ilm::parse_time_millis).map(|ms| Duration::from_millis(ms as u64)).unwrap_or(Duration::from_secs(30));
-        let c = Call { service: &ep.service, task: ep.task_type, service_settings: &ep.service_settings, secrets: &ep.secrets, task_settings: ts, input: &input, query };
-        providers::execute(&c, timeout).map_err(|(status, msg)| {
+        // The root `input_type` takes precedence over the endpoint's
+        // `task_settings.input_type` (finding 344).
+        let input_type = o.get("input_type").and_then(Value::as_str).map(str::to_ascii_lowercase).filter(|t| !t.is_empty() && t != "unspecified");
+        if let (Some(t), "voyageai") = (input_type.as_deref(), ep.service.as_str()) {
+            if !matches!(t, "ingest" | "search" | "internal_ingest" | "internal_search") {
+                return Err(EsError::action_validation(&[&format!("Input type [{t}] is not supported for [Voyage AI]")]));
+            }
+        }
+        let c = Call { service: &ep.service, task: ep.task_type, service_settings: &ep.service_settings, secrets: &ep.secrets, task_settings: ts, input: &input, query, input_type: input_type.as_deref() };
+        let res = providers::execute(&c, timeout).map_err(|(status, msg)| {
             let msg = if msg.starts_with("Error message: [") { provider_error_text(status, id, &msg) } else { msg };
             status_ex(if status == 502 { 500 } else { status }, msg)
-        })
+        })?;
+        // Vectors must have the endpoint's declared width (finding 356): a
+        // `bit` endpoint's `dimensions` counts bits, its embeddings are
+        // packed bytes (ES `DenseEmbeddingBitResults`: dims / 8).
+        if let (true, Some(want)) = (ep.task_type.is_dense(), embedding_len(&ep.service_settings)) {
+            if let Some(got) = res["text_embedding"].as_array().and_then(|a| a.iter().filter_map(|e| e["embedding"].as_array().map(Vec::len)).find(|n| *n as u64 != want)) {
+                return Err(status_ex(500, format!("Inference endpoint [{id}] returned embeddings of size [{got}], but it is configured for [{want}] dimensions")));
+            }
+        }
+        Ok(res)
     }
 
-    fn infer_local(&self, ep: &Endpoint, input: &[String], query: Option<&str>, ts: &Map<String, Value>, kind: &str) -> Value {
-        match ep.task_type {
-            Task::TextEmbedding => {
-                let model_dir = self.dir.parent().unwrap_or(&self.dir).join("ml-models").join(ep.model_id().trim_end_matches("_linux-x86_64"));
-                if let Some(rows) = real::try_embed(&model_dir, input, kind) {
-                    return json!({"text_embedding": rows.into_iter().map(|r| json!({"embedding": r})).collect::<Vec<_>>()});
-                }
-                json!({"text_embedding": input.iter().map(|t| json!({"embedding": local::embed_dense(t, None)})).collect::<Vec<_>>()})
+    /// Inference on the `elasticsearch` service. Built-in models run on
+    /// their real implementation, or on a stand-in only when the node
+    /// enabled them; other model ids run on their trained-model deployment.
+    /// Nothing is substituted silently: a model that cannot run fails.
+    fn infer_local(&self, ep: &Endpoint, input: &[String], query: Option<&str>, ts: &Map<String, Value>, kind: &str) -> Result<Value> {
+        let model_id = ep.model_id();
+        let Some(builtin) = backend::Builtin::of(model_id) else {
+            return self.infer_deployed_model(ep, input, query);
+        };
+        let imp = backend::resolve(&self.dir, builtin).map_err(|why| backend::not_deployed(model_id, &why))?;
+        if imp.is_fallback() {
+            crate::warnings::add(backend::warning(model_id, imp));
+        }
+        Ok(match ep.task_type {
+            Task::TextEmbedding | Task::Embedding if builtin == backend::Builtin::E5 => {
+                backend::check_pin(&self.dir, &ep.inference_id, imp)?;
+                let rows = match imp {
+                    backend::Implementation::Candle => real::embed(&backend::model_dir(&self.dir, builtin), input, kind)
+                        .map_err(|e| status_ex(500, format!("Failed to run inference with model [{model_id}]: {e}")))?,
+                    _ => input.iter().map(|t| local::embed_dense(t, None)).collect(),
+                };
+                json!({"text_embedding": rows.into_iter().map(|r| json!({"embedding": r})).collect::<Vec<_>>()})
             }
-            Task::SparseEmbedding => json!({"sparse_embedding": input.iter().map(|t| json!({"is_truncated": false, "embedding": local::embed_sparse(t)})).collect::<Vec<_>>()}),
-            Task::Rerank => {
+            Task::SparseEmbedding if builtin == backend::Builtin::Elser => {
+                backend::check_pin(&self.dir, &ep.inference_id, imp)?;
+                json!({"sparse_embedding": input.iter().map(|t| json!({"is_truncated": false, "embedding": local::embed_sparse(t)})).collect::<Vec<_>>()})
+            }
+            Task::Rerank if builtin == backend::Builtin::Rerank => {
                 let q = query.unwrap_or("");
                 let ret = ts.get("return_documents").and_then(Value::as_bool).unwrap_or(false);
                 let mut rows: Vec<(usize, f64)> = input.iter().enumerate().map(|(i, d)| (i, local::rerank_score(q, d))).collect();
@@ -888,7 +1021,29 @@ impl InferenceService {
                     o
                 }).collect::<Vec<_>>()})
             }
-            _ => json!({}),
+            t => return Err(status_ex(400, format!("Model [{model_id}] does not support task type [{}]", t.name()))),
+        })
+    }
+
+    /// Inference of a non-built-in `model_id` through its trained-model
+    /// deployment (an uploaded PyTorch model), as ES's internal service does.
+    fn infer_deployed_model(&self, ep: &Endpoint, input: &[String], query: Option<&str>) -> Result<Value> {
+        let model_id = ep.model_id();
+        let _ = query;
+        match ep.task_type {
+            Task::TextEmbedding | Task::Embedding | Task::SparseEmbedding => {
+                let mut rows = Vec::with_capacity(input.len());
+                for t in input {
+                    let (res, field) = models::infer_text_with_field(&self.dir, model_id, t)?;
+                    rows.push(res.get(&field).cloned().unwrap_or(Value::Null));
+                }
+                Ok(if ep.task_type == Task::SparseEmbedding {
+                    json!({"sparse_embedding": rows.into_iter().map(|r| json!({"is_truncated": false, "embedding": r})).collect::<Vec<_>>()})
+                } else {
+                    json!({"text_embedding": rows.into_iter().map(|r| json!({"embedding": r})).collect::<Vec<_>>()})
+                })
+            }
+            t => Err(status_ex(400, format!("Inference with model [{model_id}] and task type [{}] is not supported", t.name()))),
         }
     }
 
@@ -900,11 +1055,30 @@ impl InferenceService {
     /// Like [`embed`](Self::embed) with an `input_type` (`ingest` / `search`).
     pub fn embed_typed(&self, id: &str, texts: &[String], kind: &str) -> Result<Embedded> {
         let res = self.infer(None, id, &json!({"input": texts, "input_type": kind}))?;
+        // One embedding per input, of the endpoint's shape: anything else is
+        // a malformed provider answer and fails the request (finding 127).
+        let malformed = |why: String| status_ex(500, why);
         if let Some(a) = res.get("text_embedding").or_else(|| res.get("embeddings")).and_then(Value::as_array) {
-            return Ok(Embedded::Dense(a.iter().map(|e| e["embedding"].as_array().map(|v| v.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()).unwrap_or_default()).collect()));
+            if a.len() != texts.len() {
+                return Err(malformed(providers::count_mismatch(a.len(), texts.len())));
+            }
+            let dims = self.get_endpoint(id).and_then(|ep| embedding_len(&ep.service_settings));
+            let mut rows = Vec::with_capacity(a.len());
+            for e in a {
+                let v = e["embedding"].as_array().ok_or_else(|| malformed(format!("Inference endpoint [{id}] returned an embedding that is not an array")))?;
+                let v: Vec<f32> = v.iter().map(|x| x.as_f64().map(|f| f as f32)).collect::<Option<_>>().ok_or_else(|| malformed(format!("Inference endpoint [{id}] returned a non-numeric embedding value")))?;
+                if v.is_empty() || dims.is_some_and(|d| d as usize != v.len()) || rows.first().is_some_and(|f: &Vec<f32>| f.len() != v.len()) {
+                    return Err(malformed(format!("Inference endpoint [{id}] returned an embedding of [{}] dimensions{}", v.len(), dims.map(|d| format!(", expected [{d}]")).unwrap_or_default())));
+                }
+                rows.push(v);
+            }
+            return Ok(Embedded::Dense(rows));
         }
         if let Some(a) = res.get("sparse_embedding").and_then(Value::as_array) {
-            return Ok(Embedded::Sparse(a.iter().map(|e| e["embedding"].as_object().cloned().unwrap_or_default()).collect()));
+            if a.len() != texts.len() {
+                return Err(malformed(providers::count_mismatch(a.len(), texts.len())));
+            }
+            return a.iter().map(|e| e["embedding"].as_object().cloned().ok_or_else(|| malformed(format!("Inference endpoint [{id}] returned a sparse embedding that is not an object")))).collect::<Result<Vec<_>>>().map(Embedded::Sparse);
         }
         Err(status_ex(400, format!("Inference endpoint [{id}] does not produce embeddings")))
     }
@@ -927,14 +1101,6 @@ impl InferenceService {
 
     /// Rerank `docs` for `query` with an endpoint: `(index, score)` best first.
     pub fn rerank(&self, id: &str, query: &str, docs: &[String]) -> Result<Vec<(usize, f64)>> {
-        let ep = self.eps.read().get(id).cloned().ok_or_else(|| EsError::resource_not_found(format!("Inference endpoint not found [{id}]")))?;
-        if ep.is_local() {
-            // Local stand-in: score directly (no HTTP round trip).
-            let q = query;
-            let mut rows: Vec<(usize, f64)> = docs.iter().enumerate().map(|(i, d)| (i, local::rerank_score(q, d))).collect();
-            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            return Ok(rows);
-        }
         let res = self.infer(None, id, &json!({"input": docs, "query": query}))?;
         Ok(res["rerank"].as_array().into_iter().flatten().filter_map(|r| Some((r["index"].as_u64()? as usize, r["relevance_score"].as_f64()?))).collect())
     }
@@ -954,6 +1120,15 @@ pub fn model_settings(ep: &Endpoint) -> Option<Value> {
     }
 }
 
+/// The length of each embedding a dense endpoint returns: its
+/// `dimensions`, or for a `bit` endpoint (whose `dimensions` counts bits)
+/// the packed bytes, `dimensions / 8` (ES `DenseEmbeddingBitResults`).
+fn embedding_len(service_settings: &Map<String, Value>) -> Option<u64> {
+    let dims = service_settings.get("dimensions").and_then(Value::as_u64)?;
+    let bits = service_settings.get("element_type").and_then(Value::as_str).is_some_and(|t| t.eq_ignore_ascii_case("bit"));
+    Some(if bits { dims.div_ceil(8) } else { dims })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +1137,209 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = InferenceService::open(d.path());
         (d, s)
+    }
+
+    /// Finding 117: `_update` follows ES's v9 contract. The model, URL and
+    /// other identity settings cannot change (ES's unknown-settings error),
+    /// nothing of a rejected update is applied, and secret rotation, task
+    /// settings and rate limits still update.
+    #[test]
+    fn update_refuses_identity_changes_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("_state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("inference.json"), json!([{
+            "inference_id":"emb", "task_type":"text_embedding", "service":"openai",
+            "service_settings":{"model_id":"model-a", "dimensions": 4, "similarity": "cosine"}, "task_settings":{"user": "u1"}
+        }]).to_string()).unwrap();
+        std::fs::write(state.join("inference-secrets.json"), json!({"emb":{"api_key":"k1"}}).to_string()).unwrap();
+        let s = InferenceService::open(dir.path());
+        let before = s.get(None, Some("emb")).unwrap();
+        for change in [json!({"model_id": "model-b"}), json!({"url": "http://elsewhere"}), json!({"dimensions": 4, "model_id": "model-b"}), json!({"model_id": "model-a"})] {
+            // A rejected update applies none of its parts.
+            let body = json!({"service_settings": {"api_key": "k-new"}, "task_settings": {"user": "u2"}});
+            let mut body = body;
+            for (k, v) in change.as_object().unwrap() {
+                body["service_settings"][k] = v.clone();
+            }
+            let e = s.update(Some("text_embedding"), "emb", &body).unwrap_err();
+            assert_eq!(e.status, 400, "{change}");
+            assert!(e.reason.starts_with("Configuration contains settings [{") && e.reason.ends_with("] unknown to the [openai] service"), "{change}: {}", e.reason);
+            assert_eq!(s.get(None, Some("emb")).unwrap(), before, "{change}");
+            assert_eq!(s.eps.read()["emb"].secrets.get("api_key"), Some(&json!("k1")), "{change}");
+        }
+        // Secret rotation, task settings and the rate limit update.
+        s.update(Some("text_embedding"), "emb", &json!({"service_settings": {"api_key": "k2", "rate_limit": {"requests_per_minute": 10}}, "task_settings": {"user": "u3"}})).unwrap();
+        let ep = s.eps.read()["emb"].clone();
+        assert_eq!(ep.secrets.get("api_key"), Some(&json!("k2")));
+        assert_eq!(ep.task_settings.get("user"), Some(&json!("u3")));
+        assert_eq!(ep.model_id(), "model-a");
+        // ... and persist; the model stays.
+        let reopened = InferenceService::open(dir.path());
+        assert_eq!(reopened.eps.read()["emb"].model_id(), "model-a");
+        assert_eq!(reopened.eps.read()["emb"].secrets.get("api_key"), Some(&json!("k2")));
+    }
+
+    /// A fake Voyage embeddings server: answers with the width it was
+    /// asked for (`output_dimension`, else the model default 1024) and
+    /// records every request body.
+    fn fake_voyage() -> (String, Arc<Mutex<Vec<Value>>>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/embeddings", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let rec = seen.clone();
+        std::thread::spawn(move || {
+            for conn in l.incoming() {
+                let Ok(mut c) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head_end, len) = loop {
+                    let n = c.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break (None, 0);
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                        let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                        break (Some(p + 4), len);
+                    }
+                };
+                let Some(start) = head_end else { continue };
+                while buf.len() < start + len {
+                    let n = c.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body: Value = serde_json::from_slice(&buf[start..(start + len).min(buf.len())]).unwrap_or(Value::Null);
+                let n = body.get("output_dimension").and_then(Value::as_u64).unwrap_or(1024) as usize;
+                let k = body["input"].as_array().map_or(1, Vec::len);
+                rec.lock().unwrap().push(body);
+                let resp = json!({"data": (0..k).map(|i| json!({"index": i, "embedding": vec![0.5; n]})).collect::<Vec<_>>()}).to_string();
+                let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", resp.len(), resp);
+            }
+        });
+        (url, seen)
+    }
+
+    /// A strict OpenAI embeddings server: refuses the `dimensions` option
+    /// (as `text-embedding-ada-002` does) and answers 1536-wide vectors.
+    fn fake_strict_openai() -> (String, Arc<Mutex<Vec<Value>>>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/embeddings", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let rec = seen.clone();
+        std::thread::spawn(move || {
+            for conn in l.incoming() {
+                let Ok(mut c) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head_end, len) = loop {
+                    let n = c.read(&mut chunk).unwrap_or(0);
+                    if n == 0 { break (None, 0); }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                        let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                        break (Some(p + 4), len);
+                    }
+                };
+                let Some(start) = head_end else { continue };
+                while buf.len() < start + len {
+                    let n = c.read(&mut chunk).unwrap_or(0);
+                    if n == 0 { break; }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body: Value = serde_json::from_slice(&buf[start..(start + len).min(buf.len())]).unwrap_or(Value::Null);
+                let k = body["input"].as_array().map_or(1, Vec::len);
+                let refused = body.get("dimensions").is_some();
+                rec.lock().unwrap().push(body);
+                let (status, resp) = if refused {
+                    ("400 Bad Request", json!({"error": {"message": "This model does not support specifying dimensions.", "type": "invalid_request_error"}}).to_string())
+                } else {
+                    ("200 OK", json!({"data": (0..k).map(|i| json!({"index": i, "embedding": vec![0.01; 1536]})).collect::<Vec<_>>()}).to_string())
+                };
+                let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", resp.len(), resp);
+            }
+        });
+        (url, seen)
+    }
+
+    /// Finding 547: an OpenAI endpoint created without `dimensions` learns
+    /// its width from the probe but never sends it later (ada-002 refuses
+    /// the option), also when its persisted settings predate the flag.
+    #[test]
+    fn openai_learned_width_is_never_requested() {
+        let (_d, s) = svc();
+        let (url, seen) = fake_strict_openai();
+        let out = s.put("text_embedding", "ada", &json!({"service": "openai", "service_settings": {"model_id": "text-embedding-ada-002", "url": url, "api_key": "k"}})).unwrap();
+        assert_eq!(out["service_settings"]["dimensions"], json!(1536), "{out}");
+        let res = s.infer(None, "ada", &json!({"input": ["q"]})).unwrap();
+        assert_eq!(res["text_embedding"][0]["embedding"].as_array().map(Vec::len), Some(1536));
+        assert!(seen.lock().unwrap().iter().all(|b| b.get("dimensions").is_none()));
+        // An endpoint stored before the provenance flag existed.
+        s.eps.write().get_mut("ada").unwrap().service_settings.shift_remove("dimensions_set_by_user");
+        assert!(s.infer(None, "ada", &json!({"input": ["q"]})).is_ok());
+        assert!(seen.lock().unwrap().iter().all(|b| b.get("dimensions").is_none()));
+        // A width the user set is still requested.
+        let out = s.put("text_embedding", "small", &json!({"service": "openai", "service_settings": {"model_id": "text-embedding-3-small", "dimensions": 1536, "url": url, "api_key": "k"}}));
+        assert!(out.is_err(), "the strict server refuses the explicit width");
+        assert!(seen.lock().unwrap().last().unwrap().get("dimensions").is_some());
+    }
+
+    /// Findings 344 and 356 end to end on a Voyage endpoint: the
+    /// configured width is requested (and is what the endpoint reports),
+    /// the request's root input type wins over the saved one and is
+    /// translated, and unsupported input types are refused.
+    #[test]
+    fn voyage_dimensions_and_input_types_reach_the_provider() {
+        let (_d, s) = svc();
+        let (url, seen) = fake_voyage();
+        let out = s
+            .put("text_embedding", "v512", &json!({"service": "voyageai", "service_settings": {"model_id": "voyage-3-large", "dimensions": 512, "url": url, "api_key": "k"}, "task_settings": {"input_type": "ingest"}}))
+            .unwrap();
+        assert_eq!(out["service_settings"]["dimensions"], json!(512), "{out}");
+        assert!(out["service_settings"].get("dimensions_set_by_user").is_none(), "{out}");
+        let probe = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((&probe["output_dimension"], &probe["input_type"]), (&json!(512), &json!("document")), "{probe}");
+        let res = s.infer(None, "v512", &json!({"input": ["q"], "input_type": "search"})).unwrap();
+        assert_eq!(res["text_embedding"][0]["embedding"].as_array().unwrap().len(), 512);
+        let body = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((&body["output_dimension"], &body["input_type"]), (&json!(512), &json!("query")), "{body}");
+        s.infer(None, "v512", &json!({"input": ["d"]})).unwrap();
+        assert_eq!(seen.lock().unwrap().last().unwrap()["input_type"], json!("document"));
+        let e = s.infer(None, "v512", &json!({"input": ["q"], "input_type": "classification"})).unwrap_err();
+        assert!(e.reason.contains("Input type [classification] is not supported for [Voyage AI]"), "{}", e.reason);
+        // Semantic search asks for query embeddings of the same endpoint.
+        assert!(matches!(s.embed_typed("v512", &["q".to_string()], "search").unwrap(), Embedded::Dense(ref v) if v[0].len() == 512));
+        assert_eq!(seen.lock().unwrap().last().unwrap()["input_type"], json!("query"));
+        // No configured width: none is requested, the default is learned
+        // and later calls do not ask for it.
+        let out = s.put("text_embedding", "vdef", &json!({"service": "voyageai", "service_settings": {"model_id": "voyage-3-large", "url": url, "api_key": "k"}})).unwrap();
+        assert_eq!(out["service_settings"]["dimensions"], json!(1024), "{out}");
+        s.infer(None, "vdef", &json!({"input": ["x"]})).unwrap();
+        assert!(seen.lock().unwrap().last().unwrap().get("output_dimension").is_none());
+    }
+
+    /// A `bit` endpoint's `dimensions` counts bits: its packed embeddings
+    /// (dims / 8 bytes) pass the width check, a float endpoint's must
+    /// match exactly.
+    #[test]
+    fn bit_endpoint_width_counts_bits() {
+        mock::enable();
+        let (_d, s) = svc();
+        s.put("text_embedding", "bits", &json!({"service": "text_embedding_test_service", "service_settings": {"model": "m", "dimensions": 16, "api_key": "k", "similarity": "L2_NORM", "element_type": "bit"}, "task_settings": {}})).unwrap();
+        let res = s.infer(None, "bits", &json!({"input": ["inference test", "another inference test"]})).unwrap();
+        assert_eq!(res["text_embedding"][0]["embedding"].as_array().map(Vec::len), Some(2), "{res}");
+        // semantic_text's ingest and query embeddings take the same width.
+        assert!(matches!(s.embed_typed("bits", &["inference test".to_string()], "ingest").unwrap(), Embedded::Dense(ref v) if v[0].len() == 2));
+        s.put("text_embedding", "floats", &json!({"service": "text_embedding_test_service", "service_settings": {"model": "m", "dimensions": 16, "api_key": "k", "similarity": "cosine", "element_type": "float"}, "task_settings": {}})).unwrap();
+        let res = s.infer(None, "floats", &json!({"input": ["x"]})).unwrap();
+        assert_eq!(res["text_embedding"][0]["embedding"].as_array().map(Vec::len), Some(16), "{res}");
     }
 
     #[test]
@@ -1038,6 +1416,7 @@ mod tests {
     #[test]
     fn local_endpoint_lifecycle_and_infer() {
         let (d, s) = svc();
+        s.set_builtin_fallback(true);
         let r = s.put("text_embedding", "my-e5", &json!({"service": "elasticsearch", "service_settings": {"model_id": ".multilingual-e5-small", "num_allocations": 1, "num_threads": 1}})).unwrap();
         assert_eq!(r["inference_id"], "my-e5");
         let out = s.infer(Some("text_embedding"), "my-e5", &json!({"input": ["hello world", "bye"]})).unwrap();
@@ -1054,8 +1433,73 @@ mod tests {
     #[test]
     fn rerank_default_endpoint_orders_by_overlap() {
         let (_d, s) = svc();
+        s.set_builtin_fallback(true);
         let out = s.infer(None, ".rerank-v1-elasticsearch", &json!({"query": "fox", "input": ["database revenue", "the quick fox"]})).unwrap();
         assert_eq!(out["rerank"][0]["index"], 1);
         assert_eq!(out["rerank"][0]["text"], "the quick fox");
+    }
+
+    /// Without the opt-in, built-in models that cannot run fail like an
+    /// undeployed model in ES; nothing is substituted.
+    #[test]
+    fn builtin_models_fail_clearly_without_opt_in() {
+        let (_d, s) = svc();
+        let e = s.infer(None, ".elser-2-elasticsearch", &json!({"input": "hello"})).unwrap_err();
+        assert_eq!((e.status, e.kind.as_str()), (409, "status_exception"));
+        assert_eq!(e.reason, "Trained model deployment [.elser_model_2_linux-x86_64] is not allocated to any nodes");
+        let cause = e.caused_by.as_ref().unwrap().reason.clone();
+        assert!(cause.contains("no ELSER v2 implementation") && cause.contains("xpack.inference.builtin_fallback"), "{cause}");
+        // E5: no model files in this data path (and/or no candle-models feature).
+        let e = s.infer(None, ".multilingual-e5-small-elasticsearch", &json!({"input": "hello"})).unwrap_err();
+        assert_eq!(e.reason, "Trained model deployment [.multilingual-e5-small_linux-x86_64] is not allocated to any nodes");
+        let cause = e.caused_by.as_ref().unwrap().reason.clone();
+        assert!(cause.contains("candle-models") || cause.contains("not found in"), "{cause}");
+        assert!(s.infer(None, ".rerank-v1-elasticsearch", &json!({"query": "q", "input": ["a"]})).is_err());
+        assert!(s.embed(".elser-2-elasticsearch", &["x".to_string()]).is_err());
+        // GET is unchanged (ES's rendering) and names no implementation.
+        let all = s.get(None, None).unwrap();
+        assert!(all["endpoints"].as_array().unwrap().iter().all(|e| e.get("implementation").is_none()));
+        assert!(s.fallback_warning(".elser-2-elasticsearch").is_none());
+    }
+
+    #[test]
+    fn opt_in_stand_ins_report_their_implementation() {
+        let (_d, s) = svc();
+        let mut settings = Map::new();
+        settings.insert(backend::FALLBACK_SETTING.into(), json!("lexical"));
+        s.configure(&settings);
+        let out = s.infer(None, ".elser-2-elasticsearch", &json!({"input": "running dogs"})).unwrap();
+        assert!(out["sparse_embedding"][0]["embedding"]["dogs"].is_number());
+        let got = s.get(None, Some(".elser-2-elasticsearch")).unwrap();
+        assert_eq!(got["endpoints"][0]["implementation"], "lexical-fallback");
+        assert!(s.fallback_warning(".elser-2-elasticsearch").unwrap().contains("[lexical-fallback] stand-in"));
+        if !real::ACTIVE {
+            let got = s.get(None, Some(".multilingual-e5-small-elasticsearch")).unwrap();
+            assert_eq!(got["endpoints"][0]["implementation"], "hashing-fallback");
+        }
+        // Turning the setting off again makes the model unavailable.
+        s.configure(&Map::new());
+        assert_eq!(s.infer(None, ".elser-2-elasticsearch", &json!({"input": "x"})).unwrap_err().status, 409);
+    }
+
+    /// An endpoint that embedded with one implementation refuses another.
+    #[test]
+    fn endpoint_refuses_implementation_change() {
+        let (_d, s) = svc();
+        s.set_builtin_fallback(true);
+        s.put("text_embedding", "my-e5", &json!({"service": "elasticsearch", "service_settings": {"model_id": ".multilingual-e5-small", "num_allocations": 1, "num_threads": 1}})).unwrap();
+        s.infer(None, "my-e5", &json!({"input": "hello"})).unwrap();
+        let pinned = backend::pin_of(&s.dir, "my-e5").unwrap();
+        let other = if pinned == "candle" { backend::Implementation::HashingFallback } else { backend::Implementation::Candle };
+        let e = backend::check_pin(&s.dir, "my-e5", other).unwrap_err();
+        assert!(e.reason.contains(&format!("[{pinned}] but would now use [{}]", other.name())), "{}", e.reason);
+        // Simulate the real model becoming the implementation: the endpoint refuses it.
+        if pinned != "candle" {
+            backend::clear_pin(&s.dir, "my-e5");
+            backend::check_pin(&s.dir, "my-e5", backend::Implementation::Candle).unwrap();
+            let e = s.infer(None, "my-e5", &json!({"input": "hello"})).unwrap_err();
+            assert_eq!(e.status, 409);
+            assert!(e.reason.contains("produced its existing embeddings with implementation [candle] but would now use [hashing-fallback]"), "{}", e.reason);
+        }
     }
 }

@@ -410,6 +410,22 @@ pub fn pick_format(param: Option<&str>, accept: Option<&str>) -> Result<String> 
 
 /// Text table formats (csv/tsv/txt) of a table.
 pub fn text_table(t: &Table, format: &str, delimiter: Option<&str>, header: bool, drop_null_columns: bool) -> Result<String> {
+    // ES SQL intervals print in their SQL form in text formats
+    // (`StringUtils.toString`: `+1-2`, `+1 02:03:04.5`), ISO 8601 in JSON.
+    let converted;
+    let t = if t.cols.iter().any(|c| super::sqltime::is_interval(&c.ty)) {
+        let iv: Vec<bool> = t.cols.iter().map(|c| super::sqltime::is_interval(&c.ty)).collect();
+        converted = Table {
+            cols: t.cols.clone(),
+            rows: t.rows.iter().map(|r| r.iter().enumerate().map(|(i, v)| match v {
+                Val::Str(s) if iv[i] => Val::Str(super::sqltime::sql_text(s).unwrap_or_else(|| s.clone())),
+                other => other.clone(),
+            }).collect()).collect(),
+        };
+        &converted
+    } else {
+        t
+    };
     let keep: Vec<usize> = if drop_null_columns { non_null_columns(t) } else { (0..t.cols.len()).collect() };
     let mut out = String::new();
     match format {

@@ -7,8 +7,10 @@ pub enum Tok {
     Ident(String),
     /// Integer literal: value and whether it carried an `L` suffix.
     Int(i64, bool),
-    /// Floating literal (with an optional `f`/`d` suffix).
+    /// Floating literal (with an optional `d` suffix).
     Float(f64),
+    /// `float` literal (`f`/`F` suffix): the value rounded to single precision.
+    FloatF(f64),
     Str(String),
     /// Regex literal: pattern and flag letters.
     Regex(String, String),
@@ -63,7 +65,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ScriptErr> {
         if c == b'/' {
             let div = match out.last().map(|t: &Token| &t.tok) {
                 Some(Tok::Ident(word)) => !matches!(word.as_str(),"return"|"throw"|"case"),
-                Some(Tok::Str(_)|Tok::Regex(..)|Tok::Int(..)|Tok::Float(_)|Tok::P(")"|"]"|"}"|"++"|"--"))=>true,
+                Some(Tok::Str(_)|Tok::Regex(..)|Tok::Int(..)|Tok::Float(_)|Tok::FloatF(_)|Tok::P(")"|"]"|"}"|"++"|"--"))=>true,
                 _=>false,
             };
             if !div {
@@ -159,7 +161,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ScriptErr> {
                     let v = text.parse::<i64>().map_err(|_| ScriptErr::compile(start, format!("Invalid long constant [{text}].")))?;
                     out.push(Token { tok: Tok::Int(v, true), pos: start });
                 }
-                Some(b'f') | Some(b'F') | Some(b'd') | Some(b'D') => {
+                Some(b'f') | Some(b'F') => {
+                    i += 1;
+                    // Parsed straight to single precision (one rounding, as Java).
+                    let v = text.parse::<f32>().map_err(|_| ScriptErr::compile(start, format!("Invalid float constant [{text}].")))?;
+                    out.push(Token { tok: Tok::FloatF(v as f64), pos: start });
+                }
+                Some(b'd') | Some(b'D') => {
                     i += 1;
                     let v = text.parse::<f64>().map_err(|_| ScriptErr::compile(start, format!("Invalid double constant [{text}].")))?;
                     out.push(Token { tok: Tok::Float(v), pos: start });

@@ -39,6 +39,7 @@ fn put_validation_messages() {
 #[test]
 fn local_endpoint_lifecycle_and_infer() {
     let (d, s) = svc();
+    s.set_builtin_fallback(true);
     let r = s.put("text_embedding", "my-e5", &json!({"service": "elasticsearch", "service_settings": {"model_id": ".multilingual-e5-small", "num_allocations": 1, "num_threads": 1}})).unwrap();
     assert_eq!(r["inference_id"], "my-e5");
     let out = s.infer(Some("text_embedding"), "my-e5", &json!({"input": ["hello world", "bye"]})).unwrap();
@@ -54,6 +55,7 @@ fn local_endpoint_lifecycle_and_infer() {
 #[test]
 fn rerank_default_endpoint() {
     let (_d, s) = svc();
+    s.set_builtin_fallback(true);
     let out = s.infer(None, ".rerank-v1-elasticsearch", &json!({"query": "fox", "input": ["database revenue", "the quick fox"]})).unwrap();
     assert_eq!(out["rerank"][0]["index"], 1);
     assert_eq!(out["rerank"][0]["text"], "the quick fox");
@@ -111,12 +113,12 @@ fn adapters_map_requests() {
     let ss: Map<String, Value> = json!({"model_id": "m"}).as_object().unwrap().clone();
     let sec: Map<String, Value> = json!({"api_key": "k"}).as_object().unwrap().clone();
     let input = vec!["hi".to_string()];
-    let c = Call { service: "anthropic", task: Task::Completion, service_settings: &ss, secrets: &sec, task_settings: Map::new(), input: &input, query: None };
+    let c = Call { service: "anthropic", task: Task::Completion, service_settings: &ss, secrets: &sec, task_settings: Map::new(), input: &input, query: None, input_type: None };
     let r = providers::build_request(&c).unwrap();
     assert_eq!(r.body["max_tokens"], 1024);
     let out = providers::parse_response(&c, &json!({"content": [{"type": "text", "text": "yo"}]})).unwrap();
     assert_eq!(out, json!({"completion": [{"result": "yo"}]}));
-    let c = Call { service: "cohere", task: Task::Rerank, service_settings: &ss, secrets: &sec, task_settings: json!({"return_documents": true}).as_object().unwrap().clone(), input: &["a".to_string(), "b".to_string()], query: Some("q") };
+    let c = Call { service: "cohere", task: Task::Rerank, service_settings: &ss, secrets: &sec, task_settings: json!({"return_documents": true}).as_object().unwrap().clone(), input: &["a".to_string(), "b".to_string()], query: Some("q"), input_type: None };
     let out = providers::parse_response(&c, &json!({"results": [{"index": 0, "relevance_score": 0.1}, {"index": 1, "relevance_score": 0.9, "document": {"text": "b"}}]})).unwrap();
     assert_eq!(out["rerank"][0], json!({"index": 1, "relevance_score": 0.9, "text": "b"}));
     let _ = Duration::from_secs(1);
@@ -160,4 +162,51 @@ fn trained_models_crud_and_infer() {
     assert_eq!(models::infer(&st, ".multilingual-e5-small", &json!({"docs": [{"text_field": "hello"}]})).unwrap_err().status, 409);
     assert_eq!(models::delete(&st, ".multilingual-e5-small").unwrap(), json!({"acknowledged": true}));
     assert!(models::get(&st, Some("nope"), false).is_err());
+}
+
+/// Finding 126: endpoint chunking is validated with the field mapping's
+/// rules (ES builds both with `ChunkingSettingsBuilder`): word overlap 10 on
+/// a 10-word window is refused before anything else; 10 / 5 passes it.
+#[test]
+fn endpoint_chunking_is_validated_like_a_field() {
+    let (_d, s) = svc();
+    let body = |overlap: u64| json!({"service": "openai", "service_settings": {"api_key": "k", "model_id": "m", "url": "http://127.0.0.1:1/v1"}, "chunking_settings": {"strategy": "word", "max_chunk_size": 10, "overlap": overlap}});
+    let e = s.put("text_embedding", "wc", &body(10)).unwrap_err();
+    assert_eq!((e.status, e.kind.as_str()), (400, "validation_exception"), "{}", e.reason);
+    assert!(e.reason.contains("[chunking_settings] Invalid value [10") && e.reason.contains("[overlap] must be less than or equal to [5"), "{}", e.reason);
+    assert!(s.get_endpoint("wc").is_none());
+    // The valid control gets past chunking (to the unreachable provider).
+    let e = s.put("text_embedding", "wc", &body(5)).unwrap_err();
+    assert_eq!(e.reason, "Could not complete inference endpoint creation as validation call to service threw an exception.");
+    let e = s.put("text_embedding", "wc", &json!({"service": "openai", "service_settings": {"api_key": "k", "model_id": "m", "url": "http://127.0.0.1:1/v1"}, "chunking_settings": {"strategy": "word", "max_chunk_size": 5, "overlap": 1}})).unwrap_err();
+    assert!(e.reason.contains("[max_chunk_size] must be greater than or equal to [10"), "{}", e.reason);
+}
+
+/// Finding 127: provider embedding responses must carry exactly one row per
+/// input with unique, in-range indices and one shape; valid rows in any
+/// index order stay associated with their inputs.
+#[test]
+fn provider_embedding_responses_are_validated() {
+    let ss: Map<String, Value> = json!({"model_id": "m"}).as_object().unwrap().clone();
+    let sec: Map<String, Value> = json!({"api_key": "k"}).as_object().unwrap().clone();
+    let input = vec!["first".to_string(), "second".to_string()];
+    let c = Call { service: "openai", task: Task::TextEmbedding, service_settings: &ss, secrets: &sec, task_settings: Map::new(), input: &input, query: None, input_type: None };
+    let row = |i: Value, v: f64| json!({"index": i, "embedding": [v, 1.0]});
+    for (what, data) in [
+        ("zero rows", json!([])),
+        ("one row", json!([row(json!(0), 1.0)])),
+        ("three rows", json!([row(json!(0), 1.0), row(json!(1), 2.0), row(json!(2), 3.0)])),
+        ("duplicate index", json!([row(json!(0), 1.0), row(json!(0), 2.0)])),
+        ("out of range", json!([row(json!(0), 1.0), row(json!(5), 2.0)])),
+        ("negative index", json!([row(json!(-1), 1.0), row(json!(0), 2.0)])),
+        ("shape", json!([row(json!(0), 1.0), {"index": 1, "embedding": [2.0]}])),
+    ] {
+        assert!(providers::parse_response(&c, &json!({"data": data})).is_err(), "{what} accepted");
+    }
+    let out = providers::parse_response(&c, &json!({"data": [row(json!(1), 2.0), row(json!(0), 1.0)]})).unwrap();
+    assert_eq!(out, json!({"text_embedding": [{"embedding": [1.0, 1.0]}, {"embedding": [2.0, 1.0]}]}));
+    // Index-less rows (Hugging Face / Cohere forms) need the right count too.
+    assert!(providers::parse_response(&c, &json!([[1.0, 1.0]])).is_err());
+    assert!(providers::parse_response(&c, &json!({"embeddings": [[1.0], [2.0], [3.0]]})).is_err());
+    assert_eq!(providers::parse_response(&c, &json!([[1.0, 1.0], [2.0, 1.0]])).unwrap()["text_embedding"].as_array().unwrap().len(), 2);
 }

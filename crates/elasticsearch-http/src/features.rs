@@ -248,7 +248,7 @@ const ROUTES: &[Route] = &[
     r(&["GET"], "/_template", &[], &["local_param_deprecated"]),
     r(&["POST"], "/{index}/_close", &[], &["wait-for-active-shards-index-setting-removed"]),
     r(&["GET"], "/_resolve/index/{name}", &[], &["mode_filter"]),
-    r(&["PUT"], "/_ingest/pipeline/{id}", &[], &["pipeline_tracking_info"]),
+    r(&["PUT"], "/_ingest/pipeline/{id}", &[], &["field_access_pattern.flexible", "pipeline_tracking_info"]),
     r(&["PUT"], "/_cluster/settings", &[], &["repositories.default_repository_setting"]),
     r(&["PUT"], "/_synonyms/{rule_id}", &[], &["synonyms_refresh_param"]),
 
@@ -426,7 +426,7 @@ pub fn local_features(node: &elasticsearch_engine::node::Node) -> Vec<&'static s
 }
 
 // ============================================================================
-// P13 (ES|QL / EQL / SQL) capabilities. Append-only block owned by P13:
+// P13 (ES|QL / EQL / SQL) capabilities:
 // only list a capability once the behaviour behind it passes the ES YAML
 // tests gated on it (`x-pack/plugin/src/yamlRestTest/.../esql`, `eql/qa/rest`).
 // ============================================================================
@@ -436,7 +436,6 @@ pub fn local_features(node: &elasticsearch_engine::node::Node) -> Vec<&'static s
 /// `supportedQueryParameters`); the YAML suite probes these.
 const ESQL_PARAMS: &[&str] = &["format", "delimiter", "drop_null_columns", "allow_partial_results", "method", "path", "parameters", "capabilities"];
 
-/// `EsqlCapabilities` this node implements (a subset of ES 8.19's list).
 const ESQL_CAPS: &[&str] = &[
     "acosh_function",
     "add_limit_inside_mv_expand",
@@ -493,9 +492,6 @@ const ESQL_CAPS: &[&str] = &[
     "categorize_multiple_groupings",
     "categorize_options",
     "categorize_v6",
-    "change_point",
-    "change_point_by",
-    "change_point_support_null_column",
     "chunk_function_v2",
     "chunk_mv",
     "clamp_functions",
@@ -504,7 +500,6 @@ const ESQL_CAPS: &[&str] = &[
     "column_metadata_bucket_v2",
     "combine_binary_comparisons",
     "combine_disjunctive_cidrmatches",
-    "completion",
     "conditional_block_loader_for_text_fields",
     "copy_sign",
     "correct_skipped_shards_count",
@@ -554,7 +549,6 @@ const ESQL_CAPS: &[&str] = &[
     "disable_nullable_opts",
     "documents_found_and_values_loaded",
     "dot_product_vector_similarity_function",
-    "dots_in_fuse",
     "double_parameter_markers_for_identifiers",
     "double_quotes_source_enclosing",
     "drop_again_with_wildcard_after_eval",
@@ -710,8 +704,6 @@ const ESQL_CAPS: &[&str] = &[
     "function_stats",
     "functions_never_emit_text",
     "functions_source_serialization_warnings",
-    "fuse_passthrough_with_first",
-    "fuse_v6",
     "generic_vector_format",
     "geo_null_literals_folding",
     "geo_validation",
@@ -900,7 +892,6 @@ const ESQL_CAPS: &[&str] = &[
     "rename_sequential_processing",
     "repeat",
     "report_original_types",
-    "rerank",
     "resolve_groupings_before_resolving_references_to_groupings_in_aggregations",
     "retain_aggregate_when_grouping",
     "rlike_with_empty_language_pattern",

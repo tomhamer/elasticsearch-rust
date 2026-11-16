@@ -401,6 +401,17 @@ impl Coordinator {
                 self.on_request_failed(now, id, p, "disconnected: connection closed".to_string(), true);
             }
         }
+        // ES's `Peer.handleWakeUp`: a found peer that is no longer
+        // connected is no longer found.
+        let mut lost_peer = false;
+        for (addr, p) in self.peers.iter_mut() {
+            if addr == address || p.node.as_ref().is_some_and(|n| n.transport_address == address) {
+                lost_peer |= p.node.take().is_some();
+            }
+        }
+        if lost_peer && self.peer_finder_active {
+            self.on_found_peers_updated(now);
+        }
         if self.mode == Mode::Follower && self.leader_checker.as_ref().is_some_and(|c| c.node.transport_address == address) {
             self.become_candidate(now, "leader failed: disconnected");
         }
@@ -525,10 +536,14 @@ impl Coordinator {
         if node_ids.is_empty() == node_names.is_empty() {
             return Err(CoordinationError::Invalid("Please set node identifiers correctly. One and only one of [node_name], [node_names] and [node_ids] has to be set".into()));
         }
-        let max = self.settings.max_voting_config_exclusions;
+        let default_max = self.settings.max_voting_config_exclusions;
         self.submit_task(
             now,
             Box::new(move |cur: &ClusterState| {
+                // Dynamic: the cluster's value over the node's (#298).
+                let max = cur.metadata.setting("cluster.max_voting_config_exclusions")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .map(|v| v as usize).unwrap_or(default_max);
                 let mut s = cur.clone();
                 let mut add: Vec<VotingConfigExclusion> = Vec::new();
                 for id in &node_ids {
@@ -626,7 +641,12 @@ impl Coordinator {
         self.publication.is_some()
     }
     /// Master-eligible peers found by discovery (CANDIDATE mode).
+    /// ES's `PeerFinder.getFoundPeers`: empty while the peer finder is
+    /// inactive (leader or follower).
     pub fn discovered_peers(&self) -> Vec<DiscoveryNode> {
+        if !self.peer_finder_active {
+            return Vec::new();
+        }
         let mut by_id: BTreeMap<String, DiscoveryNode> = BTreeMap::new();
         for p in self.peers.values() {
             if let Some(n) = &p.node {
@@ -700,6 +720,17 @@ impl Coordinator {
         }
         self.applied = s.clone();
         self.emit(Output::ApplyState(Box::new(s)));
+    }
+
+    /// `cluster.auto_shrink_voting_configuration`: dynamic, so the cluster
+    /// metadata (transient over persistent) overrides the node setting
+    /// (production review #298: only the startup value was used).
+    fn auto_shrink(&self, s: &ClusterState) -> bool {
+        match s.metadata.setting("cluster.auto_shrink_voting_configuration") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(v)) => v.parse().unwrap_or(self.settings.auto_shrink_voting_configuration),
+            _ => self.settings.auto_shrink_voting_configuration,
+        }
     }
 
     fn no_master_block(&self, s: &ClusterState) -> NoMasterBlock {
@@ -778,8 +809,10 @@ impl Coordinator {
 
     fn activate_candidate(&mut self, now: u64) {
         self.candidate_since = now;
+        // ES's `PeerFinder.activate`: peers found before the last
+        // deactivation stay found (re-probed below) until the cluster
+        // state is applied (`closePeers`).
         self.peer_finder_active = true;
-        self.peers.clear();
         self.next_peer_wakeup = now;
         if self.applied.master_node_id.is_some() {
             let s = self.with_no_master_block(&self.applied);
@@ -795,9 +828,12 @@ impl Coordinator {
         tracing::debug!(node = %self.local.name, term = self.current_term(), "elected as master");
         self.mode = Mode::Leader;
         self.leader = Some(self.local.clone());
-        self.peer_finder_active = false;
-        self.peers.clear();
-        self.election = None;
+        // ES keeps the election scheduler (and the discovered peers) until
+        // a state of this term has been applied (`closeElectionScheduler`
+        // via `onClusterStateApplied`): a leader that loses its first
+        // publication goes on backing off instead of restarting at
+        // `cluster.election.initial_timeout`.
+        self.deactivate_peer_finder();
         self.prevote = None;
         self.leader_checker = None;
         self.emit_mode();
@@ -818,9 +854,7 @@ impl Coordinator {
             self.fail_incoming_joins("join target is a follower");
             self.mode = Mode::Follower;
         }
-        self.peer_finder_active = false;
-        self.peers.clear();
-        self.election = None;
+        self.deactivate_peer_finder();
         self.prevote = None;
         self.follower_checks.clear();
         self.lag_checks.clear();
@@ -829,6 +863,34 @@ impl Coordinator {
             self.leader_checker = Some(Checker { node: leader, last_ok: None, failures: 0, in_flight: None, next_at: now + self.settings.leader_check_interval_ms });
             self.emit_mode();
         }
+    }
+
+    /// ES's `PeerFinder.deactivate`: undiscovered addresses are dropped,
+    /// discovered peers are kept (but not reported while inactive) until
+    /// [`on_cluster_state_applied`](Self::on_cluster_state_applied) closes
+    /// them.
+    fn deactivate_peer_finder(&mut self) {
+        self.peer_finder_active = false;
+        self.peers.retain(|_, p| p.node.is_some());
+        for p in self.peers.values_mut() {
+            p.in_flight = None;
+        }
+    }
+
+    /// ES's `onClusterStateApplied` (followers after applying a commit, the
+    /// leader at the end of its publication): once not a candidate, close
+    /// the discovered peers and, if the applied state is of the current
+    /// term (`closeElectionScheduler`: "stabilised in term"), the election
+    /// scheduler. Until then a node that drops back to CANDIDATE keeps its
+    /// scheduler, whose randomised delays keep growing with every attempt.
+    fn on_cluster_state_applied(&mut self, applied_term: u64) {
+        if self.mode == Mode::Candidate {
+            return;
+        }
+        if applied_term == self.current_term() {
+            self.election = None;
+        }
+        self.peers.clear();
     }
 
     fn fail_incoming_joins(&mut self, reason: &str) {
@@ -1277,6 +1339,7 @@ impl Coordinator {
                 let committed = self.state.last_accepted_state().clone();
                 let s = if self.mode == Mode::Candidate { self.with_no_master_block(&committed) } else { committed };
                 self.set_applied(s);
+                self.on_cluster_state_applied(commit.term);
                 Ok(ApplyCommitAck { node_id: self.local.id.clone(), term: commit.term, version: commit.version })
             }
         };
@@ -1442,7 +1505,7 @@ impl Coordinator {
         let live: BTreeSet<String> =
             s.nodes.values().filter(|n| n.is_master_eligible() && (n.id == self.local.id || self.state.contains_join_vote_for(&n.id))).map(|n| n.id.clone()).collect();
         let retired: BTreeSet<String> = s.coordination.voting_config_exclusions.iter().map(|e| e.node_id.clone()).collect();
-        let cfg = reconfigure(&live, &retired, &self.local.id, current, self.settings.auto_shrink_voting_configuration);
+        let cfg = reconfigure(&live, &retired, &self.local.id, current, self.auto_shrink(s));
         if cfg == *current || self.state.last_committed_config() != self.state.last_accepted_config() || !self.state.join_votes_have_quorum_for(&cfg) {
             return None;
         }
@@ -1535,6 +1598,13 @@ impl Coordinator {
         new.coordination.last_accepted_config = base.coordination.last_accepted_config.clone();
         new.metadata.cluster_uuid = base.metadata.cluster_uuid.clone();
         new.metadata.cluster_uuid_committed = base.metadata.cluster_uuid_committed;
+        // Every index incarnation this state drops gets a tombstone (ES
+        // `IndexGraveyard`): a node that missed the deletion deletes its
+        // copy when it rejoins; a copy no tombstone names stays dangling.
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+        if crate::graveyard::record_deletions(&base.metadata, &mut new.metadata, wall, self.settings.tombstones_size) && new.metadata.version == base.metadata.version {
+            new.metadata.version += 1;
+        }
         // A master exists and the state is recovered (it is read from the
         // master's persisted state): drop the no-master and
         // state-not-recovered blocks.
@@ -1765,7 +1835,9 @@ impl Coordinator {
         // master at the end of the publication).
         let committed = self.state.last_accepted_state().clone();
         debug_assert_eq!(committed.version, version);
+        let applied_term = committed.coordination.term;
         self.set_applied(committed);
+        self.on_cluster_state_applied(applied_term);
         // Lag detector: nodes that have not applied this version within
         // `cluster.follower_lag.timeout` are removed.
         for id in p.targets.keys() {
@@ -1850,7 +1922,7 @@ impl Coordinator {
         let live: BTreeSet<String> = st.nodes.values().filter(|n| n.is_master_eligible() && (n.id == self.local.id || responsive.contains(&n.id))).map(|n| n.id.clone()).collect();
         let retired: BTreeSet<String> = st.coordination.voting_config_exclusions.iter().map(|e| e.node_id.clone()).collect();
         let current = &st.coordination.last_accepted_config;
-        let wanted = reconfigure(&live, &retired, &self.local.id, current, self.settings.auto_shrink_voting_configuration);
+        let wanted = reconfigure(&live, &retired, &self.local.id, current, self.auto_shrink(st));
         if wanted == *current || wanted.0.iter().all(|id| self.state.contains_join_vote_for(id)) {
             self.vote_reelections = 0;
             return false;

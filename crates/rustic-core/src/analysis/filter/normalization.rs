@@ -34,6 +34,10 @@ macro_rules! text_filter {
             fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
                 map_text(tokens, $func)
             }
+
+            fn normalizes(&self) -> bool {
+                true
+            }
         }
     };
 }
@@ -212,95 +216,249 @@ text_filter!(
 // Indic (script-generic)
 // ---------------------------------------------------------------------
 
-/// Normalize the Unicode representation of Indic-script text (Lucene's
-/// `IndicNormalizer`): composes `consonant + nukta` sequences into their
-/// precomposed forms and two-part dependent vowel signs into their single
-/// code points, for Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil,
-/// Telugu, Kannada and Malayalam, and removes ZWJ/ZWNJ.
+/// Lucene `IndicNormalizer`: within one script (Devanagari, Bengali,
+/// Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam), a code
+/// point that starts a decomposition is composed with the one or two that
+/// follow (a ZWJ as the third of a chillu / khanda ta sequence), per the
+/// script's entries of Lucene's table. Nothing else (no joiner) is
+/// removed.
 pub fn indic_normalize(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: Vec<char> = Vec::with_capacity(chars.len());
-    for c in chars {
-        if c == '\u{200C}' || c == '\u{200D}' {
-            continue;
-        }
-        if let Some(&prev) = out.last() {
-            if let Some(composed) = indic_compose(prev, c) {
-                *out.last_mut().unwrap() = composed;
-                continue;
+    let mut text: Vec<char> = s.chars().collect();
+    let mut len = text.len();
+    let mut i = 0;
+    while i < len {
+        if let Some((flag, base)) = indic_script(text[i]) {
+            let ch = text[i] as i32 - base;
+            if INDIC_DECOMP.iter().any(|d| d.0 == ch && d.4 & flag != 0) {
+                len = indic_compose(ch, flag, base, &mut text, i, len);
             }
         }
-        out.push(c);
+        i += 1;
     }
-    out.into_iter().collect()
+    text.truncate(len);
+    text.into_iter().collect()
 }
 
-/// Canonical two-code-point compositions for the major Indic scripts.
-fn indic_compose(a: char, b: char) -> Option<char> {
-    Some(match (a, b) {
-        // Devanagari nukta forms
-        ('\u{0928}', '\u{093C}') => '\u{0929}',
-        ('\u{0930}', '\u{093C}') => '\u{0931}',
-        ('\u{0933}', '\u{093C}') => '\u{0934}',
-        ('\u{0915}', '\u{093C}') => '\u{0958}',
-        ('\u{0916}', '\u{093C}') => '\u{0959}',
-        ('\u{0917}', '\u{093C}') => '\u{095A}',
-        ('\u{091C}', '\u{093C}') => '\u{095B}',
-        ('\u{0921}', '\u{093C}') => '\u{095C}',
-        ('\u{0922}', '\u{093C}') => '\u{095D}',
-        ('\u{092B}', '\u{093C}') => '\u{095E}',
-        ('\u{092F}', '\u{093C}') => '\u{095F}',
-        // Devanagari two-part vowels
-        ('\u{0905}', '\u{0946}') => '\u{090D}',
-        ('\u{0905}', '\u{093E}') => '\u{0906}',
-        ('\u{0906}', '\u{0945}') => '\u{0911}',
-        ('\u{0906}', '\u{0946}') => '\u{0912}',
-        ('\u{0906}', '\u{0947}') => '\u{0913}',
-        ('\u{0906}', '\u{0948}') => '\u{0914}',
-        ('\u{0905}', '\u{0947}') => '\u{0910}',
-        ('\u{093E}', '\u{0945}') => '\u{0949}',
-        ('\u{093E}', '\u{0946}') => '\u{094A}',
-        ('\u{093E}', '\u{0947}') => '\u{094B}',
-        ('\u{093E}', '\u{0948}') => '\u{094C}',
-        // Bengali
-        ('\u{09A1}', '\u{09BC}') => '\u{09DC}',
-        ('\u{09A2}', '\u{09BC}') => '\u{09DD}',
-        ('\u{09AF}', '\u{09BC}') => '\u{09DF}',
-        ('\u{09C7}', '\u{09BE}') => '\u{09CB}',
-        ('\u{09C7}', '\u{09D7}') => '\u{09CC}',
-        // Gurmukhi
-        ('\u{0A32}', '\u{0A3C}') => '\u{0A33}',
-        ('\u{0A38}', '\u{0A3C}') => '\u{0A36}',
-        ('\u{0A16}', '\u{0A3C}') => '\u{0A59}',
-        ('\u{0A17}', '\u{0A3C}') => '\u{0A5A}',
-        ('\u{0A1C}', '\u{0A3C}') => '\u{0A5B}',
-        ('\u{0A2B}', '\u{0A3C}') => '\u{0A5E}',
-        // Oriya
-        ('\u{0B21}', '\u{0B3C}') => '\u{0B5C}',
-        ('\u{0B22}', '\u{0B3C}') => '\u{0B5D}',
-        ('\u{0B47}', '\u{0B56}') => '\u{0B48}',
-        ('\u{0B47}', '\u{0B3E}') => '\u{0B4B}',
-        ('\u{0B47}', '\u{0B57}') => '\u{0B4C}',
-        // Tamil
-        ('\u{0B92}', '\u{0BD7}') => '\u{0B94}',
-        ('\u{0BC6}', '\u{0BBE}') => '\u{0BCA}',
-        ('\u{0BC7}', '\u{0BBE}') => '\u{0BCB}',
-        ('\u{0BC6}', '\u{0BD7}') => '\u{0BCC}',
-        // Telugu
-        ('\u{0C46}', '\u{0C56}') => '\u{0C48}',
-        // Kannada
-        ('\u{0CBF}', '\u{0CD5}') => '\u{0CC0}',
-        ('\u{0CC6}', '\u{0CD5}') => '\u{0CC7}',
-        ('\u{0CC6}', '\u{0CD6}') => '\u{0CC8}',
-        ('\u{0CC6}', '\u{0CC2}') => '\u{0CCA}',
-        ('\u{0CCA}', '\u{0CD5}') => '\u{0CCB}',
-        // Malayalam
-        ('\u{0D46}', '\u{0D3E}') => '\u{0D4A}',
-        ('\u{0D47}', '\u{0D3E}') => '\u{0D4B}',
-        ('\u{0D46}', '\u{0D57}') => '\u{0D4C}',
+/// The script (flag, block base) of `c`, for the scripts the normalizer knows.
+fn indic_script(c: char) -> Option<(u32, i32)> {
+    let c = c as u32;
+    let (flag, base) = match c {
+        0x0900..=0x097F => (1, 0x0900),
+        0x0980..=0x09FF => (2, 0x0980),
+        0x0A00..=0x0A7F => (4, 0x0A00),
+        0x0A80..=0x0AFF => (8, 0x0A80),
+        0x0B00..=0x0B7F => (16, 0x0B00),
+        0x0B80..=0x0BFF => (32, 0x0B80),
+        0x0C00..=0x0C7F => (64, 0x0C00),
+        0x0C80..=0x0CFF => (128, 0x0C80),
+        0x0D00..=0x0D7F => (256, 0x0D00),
         _ => return None,
-    })
+    };
+    Some((flag, base))
 }
+
+fn indic_compose(ch0: i32, flag: u32, base: i32, text: &mut Vec<char>, pos: usize, mut len: usize) -> usize {
+    if pos + 1 >= len {
+        return len;
+    }
+    if indic_script(text[pos + 1]).map(|s| s.0) != Some(flag) {
+        return len;
+    }
+    let ch1 = text[pos + 1] as i32 - base;
+    let mut ch2 = -1;
+    if pos + 2 < len {
+        ch2 = text[pos + 2] as i32 - base;
+        if text[pos + 2] == '\u{200D}' {
+            ch2 = 0xFF;
+        } else if indic_script(text[pos + 2]).map(|s| s.0) != Some(flag) {
+            ch2 = -1;
+        }
+    }
+    for d in INDIC_DECOMP {
+        if d.0 == ch0 && d.4 & flag != 0 && d.1 == ch1 && (d.2 < 0 || d.2 == ch2) {
+            text[pos] = char::from_u32((base + d.3) as u32).unwrap();
+            text.remove(pos + 1);
+            len -= 1;
+            if d.2 >= 0 {
+                text.remove(pos + 1);
+                len -= 1;
+            }
+            return len;
+        }
+    }
+    len
+}
+
+/// Lucene `IndicNormalizer.decompositions`: (ch0, ch1, ch2 or -1 (0xFF: ZWJ), composed, script flags).
+const INDIC_DECOMP: &[(i32, i32, i32, i32, u32)] = &[
+    (0x05, 0x3E, 0x45, 0x11, 9),
+    (0x05, 0x3E, 0x46, 0x12, 1),
+    (0x05, 0x3E, 0x47, 0x13, 9),
+    (0x05, 0x3E, 0x48, 0x14, 9),
+    (0x05, 0x3E, -1, 0x06, 31),
+    (0x05, 0x45, -1, 0x72, 1),
+    (0x05, 0x45, -1, 0x0D, 8),
+    (0x05, 0x46, -1, 0x04, 1),
+    (0x05, 0x47, -1, 0x0F, 8),
+    (0x05, 0x48, -1, 0x10, 12),
+    (0x05, 0x49, -1, 0x11, 9),
+    (0x05, 0x4A, -1, 0x12, 1),
+    (0x05, 0x4B, -1, 0x13, 9),
+    (0x05, 0x4C, -1, 0x14, 13),
+    (0x06, 0x45, -1, 0x11, 9),
+    (0x06, 0x46, -1, 0x12, 1),
+    (0x06, 0x47, -1, 0x13, 9),
+    (0x06, 0x48, -1, 0x14, 9),
+    (0x07, 0x57, -1, 0x08, 256),
+    (0x09, 0x41, -1, 0x0A, 1),
+    (0x09, 0x57, -1, 0x0A, 288),
+    (0x0E, 0x46, -1, 0x10, 256),
+    (0x0F, 0x45, -1, 0x0D, 1),
+    (0x0F, 0x46, -1, 0x0E, 1),
+    (0x0F, 0x47, -1, 0x10, 1),
+    (0x0F, 0x57, -1, 0x10, 16),
+    (0x12, 0x3E, -1, 0x13, 256),
+    (0x12, 0x4C, -1, 0x14, 192),
+    (0x12, 0x55, -1, 0x13, 64),
+    (0x12, 0x57, -1, 0x14, 288),
+    (0x13, 0x57, -1, 0x14, 16),
+    (0x15, 0x3C, -1, 0x58, 1),
+    (0x16, 0x3C, -1, 0x59, 5),
+    (0x17, 0x3C, -1, 0x5A, 5),
+    (0x1C, 0x3C, -1, 0x5B, 5),
+    (0x21, 0x3C, -1, 0x5C, 19),
+    (0x22, 0x3C, -1, 0x5D, 19),
+    (0x23, 0x4D, 0xFF, 0x7A, 256),
+    (0x24, 0x4D, 0xFF, 0x4E, 2),
+    (0x28, 0x3C, -1, 0x29, 1),
+    (0x28, 0x4D, 0xFF, 0x7B, 256),
+    (0x2B, 0x3C, -1, 0x5E, 5),
+    (0x2F, 0x3C, -1, 0x5F, 3),
+    (0x2C, 0x41, 0x41, 0x0B, 64),
+    (0x30, 0x3C, -1, 0x31, 1),
+    (0x30, 0x4D, 0xFF, 0x7C, 256),
+    (0x32, 0x4D, 0xFF, 0x7D, 256),
+    (0x33, 0x3C, -1, 0x34, 1),
+    (0x33, 0x4D, 0xFF, 0x7E, 256),
+    (0x35, 0x41, -1, 0x2E, 64),
+    (0x3E, 0x45, -1, 0x49, 9),
+    (0x3E, 0x46, -1, 0x4A, 1),
+    (0x3E, 0x47, -1, 0x4B, 9),
+    (0x3E, 0x48, -1, 0x4C, 9),
+    (0x3F, 0x55, -1, 0x40, 128),
+    (0x41, 0x41, -1, 0x42, 4),
+    (0x46, 0x3E, -1, 0x4A, 288),
+    (0x46, 0x42, 0x55, 0x4B, 128),
+    (0x46, 0x42, -1, 0x4A, 128),
+    (0x46, 0x46, -1, 0x48, 256),
+    (0x46, 0x55, -1, 0x47, 192),
+    (0x46, 0x56, -1, 0x48, 192),
+    (0x46, 0x57, -1, 0x4C, 288),
+    (0x47, 0x3E, -1, 0x4B, 306),
+    (0x47, 0x57, -1, 0x4C, 18),
+    (0x4A, 0x55, -1, 0x4B, 128),
+    (0x72, 0x3F, -1, 0x07, 4),
+    (0x72, 0x40, -1, 0x08, 4),
+    (0x72, 0x47, -1, 0x0F, 4),
+    (0x73, 0x41, -1, 0x09, 4),
+    (0x73, 0x42, -1, 0x0A, 4),
+    (0x73, 0x4B, -1, 0x13, 4),
+];
+
+
+/// Lucene `BengaliNormalizer` (the `bengali` analyzer's and ES
+/// `bengali_normalization`): chandrabindu removed, long vowel signs
+/// shortened, ya / ba phala and visarga handled, sibilants, na and ra
+/// unified, khanda ta to ta.
+pub fn bengali_normalize(input: &str) -> String {
+    let mut s: Vec<char> = input.chars().collect();
+    let mut len = s.len() as i64;
+    let del = |s: &mut Vec<char>, pos: i64, len: i64| -> i64 {
+        s.remove(pos as usize);
+        len - 1
+    };
+    let mut i: i64 = 0;
+    while i < len {
+        let iu = i as usize;
+        match s[iu] {
+            '\u{0981}' => {
+                len = del(&mut s, i, len);
+                i -= 1;
+            }
+            '\u{09C0}' => s[iu] = '\u{09BF}',
+            '\u{09C2}' => s[iu] = '\u{09C1}',
+            '\u{0995}' => {
+                if i + 2 < len && s[iu + 1] == '\u{09CD}' && s[iu + 2] == '\u{09BF}' {
+                    if i == 0 {
+                        s[iu] = '\u{0996}';
+                        len = del(&mut s, i + 2, len);
+                        len = del(&mut s, i + 1, len);
+                    } else {
+                        s[iu + 1] = '\u{0996}';
+                        len = del(&mut s, i + 2, len);
+                    }
+                }
+            }
+            '\u{0999}' => s[iu] = '\u{0982}',
+            '\u{09AF}' => {
+                if i - 2 == 0 && s[iu - 1] == '\u{09CD}' {
+                    s[iu - 1] = '\u{09C7}';
+                    if i + 1 < len && s[iu + 1] == '\u{09BE}' {
+                        len = del(&mut s, i + 1, len);
+                    }
+                    len = del(&mut s, i, len);
+                    i -= 1;
+                } else if i >= 1 && s[iu - 1] == '\u{09CD}' {
+                    len = del(&mut s, i, len);
+                    len = del(&mut s, i - 1, len);
+                    i -= 2;
+                }
+            }
+            '\u{09AC}' => {
+                if !((i >= 1 && s[iu - 1] != '\u{09CD}') || i == 0) {
+                    if i - 2 == 0 {
+                        len = del(&mut s, i, len);
+                        len = del(&mut s, i - 1, len);
+                        i -= 2;
+                    } else if i - 5 >= 0 && s[iu - 3] == '\u{09CD}' {
+                        len = del(&mut s, i, len);
+                        len = del(&mut s, i - 1, len);
+                        i -= 2;
+                    } else if i - 2 >= 0 {
+                        s[iu - 1] = s[iu - 2];
+                        len = del(&mut s, i, len);
+                        i -= 1;
+                    }
+                }
+            }
+            '\u{0983}' => {
+                if i == len - 1 {
+                    if len <= 3 {
+                        s[iu] = '\u{09B9}';
+                    } else {
+                        len = del(&mut s, i, len);
+                    }
+                } else {
+                    s[iu] = s[iu + 1];
+                }
+            }
+            '\u{09B6}' | '\u{09B7}' => s[iu] = '\u{09B8}',
+            '\u{09A3}' => s[iu] = '\u{09A8}',
+            '\u{09DC}' | '\u{09DD}' => s[iu] = '\u{09B0}',
+            '\u{09CE}' => s[iu] = '\u{09A4}',
+            _ => {}
+        }
+        i += 1;
+    }
+    s.truncate(len.max(0) as usize);
+    s.into_iter().collect()
+}
+
+text_filter!(
+    /// ES `bengali_normalization`: see [`bengali_normalize`].
+    BengaliNormalizationFilter,
+    bengali_normalize
+);
 
 text_filter!(
     /// ES `indic_normalization`: see [`indic_normalize`].
@@ -769,7 +927,7 @@ mod tests {
     use super::*;
 
     fn tok(text: &str) -> Vec<Token> {
-        vec![Token { text: text.to_string(), position: 3, offset_from: 1, offset_to: 2 }]
+        vec![Token { text: text.to_string(), position: 3, offset_from: 1, offset_to: 2, keyword: false }]
     }
 
     fn run(f: &dyn TokenFilter, text: &str) -> String {
@@ -845,7 +1003,20 @@ mod tests {
         assert_eq!(indic_normalize("\u{09C7}\u{09BE}"), "\u{09CB}");
         assert_eq!(indic_normalize("\u{0BC6}\u{0BBE}"), "\u{0BCA}");
         assert_eq!(indic_normalize("\u{0D46}\u{0D3E}"), "\u{0D4A}");
-        assert_eq!(indic_normalize("क\u{200D}ष"), "कष");
+        // Lucene `TestIndicNormalizer` (ZWJ only composes, #Indic P2).
+        for (i, o) in [("अाॅअाॅ", "ऑऑ"), ("अाॆअाॆ", "ऒऒ"), ("अाेअाे", "ओओ"), ("अाैअाै", "औऔ"), ("अाअा", "आआ"), ("अाैर", "और"), ("ত্\u{200D}", "ৎ")] {
+            assert_eq!(indic_normalize(i), o, "{i}");
+        }
+        // Bengali khanda ta and Malayalam chillus: the three-code-point
+        // forms compose, equivalent to the precomposed letters.
+        assert_eq!(indic_normalize("\u{09A4}\u{09CD}\u{200D}"), "\u{09CE}");
+        assert_eq!(indic_normalize("\u{09CE}"), "\u{09CE}");
+        assert_eq!(indic_normalize("\u{0D23}\u{0D4D}\u{200D}"), "\u{0D7A}");
+        assert_eq!(indic_normalize("\u{0D28}\u{0D4D}\u{200D}"), "\u{0D7B}");
+        assert_eq!(indic_normalize("\u{0D30}\u{0D4D}\u{200D}"), "\u{0D7C}");
+        assert_eq!(indic_normalize("\u{0D32}\u{0D4D}\u{200D}"), "\u{0D7D}");
+        assert_eq!(indic_normalize("\u{0D33}\u{0D4D}\u{200D}"), "\u{0D7E}");
+        assert_eq!(indic_normalize("क\u{200D}ष"), "क\u{200D}ष", "a joiner is not removed");
         assert_eq!(indic_normalize("plain"), "plain");
         assert_eq!(run(&IndicNormalizationFilter, "x"), "x");
     }

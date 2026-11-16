@@ -1,0 +1,6 @@
+# The `candle-models` feature (default) pulls in `gemm`, whose aarch64
+# kernels use half-precision instructions: Linux aarch64 builds enable the
+# FP16 extension (every Graviton generation and Armv8.2+ server has it).
+# Note: a RUSTFLAGS environment variable replaces these flags.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+fp16"]

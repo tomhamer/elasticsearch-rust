@@ -26,15 +26,59 @@ impl RegexpFlags {
 pub struct RegexpMatcher {
     re: meta::Regex,
     prefix: Vec<u8>,
+    /// Further operands of a Lucene intersection (`a&b`, `a&~(b)`): each
+    /// term must also match every `(false, re)` and none of the
+    /// `(true, re)` (complement), term by term ([`intersection`]).
+    and: Vec<(bool, meta::Regex)>,
+}
+
+/// Marker of a pattern built by [`intersection`].
+const AND_MARK: char = '\u{0}';
+
+/// One term pattern for a Lucene intersection of `operands` (`(negated,
+/// regex)`): the conjunction and complements apply to each term, as in
+/// Lucene's `RegExp` automaton, never to whole documents.
+pub fn intersection(operands: &[(bool, String)]) -> String {
+    let mut out = String::new();
+    for (neg, re) in operands {
+        out.push(AND_MARK);
+        out.push(if *neg { '-' } else { '+' });
+        out.push_str(re);
+    }
+    out
+}
+
+/// The operands of an [`intersection`] pattern (`None`: a plain pattern).
+pub fn intersection_operands(pattern: &str) -> Option<Vec<(bool, &str)>> {
+    let rest = pattern.strip_prefix(AND_MARK)?;
+    Some(rest.split(AND_MARK).map(|op| match op.strip_prefix('-') {
+        Some(re) => (true, re),
+        None => (false, op.strip_prefix('+').unwrap_or(op)),
+    }).collect())
 }
 
 impl RegexpMatcher {
-    /// Compile `pattern` with the given `flags`.
+    /// Compile `pattern` with the given `flags` (a plain pattern, or an
+    /// [`intersection`] of operands).
     pub fn new(pattern: &str, flags: RegexpFlags) -> Result<Self, String> {
+        if let Some(ops) = intersection_operands(pattern) {
+            let first = ops.iter().position(|(neg, _)| !neg);
+            let mut m = match first {
+                Some(i) => Self::new(ops[i].1, flags)?,
+                // Only complements: every term is a candidate.
+                None => Self::new("(?s:.*)", flags)?,
+            };
+            for (i, (neg, re)) in ops.iter().enumerate() {
+                if Some(i) == first {
+                    continue;
+                }
+                let sub = Self::new(re, flags)?;
+                m.and.push((*neg, sub.re));
+            }
+            return Ok(m);
+        }
         check_supported(pattern)?;
-        let mut builder = ParserBuilder::new();
-        builder.case_insensitive(flags.case_insensitive);
-        let hir = builder.build().parse(pattern).map_err(|e| e.to_string())?;
+        let hir = parse(pattern, flags.case_insensitive)?;
         let prefix = if flags.case_insensitive {
             Vec::new()
         } else {
@@ -45,7 +89,7 @@ impl RegexpMatcher {
         let re = meta::Builder::new()
             .build_from_hir(&anchored)
             .map_err(|e| e.to_string())?;
-        Ok(Self { re, prefix })
+        Ok(Self { re, prefix, and: Vec::new() })
     }
 
     /// The literal prefix every match must start with (empty when
@@ -65,12 +109,57 @@ impl std::fmt::Debug for RegexpMatcher {
 
 impl TermMatcher for RegexpMatcher {
     fn matches(&self, term: &[u8]) -> bool {
-        self.re.is_match(term)
+        self.re.is_match(term) && self.and.iter().all(|(neg, re)| re.is_match(term) != *neg)
     }
 
     fn literal_prefix(&self) -> &[u8] {
         &self.prefix
     }
+}
+
+/// Parse with Lucene's semantics: `.` matches any character, line breaks
+/// included (Lucene `RegExp` has no line-oriented mode).
+fn parse(pattern: &str, case_insensitive: bool) -> Result<Hir, String> {
+    let mut builder = ParserBuilder::new();
+    builder.case_insensitive(case_insensitive).dot_matches_new_line(true);
+    builder.build().parse(pattern).map_err(|e| e.to_string())
+}
+
+/// Literal strings every whole-term match of `pattern` must contain (for
+/// an n-gram prefilter), read from the parsed pattern: literal runs of the
+/// mandatory concatenation, descending into groups and repetitions of at
+/// least one; alternations, classes and optional parts contribute
+/// nothing. A repetition count (`{3,5}`) is never mistaken for text.
+pub fn required_literals(pattern: &str) -> Result<Vec<String>, String> {
+    check_supported(pattern)?;
+    let hir = parse(pattern, false)?;
+    fn walk(h: &Hir, out: &mut Vec<Vec<u8>>) {
+        match h.kind() {
+            HirKind::Literal(l) => out.push(l.0.to_vec()),
+            HirKind::Capture(c) => walk(&c.sub, out),
+            HirKind::Repetition(r) if r.min >= 1 => walk(&r.sub, out),
+            HirKind::Concat(parts) => {
+                let mut run: Vec<u8> = Vec::new();
+                for p in parts {
+                    if let HirKind::Literal(l) = p.kind() {
+                        run.extend_from_slice(&l.0);
+                    } else {
+                        if !run.is_empty() {
+                            out.push(std::mem::take(&mut run));
+                        }
+                        walk(p, out);
+                    }
+                }
+                if !run.is_empty() {
+                    out.push(run);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut runs = Vec::new();
+    walk(&hir, &mut runs);
+    Ok(runs.into_iter().filter_map(|r| String::from_utf8(r).ok()).collect())
 }
 
 /// Walk the HIR concatenation from the start, collecting `Literal` bytes
@@ -180,6 +269,17 @@ mod tests {
         assert!(m("a(b|c)d").matches(b"abd"));
         assert!(m("a(b|c)d").matches(b"acd"));
         assert!(!m("a(b|c)d").matches(b"add"));
+    }
+
+    /// #491/#492: `.` spans line breaks (Lucene), and the prefilter
+    /// literals come from the parsed pattern: repetition counts are not text.
+    #[test]
+    fn newlines_and_required_literals() {
+        assert!(m("first.*last").matches(b"first\nlast"));
+        assert_eq!(required_literals("serial[0-9]{3,5}").unwrap(), vec!["serial"]);
+        assert_eq!(required_literals("ab(cde)+x?yz").unwrap(), vec!["ab", "cde", "yz"]);
+        assert!(required_literals("(abc|def)").unwrap().is_empty());
+        assert_eq!(required_literals("(abc){2}").unwrap(), vec!["abc"]);
     }
 
     #[test]

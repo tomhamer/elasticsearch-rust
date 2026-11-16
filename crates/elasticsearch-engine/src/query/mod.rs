@@ -16,5 +16,8 @@ pub mod geo;
 pub mod terms_set;
 pub mod regexp;
 pub mod pinned;
+pub mod single_value;
 
 pub mod limits;
+#[cfg(test)]
+mod relevance_tests;

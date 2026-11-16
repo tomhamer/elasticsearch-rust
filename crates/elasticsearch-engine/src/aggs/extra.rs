@@ -35,9 +35,21 @@ pub(super) const EXTRA: &[&str] = &[
 ];
 
 thread_local! {
-    /// Enclosing `date_histogram`s (field, rounding), innermost last; `rate`
-    /// reads the bucket width from here.
-    static DH_PARENT: RefCell<Vec<(String, Rounding)>> = const { RefCell::new(Vec::new()) };
+    /// Enclosing `date_histogram`s (field, rounding, key of the bucket whose
+    /// sub-aggregations are being computed), innermost last; `rate` reads
+    /// the bucket width from here.
+    static DH_PARENT: RefCell<Vec<(String, Rounding, Option<i64>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The innermost enclosing `date_histogram` computes the sub-aggregations
+/// of its bucket `key` now (its own key: a runtime or `missing` parent
+/// value need not be readable from the bucket's documents).
+pub(super) fn set_dh_bucket(key: Option<i64>) {
+    DH_PARENT.with(|p| {
+        if let Some(last) = p.borrow_mut().last_mut() {
+            last.2 = key;
+        }
+    });
 }
 
 /// Marks a `date_histogram` as the parent of the sub-aggregations computed
@@ -46,7 +58,7 @@ pub(super) struct DhGuard;
 
 impl DhGuard {
     pub(super) fn push(field: &str, r: &Rounding) -> DhGuard {
-        DH_PARENT.with(|p| p.borrow_mut().push((field.to_string(), r.clone())));
+        DH_PARENT.with(|p| p.borrow_mut().push((field.to_string(), r.clone(), None)));
         DhGuard
     }
 }
@@ -213,11 +225,11 @@ impl Kahan {
     }
 }
 
-fn sort_value_order(a: &Option<Key>, b: &Option<Key>, desc: bool) -> Ordering {
+fn sort_value_order(a: &Option<Key>, b: &Option<Key>, desc: bool, missing_first: bool) -> Ordering {
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, _) => Ordering::Greater,
-        (_, None) => Ordering::Less,
+        (None, _) => if missing_first { Ordering::Less } else { Ordering::Greater },
+        (_, None) => if missing_first { Ordering::Greater } else { Ordering::Less },
         (Some(x), Some(y)) => {
             let o = cmp_key(x, y);
             if desc { o.reverse() } else { o }
@@ -258,11 +270,26 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 self.env.top_metrics_max_size, size
             )));
         }
-        let metric_fields: Vec<String> = match o.get("metrics") {
-            Some(Value::Array(a)) => a.iter().filter_map(|m| m.get("field").and_then(Value::as_str).map(str::to_string)).collect(),
-            Some(Value::Object(m)) => m.get("field").and_then(Value::as_str).map(|s| vec![s.to_string()]).unwrap_or_default(),
+        // Each metric's field and its `missing` replacement (ES
+        // `TopMetricsAggregator`: a metric a document lacks renders null
+        // unless the metric configures a replacement; the document still
+        // competes on its sort value).
+        let metric_defs: Vec<&Value> = match o.get("metrics") {
+            Some(Value::Array(a)) => a.iter().collect(),
+            Some(m @ Value::Object(_)) => vec![m],
             _ => Vec::new(),
         };
+        let metric_fields: Vec<String> = metric_defs.iter().filter_map(|m| m.get("field").and_then(Value::as_str).map(str::to_string)).collect();
+        let metric_missing: Vec<Option<Key>> = metric_defs
+            .iter()
+            .filter(|m| m.get("field").and_then(Value::as_str).is_some())
+            .map(|m| match m.get("missing") {
+                Some(Value::Number(n)) => Some(n.as_i64().map(Key::Long).unwrap_or_else(|| Key::Dbl(n.as_f64().unwrap_or(0.0)))),
+                Some(Value::String(t)) => Some(t.parse::<i64>().map(Key::Long).or_else(|_| t.parse::<f64>().map(Key::Dbl)).unwrap_or_else(|_| Key::Str(t.clone()))),
+                Some(Value::Bool(b)) => Some(Key::Bool(*b)),
+                _ => None,
+            })
+            .collect();
         if metric_fields.is_empty() {
             return Err(EsError::illegal_argument(format!("[metrics] must not be empty: [{name}]")));
         }
@@ -289,6 +316,29 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 (k.clone(), ord.map(|s| s == "desc").unwrap_or(k == "_score"))
             }
             Some(_) => return Err(EsError::parsing_at("[sort] must be a string or object", 1, 1)),
+        };
+        // The field sort's `mode` (which of a multi-valued document's values
+        // it sorts on) and `missing` (`_last`, `_first`, or a replacement
+        // value), as a search sort applies them (#576).
+        let field_opts = match &sort_v {
+            Some(Value::Object(m)) => m.get(&sort_field).and_then(Value::as_object),
+            _ => None,
+        };
+        let mode = match field_opts.and_then(|x| x.get("mode")).and_then(Value::as_str) {
+            None => None,
+            Some(m @ ("min" | "max" | "sum" | "avg" | "median")) => Some(m.to_string()),
+            Some(other) => return Err(EsError::illegal_argument(format!("Unknown SortMode [{other}]"))),
+        };
+        let (missing_first, missing_value) = match field_opts.and_then(|x| x.get("missing")) {
+            None => (false, None),
+            Some(Value::String(t)) if t == "_last" => (false, None),
+            Some(Value::String(t)) if t == "_first" => (true, None),
+            Some(Value::Number(n)) => (false, Some(n.as_i64().map(Key::Long).unwrap_or_else(|| Key::Dbl(n.as_f64().unwrap_or(0.0))))),
+            Some(Value::String(t)) => match t.parse::<i64>().map(Key::Long).or_else(|_| t.parse::<f64>().map(Key::Dbl)) {
+                Ok(k) => (false, Some(k)),
+                Err(_) => return Err(EsError::illegal_argument(format!("failed to parse missing value [{t}] for the sort of [{name}]"))),
+            },
+            Some(other) => return Err(EsError::illegal_argument(format!("failed to parse missing value [{other}] for the sort of [{name}]"))),
         };
         // `_geo_distance` sort: distance (meters) from the origin to each doc's
         // geo_point; the sort value is the distance itself.
@@ -353,9 +403,17 @@ impl<'a, 'b> Ctx<'a, 'b> {
             }
             mfs.push(f);
         }
-        let mut rows: Vec<(Option<Key>, usize, DocId)> = Vec::new();
+        // The best `size` docs, selected as they arrive (ties keep arrival
+        // order, as the stable sort of every match did); only those are held.
+        let mut best = super::TopN::new(size, |a: &(Option<Key>, usize, DocId, u64), b: &(Option<Key>, usize, DocId, u64)| sort_value_order(&a.0, &b.0, desc, missing_first).then(a.3.cmp(&b.3)));
+        let label = super::agg_label(name);
+        let mut seq = 0u64;
         for (s, v) in docs.iter().enumerate() {
             for &(d, sc) in v {
+                seq += 1;
+                if seq % super::POLL_EVERY == 0 {
+                    super::poll_cancelled()?;
+                }
                 let k = match &sf {
                     None if geo_sort.is_some() => {
                         let (gf, olat, olon) = geo_sort.as_ref().unwrap();
@@ -369,19 +427,42 @@ impl<'a, 'b> Ctx<'a, 'b> {
                     None => Some(Key::Dbl(sc as f64)),
                     Some(f) => {
                         let vals = self.values(f, s, d);
-                        if desc { vals.into_iter().max_by(cmp_key) } else { vals.into_iter().min_by(cmp_key) }
+                        let picked = match mode.as_deref() {
+                            Some("max") => vals.into_iter().max_by(cmp_key),
+                            Some("min") => vals.into_iter().min_by(cmp_key),
+                            Some(m @ ("sum" | "avg" | "median")) => {
+                                let mut xs: Vec<f64> = vals.iter().filter_map(Key::as_f64).collect();
+                                if xs.is_empty() {
+                                    None
+                                } else {
+                                    let sum: f64 = xs.iter().sum();
+                                    Some(Key::Dbl(match m {
+                                        "sum" => sum,
+                                        "avg" => sum / xs.len() as f64,
+                                        _ => {
+                                            xs.sort_by(|a, b| a.total_cmp(b));
+                                            let n = xs.len();
+                                            if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 }
+                                        }
+                                    }))
+                                }
+                            }
+                            _ if desc => vals.into_iter().max_by(cmp_key),
+                            _ => vals.into_iter().min_by(cmp_key),
+                        };
+                        picked.or_else(|| missing_value.clone())
                     }
                 };
-                rows.push((k, s, d));
+                let bytes = k.as_ref().map_or(0, Key::heap_bytes) as u64;
+                best.push(&self.mem, &label, (k, s, d, seq), bytes)?;
             }
         }
-        rows.sort_by(|a, b| sort_value_order(&a.0, &b.0, desc));
-        rows.truncate(size);
+        let rows = best.finish(&self.mem);
         let mut top = Vec::new();
-        for (k, s, d) in rows {
+        for (k, s, d, _) in rows {
             let mut metrics = Map::new();
-            for (n, f) in metric_fields.iter().zip(&mfs) {
-                let v = self.values(f, s, d).into_iter().next();
+            for ((n, f), miss) in metric_fields.iter().zip(&mfs).zip(&metric_missing) {
+                let v = self.values(f, s, d).into_iter().next().or_else(|| miss.clone());
                 let j = match (v, f.ty) {
                     (None, _) => Value::Null,
                     (Some(Key::Long(x)), Some(t)) if t.is_date() => json!(f.format.clone().unwrap_or_default().format(x, Tz::UTC)),
@@ -407,7 +488,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
     fn weighted_avg(&self, name: &str, o: &Map<String, Value>, docs: &Docs) -> Result<Value> {
         let part = |k: &str| -> Result<(FieldRef, Option<Key>)> {
             let p = o.get(k).and_then(Value::as_object).ok_or_else(|| EsError::illegal_argument(format!("[{k}] must be set for weighted_avg aggregation [{name}]")))?;
-            let f = self.field(field_name(p, name, "weighted_avg")?)?;
+            let f = self.source(p, name, "weighted_avg")?;
             let m = self.missing_key(&f, p.get("missing"))?;
             Ok((f, m))
         };
@@ -432,10 +513,15 @@ impl<'a, 'b> Ctx<'a, 'b> {
         let v = if any && wsum != 0.0 { Some(sum / wsum) } else { None };
         let mut m = Map::new();
         m.insert("value".into(), opt_num(v));
-        if let (Some(fmt), Some(x)) = (o.get("format").and_then(Value::as_str), v) {
-            if vf.ty.map(|t| t.is_date()).unwrap_or(false) {
-                m.insert("value_as_string".into(), json!(DateFormatter::new(fmt)?.format(x as i64, Tz::UTC)));
-            }
+        let date_fmt = o.get("format").and_then(Value::as_str).filter(|_| vf.ty.map(|t| t.is_date()).unwrap_or(false));
+        if let (Some(fmt), Some(x)) = (date_fmt, v) {
+            m.insert("value_as_string".into(), json!(DateFormatter::new(fmt)?.format(x as i64, Tz::UTC)));
+        }
+        // ES `InternalWeightedAvg`: a cluster shard response carries the
+        // weighted sum and the summed weights (one weight per value), which
+        // the coordinator adds up; the rendered average is not mergeable.
+        if crate::search::aggregation_shard_response() {
+            m.insert("__p".into(), json!({"sum": sum, "weight": wsum, "fmt": date_fmt}));
         }
         Ok(Value::Object(m))
     }
@@ -451,7 +537,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
         let mut srcs: Vec<(FieldRef, Option<Key>, Option<DateFormatter>)> = Vec::new();
         for t in terms {
             let to = t.as_object().ok_or_else(|| EsError::parsing_at("[terms] entries must be objects", 1, 1))?;
-            let f = self.field(field_name(to, name, "multi_terms")?)?;
+            let f = self.source(to, name, "multi_terms")?;
             let m = self.missing_key(&f, to.get("missing"))?;
             let fmt = to.get("format").and_then(Value::as_str).map(DateFormatter::new).transpose()?.or_else(|| f.format.clone());
             srcs.push((f, m, fmt));
@@ -463,31 +549,33 @@ impl<'a, 'b> Ctx<'a, 'b> {
         let min_doc_count = o.get("min_doc_count").and_then(Value::as_u64).unwrap_or(1);
         let order = parse_order(o.get("order"), &[("_count", false)])?;
         let show_err = o.get("show_term_doc_count_error").and_then(Value::as_bool).unwrap_or(false);
-        // ES selects the top `shard_size` buckets per shard before reducing;
-        // with a single shard that is the set of buckets that survive.
-        let shard_size = o.get("shard_size").and_then(Value::as_i64).unwrap_or(100).max(1) as usize;
+        // ES selects the top `shard_size` buckets per shard, by the requested
+        // order, before reducing: by default `size * 1.5 + 10`, never fewer
+        // than `size` (`BucketUtils.suggestShardSideQueueSize`).
+        let size_u = size as usize;
+        let shard_size = match o.get("shard_size").and_then(Value::as_i64) {
+            Some(n) if n > 0 => (n as usize).max(size_u),
+            _ => size_u.saturating_mul(3) / 2 + 10,
+        };
+        let needs_subs = order.iter().any(|(k, _)| k != "_count" && k != "_key");
+        let count_desc = matches!(order.first(), Some((k, false)) if k == "_count");
         let mut groups: HashMap<Vec<Key>, Docs> = HashMap::new();
         for (s, v) in docs.iter().enumerate() {
             for &(d, sc) in v {
-                let mut combos: Vec<Vec<Key>> = vec![Vec::new()];
+                // One deduplicated value list per term; their product is
+                // enumerated one combination at a time, each admitted as it
+                // joins the grouping (never materialized up front).
+                let mut per: Vec<Vec<Key>> = Vec::with_capacity(srcs.len());
                 for (f, m, _) in &srcs {
                     let mut ks = self.values_or(f, s, d, m);
                     ks.sort_by(cmp_key);
                     ks.dedup();
-                    let mut next = Vec::new();
-                    for c in &combos {
-                        for k in &ks {
-                            let mut c2 = c.clone();
-                            c2.push(k.clone());
-                            next.push(c2);
-                        }
-                    }
-                    combos = next;
+                    per.push(ks);
                 }
-                for c in combos {
+                super::for_each_combination(&per, |c| {
                     let kb = c.capacity() * std::mem::size_of::<Key>() + c.iter().map(Key::heap_bytes).sum::<usize>();
-                    self.push_grouped(name, &mut groups, c, kb, docs.len(), s, (d, sc))?;
-                }
+                    self.push_grouped(name, &mut groups, c, kb, docs.len(), s, (d, sc))
+                })?;
             }
         }
         // Each index stands for one shard (indices default to one): every
@@ -517,31 +605,10 @@ impl<'a, 'b> Ctx<'a, 'b> {
             }
             ka.iter().zip(kb.iter()).map(|(x, y)| cmp_key(x, y)).find(|c| *c != Ordering::Equal).unwrap_or(Ordering::Equal)
         };
-        let mut shard_other = 0u64;
-        let mut merged: HashMap<Vec<Key>, Docs> = HashMap::new();
-        for (_, g) in by_shard {
-            let mut sb: Vec<(Vec<Key>, Bucket)> = g.into_iter().map(|(k, d)| (k, Bucket { key: Key::Null, count: count(&d), docs: d, subs: None })).collect();
-            let shard_total: u64 = sb.iter().map(|(_, b)| b.count).sum();
-            sb.sort_by(shard_cmp);
-            sb.truncate(shard_size);
-            shard_other += shard_total - sb.iter().map(|(_, b)| b.count).sum::<u64>();
-            for (k, b) in sb {
-                let e = merged.entry(k).or_insert_with(|| vec![Vec::new(); docs.len()]);
-                for (s, v) in b.docs.into_iter().enumerate() {
-                    e[s].extend(v);
-                }
-            }
-        }
-        let mut bs: Vec<(Vec<Key>, Bucket)> =
-            merged.into_iter().map(|(k, d)| (k, Bucket { key: Key::Null, count: count(&d), docs: d, subs: None })).filter(|(_, b)| b.count >= min_doc_count).collect();
-        let total: u64 = bs.iter().map(|(_, b)| b.count).sum::<u64>() + shard_other;
-        bs.sort_by(shard_cmp);
-        if order.iter().any(|(k, _)| k != "_count" && k != "_key") {
-            for (_, b) in bs.iter_mut() {
-                b.subs = Some(self.subs(sub, &b.docs)?);
-            }
-        }
-        bs.sort_by(|(ka, a), (kb, b)| {
+        // The requested order (count descending, then key, breaking ties),
+        // used both to pick each shard's candidates and for the result.
+        let bucket_cmp = |x: &(Vec<Key>, Bucket), y: &(Vec<Key>, Bucket)| -> Ordering {
+            let ((ka, a), (kb, b)) = (x, y);
             for (k, asc) in &order {
                 let c = match k.as_str() {
                     "_count" => a.count.cmp(&b.count),
@@ -565,8 +632,49 @@ impl<'a, 'b> Ctx<'a, 'b> {
                     return c;
                 }
             }
-            Ordering::Equal
-        });
+            shard_cmp(x, y)
+        };
+        let mut shard_other = 0u64;
+        let mut merged: HashMap<Vec<Key>, Docs> = HashMap::new();
+        let shards = by_shard.len();
+        // Per truncated shard (count-descending order): its last kept count
+        // and its kept keys, for ES's error bounds.
+        let mut cut: Vec<(u64, std::collections::HashSet<Vec<Key>>)> = Vec::new();
+        for (_, g) in by_shard {
+            let mut sb: Vec<(Vec<Key>, Bucket)> = g.into_iter().map(|(k, d)| (k, Bucket { key: Key::Null, count: count(&d), docs: d, subs: None })).collect();
+            let shard_total: u64 = sb.iter().map(|(_, b)| b.count).sum();
+            if needs_subs && sb.len() > shard_size {
+                for (_, b) in sb.iter_mut() {
+                    b.subs = Some(self.subs(sub, &b.docs)?);
+                }
+            }
+            sb.sort_by(bucket_cmp);
+            let truncated = sb.len() > shard_size;
+            sb.truncate(shard_size);
+            if truncated && count_desc {
+                cut.push((sb.last().map_or(0, |(_, b)| b.count), sb.iter().map(|(k, _)| k.clone()).collect()));
+            }
+            shard_other += shard_total - sb.iter().map(|(_, b)| b.count).sum::<u64>();
+            for (k, b) in sb {
+                let e = merged.entry(k).or_insert_with(|| vec![Vec::new(); docs.len()]);
+                for (s, v) in b.docs.into_iter().enumerate() {
+                    e[s].extend(v);
+                }
+            }
+        }
+        // One shard: its result is the final one (ES reports no error).
+        if shards <= 1 {
+            cut.clear();
+        }
+        let mut bs: Vec<(Vec<Key>, Bucket)> =
+            merged.into_iter().map(|(k, d)| (k, Bucket { key: Key::Null, count: count(&d), docs: d, subs: None })).filter(|(_, b)| b.count >= min_doc_count).collect();
+        let total: u64 = bs.iter().map(|(_, b)| b.count).sum::<u64>() + shard_other;
+        if needs_subs {
+            for (_, b) in bs.iter_mut() {
+                b.subs = Some(self.subs(sub, &b.docs)?);
+            }
+        }
+        bs.sort_by(bucket_cmp);
         bs.truncate(size as usize);
         self.add_buckets(bs.len())?;
         let kept: u64 = bs.iter().map(|(_, b)| b.count).sum();
@@ -583,12 +691,18 @@ impl<'a, 'b> Ctx<'a, 'b> {
             m.insert("key_as_string".into(), json!(kas.join("|")));
             m.insert("doc_count".into(), json!(b.count));
             if show_err {
+                // ES's MultiTermsAggregator builds each shard's result with
+                // a doc count error of 0 (not unknown), which the reduce
+                // (`AbstractInternalTerms.getDocCountError`) then adds as
+                // is: a multi_terms bucket's error is always 0.
                 m.insert("doc_count_error_upper_bound".into(), json!(0));
             }
             m.extend(subs);
             out.push(m);
         }
         apply_parent_pipelines(sub, &mut out)?;
+        // ES: 0 as well (the shards' reported errors, all 0, summed).
+        let _ = &cut;
         Ok(json!({"doc_count_error_upper_bound": 0, "sum_other_doc_count": total - kept, "buckets": out}))
     }
 
@@ -687,7 +801,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
     // rare_terms
 
     fn rare_terms(&self, name: &str, o: &Map<String, Value>, sub: Option<&Map<String, Value>>, docs: &Docs) -> Result<Value> {
-        let f = self.field(field_name(o, name, "rare_terms")?)?;
+        let f = self.source(o, name, "rare_terms")?;
         let max = o.get("max_doc_count").and_then(Value::as_i64).unwrap_or(1);
         if max <= 0 {
             return Err(EsError::illegal_argument(format!("[max_doc_count] must be greater than 0. Found [{max}] in [{name}]")));
@@ -791,6 +905,10 @@ impl<'a, 'b> Ctx<'a, 'b> {
                     if sup_f == 0.0 { 0.0 } else { sub_f / sup_f }
                 }
                 "gnd" => {
+                    // ES `GND.getScore`: a background that is not a
+                    // superset gets the foreground added (a term only the
+                    // foreground holds is not frequency zero).
+                    let (sup_f, sup_n) = if bg_superset { (sup_f, sup_n) } else { (sup_f + sub_f, sup_n + sub_n) };
                     let fx = sup_f;
                     let fy = sub_n;
                     let fxy = sub_f;
@@ -891,7 +1009,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
     // auto_date_histogram
 
     fn auto_date_histogram(&self, name: &str, o: &Map<String, Value>, sub: Option<&Map<String, Value>>, docs: &Docs) -> Result<Value> {
-        let f = self.field(field_name(o, name, "auto_date_histogram")?)?;
+        let f = self.source(o, name, "auto_date_histogram")?;
         let target = o.get("buckets").and_then(Value::as_i64).unwrap_or(10);
         if target <= 0 {
             return Err(EsError::illegal_argument(format!("[buckets] must be greater than 0. Found [{target}] in [{name}]")));
@@ -920,7 +1038,9 @@ impl<'a, 'b> Ctx<'a, 'b> {
         let any_elided = elided.iter().any(|&e| e);
         let restart = || self.auto_date_histogram(name, o, sub, &self.collect_elided(&f, docs));
         let mut scalar = None;
-        if sub.is_none_or(|m| m.is_empty()) && missing.is_none() && super::DOC_WEIGHTS.with(|w| w.borrow().is_none()) {
+        // A cluster shard response returns unit-wide buckets (below).
+        let shard_response = crate::search::aggregation_shard_response();
+        if sub.is_none_or(|m| m.is_empty()) && missing.is_none() && super::DOC_WEIGHTS.with(|w| w.borrow().is_none()) && !shard_response {
             let mut cols = Vec::new();
             let mut ok = true;
             for (s, seg_docs) in docs.iter().enumerate() {
@@ -1043,28 +1163,42 @@ impl<'a, 'b> Ctx<'a, 'b> {
             }
         };
         let choice = super::auto_date::choose(lo, hi, target, min_unit, 0, tz);
+        // A shard response's buckets are one unit wide (its chosen interval
+        // reported as the floor): a multi-unit bucket anchored at this
+        // shard's own minimum need not line up with the coordinator's, which
+        // re-chooses the rounding over every shard and must split nothing
+        // (ES merges consecutive unit buckets only at the final reduce).
+        let reported = choice.interval();
+        let choice = if shard_response { super::auto_date::Choice { mult: 1, ..choice } } else { choice };
         let last_bucket = choice.bucket_of(hi);
         let key_of = |b: i64| choice.key_of(b);
         let nb = (last_bucket + 1) as usize;
-        if nb > self.env.max_buckets {
+        if nb > self.env.max_buckets && !shard_response {
             return Err(EsError::too_many_buckets(self.env.max_buckets));
         }
-        let mut groups: Vec<Docs> = vec![vec![Vec::new(); docs.len()]; nb];
+        // Sparse (only populated unit buckets of a shard response, at most
+        // one per matching value) or dense (every bucket of the range).
+        let mut groups: std::collections::BTreeMap<usize, Docs> = std::collections::BTreeMap::new();
+        if !shard_response {
+            for b in 0..nb {
+                groups.insert(b, vec![Vec::new(); docs.len()]);
+            }
+        }
         let mut seen: HashSet<(usize, usize, DocId)> = HashSet::new();
         for (x, s, d, sc) in vals {
             let b = choice.bucket_of(x) as usize;
             if seen.insert((b, s, d)) {
-                groups[b][s].push((d, sc));
+                groups.entry(b).or_insert_with(|| vec![Vec::new(); docs.len()])[s].push((d, sc));
             }
         }
-        for g in groups.iter_mut() {
+        for g in groups.values_mut() {
             for v in g.iter_mut() {
                 v.sort_by_key(|x| x.0);
             }
         }
-        self.add_buckets(nb)?;
+        self.add_buckets(groups.len())?;
         let mut out = Vec::new();
-        for (b, d) in groups.into_iter().enumerate() {
+        for (b, d) in groups.into_iter() {
             let k = key_of(b as i64);
             let mut m = Map::new();
             m.insert("key_as_string".into(), json!(fmt.format(k, tz)));
@@ -1074,14 +1208,14 @@ impl<'a, 'b> Ctx<'a, 'b> {
             out.push(m);
         }
         apply_parent_pipelines(sub, &mut out)?;
-        Ok(json!({"buckets": out, "interval": choice.interval()}))
+        Ok(json!({"buckets": out, "interval": reported}))
     }
 
     // -----------------------------------------------------------------------
     // variable_width_histogram
 
     fn variable_width_histogram(&self, name: &str, o: &Map<String, Value>, sub: Option<&Map<String, Value>>, docs: &Docs) -> Result<Value> {
-        let f = self.field(field_name(o, name, "variable_width_histogram")?)?;
+        let f = self.source(o, name, "variable_width_histogram")?;
         let k = o.get("buckets").and_then(Value::as_i64).unwrap_or(10);
         if k <= 0 {
             return Err(EsError::illegal_argument(format!("[buckets] must be greater than 0. Found [{k}] in [{name}]")));
@@ -1280,7 +1414,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
     /// `rate` of an already summed `total` over the enclosing date bucket.
     pub(super) fn rate_with_total(&self, name: &str, o: &Map<String, Value>, docs: &Docs, total: f64) -> Result<Value> {
         let parent = DH_PARENT.with(|p| p.borrow().last().cloned());
-        let Some((pfield, rounding)) = parent else {
+        let Some((pfield, rounding, bucket_key)) = parent else {
             return Err(EsError::illegal_argument(format!(
                 "The rate aggregation can only be used inside a date histogram aggregation or composite aggregation with one date histogram value source [{name}]"
             )));
@@ -1290,14 +1424,19 @@ impl<'a, 'b> Ctx<'a, 'b> {
             Some(u) => Some(CalUnit::parse(u).ok_or_else(|| EsError::illegal_argument(format!("Unsupported unit {u}")))?),
         };
         let Some(unit) = unit else { return Ok(json!({"value": fnum(total)})) };
-        // The bucket this rate is computed for: round any doc's parent value.
-        let pf = self.field(&pfield)?;
-        let mut key = None;
-        'outer: for (s, v) in docs.iter().enumerate() {
-            for &(d, _) in v {
-                if let Some(Key::Long(x)) = self.values(&pf, s, d).into_iter().next() {
-                    key = Some(rounding.round(x));
-                    break 'outer;
+        // The bucket this rate is computed for: the parent's own bucket key;
+        // else round any doc's parent value (runtime fields resolved).
+        let mut key = bucket_key;
+        if key.is_none() {
+            let mut po = Map::new();
+            po.insert("field".into(), json!(pfield));
+            let pf = self.source(&po, name, "date_histogram")?;
+            'outer: for (s, v) in docs.iter().enumerate() {
+                for &(d, _) in v {
+                    if let Some(Key::Long(x)) = self.values(&pf, s, d).into_iter().next() {
+                        key = Some(rounding.round(x));
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -1338,7 +1477,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
     // string_stats
 
     fn string_stats(&self, name: &str, o: &Map<String, Value>, docs: &Docs) -> Result<Value> {
-        let f = self.field(field_name(o, name, "string_stats")?)?;
+        let f = self.source(o, name, "string_stats")?;
         let missing = self.missing_key(&f, o.get("missing"))?;
         let show = o.get("show_distribution").and_then(Value::as_bool).unwrap_or(false);
         let mut n = 0u64;
@@ -1395,11 +1534,14 @@ impl<'a, 'b> Ctx<'a, 'b> {
         if tails != 1 && tails != 2 {
             return Err(EsError::illegal_argument(format!("[tails] must be 1 or 2. Found [{tails}] in [{name}]")));
         }
-        let fa = self.field(field_name(a, name, "t_test")?)?;
-        let fb = self.field(field_name(b, name, "t_test")?)?;
+        let fa = self.source(a, name, "t_test")?;
+        let fb = self.source(b, name, "t_test")?;
+        // Each side's `missing` replacement, as for any value source (#625).
+        let ma = self.missing_key(&fa, a.get("missing"))?;
+        let mb = self.missing_key(&fb, b.get("missing"))?;
         // ES (TTestStatsBuilder) keeps Kahan-compensated (count, sum,
         // sumOfSqrs) accumulators, fed in doc order.
-        let stats = |side: &Map<String, Value>, f: &FieldRef| -> Result<(u64, f64, f64)> {
+        let stats = |side: &Map<String, Value>, f: &FieldRef, miss: &Option<Key>| -> Result<(u64, f64, f64)> {
             let d = match side.get("filter") {
                 Some(q) => self.filter_docs(q, docs)?,
                 None => docs.clone(),
@@ -1407,7 +1549,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
             let (mut n, mut sum, mut sq) = (0u64, Kahan::default(), Kahan::default());
             for (s, v) in d.iter().enumerate() {
                 for &(doc, _) in v {
-                    for x in self.values(f, s, doc).iter().filter_map(Key::as_f64) {
+                    for x in self.values_or(f, s, doc, miss).iter().filter_map(Key::as_f64) {
                         n += 1;
                         sum.add(x);
                         sq.add(x * x);
@@ -1424,8 +1566,8 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 let (mut count, mut sum, mut sq) = (0u64, Kahan::default(), Kahan::default());
                 for (s, v) in docs.iter().enumerate() {
                     for &(d, _) in v {
-                        let xa: Vec<f64> = self.values(&fa, s, d).iter().filter_map(Key::as_f64).collect();
-                        let xb: Vec<f64> = self.values(&fb, s, d).iter().filter_map(Key::as_f64).collect();
+                        let xa: Vec<f64> = self.values_or(&fa, s, d, &ma).iter().filter_map(Key::as_f64).collect();
+                        let xb: Vec<f64> = self.values_or(&fb, s, d, &mb).iter().filter_map(Key::as_f64).collect();
                         if xa.is_empty() || xb.is_empty() {
                             continue;
                         }
@@ -1440,7 +1582,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 }
                 ((count, sum.value, sq.value), (0, 0.0, 0.0))
             }
-            "homoscedastic" | "heteroscedastic" => (stats(a, &fa)?, stats(b, &fb)?),
+            "homoscedastic" | "heteroscedastic" => (stats(a, &fa, &ma)?, stats(b, &fb, &mb)?),
             other => return Err(EsError::illegal_argument(format!("Unknown value [{other}] for [type] in [{name}], expected one of [paired, homoscedastic, heteroscedastic]"))),
         };
         let mut v = t_test_value(ty, tails, sa, sb);

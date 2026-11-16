@@ -21,6 +21,7 @@ pub mod util;
 use crate::front::{self, classify::ClusterApi, local_engine, RestReq, RestResp};
 use crate::master::now_millis;
 use crate::node::ClusterNode;
+use elasticsearch_engine::boxed_future::boxed;
 use elasticsearch_cluster::allocation::{ExplainOptions, RerouteFlags};
 use elasticsearch_cluster::health::{self, ActiveShardCount, HealthInputs, HealthStatus, Level, WaitConditions};
 use elasticsearch_cluster::state::ClusterState;
@@ -383,49 +384,49 @@ pub async fn handle(node: &Arc<ClusterNode>, api: ClusterApi, req: &RestReq) -> 
 async fn handle_inner(node: &Arc<ClusterNode>, api: ClusterApi, req: &RestReq) -> RestResp {
     use ClusterApi as C;
     match api {
-        C::Root => root(node, req).await,
-        C::Health => cluster_health(node, req).await,
-        C::State => state_api(node, req).await,
-        C::Settings => settings(node, req).await,
+        C::Root => boxed(|| root(node, req)).await,
+        C::Health => boxed(|| cluster_health(node, req)).await,
+        C::State => boxed(|| state_api(node, req)).await,
+        C::Settings => boxed(|| settings(node, req)).await,
         C::PendingTasks => RestResp::json(200, &json!({"tasks": []})),
-        C::Reroute => front::retry_on_new_master(node, req, move || reroute(node, req)).await,
-        C::AllocationExplain => explain(node, req).await,
-        C::VotingConfigExclusions => voting_exclusions(node, req).await,
-        C::NodesInfo | C::NodesStats | C::NodesHotThreads | C::NodesUsage => nodes::handle(node, req).await,
-        C::NodeShutdown => node_shutdown::handle(node, req).await,
-        C::Autoscaling => autoscaling::handle(node, req).await,
-        C::Dangling => dangling::handle(node, req).await,
-        C::CatNodes => cat_tables::cat_nodes(node, req).await,
+        C::Reroute => boxed(|| front::retry_on_new_master(node, req, move || reroute(node, req))).await,
+        C::AllocationExplain => boxed(|| explain(node, req)).await,
+        C::VotingConfigExclusions => boxed(|| voting_exclusions(node, req)).await,
+        C::NodesInfo | C::NodesStats | C::NodesHotThreads | C::NodesUsage => boxed(|| nodes::handle(node, req)).await,
+        C::NodeShutdown => boxed(|| node_shutdown::handle(node, req)).await,
+        C::Autoscaling => boxed(|| autoscaling::handle(node, req)).await,
+        C::Dangling => boxed(|| dangling::handle(node, req)).await,
+        C::CatNodes => boxed(|| cat_tables::cat_nodes(node, req)).await,
         C::CatMaster => cat_tables::cat_master(node, req),
         C::CatHealth => cat_tables::cat_health(node, req),
-        C::CatShards => cat_tables::cat_shards(node, req).await,
-        C::CatAllocation => cat_tables::cat_allocation(node, req).await,
+        C::CatShards => boxed(|| cat_tables::cat_shards(node, req)).await,
+        C::CatAllocation => boxed(|| cat_tables::cat_allocation(node, req)).await,
         C::CatNodeattrs => cat_tables::cat_nodeattrs(node, req),
-        C::CatFielddata => cat_tables::cat_fielddata(node, req).await,
+        C::CatFielddata => boxed(|| cat_tables::cat_fielddata(node, req)).await,
         C::CatPendingTasks => cat_tables::cat_pending_tasks(req),
-        C::Tasks | C::TaskRethrottle => tasks::handle(node, req).await,
-        C::CatTasks => tasks::cat_tasks(node, req).await,
-        C::CatIndices => cat_tables::cat_indices(node, req).await,
-        C::CatCount => cat_tables::cat_count(node, req).await,
-        C::CatRecovery => cat_tables::cat_recovery(node, req).await,
-        C::Recovery => recovery::indices_recovery(node, req).await,
-        C::Stats => cluster_stats(node, req).await,
-        C::CatSegments => indices_apis::cat_segments(node, req).await,
-        C::FieldCaps => indices_apis::field_caps(node, req).await,
-        C::ShardStores => indices_apis::shard_stores(node, req).await,
-        C::Segments => indices_apis::segments(node, req).await,
+        C::Tasks | C::TaskRethrottle => boxed(|| tasks::handle(node, req)).await,
+        C::CatTasks => boxed(|| tasks::cat_tasks(node, req)).await,
+        C::CatIndices => boxed(|| cat_tables::cat_indices(node, req)).await,
+        C::CatCount => boxed(|| cat_tables::cat_count(node, req)).await,
+        C::CatRecovery => boxed(|| cat_tables::cat_recovery(node, req)).await,
+        C::Recovery => boxed(|| recovery::indices_recovery(node, req)).await,
+        C::Stats => boxed(|| cluster_stats(node, req)).await,
+        C::CatSegments => boxed(|| indices_apis::cat_segments(node, req)).await,
+        C::FieldCaps => boxed(|| indices_apis::field_caps(node, req)).await,
+        C::ShardStores => boxed(|| indices_apis::shard_stores(node, req)).await,
+        C::Segments => boxed(|| indices_apis::segments(node, req)).await,
         C::ClearCache => indices_apis::clear_cache(node, req),
-        C::ResolveCluster => indices_apis::resolve_cluster(node, req).await,
-        C::ReloadSecureSettings => crate::keystore::reload::handle(node, req).await,
-        C::KnnSearch => indices_apis::knn_search(node, req).await,
-        C::Snapshot | C::Slm | C::CatSnapshots | C::CatRepositories => crate::snapshot_api::handle(node, req).await,
-        C::CatThreadPool | C::CatPlugins => local_engine(node, req).await,
+        C::ResolveCluster => boxed(|| indices_apis::resolve_cluster(node, req)).await,
+        C::ReloadSecureSettings => boxed(|| crate::keystore::reload::handle(node, req)).await,
+        C::KnnSearch => boxed(|| indices_apis::knn_search(node, req)).await,
+        C::Snapshot | C::Slm | C::CatSnapshots | C::CatRepositories => boxed(|| crate::snapshot_api::handle(node, req)).await,
+        C::CatThreadPool | C::CatPlugins => boxed(|| local_engine(node, req)).await,
         // Use the configured engine remote aliases after handle() awaited its mirror.
         // Returning an empty object here hid required disconnected remotes.
-        C::RemoteInfo => local_engine(node, req).await,
-        C::DesiredBalance => internal::desired_balance(node, req).await,
-        C::DesiredNodes => desired_nodes::handle(node, req).await,
-        C::PrevalidateNodeRemoval => internal::prevalidate_node_removal(node, req),
+        C::RemoteInfo => boxed(|| local_engine(node, req)).await,
+        C::DesiredBalance => boxed(|| internal::desired_balance(node, req)).await,
+        C::DesiredNodes => boxed(|| desired_nodes::handle(node, req)).await,
+        C::PrevalidateNodeRemoval => boxed(|| internal::prevalidate_node_removal(node, req)).await,
         C::Capabilities => capabilities::handle(node, req),
     }
 }
@@ -688,26 +689,46 @@ async fn reroute(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
     let flags = RerouteFlags { dry_run: p.get("dry_run").map(|v| v != "false").unwrap_or(false), explain: p.get("explain").map(|v| v != "false").unwrap_or(false), retry_failed: p.get("retry_failed").map(|v| v != "false").unwrap_or(false) };
     let body = req.json().unwrap_or(json!({}));
     let ctx = node.master.clone();
-    let st = node.state();
-    let info = ctx.cluster_info.lock().clone();
-    let stores = elasticsearch_cluster::allocation::ShardStoreInfo::from_routing(&st);
-    let result = match ctx.allocation.reroute_commands(&st, &body, flags, now_millis(), &info, &stores) {
-        Ok(r) => r,
-        Err((status, kind, reason)) => return RestResp::error(status, &kind, &reason),
-    };
-    if !flags.dry_run {
-        let body2 = body.clone();
-        let ctx2 = ctx.clone();
+    let result = if flags.dry_run {
+        let st = node.state();
+        let info = ctx.cluster_info.lock().clone();
+        let stores = elasticsearch_cluster::allocation::ShardStoreInfo::from_routing(&st);
+        match ctx.allocation.reroute_commands(&st, &body, flags, now_millis(), &info, &stores) {
+            Ok(r) => r,
+            Err((status, kind, reason)) => return RestResp::error(status, &kind, &reason),
+        }
+    } else {
+        // ES `TransportClusterRerouteAction`: the commands are validated and
+        // applied in one cluster state update task, against the state it
+        // runs on. A pre-check against this node's applied state (which can
+        // trail the master's latest published one) used to reject a command
+        // the real state accepts ("primary is already assigned" while the
+        // primary had left with its node).
+        let outcome: Arc<parking_lot::Mutex<Option<Result<elasticsearch_cluster::allocation::RerouteCommandsResult, (u16, String, String)>>>> = Arc::new(parking_lot::Mutex::new(None));
+        let (body2, ctx2, out2) = (body.clone(), ctx.clone(), outcome.clone());
         let task: elasticsearch_cluster::coordination::StateTask = Box::new(move |s: &ClusterState| {
             let info = ctx2.cluster_info.lock().clone();
             let stores = elasticsearch_cluster::allocation::ShardStoreInfo::from_routing(s);
-            let r = ctx2.allocation.reroute_commands(s, &body2, flags, now_millis(), &info, &stores).map_err(|(_, _, r)| r)?;
-            Ok(ctx2.reroute(&r.state))
+            match ctx2.allocation.reroute_commands(s, &body2, flags, now_millis(), &info, &stores) {
+                Ok(r) => {
+                    let next = ctx2.reroute(&r.state);
+                    *out2.lock() = Some(Ok(r));
+                    Ok(next)
+                }
+                Err((status, kind, reason)) => {
+                    *out2.lock() = Some(Err((status, kind.to_string(), reason.clone())));
+                    Err(reason)
+                }
+            }
         });
-        if let Err(e) = node.coord().submit(task).await {
-            return front::task_error(&e);
+        let submitted = node.coord().submit(task).await;
+        match (outcome.lock().take(), submitted) {
+            (Some(Err((status, kind, reason))), _) => return RestResp::error(status, &kind, &reason),
+            (_, Err(e)) => return front::task_error(&e),
+            (Some(Ok(r)), Ok(_)) => r,
+            (None, Ok(_)) => return RestResp::error(500, "illegal_state_exception", "the reroute task did not run"),
         }
-    }
+    };
     let mut out = json!({"acknowledged": true});
     if flags.explain {
         out["explanations"] = json!(result.explanations);
@@ -757,7 +778,7 @@ async fn explain(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
     };
     let st = node.state();
     let info = node.master.cluster_info.lock().clone();
-    let stores = elasticsearch_cluster::allocation::ShardStoreInfo::from_routing(&st);
+    let stores = node.master.store_info(&st);
     match node.master.allocation.explain(&st, &body, opts, now_millis(), &info, &stores) {
         Ok(v) => RestResp::json(200, &v),
         Err((status, kind, reason)) => RestResp::error(status, &kind, &reason),
@@ -818,7 +839,30 @@ async fn voting_exclusions(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
         if ids.is_empty() == names.is_empty() {
             return RestResp::error(400, "illegal_argument_exception", "Please set node identifiers correctly. One and only one of [node_name], [node_names] and [node_ids] has to be set");
         }
-        node.coord().add_voting_config_exclusions(ids, names).await
+        let timeout = p.get("timeout").and_then(|t| elasticsearch_engine::date::parse_time_value(t)).filter(|t| *t >= 0).map(|t| Duration::from_millis(t as u64)).unwrap_or(Duration::from_secs(30));
+        let r = node.coord().add_voting_config_exclusions(ids.clone(), names.clone()).await;
+        if r.is_ok() {
+            // ES `TransportAddVotingConfigExclusionsAction`: the response
+            // waits until the excluded nodes are out of the committed and
+            // accepted voting configurations; publishing the exclusion
+            // record alone does not make them safe to stop (production
+            // review #289: a live quorum may not allow the removal yet).
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let st = node.state();
+                let c = &st.coordination;
+                let excluded: Vec<String> = c.voting_config_exclusions.iter().filter(|e| ids.contains(&e.node_id) || names.contains(&e.node_name)).map(|e| e.node_id.clone()).collect();
+                if !excluded.is_empty() && excluded.iter().all(|id| !c.last_committed_config.0.contains(id) && !c.last_accepted_config.0.contains(id)) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let what = if ids.is_empty() { names.join(", ") } else { ids.join(", ") };
+                    return RestResp::error(429, "elasticsearch_timeout_exception", &format!("timed out waiting for voting config exclusions [{what}] to take effect"));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        r
     };
     match r {
         Ok(_) => RestResp::new(200,vec![],vec![]),
@@ -934,19 +978,20 @@ async fn cluster_stats(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
         let ccs=match nodes::cluster_ccs_stats(node).await{Ok(v)=>v,Err(e)=>return RestResp::from_es_error(&e)};
         v["ccs"]["_search"] = match take_owned(&mut owner,ccs){Ok(v)=>v,Err(e)=>return RestResp::from_es_error(&e)};
     }
-    // Remotes seeded with this cluster's own address describe this cluster:
-    // the engine filled them from the serving node's local copies, so use
-    // the cluster-wide figures computed above.
-    let totals = json!({
-        "status": v["status"], "nodes_count": v["nodes"]["count"]["total"], "shards_count": v["indices"]["shards"]["total"],
-        "indices_count": v["indices"]["count"], "indices_total_size_in_bytes": v["indices"]["store"]["size_in_bytes"],
-    });
-    if let Some(clusters) = v["ccs"]["clusters"].as_object_mut() {
-        for c in clusters.values_mut() {
-            for (k, t) in totals.as_object().into_iter().flatten() {
-                if c.get(k).is_some() && !t.is_null() {
-                    c[k] = t.clone();
-                }
+    // `include_remotes`: each connected remote cluster's own stats summary
+    // (ES `RemoteClusterStatsResponse`), fetched over its connection.
+    if v["ccs"].is_object() {
+        let include = req.params().get("include_remotes").is_some_and(|x| x.is_empty() || x == "true");
+        if let Some(o) = v["ccs"].as_object_mut() {
+            o.remove("clusters");
+        }
+        if include {
+            let identity = crate::front::ccs::identity(node, req).await;
+            let aliases = crate::remote_cluster::service(node).map(|s| s.aliases()).unwrap_or_default();
+            let stats = futures::future::join_all(aliases.iter().map(|a| crate::remote_cluster::remote_cluster_stats(node, a, identity.clone()))).await;
+            let clusters: serde_json::Map<String, Value> = aliases.into_iter().zip(stats).filter_map(|(a, s)| s.map(|s| (a, s))).collect();
+            if !clusters.is_empty() {
+                v["ccs"]["clusters"] = Value::Object(clusters);
             }
         }
     }

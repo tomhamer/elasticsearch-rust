@@ -176,6 +176,9 @@ pub struct FinalRead {
     pub copies: Vec<Copy>,
     pub passes: usize,
     pub stable: bool,
+    /// The last pass's failure (routing unreadable, a set-up index absent),
+    /// when the read never succeeded twice alike.
+    pub error: Option<String>,
 }
 
 /// Repeat full read passes until two consecutive passes are identical.
@@ -192,20 +195,28 @@ pub struct FinalRead {
 pub async fn read_stable<F, Fut>(mut pass: F, max_passes: usize, pause: Duration) -> FinalRead
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Vec<Copy>>,
+    Fut: std::future::Future<Output = Result<Vec<Copy>, String>>,
 {
     let mut prev: Option<Vec<Copy>> = None;
     let mut n = 0;
     loop {
         n += 1;
-        let cur = pass().await;
-        if prev.as_ref() == Some(&cur) {
-            return FinalRead { copies: cur, passes: n, stable: true };
+        // A failed pass is no evidence (production review #459): it never
+        // counts as stable, and the last failure is reported if no later
+        // passes agree.
+        let (cur, error) = match pass().await {
+            Ok(c) => (Some(c), None),
+            Err(e) => (None, Some(e)),
+        };
+        if cur.is_some() && prev == cur {
+            return FinalRead { copies: cur.unwrap_or_default(), passes: n, stable: true, error: None };
         }
         if n >= max_passes.max(1) {
-            return FinalRead { copies: cur, passes: n, stable: false };
+            return FinalRead { copies: cur.or(prev).unwrap_or_default(), passes: n, stable: false, error };
         }
-        prev = Some(cur);
+        if cur.is_some() {
+            prev = cur;
+        }
         tokio::time::sleep(pause).await;
     }
 }
@@ -213,9 +224,12 @@ where
 /// Read every copy of every index directly from the node holding it
 /// (reads are served by the receiving node when it holds an active copy).
 /// One pass; `read_stable` repeats it until it is quiescent.
-async fn read_copies(api: &Api, ops: &[Op], indices: &[String]) -> Vec<Copy> {
+async fn read_copies(api: &Api, ops: &[Op], indices: &[String]) -> Result<Vec<Copy>, String> {
     let mut copies = Vec::new();
-    let Some(rt) = api.routing().await else { return copies };
+    let Some(rt) = api.routing().await else { return Err("the routing table could not be read".into()) };
+    if let Some(ix) = indices.iter().find(|ix| !rt.started.contains_key(*ix)) {
+        return Err(format!("index {ix} has no started copy in the routing table"));
+    }
     let mut keys: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for o in ops {
         keys.entry(o.index.as_str()).or_default().insert(o.key.as_str());
@@ -255,7 +269,7 @@ async fn read_copies(api: &Api, ops: &[Op], indices: &[String]) -> Vec<Copy> {
             copies.push(cp);
         }
     }
-    copies
+    Ok(copies)
 }
 
 pub async fn run_one(cfg: &Config, scenario: &str, seed: u64) -> RunResult {
@@ -349,10 +363,11 @@ pub async fn run_one(cfg: &Config, scenario: &str, seed: u64) -> RunResult {
     res.converge_secs = converged.as_ref().ok().copied();
     let ops = hist.snapshot();
     let fin = read_stable(|| read_copies(&api, &ops, &indices), 30, Duration::from_secs(2)).await;
-    nem.log("final-read", vec![], vec![], format!("{} pass(es), stable={}", fin.passes, fin.stable));
+    nem.log("final-read", vec![], vec![], format!("{} pass(es), stable={}{}", fin.passes, fin.stable, fin.error.as_deref().map(|e| format!(", error: {e}")).unwrap_or_default()));
     if !fin.stable {
         println!("  final copy read did not stabilise after {} passes", fin.passes);
     }
+    let (final_stable, final_error) = (fin.stable, fin.error.clone());
     let copies = fin.copies;
     stop_monitor.store(true, Ordering::SeqCst);
     let _ = mon_task.await;
@@ -363,7 +378,8 @@ pub async fn run_one(cfg: &Config, scenario: &str, seed: u64) -> RunResult {
     let events = nem.events.lock().clone();
     let windows = nem.windows.lock().clone();
     let crashes = crashes.lock().clone();
-    let verdict = checker::check(&Input { ops: &ops, copies: &copies, obs: &obs, samples: &samples, events: &events, windows: &windows, grace: cfg.grace(), converged: converged.clone(), crashes: &crashes });
+    let evidence = checker::Evidence { expected_indices: indices.clone(), final_stable, final_error, scenario: crate::nemesis::scenario_coverage(scenario, &events) };
+    let verdict = checker::check(&Input { ops: &ops, copies: &copies, obs: &obs, samples: &samples, events: &events, windows: &windows, grace: cfg.grace(), converged: converged.clone(), crashes: &crashes, evidence });
 
     write_jsonl(&dir.join("history.jsonl"), &ops);
     write_jsonl(&dir.join("nemesis.jsonl"), &events);
@@ -584,7 +600,7 @@ mod tests {
     fn g5(copies: &[Copy]) -> Vec<String> {
         let ops = ops();
         let samples = BTreeMap::new();
-        let v = checker::check(&Input { ops: &ops, copies, obs: &[], samples: &samples, events: &[], windows: &[], grace: 5.0, converged: Ok(0.0), crashes: &[] });
+        let v = checker::check(&Input { ops: &ops, copies, obs: &[], samples: &samples, events: &[], windows: &[], grace: 5.0, converged: Ok(0.0), crashes: &[], evidence: checker::Evidence::default() });
         v.violations.iter().filter(|x| x.guarantee == "G5").map(|x| x.kind.clone()).collect()
     }
     async fn replay(passes: Vec<Vec<Copy>>, max: usize) -> FinalRead {
@@ -593,7 +609,7 @@ mod tests {
             || {
                 let mut q = q.lock();
                 let next = if q.len() > 1 { q.pop_front().unwrap() } else { q.front().cloned().unwrap() };
-                async move { next }
+                async move { Ok(next) }
             },
             max,
             Duration::ZERO,
@@ -630,4 +646,53 @@ mod tests {
         assert!(!r.stable);
         assert_eq!(r.passes, 4);
     }
+
+    /// Production review #459: a final read whose routing never answers,
+    /// or that misses a set-up index, is incomplete evidence: it fails
+    /// qualification instead of passing with nothing compared.
+    #[tokio::test]
+    async fn missing_final_evidence_fails_qualification() {
+        let failing = read_stable(|| async { Err::<Vec<Copy>, String>("the routing table could not be read".into()) }, 3, Duration::ZERO).await;
+        assert!(!failing.stable);
+        assert!(failing.copies.is_empty());
+        assert_eq!(failing.error.as_deref(), Some("the routing table could not be read"));
+        let ops = ops();
+        let samples = BTreeMap::new();
+        let verdict = |copies: &[Copy], ev: checker::Evidence| {
+            let v = checker::check(&Input { ops: &ops, copies, obs: &[], samples: &samples, events: &[], windows: &[], grace: 5.0, converged: Ok(0.0), crashes: &[], evidence: ev });
+            v.violations.iter().map(|x| x.kind.clone()).collect::<Vec<_>>()
+        };
+        let expected = vec!["jepsen-a".to_string(), "jepsen-b".to_string()];
+        let k = verdict(&failing.copies, checker::Evidence { expected_indices: expected.clone(), final_stable: failing.stable, final_error: failing.error.clone(), scenario: Ok(()) });
+        assert!(k.contains(&"final-read-failed".to_string()) && k.contains(&"final-read-unstable".to_string()) && k.contains(&"index-missing".to_string()), "{k:?}");
+        // Complete stable evidence for jepsen-a only: jepsen-b is missing.
+        let k = verdict(&settled(), checker::Evidence { expected_indices: expected.clone(), ..Default::default() });
+        assert_eq!(k, vec!["index-missing".to_string()], "{k:?}");
+        // Complete evidence passes.
+        let k = verdict(&settled(), checker::Evidence { expected_indices: vec!["jepsen-a".into()], ..Default::default() });
+        assert!(k.is_empty(), "{k:?}");
+    }
+
+    /// Production review #460: a scenario whose fault failed to apply, or a
+    /// kill-during-recovery that never saw a recovery, does not qualify.
+    #[test]
+    fn unapplied_faults_fail_coverage() {
+        use crate::nemesis::{scenario_coverage, Event};
+        let ev = |kind: &str, detail: &str| Event { t: 1.0, kind: kind.into(), nodes: vec![], roles: vec![], detail: detail.into() };
+        assert!(scenario_coverage("majority-minority", &[ev("partition-failed", "iptables: permission denied")]).is_err());
+        assert!(scenario_coverage("majority-minority", &[]).is_err());
+        assert!(scenario_coverage("majority-minority", &[ev("partition", "split"), ev("heal", "")]).is_ok());
+        assert!(scenario_coverage("kill-during-recovery", &[ev("kill", "x"), ev("recovery", "observed INITIALIZING copy of jepsen-a on n2: false")]).is_err());
+        assert!(scenario_coverage("kill-during-recovery", &[ev("recovery", "observed INITIALIZING copy of jepsen-a on n2: true"), ev("kill", "x")]).is_ok());
+        assert!(scenario_coverage("chaos", &[ev("wipe-failed", "busy")]).is_err());
+        // full-restart applies its fault as `kill-all` / `stop-all`.
+        assert!(scenario_coverage("full-restart", &[ev("kill-all", ""), ev("start", "")]).is_ok());
+        assert!(scenario_coverage("full-restart", &[ev("stop-all", "")]).is_ok());
+        assert!(scenario_coverage("full-restart", &[ev("start", "")]).is_err());
+        let ops = ops();
+        let samples = BTreeMap::new();
+        let v = checker::check(&Input { ops: &ops, copies: &settled(), obs: &[], samples: &samples, events: &[], windows: &[], grace: 5.0, converged: Ok(0.0), crashes: &[], evidence: checker::Evidence { scenario: Err("partition failed".into()), ..Default::default() } });
+        assert!(v.violations.iter().any(|x| x.kind == "fault-not-applied"));
+    }
+
 }

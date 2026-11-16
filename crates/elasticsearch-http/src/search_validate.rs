@@ -58,8 +58,12 @@ pub(crate) fn validate_request(body: &Value, params: &HashMap<String, String>, r
 }
 
 /// `search.max_open_scroll_context` (cluster setting, default 500): ES
-/// counts one context per shard a scroll searches, per node.
-pub(crate) fn check_scroll_contexts(node: &Node, adding: usize) -> Result<()> {
+/// counts one context per shard a scroll searches, per node. Reserves
+/// `adding` contexts of the node's budget (shared by every shard engine of
+/// a cluster node) before any search work; the permit goes in the scroll's
+/// context, and dropping it (a failed search, a clear, an expiry) gives
+/// the contexts back.
+pub(crate) fn check_scroll_contexts(node: &Node, adding: usize) -> Result<elasticsearch_engine::node::ScrollPermit> {
     let max = {
         let cs = node.cluster_settings.read();
         cs.1.get("search.max_open_scroll_context")
@@ -67,14 +71,23 @@ pub(crate) fn check_scroll_contexts(node: &Node, adding: usize) -> Result<()> {
             .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
             .unwrap_or(500) as usize
     };
-    let now = std::time::Instant::now();
-    let open: usize = node.scrolls.lock().values().filter(|s| s.expires > now).map(|s| s.targets.len().max(1)).sum();
-    if open + adding > max {
-        return Err(EsError::new(429, "too_many_scroll_contexts_exception", format!(
-            "Trying to create too many scroll contexts. Must be less than or equal to: [{max}]. This limit can be set by changing the [search.max_open_scroll_context] setting."
-        )));
+    let budget = node.scroll_budget.lock().clone();
+    if let Some(p) = budget.try_reserve(adding, max) {
+        return Ok(p);
     }
-    Ok(())
+    // Expired contexts this engine still holds give their share back first.
+    let now = std::time::Instant::now();
+    let expired: Vec<elasticsearch_engine::node::ScrollCtx> = {
+        let mut m = node.scrolls.lock();
+        let keys: Vec<String> = m.iter().filter(|(_, s)| s.expires <= now).map(|(k, _)| k.clone()).collect();
+        keys.iter().filter_map(|k| m.remove(k)).collect()
+    };
+    drop(expired);
+    budget.try_reserve(adding, max).ok_or_else(|| {
+        EsError::new(429, "too_many_scroll_contexts_exception", format!(
+            "Trying to create too many scroll contexts. Must be less than or equal to: [{max}]. This limit can be set by changing the [search.max_open_scroll_context] setting."
+        ))
+    })
 }
 
 fn cluster_time_setting(node: &Node, key: &str, default_ms: i64) -> i64 {
@@ -91,12 +104,18 @@ mod scroll_total_tests {
     use super::*;
     use serde_json::json;
 
+    /// #384: the cap is reserved atomically, over every engine sharing the
+    /// node's budget; an expired context gives its share back.
     #[test]
     fn open_scroll_contexts_are_capped() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = Node::open(dir.path()).unwrap();
-        node.cluster_settings.write().0.insert("search.max_open_scroll_context".into(), json!("2"));
-        let ctx = |expires| elasticsearch_engine::node::ScrollCtx {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let engines: Vec<std::sync::Arc<Node>> = dirs.iter().map(|d| Node::open(d.path()).unwrap()).collect();
+        // A cluster node's shard engine shares engine 0's budget.
+        *engines[1].scroll_budget.lock() = engines[0].scroll_budget.lock().clone();
+        for e in &engines {
+            e.cluster_settings.write().0.insert("search.max_open_scroll_context".into(), json!("3"));
+        }
+        let ctx = |expires, permit| elasticsearch_engine::node::ScrollCtx {
             targets: Vec::new(),
             req: elasticsearch_engine::search::parse_request(&json!({}), &HashMap::new()).unwrap(),
             cursors: Vec::new(),
@@ -104,16 +123,33 @@ mod scroll_total_tests {
             expires,
             accounting: None,
             lost: Vec::new(),
+            owner: None,
+            permit: Some(permit),
         };
         let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        check_scroll_contexts(&node, 2).unwrap();
-        node.scrolls.lock().insert("a".into(), ctx(later));
-        node.scrolls.lock().insert("old".into(), ctx(std::time::Instant::now()));
-        check_scroll_contexts(&node, 1).unwrap();
-        node.scrolls.lock().insert("b".into(), ctx(later));
-        let e = check_scroll_contexts(&node, 1).unwrap_err();
+        let p = check_scroll_contexts(&engines[0], 2).unwrap();
+        engines[0].scrolls.lock().insert("a".into(), ctx(later, p));
+        // Engine 1 sees engine 0's two contexts.
+        let e = check_scroll_contexts(&engines[1], 2).err().unwrap();
         assert_eq!((e.status, e.kind.as_str()), (429, "too_many_scroll_contexts_exception"));
-        assert!(e.reason.contains("less than or equal to: [2]"), "{}", e.reason);
+        assert!(e.reason.contains("less than or equal to: [3]"), "{}", e.reason);
+        let p = check_scroll_contexts(&engines[1], 1).unwrap();
+        engines[1].scrolls.lock().insert("old".into(), ctx(std::time::Instant::now(), p));
+        // Full; engine 1's expired context makes room for its next scroll.
+        assert!(check_scroll_contexts(&engines[0], 1).is_err());
+        let p = check_scroll_contexts(&engines[1], 1).unwrap();
+        assert!(engines[1].scrolls.lock().is_empty());
+        // A failed first search drops its permit: the contexts come back.
+        drop(p);
+        assert_eq!(engines[0].scroll_budget.lock().open(), 2);
+        // Concurrent starts never pass the cap together.
+        engines[0].scrolls.lock().clear();
+        let held: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8).map(|i| { let e = engines[i % 2].clone(); s.spawn(move || check_scroll_contexts(&e, 1).ok()) }).collect();
+            hs.into_iter().filter_map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(held.len(), 3);
+        assert_eq!(engines[0].scroll_budget.lock().open(), 3);
     }
 
     #[test]
@@ -351,10 +387,7 @@ pub(crate) fn index_boosts(node: &Node, body: &Value, params: &HashMap<String, S
 /// `IndexNameExpressionResolver.checkForRemoteIndexExpression`: APIs that
 /// do not allow remote indices reject `cluster:index` expressions.
 pub(crate) fn reject_remote(expr: &str) -> Result<()> {
-    let is_remote = |e: &str| {
-        let e = e.strip_prefix('-').unwrap_or(e);
-        !e.starts_with('<') && e.find(':').is_some_and(|i| i > 0 && !e[i..].starts_with("::"))
-    };
+    let is_remote = |e: &str| elasticsearch_engine::ccr::remote::is_remote_part(e.strip_prefix('-').unwrap_or(e));
     let parts: Vec<&str> = expr.split(',').map(str::trim).collect();
     if parts.iter().any(|p| is_remote(p)) {
         let remote: Vec<&str> = parts.into_iter().filter(|p| is_remote(p)).collect();

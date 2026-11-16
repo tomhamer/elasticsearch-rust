@@ -67,6 +67,10 @@ pub struct WordDelimiterFilter {
     pub stem_english_possessive: bool,
     /// Tokens that must not be split.
     pub protected_words: HashSet<String>,
+    /// `word_delimiter_graph`: a split token's alternatives spanning
+    /// several positions (the preserved original, catenations) are recorded
+    /// as a token graph for query builders (Lucene's position lengths).
+    pub graph: bool,
 }
 
 impl Default for WordDelimiterFilter {
@@ -82,13 +86,22 @@ impl Default for WordDelimiterFilter {
             preserve_original: false,
             stem_english_possessive: true,
             protected_words: HashSet::new(),
+            graph: false,
         }
     }
 }
 
-/// ES `word_delimiter_graph`: same output texts as
-/// [`WordDelimiterFilter`] (see module docs for positions).
+/// ES `word_delimiter_graph`: [`WordDelimiterFilter`] with
+/// [`WordDelimiterFilter::graph`] set (P2: the original product code stays
+/// an alternative path of an AND / phrase query).
 pub type WordDelimiterGraphFilter = WordDelimiterFilter;
+
+impl WordDelimiterFilter {
+    /// The `word_delimiter_graph` filter with ES defaults.
+    pub fn graph() -> Self {
+        Self { graph: true, ..Self::default() }
+    }
+}
 
 /// One sub-word: char range and type mask.
 struct Part {
@@ -181,6 +194,8 @@ impl TokenFilter for WordDelimiterFilter {
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
         let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
         let mut shift: u32 = 0;
+        let recording = self.graph && super::synonym::recording_graph();
+        let mut groups: Vec<super::synonym::SynonymGraphGroup> = Vec::new();
         for t in tokens {
             let base = t.position + shift;
             if self.protected_words.contains(&t.text) {
@@ -220,7 +235,7 @@ impl TokenFilter for WordDelimiterFilter {
             if self.catenate_all && parts.len() > 1 {
                 let text: String = parts.iter().map(text_of).collect();
                 push(
-                    Token { text, position: base, offset_from: byte_off(parts[0].start), offset_to: byte_off(parts.last().unwrap().end) },
+                    Token { text, position: base, offset_from: byte_off(parts[0].start), offset_to: byte_off(parts.last().unwrap().end), keyword: false },
                     &mut emitted,
                 );
             }
@@ -247,8 +262,7 @@ impl TokenFilter for WordDelimiterFilter {
                                 text,
                                 position: base + run_start as u32,
                                 offset_from: byte_off(run[0].start),
-                                offset_to: byte_off(run[run.len() - 1].end),
-                            },
+                                offset_to: byte_off(run[run.len() - 1].end), keyword: false },
                             &mut emitted,
                         );
                     }
@@ -259,7 +273,7 @@ impl TokenFilter for WordDelimiterFilter {
             for p in &parts {
                 if self.should_generate(p.ty) {
                     push(
-                        Token { text: text_of(p), position: base + next_pos, offset_from: byte_off(p.start), offset_to: byte_off(p.end) },
+                        Token { text: text_of(p), position: base + next_pos, offset_from: byte_off(p.start), offset_to: byte_off(p.end), keyword: false },
                         &mut emitted,
                     );
                     next_pos += 1;
@@ -269,7 +283,40 @@ impl TokenFilter for WordDelimiterFilter {
                 shift += next_pos - 1;
             }
             emitted.sort_by_key(|t| t.position);
+            if self.graph && recording && next_pos > 1 {
+                // Each emitted token spans [position, position + length):
+                // a part one position, the original / catenations the
+                // parts they cover. Every path from the first position to
+                // the end is an alternative of this token.
+                let span = |tok: &Token| -> u32 {
+                    let parts_covered = parts.iter().filter(|p| self.should_generate(p.ty) && byte_off(p.start) >= tok.offset_from && byte_off(p.end) <= tok.offset_to).count() as u32;
+                    parts_covered.max(1)
+                };
+                let edges: Vec<(u32, u32, usize)> = emitted.iter().enumerate().map(|(k, tok)| (tok.position - base, tok.position - base + span(tok), out.len() + k)).collect();
+                let mut paths: Vec<Vec<usize>> = Vec::new();
+                fn walk(at: u32, end: u32, edges: &[(u32, u32, usize)], path: &mut Vec<usize>, paths: &mut Vec<Vec<usize>>) {
+                    if paths.len() >= 64 {
+                        return;
+                    }
+                    if at == end {
+                        paths.push(path.clone());
+                        return;
+                    }
+                    for e in edges.iter().filter(|e| e.0 == at && e.1 <= end) {
+                        path.push(e.2);
+                        walk(e.1, end, edges, path, paths);
+                        path.pop();
+                    }
+                }
+                walk(0, next_pos, &edges, &mut Vec::new(), &mut paths);
+                if paths.len() > 1 {
+                    groups.push(super::synonym::SynonymGraphGroup { paths });
+                }
+            }
             out.extend(emitted);
+        }
+        if self.graph && recording {
+            super::synonym::publish_graph(groups, out.len());
         }
         out
     }
@@ -280,7 +327,7 @@ mod tests {
     use super::*;
 
     fn tok(text: &str, pos: u32) -> Token {
-        Token { text: text.into(), position: pos, offset_from: 0, offset_to: text.len() as u32 }
+        Token { text: text.into(), position: pos, offset_from: 0, offset_to: text.len() as u32, keyword: false }
     }
     fn texts(t: &[Token]) -> Vec<&str> {
         t.iter().map(|t| t.text.as_str()).collect()

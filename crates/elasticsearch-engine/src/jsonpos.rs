@@ -792,6 +792,72 @@ pub fn parse_plain(text: &[u8]) -> Option<Value> {
     serde_json::from_slice::<NoDup>(text).ok().map(|v| v.0)
 }
 
+/// Jackson's `StreamReadConstraints` default `maxNestingDepth`, which ES
+/// keeps for request and document bodies.
+pub const MAX_NESTING_DEPTH: usize = 1000;
+/// Nesting serde_json parses by default (deeper bodies take [`parse_deep`]).
+pub const SERDE_DEPTH: usize = 128;
+
+/// The deepest array / object nesting of a JSON text (strings skipped),
+/// and, past `max`, the 1-based line and column of the first container
+/// opened beyond it. A byte scan: no recursion, nothing allocated.
+pub fn nesting(text: &[u8], max: usize) -> (usize, Option<(usize, usize)>) {
+    let (mut depth, mut deepest, mut in_str, mut esc) = (0usize, 0usize, false, false);
+    let (mut line, mut col) = (1usize, 0usize);
+    for &b in text {
+        if b == b'\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+                if depth > max {
+                    return (depth, Some((line, col)));
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    (deepest, None)
+}
+
+/// ES's error for a body nested deeper than [`MAX_NESTING_DEPTH`].
+pub fn nesting_error(depth: usize, line: usize, col: usize) -> crate::error::EsError {
+    crate::error::EsError::new(400, "x_content_parse_exception", format!(
+        "[{line}:{col}] Document nesting depth ({depth}) exceeds the maximum allowed ({MAX_NESTING_DEPTH}, from `StreamReadConstraints.getMaxNestingDepth()`)"
+    ))
+}
+
+/// [`parse_plain`] for bodies nested deeper than serde's default limit (up
+/// to [`MAX_NESTING_DEPTH`], which the caller checked): serde's recursion
+/// limit lifted, on the guarded parse stack (`crate::parse_depth::guarded`).
+pub fn parse_deep(text: &[u8]) -> serde_json::Result<Value> {
+    crate::parse_depth::guarded(|| {
+        use serde::Deserialize;
+        let mut de = serde_json::Deserializer::from_slice(text);
+        de.disable_recursion_limit();
+        let v = NoDup::deserialize(&mut de)?;
+        de.end()?;
+        Ok(v.0)
+    })
+}
+
 /// A JSON value whose objects have no duplicate keys.
 struct NoDup(Value);
 

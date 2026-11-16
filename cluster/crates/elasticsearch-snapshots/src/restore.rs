@@ -219,13 +219,49 @@ pub struct RestoreIndexPlan {
     pub replaces_closed_index: bool,
 }
 
+/// A data stream the request names (ES `getDataStreamsToRestore`): it is
+/// restored whole, with its backing and failure indices renamed like it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreDataStreamPlan {
+    pub source_name: String,
+    pub target_name: String,
+    /// The snapshot's stream record under the target name, its `indices`
+    /// and `failure_indices` naming the planned target indices.
+    pub record: Value,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestorePlan {
     pub repository: String,
     pub snapshot: SnapshotInfo,
     pub indices: Vec<RestoreIndexPlan>,
     pub global_metadata: Option<Value>,
+    /// The feature states this restore brings back (their current system
+    /// indices are deleted before the restore).
     pub feature_states: Vec<String>,
+    /// Data streams restored whole. A backing index selected by its own
+    /// name only is restored as a plain index: it never joins (or
+    /// replaces) a stream (ES restore semantics).
+    pub data_streams: Vec<RestoreDataStreamPlan>,
+}
+
+/// Cluster metadata custom holding the data stream records.
+pub const DATA_STREAMS_CUSTOM: &str = "data_stream";
+
+/// ES `RestoreService.renameIndex` for a member of a restored data stream:
+/// the `.ds-` / `.fs-` prefix is kept out of the rename, so the member is
+/// renamed exactly like its stream.
+pub fn rename_stream_member(name: &str, pattern: &str, replacement: &str) -> Result<String> {
+    for prefix in [".ds-", ".fs-"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return Ok(format!("{prefix}{}", rename_index(rest, pattern, replacement)?));
+        }
+    }
+    rename_index(name, pattern, replacement)
+}
+
+fn names_of(v: &Value) -> Vec<String> {
+    v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()
 }
 
 impl RestorePlan {
@@ -293,7 +329,77 @@ impl SnapshotsService {
         }
 
         let exprs = if req.indices.is_empty() { vec!["_all".to_string()] } else { req.indices.clone() };
-        let (selected, missing) = resolve_names(&exprs, &info.indices);
+        // Data streams the request names (ES `getDataStreamsToRestore`,
+        // lenient): restored whole. Their names leave the index
+        // expressions and their backing and failure indices join them.
+        let mut streams: BTreeMap<String, Value> = BTreeMap::new();
+        if !info.data_streams.is_empty() {
+            let (requested, _) = resolve_names(&exprs, &info.data_streams);
+            if !requested.is_empty() {
+                let g = r.read_global_metadata(&entry.uuid).await?;
+                for name in requested {
+                    match g["customs"][DATA_STREAMS_CUSTOM].get(&name) {
+                        Some(rec) if rec.is_object() => {
+                            streams.insert(name, rec.clone());
+                        }
+                        _ => {
+                            return Err(SnapshotError::snapshot_restore(&snap_ref, format!("data stream [{name}] is not described by the snapshot's metadata")));
+                        }
+                    }
+                }
+            }
+        }
+        let mut members: BTreeMap<String, ()> = BTreeMap::new();
+        for rec in streams.values() {
+            for m in names_of(&rec["indices"]).into_iter().chain(names_of(&rec["failure_indices"])) {
+                if info.indices.contains(&m) {
+                    members.insert(m, ());
+                }
+            }
+        }
+        let (selected, missing) = if streams.is_empty() {
+            resolve_names(&exprs, &info.indices)
+        } else {
+            let index_exprs: Vec<String> = exprs.iter().filter(|e| !streams.contains_key(e.trim())).cloned().collect();
+            let (mut selected, missing) = if index_exprs.is_empty() { (Vec::new(), Vec::new()) } else { resolve_names(&index_exprs, &info.indices) };
+            for m in members.keys() {
+                if !selected.contains(m) {
+                    selected.push(m.clone());
+                }
+            }
+            (selected, missing)
+        };
+        // Feature states (ES `RestoreService` feature-state selection):
+        // `none` restores none, named ones must be in the snapshot, and
+        // with no selection the global-state flag restores every one.
+        // Their system indices join the selection (production review #393).
+        let mut selected = selected;
+        let fs: Vec<&String> = req.feature_states.iter().filter(|f| !f.is_empty()).collect();
+        let none = fs.iter().any(|f| f.as_str() == "none" || f.as_str() == "_none");
+        if none && fs.len() > 1 {
+            return Err(SnapshotError::snapshot_restore(&snap_ref, "the feature_states value [none] indicates that no feature states should be restored, but other feature states were requested".to_string()));
+        }
+        let chosen: Vec<&crate::snapshot::FeatureState> = if none {
+            Vec::new()
+        } else if fs.is_empty() {
+            if req.include_global_state { info.feature_states.iter().collect() } else { Vec::new() }
+        } else {
+            let absent: Vec<&str> = fs.iter().filter(|f| !info.feature_states.iter().any(|s| &s.feature_name == **f)).map(|f| f.as_str()).collect();
+            if !absent.is_empty() {
+                return Err(SnapshotError::snapshot_restore(&snap_ref, format!("requested feature states [[{}]] are not present in snapshot", absent.join(", "))));
+            }
+            info.feature_states.iter().filter(|s| fs.iter().any(|f| **f == s.feature_name)).collect()
+        };
+        let chosen_names: Vec<String> = chosen.iter().map(|f| f.feature_name.clone()).collect();
+        let mut feature_indices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for f in chosen {
+            feature_indices.extend(f.indices.iter().cloned());
+            for i in &f.indices {
+                if info.indices.contains(i) && !selected.contains(i) {
+                    selected.push(i.clone());
+                }
+            }
+        }
         if let Some(m) = missing.first() {
             if !req.ignore_unavailable {
                 return Err(SnapshotError::index_not_found(m));
@@ -308,6 +414,7 @@ impl SnapshotsService {
         let mut targets = Vec::new();
         for index in &selected {
             let target = match (&req.rename_pattern, &req.rename_replacement) {
+                (Some(p), Some(rep)) if members.contains_key(index) => rename_stream_member(index, p, rep)?,
                 (Some(p), Some(rep)) => rename_index(index, p, rep)?,
                 _ => index.clone(),
             };
@@ -352,7 +459,11 @@ impl SnapshotsService {
                 }
             }
             let mut replaces_closed = false;
-            if let Some(existing) = cluster_indices.get(&target) {
+            // A restored feature state's system indices replace the current
+            // ones, which the caller deletes first (ES `RestoreService`
+            // deletes the feature's existing indices in the same update).
+            let replaced_by_feature = feature_indices.contains(&index) && target == index;
+            if let Some(existing) = cluster_indices.get(&target).filter(|_| !replaced_by_feature) {
                 if existing.open {
                     return Err(SnapshotError::snapshot_restore(
                         &snap_ref,
@@ -391,12 +502,37 @@ impl SnapshotsService {
         }
         let global_metadata =
             if req.include_global_state { Some(r.read_global_metadata(&entry.uuid).await?) } else { None };
+        // Each restored stream under its target name, naming its renamed
+        // members (never the source's: a renamed copy owns its backing and
+        // failure indices, ES `updateDataStream`).
+        let target_of: BTreeMap<&str, &str> = plans.iter().map(|p| (p.source_index.as_str(), p.target_index.as_str())).collect();
+        let mut data_streams = Vec::new();
+        let mut stream_targets: BTreeMap<String, String> = BTreeMap::new();
+        for (name, rec) in &streams {
+            let target = match (&req.rename_pattern, &req.rename_replacement) {
+                (Some(p), Some(rep)) => rename_index(name, p, rep)?,
+                _ => name.clone(),
+            };
+            if let Some(prev) = stream_targets.insert(target.clone(), name.clone()) {
+                return Err(SnapshotError::snapshot_restore(&snap_ref, format!("data streams [{name}] and [{prev}] are renamed into the same data stream [{target}]")));
+            }
+            if renamed.contains_key(&target) {
+                return Err(SnapshotError::snapshot_restore(&snap_ref, format!("data stream [{name}] is renamed into [{target}], the name of a restored index")));
+            }
+            let map = |key: &str| -> Vec<Value> { names_of(&rec[key]).iter().filter_map(|m| target_of.get(m.as_str()).map(|t| json!(t))).collect() };
+            let mut record = rec.clone();
+            record["name"] = json!(target);
+            record["indices"] = Value::Array(map("indices"));
+            record["failure_indices"] = Value::Array(map("failure_indices"));
+            data_streams.push(RestoreDataStreamPlan { source_name: name.clone(), target_name: target, record });
+        }
         Ok(RestorePlan {
             repository: repo.to_string(),
             snapshot: info,
             indices: plans,
             global_metadata,
-            feature_states: req.feature_states.clone(),
+            feature_states: chosen_names,
+            data_streams,
         })
     }
 }
@@ -415,6 +551,15 @@ mod tests {
     }
 
     use super::*;
+
+    /// #104: a restored stream's members are renamed like the stream, the
+    /// `.ds-` / `.fs-` prefix outside the pattern (ES `renameIndex`).
+    #[test]
+    fn stream_members_rename_like_their_stream() {
+        assert_eq!(rename_stream_member(".fs-logs-b-2026.11.01-000002", "^logs-b", "logs-c").unwrap(), ".fs-logs-c-2026.11.01-000002");
+        assert_eq!(rename_stream_member(".ds-logs-b-2026.11.01-000001", "^logs-b", "logs-c").unwrap(), ".ds-logs-c-2026.11.01-000001");
+        assert_eq!(rename_index(".fs-logs-b-2026.11.01-000002", "^logs-b", "logs-c").unwrap(), ".fs-logs-b-2026.11.01-000002");
+    }
 
     #[test]
     fn rename_patterns() {

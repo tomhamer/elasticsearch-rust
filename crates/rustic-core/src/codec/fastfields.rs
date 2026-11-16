@@ -69,6 +69,7 @@
 //! min/max table.
 
 use super::varint::{read_bytes, read_u32_le, read_vint, write_vint};
+use std::sync::Arc;
 use crate::error::{Result, RusticError};
 use crate::fast_fields::FastFields;
 use crate::types::DocId;
@@ -757,17 +758,32 @@ fn delta_packing<T: FastValue>(n: usize, value_at: &dyn Fn(usize) -> T, mins: &[
         let start = b * BLOCK_SIZE;
         let end = (start + BLOCK_SIZE).min(n);
         let plain = cum[b + 1] - cum[b];
-        let off = |i: usize| (bits(value_at(i)).wrapping_sub(bits(m)) / gcd) as i64;
+        let uoff = |i: usize| bits(value_at(i)).wrapping_sub(bits(m)) / gcd;
+        let off = |i: usize| uoff(i) as i64;
+        // Deltas are exact only while every offset is a non-negative i64
+        // and their differences and range fit: else the block stays plain
+        // (a full-width u64 offset must not narrow into the head).
+        let mut exact = (start..end).all(|i| uoff(i) <= i64::MAX as u64);
         let first = off(start);
         let mut dmin = i64::MAX;
         let mut dmax = i64::MIN;
-        for i in start + 1..end {
-            let d = off(i) - off(i - 1);
-            dmin = dmin.min(d);
-            dmax = dmax.max(d);
+        if exact {
+            for i in start + 1..end {
+                match off(i).checked_sub(off(i - 1)) {
+                    Some(d) => {
+                        dmin = dmin.min(d);
+                        dmax = dmax.max(d);
+                    }
+                    None => {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
         }
+        let exact = exact && (end - start <= 1 || dmax.checked_sub(dmin).is_some());
         let plain_head = (0, i32::MIN, [0u16; 3]);
-        let (head, w) = if end - start > 1 && first <= u32::MAX as i64 && dmin > i32::MIN as i64 && dmin <= i32::MAX as i64 {
+        let (head, w) = if exact && end - start > 1 && (0..=u32::MAX as i64).contains(&first) && dmin > i32::MIN as i64 && dmin <= i32::MAX as i64 {
             // Widths dividing 64 (a popcount per bit plane), at most 8 (u16
             // checkpoints hold 192 entries).
             let w = match 64 - ((dmax - dmin) as u64).leading_zeros() { 0 => 0, 1 => 1, 2 => 2, 3 | 4 => 4, 5..=8 => 8, _ => u32::MAX };
@@ -2086,7 +2102,10 @@ impl<'a, T: FastValue> ColumnReader<'a, T> {
         self.present.is_empty() && self.run_dir.is_empty()
     }
 
-    #[inline]
+    // One attribute: with a plain `#[inline]` next to it, `inline(always)`
+    // is ignored (rustc warns), and once the run-directory branch grew these
+    // bodies fat LTO kept them out of line in every doc-value loop (nested
+    // sorts and date histograms 20-50% slower).
     #[inline(always)]
     fn present_word(&self, w: usize) -> u64 {
         if !self.run_dir.is_empty() {
@@ -2134,7 +2153,9 @@ impl<'a, T: FastValue> ColumnReader<'a, T> {
         k
     }
 
-    /// Presence word `w` from the runs.
+    /// Presence word `w` from the runs (out of line: the bitmap path stays
+    /// small enough to inline).
+    #[inline(never)]
     fn run_word(&self, w: usize) -> u64 {
         let (lo, hi) = (w * 64, w * 64 + 64);
         let r = self.run_count();
@@ -2156,12 +2177,18 @@ impl<'a, T: FastValue> ColumnReader<'a, T> {
     #[inline(always)]
     fn present_rank(&self, i: usize) -> usize {
         if !self.run_dir.is_empty() {
-            let k = self.run_find(i);
-            return u32_at(self.runs, 4 * k + 2) + (i - u32_at(self.runs, 4 * k));
+            return self.present_rank_runs(i);
         }
         let w = i / 64;
         let rank = u32::from_le_bytes(self.ranks[w * 4..w * 4 + 4].try_into().unwrap()) as usize;
         rank + (self.present_word(w) & ((1u64 << (i % 64)) - 1)).count_ones() as usize
+    }
+
+    /// [`Self::present_rank`] of a run-directory column (out of line).
+    #[inline(never)]
+    fn present_rank_runs(&self, i: usize) -> usize {
+        let k = self.run_find(i);
+        u32_at(self.runs, 4 * k + 2) + (i - u32_at(self.runs, 4 * k))
     }
 
     /// The docs with a value as bitset words over the column's docs (bit
@@ -2201,7 +2228,6 @@ impl<'a, T: FastValue> ColumnReader<'a, T> {
         Some(RangeDocs { col: self, lower, upper, cur: crate::query::docset::TERMINATED, next: 0, block: 0, state: 0, hint })
     }
 
-    #[inline]
     #[inline(always)]
     pub fn has_value(&self, doc: DocId) -> bool {
         let i = doc as usize;
@@ -2209,10 +2235,16 @@ impl<'a, T: FastValue> ColumnReader<'a, T> {
             return false;
         }
         if !self.run_dir.is_empty() {
-            let k = self.run_find(i);
-            return k < self.run_count() && u32_at(self.runs, 4 * k) <= i;
+            return self.has_value_runs(i);
         }
         self.present.is_empty() || (self.present_word(i / 64) >> (i % 64)) & 1 == 1
+    }
+
+    /// [`Self::has_value`] of a run-directory column (out of line).
+    #[inline(never)]
+    fn has_value_runs(&self, i: usize) -> bool {
+        let k = self.run_find(i);
+        k < self.run_count() && u32_at(self.runs, 4 * k) <= i
     }
 
     /// Document IDs with a value, in ascending order. Sparse columns walk
@@ -3024,8 +3056,36 @@ pub struct NormsReader<'a> {
     num_docs: u32,
     total: u64,
     bytes: &'a [u8],
-    /// [`TAG_CONST_NORMS`]: `bytes`, a run of [`constant_bytes`].
-    run: Option<&'static [u8]>,
+    /// [`TAG_CONST_NORMS`] read through a segment's table: the admitted run
+    /// `bytes` views (freed with the segment's last reader).
+    shared: Option<Arc<ConstRun>>,
+}
+
+/// A constant norms column expanded to one byte per doc: owned by its
+/// segment (the run is freed with it), its memory admitted.
+pub struct ConstRun {
+    bytes: Box<[u8]>,
+    _memory: crate::admission::Reservation,
+}
+
+impl ConstRun {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Per segment, one cell per constant norms column: its run, expanded on
+/// first use.
+pub type ConstNorms = std::collections::HashMap<u16, std::sync::OnceLock<Arc<ConstRun>>>;
+
+/// Whether a directory entry's tag is a norms column.
+pub fn is_norms_tag(tag: u8) -> bool {
+    tag == TAG_NORMS || tag == TAG_CONST_NORMS
+}
+
+/// The [`ConstNorms`] cells of a parsed column directory.
+pub fn const_norms(columns: &[ColumnEntry]) -> ConstNorms {
+    columns.iter().filter(|c| c.tag == TAG_CONST_NORMS).map(|c| (c.field, std::sync::OnceLock::new())).collect()
 }
 
 impl<'a> NormsReader<'a> {
@@ -3034,24 +3094,41 @@ impl<'a> NormsReader<'a> {
         let num_docs = read_u32_le(data, &mut pos)?;
         let total = super::varint::read_u64_le(data, &mut pos)?;
         let bytes = read_bytes(data, &mut pos, num_docs as usize)?;
-        Ok(Self { num_docs, total, bytes, run: None })
+        Ok(Self { num_docs, total, bytes, shared: None })
     }
 
-    /// A constant norms column ([`TAG_CONST_NORMS`]): its bytes are a view
-    /// of a process-wide run of that byte.
+    /// A constant norms column ([`TAG_CONST_NORMS`]) without a segment
+    /// table to keep its run: a view of a process-wide run of that byte
+    /// (directory readers outside a segment, tests).
     pub fn open_constant(data: &[u8]) -> Result<NormsReader<'static>> {
         let mut pos = 0;
         let num_docs = read_u32_le(data, &mut pos)?;
         let total = super::varint::read_u64_le(data, &mut pos)?;
         let value = read_bytes(data, &mut pos, 1)?[0];
         let run = constant_bytes(value, num_docs as usize);
-        Ok(NormsReader { num_docs, total, bytes: run, run: Some(run) })
+        Ok(NormsReader { num_docs, total, bytes: run, shared: None })
     }
 
-    /// A constant column's bytes: a process-wide run, not the segment's
-    /// mapping.
-    pub fn constant_run(&self) -> Option<&'static [u8]> {
-        self.run
+    /// A constant norms column expanded into `cell` (its segment's
+    /// [`ConstNorms`] cell) on first use, the run's bytes admitted before
+    /// they are allocated (charged even past the budget: scoring needs the
+    /// norms) and freed with the segment.
+    pub fn open_constant_in(data: &[u8], cell: &'a std::sync::OnceLock<Arc<ConstRun>>) -> Result<NormsReader<'a>> {
+        let mut pos = 0;
+        let num_docs = read_u32_le(data, &mut pos)?;
+        let total = super::varint::read_u64_le(data, &mut pos)?;
+        let value = read_bytes(data, &mut pos, 1)?[0];
+        let run = cell.get_or_init(|| {
+            let memory = crate::admission::forced(|| crate::admission::shared().reserve(num_docs as u64, "constant norms"))
+                .unwrap_or_else(|_| crate::admission::shared().reserve(0, "constant norms").expect("an empty reservation"));
+            Arc::new(ConstRun { bytes: vec![value; num_docs as usize].into_boxed_slice(), _memory: memory })
+        });
+        Ok(NormsReader { num_docs, total, bytes: &run.bytes, shared: Some(run.clone()) })
+    }
+
+    /// A constant column's segment-owned run (see [`Self::open_constant_in`]).
+    pub fn constant_run(&self) -> Option<Arc<ConstRun>> {
+        self.shared.clone()
     }
 
     pub fn num_docs(&self) -> u32 {
@@ -5366,8 +5443,32 @@ impl ColumnEntry {
 /// Parse the column directory of a fast-field section (what
 /// [`FastFieldsReader::open`] does on every call; segments parse it once
 /// and reuse it through [`FastFieldsReader::with_directory`]).
+/// Parse a fast-field section's column directory. Two layouts:
+/// `vint n, n × (u16 field, u8 tag, vint off, vint len), bodies` (offsets
+/// from the directory's end), or, from [`crate::codec::FAST_TRAILER_SINCE`]
+/// (a merge streaming its columns straight into the segment file), the
+/// directory after the bodies: `0x00, bodies, directory, u64 directory
+/// start` (offsets from the section start). A section of the first
+/// layout starts with its column count: a `0x00` byte only when it is
+/// that one byte (no columns).
 pub fn parse_column_directory(data: &[u8]) -> Result<Vec<ColumnEntry>> {
-    let mut pos = 0;
+    if data.len() > 1 && data[0] == 0 {
+        if data.len() < 9 {
+            return Err(RusticError::Corrupted("fast field trailer truncated".into()));
+        }
+        let at = u64::from_le_bytes(data[data.len() - 8..].try_into().unwrap()) as usize;
+        if at < 1 || at > data.len() - 8 {
+            return Err(RusticError::Corrupted("fast field directory out of range".into()));
+        }
+        return parse_column_entries(&data[..data.len() - 8], at, Some(0));
+    }
+    parse_column_entries(data, 0, None)
+}
+
+/// The directory at `pos` of `data`; offsets from `base`, else from the
+/// directory's end.
+fn parse_column_entries(data: &[u8], mut pos: usize, base: Option<usize>) -> Result<Vec<ColumnEntry>> {
+    let limit = if base.is_some() { pos } else { data.len() };
     let n = read_vint(data, &mut pos)? as usize;
     let mut entries = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
@@ -5377,12 +5478,12 @@ pub fn parse_column_directory(data: &[u8]) -> Result<Vec<ColumnEntry>> {
         let len = read_vint(data, &mut pos)? as usize;
         entries.push((field, tag, off, len));
     }
-    let base = pos;
+    let base = base.unwrap_or(pos);
     let mut out = Vec::with_capacity(entries.len());
     for (field, tag, off, len) in entries {
-        let start = base + off;
-        let end = start + len;
-        if end > data.len() {
+        let start = base.checked_add(off).ok_or_else(|| RusticError::Corrupted("fast field column out of range".into()))?;
+        let end = start.checked_add(len).ok_or_else(|| RusticError::Corrupted("fast field column out of range".into()))?;
+        if end > limit {
             return Err(RusticError::Corrupted("fast field column out of range".into()));
         }
         let sparse = tag == TAG_SPARSE_KEYWORD;
@@ -5432,6 +5533,8 @@ pub fn column_parts(tag: u8, data: &[u8]) -> Result<ColumnParts> {
 pub struct FastFieldsReader<'a> {
     data: &'a [u8],
     columns: std::borrow::Cow<'a, [ColumnEntry]>,
+    /// Segment-owned constant norms runs ([`ConstNorms`]).
+    const_norms: Option<&'a ConstNorms>,
     keyword_tables: Option<&'a std::collections::HashMap<u16, std::sync::OnceLock<Option<KeywordTable>>>>,
     /// Segment-owned: the single-valued numeric columns already opened with
     /// their presence ranks validated ([`ColumnReader::open_checked`]).
@@ -5449,29 +5552,35 @@ pub fn numeric_checks(columns: &[ColumnEntry]) -> NumericChecks {
 
 impl<'a> FastFieldsReader<'a> {
     pub fn open(data: &'a [u8]) -> Result<Self> {
-        Ok(Self { data, columns: std::borrow::Cow::Owned(parse_column_directory(data)?), keyword_tables: None, numeric_checks: None })
+        Ok(Self { data, columns: std::borrow::Cow::Owned(parse_column_directory(data)?), const_norms: None, keyword_tables: None, numeric_checks: None })
     }
 
     /// A reader over `data` with an already parsed directory (no parsing,
     /// no allocation).
     pub fn with_directory(data: &'a [u8], columns: &'a [ColumnEntry]) -> Self {
-        Self { data, columns: std::borrow::Cow::Borrowed(columns), keyword_tables: None, numeric_checks: None }
+        Self { data, columns: std::borrow::Cow::Borrowed(columns), const_norms: None, keyword_tables: None, numeric_checks: None }
     }
 
     /// Segment-owned parsed keyword tables, initialized lazily once per column.
     pub fn with_keyword_tables(data: &'a [u8], columns: &'a [ColumnEntry], keyword_tables: &'a std::collections::HashMap<u16, std::sync::OnceLock<Option<KeywordTable>>>) -> Self {
-        Self { data, columns: std::borrow::Cow::Borrowed(columns), keyword_tables: Some(keyword_tables), numeric_checks: None }
+        Self { data, columns: std::borrow::Cow::Borrowed(columns), const_norms: None, keyword_tables: Some(keyword_tables), numeric_checks: None }
     }
 
     /// [`Self::with_keyword_tables`] that also validates each numeric
     /// column's presence ranks once per segment (`numeric_checks`) instead of
     /// on every open: SQL and ES|QL column reads open a column per batch.
     pub fn with_segment_tables(data: &'a [u8], columns: &'a [ColumnEntry], keyword_tables: &'a std::collections::HashMap<u16, std::sync::OnceLock<Option<KeywordTable>>>, numeric_checks: &'a NumericChecks) -> Self {
-        Self { data, columns: std::borrow::Cow::Borrowed(columns), keyword_tables: Some(keyword_tables), numeric_checks: Some(numeric_checks) }
+        Self { data, columns: std::borrow::Cow::Borrowed(columns), const_norms: None, keyword_tables: Some(keyword_tables), numeric_checks: Some(numeric_checks) }
+    }
+
+    /// Constant norms columns expand into `table` (their segment's).
+    pub fn with_const_norms(mut self, table: &'a ConstNorms) -> Self {
+        self.const_norms = Some(table);
+        self
     }
 
     pub fn empty() -> Self {
-        Self { data: &[], columns: std::borrow::Cow::Borrowed(&[]), keyword_tables: None, numeric_checks: None }
+        Self { data: &[], columns: std::borrow::Cow::Borrowed(&[]), const_norms: None, keyword_tables: None, numeric_checks: None }
     }
 
     #[inline]
@@ -5552,7 +5661,13 @@ impl<'a> FastFieldsReader<'a> {
     pub fn get_norms(&self, field: u16) -> Option<NormsReader<'a>> {
         match self.column(field, TAG_NORMS) {
             Some(b) => NormsReader::open(b).ok(),
-            None => self.column(field, TAG_CONST_NORMS).and_then(|b| NormsReader::open_constant(b).ok()),
+            None => {
+                let b = self.column(field, TAG_CONST_NORMS)?;
+                match self.const_norms.and_then(|t| t.get(&field)) {
+                    Some(cell) => NormsReader::open_constant_in(b, cell).ok(),
+                    None => NormsReader::open_constant(b).ok(),
+                }
+            }
         }
     }
 
@@ -7273,6 +7388,36 @@ mod tests {
     /// A norms column whose docs all have the same length is one byte from
     /// v27 (Lucene's constant norms) and reads as the per-doc column it
     /// replaces; before v27, and for any other column, it stays per doc.
+    /// #300: a block whose offsets reach full u64 width (here u64::MAX
+    /// then 0 after 256 small values) is never narrowed into a delta head:
+    /// every value reads back exactly at v37 and at the current version;
+    /// signed values across the sign boundary too.
+    #[test]
+    fn full_width_offsets_are_not_narrowed() {
+        let mut values: Vec<u64> = (0..256).collect();
+        values.extend([u64::MAX, 0]);
+        let mut signed: Vec<i64> = (0..256).map(|i| i - 128).collect();
+        signed.extend([i64::MIN, i64::MAX]);
+        let n = values.len() as u32;
+        let mut fields = FastFields::new(n);
+        for d in 0..n {
+            fields.u64_column_mut(1).set(d, values[d as usize]);
+            fields.i64_column_mut(2).set(d, signed[d as usize]);
+        }
+        fields.build_all();
+        for version in [36, 37, crate::codec::VERSION] {
+            crate::codec::TEST_WRITE_VERSION.with(|v| v.set(version));
+            let bytes = encode_fast_fields(&fields);
+            crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+            let reader = FastFieldsReader::open(&bytes).unwrap();
+            let (u, i) = (reader.get_u64(1).unwrap(), reader.get_i64(2).unwrap());
+            for d in 0..n {
+                assert_eq!(u.get(d), Some(values[d as usize]), "u64 doc {d} v{version}");
+                assert_eq!(i.get(d), Some(signed[d as usize]), "i64 doc {d} v{version}");
+            }
+        }
+    }
+
     #[test]
     fn constant_norms_roundtrip() {
         for (lengths, docs) in [(vec![3u32], 500u32), (vec![1, 2], 300), (vec![7], 1)] {
@@ -7284,7 +7429,8 @@ mod tests {
             let constant = lengths.len() == 1;
             for version in [crate::codec::CONSTANT_NORMS_SINCE - 1, crate::codec::CONSTANT_NORMS_SINCE] {
                 let bytes = encode_fast_fields_versioned(&ff, docs, version);
-                let r = FastFieldsReader::open(&bytes).unwrap();
+                let table = const_norms(&parse_column_directory(&bytes).unwrap());
+                let r = FastFieldsReader::open(&bytes).unwrap().with_const_norms(&table);
                 let n = r.get_norms(4).unwrap();
                 let small = version >= crate::codec::CONSTANT_NORMS_SINCE && constant;
                 assert_eq!(n.constant_run().is_some(), small, "{lengths:?} v{version}");
@@ -7309,6 +7455,31 @@ mod tests {
         let bytes = encode_fast_fields_versioned(&ff, 10_000, crate::codec::CONSTANT_NORMS_SINCE);
         let r = FastFieldsReader::open(&bytes).unwrap();
         assert!(r.get_norms(1).unwrap().bytes().iter().all(|&b| b == crate::query::bm25::int_to_byte4(2)));
+    }
+
+    /// #301: a constant norms column expands into its segment's table on
+    /// first use only, admitted, shared by its readers, and freed with the
+    /// table (never leaked for the process).
+    #[test]
+    fn constant_norms_are_owned_admitted_and_freed() {
+        let docs = 50_000u32;
+        let mut ff = FastFields::new(0);
+        for i in 0..docs { ff.norms_mut(1).set(i, 3); ff.norms_mut(2).set(i, 5); }
+        ff.set_num_docs(docs);
+        let bytes = encode_fast_fields_versioned(&ff, docs, crate::codec::CONSTANT_NORMS_SINCE);
+        let _budget = crate::admission::private_shared(1 << 30);
+        let budget = crate::admission::shared();
+        let table = const_norms(&parse_column_directory(&bytes).unwrap());
+        {
+            let r = FastFieldsReader::open(&bytes).unwrap().with_const_norms(&table);
+            assert_eq!(budget.used(), 0, "nothing expanded before use");
+            let (a, b) = (r.get_norms(1).unwrap(), r.get_norms(1).unwrap());
+            assert_eq!(a.bytes().as_ptr(), b.bytes().as_ptr(), "one run per column");
+            assert_eq!(budget.used(), docs as u64, "admitted: field 1 only");
+            assert!(a.bytes().iter().all(|&x| x == crate::query::bm25::int_to_byte4(3)));
+        }
+        drop(table);
+        assert_eq!(budget.used(), 0, "freed with the segment's table");
     }
 
     #[test]

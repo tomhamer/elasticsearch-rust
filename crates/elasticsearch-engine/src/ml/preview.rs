@@ -91,17 +91,30 @@ fn run(node: &Node, df: &Value, job: &Value, start: Option<i64>, end: Option<i64
 }
 
 /// The documents a datafeed sends for `[start, end)` (time field as epoch
-/// millis), at most `size` of them in time order. Used by the preview and
-/// the datafeed runner.
+/// millis), at most `size` of them in time order (the preview: the first
+/// page). The datafeed runner pages through a window with [`Extractor`].
 pub fn fetch(node: &Node, df: &Value, job: &Value, start: Option<i64>, end: Option<i64>, size: usize) -> Result<Value> {
-    let time_field = job["data_description"]["time_field"].as_str().unwrap_or("time").to_string();
-    let indices: Vec<String> = df["indices"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect();
-    // A concrete missing index is a 404 (ES fails the preview search).
-    for i in &indices {
+    if df.get("aggregations").is_some_and(Value::is_object) {
+        // The preview: the first page of a composite aggregation.
+        return fetch_aggregated(node, df, job, start, end, None).map(|(docs, _)| Value::Array(docs));
+    }
+    check_indices(node, df)?;
+    let src = Source::new(df, job);
+    let resp = super::search(node, &src.target, &src.body(df, start, end, size))?;
+    Ok(Value::Array(resp["hits"]["hits"].as_array().into_iter().flatten().map(|h| src.doc(h)).collect()))
+}
+
+/// A concrete missing index is a 404 (ES fails the preview search).
+fn check_indices(node: &Node, df: &Value) -> Result<()> {
+    for i in df["indices"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         if !i.contains('*') && node.resolve(i, crate::node::ResolveOpts { allow_no_indices: true, ..Default::default() }).map(|t| t.is_empty()).unwrap_or(true) {
             return Err(EsError::index_not_found(i));
         }
     }
+    Ok(())
+}
+
+fn time_query(df: &Value, time_field: &str, start: Option<i64>, end: Option<i64>) -> Value {
     let mut range = Map::new();
     if let Some(s) = start {
         range.insert("gte".into(), json!(s));
@@ -110,49 +123,45 @@ pub fn fetch(node: &Node, df: &Value, job: &Value, start: Option<i64>, end: Opti
         range.insert("lt".into(), json!(e));
     }
     range.insert("format".into(), json!("epoch_millis"));
-    let query = json!({"bool": {"filter": [df["query"].clone(), {"range": {time_field.clone(): range}}]}});
-    let target = indices.join(",");
-    if let Some(aggs) = df.get("aggregations").filter(|a| a.is_object()) {
-        let mut search = json!({"size": 0, "query": query, "aggs": aggs});
+    json!({"bool": {"filter": [df["query"].clone(), {"range": {time_field.to_string(): range}}]}})
+}
+
+/// The source side of a scroll datafeed: its indices, the fields it sends
+/// and how a hit becomes a document.
+struct Source {
+    target: String,
+    time_field: String,
+    fields: Vec<String>,
+}
+
+impl Source {
+    fn new(df: &Value, job: &Value) -> Source {
+        let time_field = job["data_description"]["time_field"].as_str().unwrap_or("time").to_string();
+        let target = df["indices"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(",");
+        let mut fields = vec![time_field.clone()];
+        fields.extend(analysis_fields(job).into_iter().filter(|f| *f != time_field));
+        Source { target, time_field, fields }
+    }
+
+    /// Time-ordered search of `[start, end)`.
+    fn body(&self, df: &Value, start: Option<i64>, end: Option<i64>, size: usize) -> Value {
+        let tf = &self.time_field;
+        let mut search = json!({"size": size, "query": time_query(df, tf, start, end), "sort": [{tf.clone(): {"order": "asc"}}], "_source": false,
+            "fields": self.fields.iter().map(|f| if f == tf { json!({"field": f, "format": "epoch_millis"}) } else { json!({"field": f}) }).collect::<Vec<_>>()});
         if let Some(rm) = df.get("runtime_mappings") {
             search["runtime_mappings"] = rm.clone();
         }
-        let resp = super::search(node, &target, &search)?;
-        let summary = job["analysis_config"]["summary_count_field_name"].as_str().map(str::to_string);
-        let include_doc_count = summary.as_deref() == Some("doc_count");
-        let mut out = Vec::new();
-        for (name, agg) in resp["aggregations"].as_object().into_iter().flatten() {
-            let _ = name;
-            for b in agg["buckets"].as_array().into_iter().flatten() {
-                if b["doc_count"].as_i64().unwrap_or(0) == 0 {
-                    continue;
-                }
-                let mut base = Map::new();
-                let t = b.get(&time_field).and_then(|m| m["value"].as_f64()).or_else(|| b["key"].as_f64()).unwrap_or(0.0);
-                base.insert(time_field.clone(), json!(t as i64));
-                flatten_bucket(b, base, &time_field, include_doc_count, &mut out);
-            }
+        if let Some(sf) = df.get("script_fields") {
+            search["script_fields"] = sf.clone();
         }
-        return Ok(Value::Array(out));
+        search
     }
-    let fields = analysis_fields(job);
-    let mut all = vec![time_field.clone()];
-    all.extend(fields.iter().filter(|f| **f != time_field).cloned());
-    let mut search = json!({"size": size, "query": query, "sort": [{time_field.clone(): {"order": "asc"}}], "_source": false,
-        "fields": all.iter().map(|f| if *f == time_field { json!({"field": f, "format": "epoch_millis"}) } else { json!({"field": f}) }).collect::<Vec<_>>()});
-    if let Some(rm) = df.get("runtime_mappings") {
-        search["runtime_mappings"] = rm.clone();
-    }
-    if let Some(sf) = df.get("script_fields") {
-        search["script_fields"] = sf.clone();
-    }
-    let resp = super::search(node, &target, &search)?;
-    let mut out = Vec::new();
-    for h in resp["hits"]["hits"].as_array().into_iter().flatten() {
+
+    fn doc(&self, h: &Value) -> Value {
         let mut doc = Map::new();
-        for f in &all {
+        for f in &self.fields {
             let Some(arr) = h["fields"].get(f).and_then(Value::as_array) else { continue };
-            let v = if *f == time_field {
+            let v = if *f == self.time_field {
                 let first = arr.first().cloned().unwrap_or(Value::Null);
                 match &first {
                     Value::String(s) => s.split('.').next().and_then(|x| x.parse::<i64>().ok()).map(|x| json!(x)).unwrap_or(first),
@@ -165,9 +174,201 @@ pub fn fetch(node: &Node, df: &Value, job: &Value, start: Option<i64>, end: Opti
             };
             doc.insert(f.clone(), v);
         }
-        out.push(Value::Object(doc));
+        Value::Object(doc)
     }
-    Ok(Value::Array(out))
+}
+
+/// Extracts one datafeed search window `[start, end)` (ES
+/// `ScrollDataExtractor` / `AggregationDataExtractor`): a scroll in time
+/// order, so documents sharing a timestamp are never skipped or repeated
+/// across pages. A failed page leaves the extractor where it was; the next
+/// call retries it.
+pub struct Extractor {
+    df: Value,
+    end: i64,
+    start: i64,
+    size: usize,
+    aggregated: bool,
+    agg_done: bool,
+    /// A composite aggregation's `after_key` of the last page handed out.
+    after: Option<Value>,
+    source: Source,
+    scroll: Option<super::Scroll>,
+    /// Timestamp of the last document handed out, and the identities
+    /// (`_index` / `_id`) of the documents with it that were handed out, to
+    /// resume a lost scroll exactly: a reopened search from that timestamp
+    /// skips exactly those, so a deleted or newly inserted tied document
+    /// neither hides an unread one nor is repeated.
+    last: Option<(i64, std::collections::HashSet<String>)>,
+    /// A reopened scroll is still at `last`'s timestamp.
+    resuming: bool,
+}
+
+/// A hit's identity across searches (`_index` and `_id`).
+fn identity(h: &Value) -> String {
+    format!("{}\u{0}{}", h["_index"].as_str().unwrap_or(""), h["_id"].as_str().unwrap_or(""))
+}
+
+impl Extractor {
+    pub fn new(df: &Value, job: &Value, start: i64, end: i64, size: usize) -> Extractor {
+        let aggregated = df.get("aggregations").is_some_and(Value::is_object);
+        Extractor { df: df.clone(), end, start, size, aggregated, agg_done: false, after: None, source: Source::new(df, job), scroll: None, last: None, resuming: false }
+    }
+
+    /// The next documents of the window; empty once it is exhausted.
+    pub fn next(&mut self, node: &Node, job: &Value) -> Result<Vec<Value>> {
+        if self.aggregated {
+            // One search (one page of a composite aggregation, resumed
+            // after the last page's `after_key`) per call; a failed or
+            // partial page leaves the position where it was.
+            while !self.agg_done {
+                let (docs, after) = fetch_aggregated(node, &self.df, job, Some(self.start), Some(self.end), self.after.as_ref())?;
+                match after {
+                    Some(a) => self.after = Some(a),
+                    None => self.agg_done = true,
+                }
+                if !docs.is_empty() {
+                    return Ok(docs);
+                }
+            }
+            return Ok(Vec::new());
+        }
+        loop {
+            if self.scroll.is_none() {
+                check_indices(node, &self.df)?;
+                let from = self.last.as_ref().map(|(t, _)| *t).unwrap_or(self.start);
+                let body = self.source.body(&self.df, Some(from), Some(self.end), self.size);
+                self.scroll = Some(super::Scroll::new(&self.source.target, body));
+            }
+            let scroll = self.scroll.as_mut().expect("scroll opened above");
+            let hits = match scroll.next_page(node) {
+                Ok(h) => h,
+                Err(e) => {
+                    if scroll.lost() {
+                        // Reopen from the last timestamp, skipping the
+                        // documents at it that were already handed out.
+                        self.scroll = None;
+                        self.resuming = self.last.is_some();
+                    }
+                    return Err(e);
+                }
+            };
+            if hits.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut docs = Vec::with_capacity(hits.len());
+            for h in &hits {
+                let doc = self.source.doc(h);
+                let ts = doc.get(&self.source.time_field).and_then(Value::as_i64);
+                let id = identity(h);
+                if self.resuming {
+                    match (&self.last, ts) {
+                        (Some((t, seen)), Some(x)) if x == *t => {
+                            if seen.contains(&id) {
+                                continue;
+                            }
+                        }
+                        _ => self.resuming = false,
+                    }
+                }
+                if let Some(t) = ts {
+                    match &mut self.last {
+                        Some((l, seen)) if *l == t => {
+                            seen.insert(id);
+                        }
+                        last => *last = Some((t, std::iter::once(id).collect())),
+                    }
+                }
+                docs.push(doc);
+            }
+            if !docs.is_empty() {
+                return Ok(docs);
+            }
+        }
+    }
+}
+
+impl Extractor {
+    /// Tests: lose the open scroll's position.
+    #[cfg(test)]
+    pub(crate) fn lose_scroll(&mut self) {
+        if let Some(s) = self.scroll.as_mut() {
+            s.lose();
+        }
+    }
+}
+
+/// The datafeed's top-level composite aggregation: its name and the names
+/// of its `date_histogram` sources.
+fn composite_of(aggs: &Value) -> Option<(String, Vec<String>)> {
+    aggs.as_object()?.iter().find_map(|(name, a)| {
+        let sources = a.get("composite")?["sources"].as_array().cloned().unwrap_or_default();
+        let dates = sources.iter().filter_map(Value::as_object).flat_map(|s| s.iter()).filter(|(_, v)| v.get("date_histogram").is_some()).map(|(k, _)| k.clone()).collect();
+        Some((name.clone(), dates))
+    })
+}
+
+/// One search of an aggregated datafeed over `[start, end)` (a composite
+/// aggregation: the page after `after`): the flattened rows, and the
+/// composite's next `after_key` (`None` once its pages are exhausted, and
+/// for other aggregations). A partial response (shard failures, timeout)
+/// is an error: the runner retries the window rather than analysing part
+/// of it.
+fn fetch_aggregated(node: &Node, df: &Value, job: &Value, start: Option<i64>, end: Option<i64>, after: Option<&Value>) -> Result<(Vec<Value>, Option<Value>)> {
+    check_indices(node, df)?;
+    let time_field = job["data_description"]["time_field"].as_str().unwrap_or("time").to_string();
+    let target = df["indices"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(",");
+    let mut aggs = df["aggregations"].clone();
+    let composite = composite_of(&aggs);
+    if let (Some((name, _)), Some(after)) = (&composite, after) {
+        aggs[name.as_str()]["composite"]["after"] = after.clone();
+    }
+    let mut search = json!({"size": 0, "query": time_query(df, &time_field, start, end), "aggs": aggs});
+    if let Some(rm) = df.get("runtime_mappings") {
+        search["runtime_mappings"] = rm.clone();
+    }
+    #[allow(unused_mut)]
+    let mut resp = super::search(node, &target, &search)?;
+    #[cfg(test)]
+    if partial_left(&format!("{}#{target}", node.data.display())) {
+        // A 200 response one shard of which failed.
+        resp["_shards"]["failed"] = json!(1);
+    }
+    super::require_complete(&resp)?;
+    let summary = job["analysis_config"]["summary_count_field_name"].as_str().map(str::to_string);
+    let include_doc_count = summary.as_deref() == Some("doc_count");
+    let mut out = Vec::new();
+    let mut next = None;
+    for (name, agg) in resp["aggregations"].as_object().into_iter().flatten() {
+        let buckets = agg["buckets"].as_array().cloned().unwrap_or_default();
+        let dates: Option<&Vec<String>> = composite.as_ref().filter(|(n, _)| n == name).map(|(_, d)| d);
+        if dates.is_some() && !buckets.is_empty() {
+            next = agg.get("after_key").filter(|k| !k.is_null()).cloned();
+        }
+        for b in &buckets {
+            if b["doc_count"].as_i64().unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut base = Map::new();
+            let key_time = match dates {
+                // Composite: the date_histogram source's key is the bucket
+                // time; every other source's key is a field of the row.
+                Some(dates) => {
+                    for (src, v) in b["key"].as_object().into_iter().flatten() {
+                        if !dates.contains(src) && !v.is_null() {
+                            base.insert(src.clone(), v.clone());
+                        }
+                    }
+                    dates.iter().find_map(|d| b["key"][d.as_str()].as_f64())
+                }
+                None => b["key"].as_f64(),
+            };
+            let t = b.get(&time_field).and_then(|m| m["value"].as_f64()).or(key_time).unwrap_or(0.0);
+            base.insert(time_field.clone(), json!(t as i64));
+            flatten_bucket(b, base, &time_field, include_doc_count, &mut out);
+        }
+    }
+    Ok((out, next))
 }
 
 fn flatten_bucket(b: &Value, base: Map<String, Value>, time_field: &str, include_doc_count: bool, out: &mut Vec<Value>) {
@@ -201,5 +402,22 @@ fn flatten_bucket(b: &Value, base: Map<String, Value>, time_field: &str, include
             d.insert(name.clone(), sb["key"].clone());
             flatten_bucket(sb, d, time_field, include_doc_count, out);
         }
+    }
+}
+
+/// Test builds: searches of these targets (`<node data>#<target>`) answer
+/// partially (one shard failed) this many more times.
+#[cfg(test)]
+pub(crate) static PARTIAL: parking_lot::Mutex<Vec<(String, u32)>> = parking_lot::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn partial_left(target: &str) -> bool {
+    let mut p = PARTIAL.lock();
+    match p.iter_mut().find(|(t, n)| t == target && *n > 0) {
+        Some(e) => {
+            e.1 -= 1;
+            true
+        }
+        None => false,
     }
 }

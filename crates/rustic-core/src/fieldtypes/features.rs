@@ -57,9 +57,12 @@ impl FeatureFunction {
         match *self {
             FeatureFunction::Saturation { pivot } => s / (s + pivot),
             FeatureFunction::Log { scaling_factor } => (scaling_factor + s).ln(),
+            // Lucene `FeatureField.SigmoidFunction`: powers in double
+            // precision, `1 - p^a / (S^a + p^a)` (finite for every valid
+            // feature and parameter; 0.5 at S = pivot).
             FeatureFunction::Sigmoid { pivot, exponent } => {
-                let a = s.powf(exponent);
-                a / (a + pivot.powf(exponent))
+                let pa = (pivot as f64).powf(exponent as f64);
+                (1.0 - pa / ((s as f64).powf(exponent as f64) + pa)) as f32
             }
             FeatureFunction::Linear => s,
         }
@@ -84,5 +87,9 @@ mod tests {
         assert_eq!(FeatureFunction::Linear.score(3.0), 3.0);
         assert!((FeatureFunction::Log { scaling_factor: 1.0 }.score(std::f32::consts::E - 1.0) - 1.0).abs() < 1e-6);
         assert_eq!(FeatureFunction::Sigmoid { pivot: 2.0, exponent: 1.0 }.score(2.0), 0.5);
+        // #453: 2^140 overflows f32, not f64.
+        assert_eq!(FeatureFunction::Sigmoid { pivot: 16384.0, exponent: 10.0 }.score(16384.0), 0.5);
+        let s = FeatureFunction::Sigmoid { pivot: 16384.0, exponent: 10.0 };
+        assert!(s.score(8192.0) < 0.5 && s.score(32768.0) > 0.5 && s.score(1e30).is_finite());
     }
 }

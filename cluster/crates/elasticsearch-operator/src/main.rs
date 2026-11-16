@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
     let client = kube::Client::try_default().await?;
     tracing::info!(namespace = ?namespace, default_image_repository = %repo, "starting elasticsearch-operator");
-    let ctx = controller::Context { client, default_image_repository: repo, es_client: controller::http_es_client_factory(Duration::from_secs(timeout)) };
+    let ctx = controller::Context { client, default_image_repository: repo, es_client: controller::https_es_client_factory(Duration::from_secs(timeout)) };
     controller::run(ctx, namespace).await;
     Ok(())
 }

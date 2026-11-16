@@ -10,7 +10,7 @@ use crate::error::{EsError, Result};
 use crate::mapping::FieldLookup;
 use crate::query::dsl::QueryContext;
 use parking_lot::Mutex;
-use rustic_core::query::{BoostMode, CustomQuery, PreparedScoreFunction, DocSet, Explanation, LeafReader, Query, ScoreFunction, ScoreMode, Scorer, SearchContext, TERMINATED};
+use rustic_core::query::{BoostMode, CustomQuery, FactorAcc, PreparedScoreFunction, DocSet, Explanation, LeafReader, Query, ScoreFunction, ScoreMode, Scorer, SearchContext, TERMINATED};
 use rustic_core::types::DocId;
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -81,8 +81,18 @@ struct ScriptFilter {
     boost: f32,
 }
 
-/// Skips hidden nested child docs: a top-level script never runs on them
-/// (ES ANDs a non-nested filter in front of the query).
+/// Docs of `leaf` outside the nested scope the scorer is being built in
+/// (empty: the leaf has no nested docs). A top-level script never runs on
+/// hidden nested child docs (ES ANDs a non-nested filter in front of the
+/// query); inside a `nested` query it runs on exactly that path's docs
+/// (the nested type filter of `ToParentBlockJoinQuery`'s child query).
+fn out_of_scope(leaf: &LeafReader<'_>) -> Vec<bool> {
+    let Some(info) = leaf.nested_info() else { return Vec::new() };
+    let scope = rustic_core::query::nested_scope_ord();
+    (0..leaf.num_docs()).map(|d| info.ord(d) != scope).collect()
+}
+
+/// Skips the docs outside the scorer's nested scope ([`out_of_scope`]).
 struct RootOnly {
     inner: Box<dyn Scorer>,
     nested: Vec<bool>,
@@ -93,7 +103,7 @@ impl RootOnly {
         if leaf.nested_info().is_none() {
             return inner;
         }
-        let nested = (0..leaf.num_docs()).map(|d| !leaf.is_root(d)).collect();
+        let nested = out_of_scope(leaf);
         Box::new(RootOnly { inner, nested })
     }
     fn skip(&mut self, mut d: DocId) -> DocId {
@@ -194,7 +204,7 @@ impl CustomQuery for ScriptFilter {
     fn scorer(&self, leaf: &LeafReader<'_>, _ctx: &SearchContext) -> Option<Box<dyn Scorer>> {
         let exec = self.b.executor(leaf);
         // `cur` starts "before the first doc": advance() moves to 0.
-        let nested = if leaf.nested_info().is_some() { (0..leaf.num_docs()).map(|d| !leaf.is_root(d)).collect() } else { Vec::new() };
+        let nested = out_of_scope(leaf);
         let mut s = ScriptFilterScorer { exec, b: self.b.clone(), num_docs: leaf.num_docs(), cur: TERMINATED, boost: self.boost, nested };
         s.cur = TERMINATED;
         Some(Box::new(FirstAdvance { inner: s, started: false }))
@@ -448,7 +458,7 @@ pub fn script_score_query(body: &Value, ctx: &QueryContext, parse: &dyn Fn(&Valu
     let s = o.get("script").ok_or_else(|| EsError::parsing("[script_score] requires 'script' field").with("line", 1).with("col", 1))?;
     let inner = parse(q, ctx)?;
     let script = super::compile_search_script(s, ScriptContext::Score)?;
-    let min_score = o.get("min_score").and_then(Value::as_f64).map(|x| x as f32);
+    let min_score = o.get("min_score").and_then(num_f32);
     let b = Binding::new(script, ctx);
     let boost = boost_of(o)?;
     let bulk_ok = min_score.is_none() && boost.is_finite() && boost > 0.0 && b.runtime.is_none() && b.cancel.is_none();
@@ -557,6 +567,15 @@ impl Prep {
             Prep::Script { exec, weight } => Some(super::execute_score(exec, doc, score)? * *weight),
         })
     }
+
+    /// The function's `weight` (1 unless set): what `avg` divides by.
+    fn weight(&self) -> f64 {
+        match self {
+            Prep::Core(p) => p.weight_of(),
+            Prep::Filtered { inner, .. } => inner.weight(),
+            Prep::Script { weight, .. } => *weight,
+        }
+    }
 }
 
 struct FsScorer {
@@ -571,61 +590,45 @@ struct FsScorer {
     boost_mode: BoostMode,
     max_boost: f32,
     min_score: Option<f32>,
-    boost: f32,
     cur: f32,
+    /// Where an invalid (negative or NaN) score is reported, as the generic
+    /// function_score scorer reports it.
+    invalid: std::sync::Arc<parking_lot::Mutex<Option<(DocId, f32)>>>,
 }
 
 // SAFETY: see `Executor` (single-owner reference-counted state).
 unsafe impl Send for FsScorer {}
 
 impl FsScorer {
+    /// The score of `d`: the inner query's score (its `boost` and any
+    /// enclosing boost folded in, as ES's `FunctionScoreQuery` passes the
+    /// boost to its sub-query's weight) met by `boost_mode` with the
+    /// applicable functions combined
+    /// as the generic scorer combines them ([`FactorAcc`]: `avg` over the
+    /// sum of the weights, `first` evaluating no later function), capped
+    /// at `max_boost`, then met with the query score by `boost_mode`.
     fn compute(&mut self, d: DocId) -> std::result::Result<f32, (usize, Box<super::ScriptErr>)> {
         let q = self.inner.score();
-        // Function values: on the stack for the usual few functions.
-        let mut buf = [0f64; 8];
-        let mut heap: Vec<f64> = Vec::new();
-        let mut n = 0usize;
+        let mut acc = FactorAcc::new(self.score_mode);
         for (i, p) in self.preps.iter_mut().enumerate() {
             match p.eval(d, q) {
                 Ok(Some(v)) => {
-                    if n < buf.len() {
-                        buf[n] = v;
-                    } else {
-                        if n == buf.len() {
-                            heap.extend_from_slice(&buf);
-                        }
-                        heap.push(v);
+                    if !acc.push(v, p.weight()) {
+                        break;
                     }
-                    n += 1;
                 }
                 Ok(None) => {}
                 Err(e) => return Err((i, e)),
             }
         }
-        let parts: &[f64] = if n <= buf.len() { &buf[..n] } else { &heap };
-        let f = if parts.is_empty() {
-            1.0
-        } else {
-            match self.score_mode {
-                ScoreMode::Multiply => parts.iter().product(),
-                ScoreMode::Sum => parts.iter().sum(),
-                ScoreMode::Avg => parts.iter().sum::<f64>() / parts.len() as f64,
-                ScoreMode::First => parts[0],
-                ScoreMode::Max => parts.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                ScoreMode::Min => parts.iter().copied().fold(f64::INFINITY, f64::min),
+        let s = self.boost_mode.combine(q as f64, acc.finish(self.max_boost)) as f32;
+        if !(s >= 0.0) {
+            let mut slot = self.invalid.lock();
+            if slot.is_none() {
+                *slot = Some((d, s));
             }
-        };
-        let f = f.min(self.max_boost as f64);
-        let qd = q as f64;
-        let s = match self.boost_mode {
-            BoostMode::Multiply => qd * f,
-            BoostMode::Replace => f,
-            BoostMode::Sum => qd + f,
-            BoostMode::Avg => (qd + f) / 2.0,
-            BoostMode::Max => qd.max(f),
-            BoostMode::Min => qd.min(f),
-        };
-        Ok(s as f32 * self.boost)
+        }
+        Ok(s)
     }
 
     fn settle(&mut self, mut d: DocId) -> DocId {
@@ -697,8 +700,10 @@ impl Scorer for FsScorer {
 
 impl FunctionScoreScript {
     /// The scorer over `leaf`'s docs, or over `range` of them only.
-    fn build(&self, leaf: &LeafReader<'_>, ctx: &SearchContext, range: Option<(DocId, DocId)>) -> Option<Box<dyn Scorer>> {
-        let inner = RootOnly::wrap(self.inner.scorer(leaf, ctx)?, leaf);
+    /// `boost`: this query's own boost times any enclosing one, folded into
+    /// the inner query's scores (never applied to the combined score).
+    fn build(&self, leaf: &LeafReader<'_>, ctx: &SearchContext, range: Option<(DocId, DocId)>, boost: f32) -> Option<Box<dyn Scorer>> {
+        let inner = RootOnly::wrap(self.inner.scorer_b(leaf, ctx, boost)?, leaf);
         let inner: Box<dyn Scorer> = match range {
             Some((lo, hi)) => Box::new(rustic_core::query::scorer::DocRangeScorer::new(inner, lo, hi)),
             None => inner,
@@ -722,7 +727,7 @@ impl FunctionScoreScript {
             }
         }
         Some(Box::new(FsScorer {
-            compound_top_k: self.compound_top_k.as_ref().and_then(|plan| plan.bind(leaf)),
+            compound_top_k: self.compound_top_k.as_ref().filter(|_| boost == 1.0).and_then(|plan| plan.bind(leaf)),
             range: range.unwrap_or((0, DocId::MAX)),
             inner,
             preps,
@@ -731,14 +736,24 @@ impl FunctionScoreScript {
             boost_mode: self.boost_mode,
             max_boost: self.max_boost,
             min_score: self.min_score,
-            boost: self.boost,
             cur: 0.0,
+            invalid: ctx.invalid_score.clone(),
         }))
     }
 }
 
 impl CustomQuery for FunctionScoreScript {
     fn scorer(&self, leaf: &LeafReader<'_>, ctx: &SearchContext) -> Option<Box<dyn Scorer>> {
+        self.scorer_b(leaf, ctx, 1.0)
+    }
+    /// ES folds the function_score's boost (and an enclosing one) into its
+    /// sub-query's weight: the functions and `boost_mode` combine with the
+    /// boosted query score, and `min_score` reads that combination.
+    fn absorbs_boost(&self) -> bool {
+        true
+    }
+    fn scorer_b(&self, leaf: &LeafReader<'_>, ctx: &SearchContext, outer: f32) -> Option<Box<dyn Scorer>> {
+        let boost = self.boost * outer;
         // A large sealed segment scores its doc ranges as parts (each its
         // own script executors, and its compound top-k plan over its range
         // only), collected on the search pool: a merged segment of millions
@@ -749,12 +764,12 @@ impl CustomQuery for FunctionScoreScript {
             if ranges.len() > 1 {
                 let mut parts = Vec::with_capacity(ranges.len());
                 for r in ranges {
-                    parts.push(self.build(leaf, ctx, Some(r))?);
+                    parts.push(self.build(leaf, ctx, Some(r), boost)?);
                 }
                 return Some(Box::new(rustic_core::query::scorer::PartedScorer::new(parts)));
             }
         }
-        self.build(leaf, ctx, None)
+        self.build(leaf, ctx, None, boost)
     }
     fn children(&self) -> Vec<&Query> {
         let mut v = vec![&self.inner];
@@ -764,6 +779,12 @@ impl CustomQuery for FunctionScoreScript {
     fn name(&self) -> &'static str {
         "function_score"
     }
+}
+
+/// A number or a numeric string, as the generic `function_score` parser
+/// reads `weight`, `max_boost` and `min_score`.
+fn num_f32(v: &Value) -> Option<f32> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).map(|x| x as f32)
 }
 
 /// Does this `function_score` body use a `script_score` function?
@@ -789,7 +810,7 @@ pub fn function_score_query(
         if let Some(ss) = fo.get("script_score") {
             let s = ss.get("script").ok_or_else(|| EsError::parsing("script_score function requires a [script]").with("line", 1).with("col", 1))?;
             let script = super::compile_search_script(s, ScriptContext::Score)?;
-            let weight = fo.get("weight").and_then(Value::as_f64).map(|w| w as f32);
+            let weight = fo.get("weight").and_then(num_f32);
             let filter = match fo.get("filter") {
                 Some(f) => {
                     let q = parse(f, ctx)?;
@@ -826,7 +847,7 @@ pub fn function_score_query(
         "first" => ScoreMode::First,
         "max" => ScoreMode::Max,
         "min" => ScoreMode::Min,
-        other => return Err(EsError::parsing(format!("failed to parse [score_mode]. Illegal score_mode: {other}"))),
+        other => return Err(EsError::illegal_argument(format!("No enum constant org.elasticsearch.common.lucene.search.function.FunctionScoreQuery.ScoreMode.{}", other.to_ascii_uppercase()))),
     };
     let boost_mode = match o.get("boost_mode").and_then(Value::as_str).unwrap_or("multiply") {
         "multiply" => BoostMode::Multiply,
@@ -835,10 +856,10 @@ pub fn function_score_query(
         "avg" => BoostMode::Avg,
         "max" => BoostMode::Max,
         "min" => BoostMode::Min,
-        other => return Err(EsError::parsing(format!("failed to parse [boost_mode]. Illegal boost_mode: {other}"))),
+        other => return Err(EsError::illegal_argument(format!("No enum constant org.elasticsearch.common.lucene.search.function.CombineFunction.{}", other.to_ascii_uppercase()))),
     };
-    let max_boost = o.get("max_boost").and_then(Value::as_f64).map(|x| x as f32).unwrap_or(f32::MAX);
-    let min_score = o.get("min_score").and_then(Value::as_f64).map(|x| x as f32);
+    let max_boost = o.get("max_boost").and_then(num_f32).unwrap_or(f32::MAX);
+    let min_score = o.get("min_score").and_then(num_f32);
     let boost = boost_of(o)?;
     let compound_top_k = if matches!(inner, Query::MatchAll) && min_score.is_none() && boost == 1.0
         && max_boost == f32::MAX && matches!(boost_mode, BoostMode::Multiply | BoostMode::Replace) {
@@ -1425,11 +1446,67 @@ use rustic_core::query::{Bm25Params, SortField, SortKind, SortMissing, SortMode,
 pub enum SortKeyDef {
     Score { desc: bool },
     Doc,
-    Field { field: u16, kind: SortKind, missing: SortMissing, mode: Option<SortMode>, desc: bool },
+    /// A mapped field (the core's [`SortField::Field`]); `cast`:
+    /// `numeric_type: long` over a floating-point field.
+    Field { field: u16, kind: SortKind, missing: SortMissing, mode: Option<SortMode>, desc: bool, cast: Option<LongCast> },
+    /// A numeric field under a nested path (the core's [`SortField::Nested`]):
+    /// its children's (under `filter`) values picked by `mode`; `bits`: the
+    /// filter's matches on the leaf (by leaf ordinal) once computed.
+    NestedField {
+        path: String,
+        filter: Option<Box<Query>>,
+        bits: Option<(usize, Vec<u64>)>,
+        field: u16,
+        kind: SortKind,
+        missing: SortMissing,
+        mode: Option<SortMode>,
+        desc: bool,
+        cast: Option<LongCast>,
+        /// At most this many eligible children per root (SIDE 014).
+        max_children: Option<usize>,
+    },
+    /// Script / runtime field values: `mode` picks among several (min
+    /// ascending, max descending by default), `missing` stands in for none.
     /// `version`: string values sort as versions (encoded).
-    Values { src: ValueSource, string: bool, desc: bool, version: bool },
+    Values { src: ValueSource, string: bool, desc: bool, version: bool, mode: Option<SortMode>, missing: SortMissing },
     /// `_ts_routing_hash`: the routing hash bytes leading a time series `_id`.
     TsRoutingHash { desc: bool },
+}
+
+/// `numeric_type: long` over a floating-point field (ES
+/// `LongValuesComparatorSource` over `castToLong` doc values): every value
+/// is cast to a long (Java `(long) value`: toward zero, saturating, NaN as
+/// 0) before the sort mode picks among them, so ordering, ties and
+/// `search_after` cursors all use the cast keys. A `scaled_float` casts its
+/// doc value (the scaled long times the inverse factor).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LongCast {
+    pub scaling: Option<f64>,
+}
+
+impl LongCast {
+    pub fn apply(self, x: f64) -> i64 {
+        let x = match self.scaling {
+            Some(f) => crate::aggs::es_scaled(x, Some((f, 1.0 / f))),
+            None => x,
+        };
+        x as i64
+    }
+}
+
+/// The cast of criterion `spec` (resolved to `sf`) when it is a
+/// `numeric_type: long` sort of a floating-point field.
+pub(crate) fn long_cast(spec: &crate::search::SortSpec, sf: &SortField, lookup: &FieldLookup) -> Option<LongCast> {
+    // A nested field's criterion casts its children's values the same way.
+    let inner = match sf {
+        SortField::Nested { sort, .. } => &**sort,
+        other => other,
+    };
+    if spec.numeric_type.as_deref() != Some("long") || !matches!(inner, SortField::Field { kind: SortKind::F64, .. }) {
+        return None;
+    }
+    let scaling = lookup.get(&spec.field).filter(|f| f.ty == crate::mapping::EsType::ScaledFloat && f.scaling_factor.is_finite() && f.scaling_factor > 0.0).map(|f| f.scaling_factor);
+    Some(LongCast { scaling })
 }
 
 /// Render of a runtime field used as a sort key (`None` if `name` is not a
@@ -1463,10 +1540,17 @@ fn lookup_field_json(spec: &super::LookupSpec, lookup: &FieldLookup, leaf: &Leaf
         inputs = crate::search::docvalue_values(leaf, lookup, &format!("{}.keyword", spec.input_field), doc, None)?;
     }
     let mut out = Vec::new();
-    // Only `_id` target lookups go through realtime get; other target fields need a search.
+    // Other target fields: a term search of the target index per input value
+    // (ES `LookupField`: `term` on the target field, size 1), each match
+    // contributing its fetch fields.
     if spec.target_field != "_id" {
+        for input in inputs {
+            let value = crate::query::dsl::scalar_string(&input);
+            out.extend(super::lookup_term(&spec.target_index, &spec.target_field, &value, &spec.fetch_fields)?);
+        }
         return Ok(out);
     }
+    // `_id` target lookups go through realtime get.
     for input in inputs {
         let id = crate::query::dsl::scalar_string(&input);
         let mut entry = Map::new();
@@ -1496,45 +1580,87 @@ pub fn script_sort_render(spec: Option<&Value>) -> Result<&'static str> {
     }
 }
 
-/// Sort keys to collect here when any criterion is a `_script` or a
-/// runtime field; `None` = the core searcher can sort.
-pub fn sort_keys(specs: &[(String, bool)], fields: &[SortField], extra: &HashMap<String, Value>, index: &str, lookup: &FieldLookup) -> Result<Option<Vec<SortKeyDef>>> {
+fn sort_mode(m: Option<&str>) -> Result<Option<SortMode>> {
+    Ok(match m {
+        None => None,
+        Some("min") => Some(SortMode::Min),
+        Some("max") => Some(SortMode::Max),
+        Some("sum") => Some(SortMode::Sum),
+        Some("avg") => Some(SortMode::Avg),
+        Some("median") => Some(SortMode::Median),
+        Some(o) => return Err(EsError::illegal_argument(format!("Unknown SortMode [{o}]"))),
+    })
+}
+
+/// Sort keys to collect here when any criterion is a `_script`, a runtime
+/// field or a `numeric_type: long` cast of a floating-point field; `None` =
+/// the core searcher can sort. `fields` are the criteria as resolved
+/// (`crate::search::resolve_sort`), one per spec.
+pub fn sort_keys(specs: &[crate::search::SortSpec], fields: &[SortField], index: &str, lookup: &FieldLookup) -> Result<Option<Vec<SortKeyDef>>> {
     let tsdb = lookup.get(crate::tsdb::TSID_FIELD).is_some();
-    let needs = specs.iter().any(|(f, _)| f == "_script" || runtime_render(index, f).is_some() || (tsdb && f == "_ts_routing_hash"));
+    let needs = specs.iter().zip(fields).any(|(s, sf)| s.field == "_script" || runtime_render(index, &s.field).is_some() || (tsdb && s.field == "_ts_routing_hash") || long_cast(s, sf, lookup).is_some());
     if !needs {
         return Ok(None);
     }
     let mut out = Vec::new();
-    for ((name, desc), sf) in specs.iter().zip(fields) {
-        let desc = *desc;
-        out.push(match name.as_str() {
+    // `_script` criteria seen so far: each has its own definition.
+    let mut scripts = 0usize;
+    for (spec, sf) in specs.iter().zip(fields) {
+        let desc = spec.descending;
+        out.push(match spec.field.as_str() {
             "_score" => SortKeyDef::Score { desc },
             "_doc" | "_shard_doc" => SortKeyDef::Doc,
             "_ts_routing_hash" if tsdb => SortKeyDef::TsRoutingHash { desc },
             "_script" => {
-                let spec = extra.get("_script");
-                let render = script_sort_render(spec)?;
+                let ordinal = scripts;
+                scripts += 1;
+                let def = spec.extra.as_ref();
+                let render = script_sort_render(def)?;
                 let string = render != "double";
-                let s = spec.and_then(|s| s.get("script")).ok_or_else(|| EsError::parsing("[_script] sort requires a [script]"))?;
-                let environment=env();
-                // sort_extras retains the last occurrence of a sort field.
-                // Select the corresponding raw subtree using the same rule.
-                let raw=environment.as_ref().and_then(|e|e.raw_sort.as_ref()).and_then(|sort| {
-                    match sort {
-                        crate::source_json::Source::Array(entries)=>entries.iter().rev().find_map(|entry|entry.get("_script")),
-                        entry=>entry.get("_script"),
-                    }
-                }).and_then(|spec|spec.get("script"));
+                let s = def.and_then(|s| s.get("script")).ok_or_else(|| EsError::parsing("[_script] sort requires a [script]"))?;
+                let environment = env();
+                // The raw subtree of the same (`ordinal`-th) `_script` criterion.
+                let raw = environment
+                    .as_ref()
+                    .and_then(|e| e.raw_sort.as_ref())
+                    .and_then(|sort| match sort {
+                        crate::source_json::Source::Array(entries) => entries.iter().filter_map(|entry| entry.get("_script")).nth(ordinal),
+                        entry => entry.get("_script").filter(|_| ordinal == 0),
+                    })
+                    .and_then(|spec| spec.get("script"));
                 let cs = super::compile_json_source(s, raw, if string { ScriptContext::StringSort } else { ScriptContext::NumberSort }, None)?;
-                SortKeyDef::Values { src: ValueSource::script(cs, index, lookup), string, desc, version: render == "version" }
+                let mode = sort_mode(spec.mode.as_deref())?;
+                SortKeyDef::Values { src: ValueSource::script(cs, index, lookup), string, desc, version: render == "version", mode, missing: SortMissing::Last }
             }
             n => match ValueSource::runtime(n, index) {
                 Some(src) => {
                     let string = matches!(src.runtime_type(), Some(super::RtType::Keyword | super::RtType::Ip));
-                    SortKeyDef::Values { src, string, desc, version: false }
+                    // The criterion's `mode` and `missing` as resolved.
+                    let (mode, missing) = match sf {
+                        SortField::Field { mode, missing, .. } => (*mode, missing.clone()),
+                        _ => (sort_mode(spec.mode.as_deref())?, SortMissing::Last),
+                    };
+                    SortKeyDef::Values { src, string, desc, version: false, mode, missing }
                 }
                 None => match sf {
-                    SortField::Field { field, kind, missing, mode, descending } => SortKeyDef::Field { field: *field, kind: *kind, missing: missing.clone(), mode: *mode, desc: *descending },
+                    SortField::Field { field, kind, missing, mode, descending } => {
+                        SortKeyDef::Field { field: *field, kind: *kind, missing: missing.clone(), mode: *mode, desc: *descending, cast: long_cast(spec, sf, lookup) }
+                    }
+                    SortField::Nested { path, filter, sort, max_children } if matches!(&**sort, SortField::Field { kind: SortKind::F64 | SortKind::I64, .. }) => {
+                        let SortField::Field { field, kind, missing, mode, descending } = &**sort else { unreachable!() };
+                        SortKeyDef::NestedField {
+                            path: path.clone(),
+                            filter: filter.clone(),
+                            bits: None,
+                            field: *field,
+                            kind: *kind,
+                            missing: missing.clone(),
+                            mode: *mode,
+                            desc: *descending,
+                            cast: long_cast(spec, sf, lookup),
+                            max_children: *max_children,
+                        }
+                    }
                     _ => return Err(EsError::illegal_argument(format!("sorting on [{n}] together with a script or runtime field sort is not supported"))),
                 },
             },
@@ -1543,30 +1669,122 @@ pub fn sort_keys(specs: &[(String, bool)], fields: &[SortField], extra: &HashMap
     Ok(Some(out))
 }
 
-fn pick(vals: Vec<SortValue>, desc: bool, mode: Option<SortMode>) -> SortValue {
+/// Java's `Math.round` of a double, as a long.
+fn round_long(value: f64) -> i64 {
+    let floor = value.floor();
+    (if value - floor >= 0.5 { floor + 1.0 } else { floor }) as i64
+}
+
+/// ES `MultiValueMode` over long values, as the core searcher picks them
+/// (`unsigned`: shifted unsigned longs, averaged as doubles).
+fn pick_longs(mut v: Vec<i64>, mode: SortMode, unsigned: bool) -> SortValue {
+    match (v.len(), mode) {
+        (0, _) => SortValue::Missing,
+        (_, SortMode::Min) => SortValue::I64(*v.iter().min().unwrap()),
+        (_, SortMode::Max) => SortValue::I64(*v.iter().max().unwrap()),
+        (_, SortMode::Sum) => SortValue::I64(v.iter().fold(0i64, |sum, &x| sum.wrapping_add(x))),
+        (1, _) if !unsigned => SortValue::I64(v[0]),
+        (_, SortMode::Avg) if !unsigned => SortValue::I64(round_long(v.iter().fold(0i64, |sum, &x| sum.wrapping_add(x)) as f64 / v.len() as f64)),
+        (_, SortMode::Median) if !unsigned => {
+            v.sort_unstable();
+            let m = v.len() / 2;
+            SortValue::I64(if v.len() % 2 == 0 { round_long((v[m - 1] as f64 + v[m] as f64) / 2.0) } else { v[m] })
+        }
+        (_, m) => pick_doubles(v.into_iter().map(|x| x as f64).collect(), m),
+    }
+}
+
+/// ES `MultiValueMode` over double values.
+fn pick_doubles(mut v: Vec<f64>, mode: SortMode) -> SortValue {
+    if v.is_empty() {
+        return SortValue::Missing;
+    }
+    SortValue::F64(match mode {
+        SortMode::Min => v.iter().copied().fold(f64::INFINITY, f64::min),
+        SortMode::Max => v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        SortMode::Sum => v.iter().sum(),
+        SortMode::Avg => v.iter().sum::<f64>() / v.len() as f64,
+        SortMode::Median => {
+            v.sort_by(|a, b| a.total_cmp(b));
+            let n = v.len();
+            if n % 2 == 1 {
+                v[n / 2]
+            } else {
+                (v[n / 2 - 1] + v[n / 2]) / 2.0
+            }
+        }
+    })
+}
+
+/// The sort value of mapped field `field` of `doc`, picked by `mode` (min
+/// ascending, max descending by default) as the core searcher picks it,
+/// `missing` standing in for a doc without one. Shared by this collector
+/// and inner hits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn field_sort_value(leaf: &LeafReader<'_>, doc: DocId, field: u16, kind: SortKind, desc: bool, mode: Option<SortMode>, missing: &SortMissing, cast: Option<LongCast>) -> Result<SortValue> {
+    let mode = mode.unwrap_or(if desc { SortMode::Max } else { SortMode::Min });
+    let v = match (kind, cast) {
+        (SortKind::F64, Some(c)) => pick_longs(leaf.f64_values(field, doc).into_iter().map(|x| c.apply(x)).collect(), mode, false),
+        (SortKind::F64, None) => pick_doubles(leaf.f64_values(field, doc), mode),
+        (SortKind::I64, _) => {
+            let v = leaf.i64_values(field, doc);
+            if v.is_empty() {
+                // u64 columns (unsigned_long) sort as longs shifted by Long.MIN_VALUE.
+                pick_longs(leaf.u64_values(field, doc).into_iter().map(|x| (x ^ (1u64 << 63)) as i64).collect(), mode, true)
+            } else {
+                pick_longs(v, mode, false)
+            }
+        }
+        (SortKind::Keyword, _) => {
+            let mut v = leaf.keyword_values(field, doc);
+            v.sort();
+            let pick = if mode == SortMode::Max { v.pop() } else { v.into_iter().next() };
+            pick.map(SortValue::Str).unwrap_or(SortValue::Missing)
+        }
+        // Ordinals follow term order: the smallest / largest term.
+        (SortKind::Fielddata, _) => {
+            let fd = leaf.uninverted(field)?;
+            let ords = fd.ords(doc);
+            let o = if mode == SortMode::Max { ords.last() } else { ords.first() };
+            o.map(|&o| SortValue::Str(fd.term_string(o))).unwrap_or(SortValue::Missing)
+        }
+    };
+    Ok(match (v, missing) {
+        // A cast sort's missing value is a long too.
+        (SortValue::Missing, SortMissing::Value(SortValue::F64(x))) if cast.is_some() => SortValue::I64(*x as i64),
+        (SortValue::Missing, SortMissing::Value(m)) => m.clone(),
+        (v, _) => v,
+    })
+}
+
+/// Pick among several script / runtime values: long rules when every
+/// value is a long, double rules for numbers, else the smallest / largest.
+fn pick_values(vals: Vec<SortValue>, desc: bool, mode: Option<SortMode>) -> SortValue {
     if vals.is_empty() {
         return SortValue::Missing;
     }
-    let num = |v: &SortValue| match v {
-        SortValue::I64(i) => *i as f64,
-        SortValue::F64(f) => *f,
-        _ => 0.0,
-    };
-    match mode {
-        Some(SortMode::Sum) => SortValue::F64(vals.iter().map(num).sum()),
-        Some(SortMode::Avg) => SortValue::F64(vals.iter().map(num).sum::<f64>() / vals.len() as f64),
-        _ => {
-            let max = matches!(mode, Some(SortMode::Max)) || (mode.is_none() && desc);
-            let mut best = vals[0].clone();
-            for v in vals.into_iter().skip(1) {
-                let o = cmp_vals(&v, &best);
-                if (max && o.is_gt()) || (!max && o.is_lt()) {
-                    best = v;
-                }
-            }
-            best
+    let mode = mode.unwrap_or(if desc { SortMode::Max } else { SortMode::Min });
+    if vals.iter().all(|v| matches!(v, SortValue::I64(_))) {
+        return pick_longs(vals.into_iter().map(|v| if let SortValue::I64(x) = v { x } else { 0 }).collect(), mode, false);
+    }
+    if vals.iter().all(|v| matches!(v, SortValue::I64(_) | SortValue::F64(_))) {
+        let num = |v: &SortValue| match v {
+            SortValue::I64(i) => *i as f64,
+            SortValue::F64(f) => *f,
+            _ => 0.0,
+        };
+        return pick_doubles(vals.iter().map(num).collect(), mode);
+    }
+    let max = mode == SortMode::Max;
+    let mut it = vals.into_iter();
+    let mut best = it.next().unwrap_or(SortValue::Missing);
+    for v in it {
+        let o = cmp_vals(&v, &best);
+        if (max && o.is_gt()) || (!max && o.is_lt()) {
+            best = v;
         }
     }
+    best
 }
 
 fn cmp_vals(a: &SortValue, b: &SortValue) -> std::cmp::Ordering {
@@ -1604,8 +1822,22 @@ impl SortKeyDef {
         match self {
             SortKeyDef::Score { desc } => SortKeyDef::Score { desc: *desc },
             SortKeyDef::Doc => SortKeyDef::Doc,
-            SortKeyDef::Field { field, kind, missing, mode, desc } => SortKeyDef::Field { field: *field, kind: *kind, missing: missing.clone(), mode: *mode, desc: *desc },
-            SortKeyDef::Values { src, string, desc, version } => SortKeyDef::Values { src: src.fork(), string: *string, desc: *desc, version: *version },
+            SortKeyDef::Field { field, kind, missing, mode, desc, cast } => SortKeyDef::Field { field: *field, kind: *kind, missing: missing.clone(), mode: *mode, desc: *desc, cast: *cast },
+            SortKeyDef::NestedField { path, filter, field, kind, missing, mode, desc, cast, max_children, .. } => SortKeyDef::NestedField {
+                path: path.clone(),
+                filter: filter.clone(),
+                bits: None,
+                field: *field,
+                kind: *kind,
+                missing: missing.clone(),
+                mode: *mode,
+                desc: *desc,
+                cast: *cast,
+                max_children: *max_children,
+            },
+            SortKeyDef::Values { src, string, desc, version, mode, missing } => {
+                SortKeyDef::Values { src: src.fork(), string: *string, desc: *desc, version: *version, mode: *mode, missing: missing.clone() }
+            }
             SortKeyDef::TsRoutingHash { desc } => SortKeyDef::TsRoutingHash { desc: *desc },
         }
     }
@@ -1614,29 +1846,51 @@ impl SortKeyDef {
         match self {
             SortKeyDef::Score { desc } => !*desc,
             SortKeyDef::Doc => false,
-            SortKeyDef::Field { desc, .. } | SortKeyDef::Values { desc, .. } | SortKeyDef::TsRoutingHash { desc } => *desc,
+            SortKeyDef::Field { desc, .. } | SortKeyDef::NestedField { desc, .. } | SortKeyDef::Values { desc, .. } | SortKeyDef::TsRoutingHash { desc } => *desc,
         }
+    }
+
+    /// `(descending, missing first)` of the key.
+    fn order(&self) -> (bool, bool) {
+        let missing_first = match self {
+            SortKeyDef::Field { missing, .. } | SortKeyDef::NestedField { missing, .. } | SortKeyDef::Values { missing, .. } => matches!(missing, SortMissing::First),
+            _ => false,
+        };
+        (self.descending(), missing_first)
     }
 }
 
-/// Order of two hits' sort values (missing last, then per-key direction).
-fn cmp_sort(descs: &[bool], a: &[SortValue], b: &[SortValue]) -> std::cmp::Ordering {
-    for (i, desc) in descs.iter().enumerate() {
+/// Whether `v` is the value a missing one sorts as (`low`: at the low end
+/// of the ascending order), which ties with it, as ES substitutes it.
+fn is_sentinel(v: &SortValue, low: bool) -> bool {
+    match v {
+        SortValue::I64(x) => *x == if low { i64::MIN } else { i64::MAX },
+        SortValue::F64(x) => *x == if low { f64::NEG_INFINITY } else { f64::INFINITY },
+        _ => false,
+    }
+}
+
+/// Order of two hits' sort values: per key `(descending, missing first)`;
+/// a missing value goes last (first with `missing: _first`) either way.
+fn cmp_sort(orders: &[(bool, bool)], a: &[SortValue], b: &[SortValue]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (i, &(desc, missing_first)) in orders.iter().enumerate() {
         let (Some(x), Some(y)) = (a.get(i), b.get(i)) else { break };
         let o = match (x, y) {
-            (SortValue::Missing, SortValue::Missing) => std::cmp::Ordering::Equal,
-            (SortValue::Missing, _) => std::cmp::Ordering::Greater,
-            (_, SortValue::Missing) => std::cmp::Ordering::Less,
+            (SortValue::Missing, SortValue::Missing) => Ordering::Equal,
+            (SortValue::Missing, v) | (v, SortValue::Missing) if is_sentinel(v, missing_first != desc) => Ordering::Equal,
+            (SortValue::Missing, _) => if missing_first { Ordering::Less } else { Ordering::Greater },
+            (_, SortValue::Missing) => if missing_first { Ordering::Greater } else { Ordering::Less },
             _ => {
                 let o = cmp_vals(x, y);
-                if *desc { o.reverse() } else { o }
+                if desc { o.reverse() } else { o }
             }
         };
-        if o != std::cmp::Ordering::Equal {
+        if o != Ordering::Equal {
             return o;
         }
     }
-    std::cmp::Ordering::Equal
+    Ordering::Equal
 }
 
 /// One leaf's share of [`collect_sorted`].
@@ -1647,7 +1901,7 @@ struct LeafTop {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_leaf(li: usize, leaf: &LeafReader<'_>, query: &Query, ctx: &SearchContext, keys: &mut [SortKeyDef], descs: &[bool], k: usize, min_score: Option<f32>, after: Option<&TopHit>) -> Result<LeafTop> {
+fn collect_leaf(li: usize, leaf: &LeafReader<'_>, query: &Query, ctx: &SearchContext, keys: &mut [SortKeyDef], orders: &[(bool, bool)], k: usize, min_score: Option<f32>, after: Option<&TopHit>) -> Result<LeafTop> {
     let mut out = LeafTop { hits: Vec::new(), total: 0, max_score: f32::NEG_INFINITY };
     let Some(mut s) = query.scorer(leaf, ctx) else { return Ok(out) };
     let live = leaf.live_docs();
@@ -1676,24 +1930,40 @@ fn collect_leaf(li: usize, leaf: &LeafReader<'_>, query: &Query, ctx: &SearchCon
             vals.push(match key {
                 SortKeyDef::Score { .. } => SortValue::F64(sc as f64),
                 SortKeyDef::Doc => SortValue::I64(d as i64),
-                SortKeyDef::Field { field, kind, missing, mode, desc } => {
-                    let raw: Vec<SortValue> = match kind {
-                        SortKind::I64 => leaf.i64_values(*field, d).into_iter().map(SortValue::I64).collect(),
-                        SortKind::F64 => leaf.f64_values(*field, d).into_iter().map(SortValue::F64).collect(),
-                        // `pick` only needs the extremes: the smallest and largest term.
-                        SortKind::Fielddata => {
-                            let fd = leaf.uninverted(*field)?;
-                            let ords = fd.ords(d);
-                            ords.first().into_iter().chain(ords.last().filter(|_| ords.len() > 1)).map(|&o| SortValue::Str(fd.term_string(o))).collect()
+                SortKeyDef::Field { field, kind, missing, mode, desc, cast } => field_sort_value(leaf, d, *field, *kind, *desc, *mode, missing, *cast)?,
+                SortKeyDef::NestedField { path, filter, bits, field, kind, missing, mode, desc, cast, max_children } => {
+                    if let Some(f) = filter {
+                        if bits.as_ref().is_none_or(|(at, _)| *at != li) {
+                            let mut b = vec![0u64; (leaf.num_docs() as usize).div_ceil(64)];
+                            if let Some(mut sc) = f.scorer(leaf, ctx) {
+                                loop {
+                                    let c = sc.advance();
+                                    if c == TERMINATED {
+                                        break;
+                                    }
+                                    if let Some(w) = b.get_mut(c as usize / 64) {
+                                        *w |= 1 << (c % 64);
+                                    }
+                                }
+                            }
+                            *bits = Some((li, b));
                         }
-                        SortKind::Keyword => leaf.keyword_values(*field, d).into_iter().map(SortValue::Str).collect(),
+                    }
+                    let kids: Vec<DocId> = leaf
+                        .nested_children(d, path)
+                        .into_iter()
+                        .filter(|&c| bits.as_ref().is_none_or(|(_, b)| b.get(c as usize / 64).is_some_and(|w| (w >> (c % 64)) & 1 == 1)))
+                        .take(max_children.unwrap_or(usize::MAX))
+                        .collect();
+                    let m = mode.unwrap_or(if *desc { SortMode::Max } else { SortMode::Min });
+                    let v = match (*kind, *cast) {
+                        (SortKind::F64, Some(c)) => pick_longs(kids.iter().flat_map(|&k| leaf.f64_values(*field, k)).map(|x| c.apply(x)).collect(), m, false),
+                        (SortKind::F64, None) => pick_doubles(kids.iter().flat_map(|&k| leaf.f64_values(*field, k)).collect(), m),
+                        _ => pick_longs(kids.iter().flat_map(|&k| leaf.i64_values(*field, k)).collect(), m, false),
                     };
-                    match pick(raw, *desc, *mode) {
-                        SortValue::Missing => match missing {
-                            SortMissing::Value(v) => v.clone(),
-                            _ => SortValue::Missing,
-                        },
-                        v => v,
+                    match (v, &*missing) {
+                        (SortValue::Missing, SortMissing::Value(x)) => x.clone(),
+                        (v, _) => v,
                     }
                 }
                 SortKeyDef::TsRoutingHash { .. } => {
@@ -1704,19 +1974,23 @@ fn collect_leaf(li: usize, leaf: &LeafReader<'_>, query: &Query, ctx: &SearchCon
                         .map(|b| SortValue::Str(b[..4].iter().map(|x| *x as char).collect()))
                         .unwrap_or(SortValue::Missing)
                 }
-                SortKeyDef::Values { src, string, desc, version } => {
-                    let (string, desc, version) = (*string, *desc, *version);
-                    src.with_values(leaf_key, leaf, d, sc, |vs| match vs.len() {
+                SortKeyDef::Values { src, string, desc, version, mode, missing } => {
+                    let (string, desc, version, mode) = (*string, *desc, *version, *mode);
+                    let v = src.with_values(leaf_key, leaf, d, sc, |vs| match vs.len() {
                         0 => SortValue::Missing,
                         1 if !version => val_to_sort(&vs[0], string),
-                        _ => pick(
+                        _ => pick_values(
                             vs.iter()
                                 .map(|v| if version { SortValue::Str(rustic_core::fieldtypes::version::encode(&v.to_java_string())) } else { val_to_sort(v, string) })
                                 .collect(),
                             desc,
-                            None,
+                            mode,
                         ),
-                    })?
+                    })?;
+                    match (v, &*missing) {
+                        (SortValue::Missing, SortMissing::Value(m)) => m.clone(),
+                        (v, _) => v,
+                    }
                 }
             });
         }
@@ -1724,16 +1998,16 @@ fn collect_leaf(li: usize, leaf: &LeafReader<'_>, query: &Query, ctx: &SearchCon
             continue;
         }
         // `search_after`: only hits sorting strictly after the given values.
-        if after.is_some_and(|a| cmp_sort(descs, &vals, &a.sort) != std::cmp::Ordering::Greater) {
+        if after.is_some_and(|a| cmp_sort(orders, &vals, &a.sort) != std::cmp::Ordering::Greater) {
             continue;
         }
         // Same leaf, later doc: a tie with the k-th best sorts after it.
-        if worst.as_ref().is_some_and(|w| cmp_sort(descs, &vals, w) != std::cmp::Ordering::Less) {
+        if worst.as_ref().is_some_and(|w| cmp_sort(orders, &vals, w) != std::cmp::Ordering::Less) {
             continue;
         }
         out.hits.push(TopHit::new(li, d, sc, vals.clone()));
         if out.hits.len() >= cap {
-            out.hits.sort_by(|a, b| cmp_sort(descs, &a.sort, &b.sort).then(a.doc.cmp(&b.doc)));
+            out.hits.sort_by(|a, b| cmp_sort(orders, &a.sort, &b.sort).then(a.doc.cmp(&b.doc)));
             out.hits.truncate(k);
             worst = out.hits.last().map(|h| h.sort.clone());
         }
@@ -1747,13 +2021,13 @@ pub fn collect_sorted(leaves: &[LeafReader<'_>], query: &Query, keys: &mut [Sort
     use rayon::prelude::*;
     let ctx = SearchContext::for_query(query, leaves, Bm25Params::default());
     ctx.execution_result()?;
-    let descs: Vec<bool> = keys.iter().map(SortKeyDef::descending).collect();
+    let orders: Vec<(bool, bool)> = keys.iter().map(SortKeyDef::order).collect();
     let parts: Vec<Result<LeafTop>> = if leaves.len() > 1 && rayon::current_thread_index().is_none() {
         let forks: Vec<Vec<SortKeyDef>> = leaves.iter().map(|_| keys.iter().map(SortKeyDef::fork).collect()).collect();
-        let (ctx, descs) = (&ctx, &descs[..]);
-        rustic_core::query::searcher::in_search_pool(|| forks.into_par_iter().enumerate().map(|(li, mut ks)| collect_leaf(li, &leaves[li], query, ctx, &mut ks, descs, k, min_score, after)).collect())
+        let (ctx, orders) = (&ctx, &orders[..]);
+        rustic_core::query::searcher::in_search_pool(|| forks.into_par_iter().enumerate().map(|(li, mut ks)| collect_leaf(li, &leaves[li], query, ctx, &mut ks, orders, k, min_score, after)).collect())
     } else {
-        leaves.iter().enumerate().map(|(li, leaf)| collect_leaf(li, leaf, query, &ctx, keys, &descs, k, min_score, after)).collect()
+        leaves.iter().enumerate().map(|(li, leaf)| collect_leaf(li, leaf, query, &ctx, keys, &orders, k, min_score, after)).collect()
     };
     let mut all: Vec<TopHit> = Vec::new();
     let mut total = 0u64;
@@ -1767,13 +2041,12 @@ pub fn collect_sorted(leaves: &[LeafReader<'_>], query: &Query, keys: &mut [Sort
     if let Some(e) = env().and_then(|e| e.take_error()) {
         return Err(e);
     }
-    all.sort_by(|a, b| cmp_sort(&descs, &a.sort, &b.sort).then(a.leaf.cmp(&b.leaf)).then(a.doc.cmp(&b.doc)));
+    all.sort_by(|a, b| cmp_sort(&orders, &a.sort, &b.sort).then(a.leaf.cmp(&b.leaf)).then(a.doc.cmp(&b.doc)));
     all.truncate(k);
     ctx.execution_result()?;
     Ok(TopDocs { total_hits: total, total_hits_relation: TotalHitsRelation::Eq, max_score, hits: all, terminated_early: false, timed_out: ctx.vector_timed_out.load(std::sync::atomic::Ordering::Relaxed), invalid_score: None, execution_error: ctx.execution_error.lock().clone() })
 }
 
-use std::collections::HashMap;
 
 /// Validate request-level `script_fields` against `index.max_script_fields`.
 pub fn check_script_fields(v: &Value, max: usize) -> Result<()> {

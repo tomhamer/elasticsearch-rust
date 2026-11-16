@@ -460,6 +460,11 @@ Elasticsearch client, Kibana or Rally against it.
 For Kubernetes, see [cluster/deploy](cluster/deploy): the operator, Helm
 charts and Docker images.
 
+For migration from a running Elasticsearch 9.5.5 cluster, see
+[Migrating with remote reindex](MIGRATION.md). The existing HTTP `_reindex`
+path copies documents; destination configuration and write cutover are
+managed separately.
+
 ---
 
 ## Repository map
@@ -471,18 +476,54 @@ cluster/            cluster crates, deployment (Docker, Helm, Kubernetes operato
 bench/              benchmark harnesses, results and correctness gates
 scripts/            test-suite and correctness-gate launchers
 tests/es-yaml/      Elasticsearch YAML REST suite fetcher
-migrate/            es-lucene-import: import existing Elasticsearch data
+MIGRATION.md        migration from Elasticsearch using HTTP remote reindex
 ```
 
 ---
 
 ## Unsupported features
 
-- **ELSER.** Elastic's ELSER model weights are not available outside
-  Elastic, so ELSER endpoints (`.elser_model_2`, `.elser-2-elasticsearch`) are
-  served by a built-in sparse encoder with the same output shape. Mappings,
-  pipelines and `semantic_text` work unchanged, but relevance will differ from
-  ELSER. For learned embeddings, use `.multilingual-e5-small`: builds with the
-  `candle-models` feature run the real E5 model from its weights, and any
-  inference endpoint can point at an external model service.
-- **Cross-cluster replication (CCR)** is not supported yet.
+- **ELSER and Elastic Rerank.** Their model weights are not available
+  outside Elastic, so rustic cannot run `.elser_model_2` or `.rerank-v1`. By
+  default their endpoints (`.elser-2-elasticsearch`, `.rerank-v1-elasticsearch`,
+  and `semantic_text` fields that default to ELSER) fail the way ES fails for
+  a model that is not deployed (`status_exception`, "Trained model deployment
+  [...] is not allocated to any nodes", with the reason as its cause).
+  Setting `xpack.inference.builtin_fallback: lexical` explicitly enables
+  built-in lexical stand-ins with the same output shape but different
+  relevance; responses then carry a warning header, and `GET _inference` and
+  `GET _ml/trained_models/_stats` report `"implementation": "lexical-fallback"`.
+- **multilingual-e5-small** runs the real model (the default
+  `candle-models` feature; its weights are not bundled) once its files
+  (`config.json`, `tokenizer.json`,
+  `model.safetensors` from `intfloat/multilingual-e5-small`) in
+  `<path.data>/ml-models/.multilingual-e5-small/` (or
+  `ES_ML_MODEL_DIR_MULTILINGUAL_E5_SMALL`). Otherwise it fails like ELSER, or,
+  with `xpack.inference.builtin_fallback: lexical`, uses a feature-hashing
+  stand-in (`"implementation": "hashing-fallback"`). An endpoint keeps the
+  implementation it first embedded with and refuses to switch, so an index
+  never mixes vectors from two implementations. For other learned models,
+  point an inference endpoint at an external service (HTTPS, verified against
+  the Mozilla and system roots).
+- **Cross-cluster search (CCS) and cross-cluster replication (CCR) work
+  between clusters of this engine only**, not with Elasticsearch nodes (the
+  Elasticsearch binary transport protocol is not implemented). Remote
+  clusters connect in sniff or proxy mode with certificate-based security.
+  Remote credentials can also be cross-cluster API keys (RCS 2.0). CCS
+  covers search (including `dfs_query_then_fetch`, retrievers and RRF),
+  `_count`, `_msearch`, async search, point in time with aggregations, field
+  caps, resolve APIs, ES|QL and SQL, with `skip_unavailable` and `_clusters`
+  accounting. CCR covers follow, pause, resume, unfollow, auto-follow,
+  retention leases and the ILM unfollow action.
+- **Rollup job execution.** Rollup jobs (deprecated in Elasticsearch in favour
+  of downsampling) can be created, listed, deleted and searched with
+  `_rollup_search` over existing rollup indices, but there is no rollup
+  indexer: `POST _rollup/job/{id}/_start` is rejected with an
+  `illegal_argument_exception` ("rollup job execution is not supported") and
+  jobs always report `job_state: stopped`. Use downsampling or a transform.
+- **Regression and classification data frame analytics.** These need
+  Elastic's boosted-tree trainer (ml-cpp), which is not part of this build.
+  Their configs can be created, explained and previewed, but `_start`
+  returns a `status_exception` instead of running them. Outlier detection
+  runs in process (up to 200,000 analysed documents per job), with scores
+  close to, but not bit-identical with, Elasticsearch's.

@@ -83,6 +83,8 @@ pub enum WireVal {
     Du(i64),
     P(i64, i64),
     M(Vec<WireVal>),
+    U(u64),
+    Ns(i64),
 }
 
 impl From<&Val> for WireVal {
@@ -98,6 +100,8 @@ impl From<&Val> for WireVal {
             Val::Dur(d) => WireVal::Du(*d),
             Val::Period(m, d) => WireVal::P(*m, *d),
             Val::Multi(m) => WireVal::M(m.iter().map(WireVal::from).collect()),
+            Val::ULong(u) => WireVal::U(*u),
+            Val::Nanos(n) => WireVal::Ns(*n),
         }
     }
 }
@@ -115,6 +119,8 @@ impl From<&WireVal> for Val {
             WireVal::Du(d) => Val::Dur(*d),
             WireVal::P(m, d) => Val::Period(*m, *d),
             WireVal::M(m) => Val::Multi(m.iter().map(Val::from).collect()),
+            WireVal::U(u) => Val::ULong(*u),
+            WireVal::Ns(n) => Val::Nanos(*n),
         }
     }
 }
@@ -417,32 +423,19 @@ pub fn partial_groups(rows: &[Vec<Val>], by: &[usize], aggs: &[(AggKind, Option<
         let groups: Vec<usize> = if by.is_empty() {
             vec![0]
         } else {
-            let mut combos: Vec<Vec<Val>> = vec![vec![]];
-            for &g in by {
-                let opts: Vec<Val> = match &r[g] {
-                    Val::Multi(m) => m.clone(),
-                    v => vec![v.clone()],
-                };
-                let mut next = Vec::with_capacity(combos.len() * opts.len());
-                for c in &combos {
-                    for o in &opts {
-                        let mut c2 = c.clone();
-                        c2.push(o.clone());
-                        next.push(c2);
-                    }
-                }
-                combos = next;
-            }
-            combos
-                .into_iter()
-                .map(|c| {
-                    let k: Vec<String> = c.iter().map(Val::key).collect();
-                    *index.entry(k).or_insert_with(|| {
-                        order.push((c, fresh()));
-                        order.len() - 1
-                    })
-                })
-                .collect()
+            // One group per distinct combination (a repeated key value
+            // counts the row once), enumerated without holding them all.
+            let opts: Vec<Vec<Val>> = by.iter().map(|&g| super::exec::distinct_group_values(r[g].clone())).collect();
+            let mut groups = Vec::new();
+            let _ = super::exec::for_each_combo(&opts, |c| -> std::result::Result<(), std::convert::Infallible> {
+                let k: Vec<String> = c.iter().map(Val::key).collect();
+                groups.push(*index.entry(k).or_insert_with(|| {
+                    order.push((c.to_vec(), fresh()));
+                    order.len() - 1
+                }));
+                Ok(())
+            });
+            groups
         };
         for gi in groups {
             for (acc, (kind, col)) in order[gi].1.iter_mut().zip(aggs) {

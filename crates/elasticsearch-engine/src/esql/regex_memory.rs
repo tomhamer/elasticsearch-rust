@@ -57,7 +57,29 @@ impl Program {
         self.re.search_captures_with(&mut cache,&Input::new(text),&mut captures);
         Ok(Captures{captures,_memory:memory})
     }
-    /// Replacement is literal, including '$', as required by ES|QL REPLACE.
+    /// Java `Matcher.replaceAll(replacement)` (ES|QL `REPLACE`): `$n`
+    /// (as many digits as name an existing group), `${name}` and `\x`
+    /// escapes. `Err(exception)`: Java's exception for an invalid
+    /// replacement (`java.lang.IllegalArgumentException: ..` /
+    /// `java.lang.IndexOutOfBoundsException: No group n`).
+    pub(crate) fn replace_java(&self,text:&str,replacement:&str)->Result<std::result::Result<String,String>> {
+        let _scratch=self.scratch()?;
+        let mut cache=self.re.create_cache();
+        let mut caps=self.re.create_captures();
+        let mut result=String::new();let mut end=0;
+        let mut at=0usize;
+        while at<=text.len() {
+            self.re.search_captures_with(&mut cache,&Input::new(text).range(at..),&mut caps);
+            let Some(m)=caps.get_match() else { break };
+            result.push_str(&text[end..m.start()]);
+            if let Err(e)=expand_java(&caps,text,replacement,&mut result) { return Ok(Err(e)); }
+            end=m.end();
+            // An empty match advances one character.
+            at=if m.is_empty() { match text[m.end()..].chars().next() { Some(c)=>m.end()+c.len_utf8(), None=>break } } else { m.end() };
+        }
+        result.push_str(&text[end..]);Ok(Ok(result))
+    }
+    /// Literal replacement (every match replaced by `replacement` as is).
     /// Caller owns the output's pre-admitted scalar guard across handoff.
     pub(crate) fn replace(&self,text:&str,replacement:&str)->Result<String> {
         let _scratch=self.scratch()?;
@@ -69,6 +91,57 @@ impl Program {
         }
         result.push_str(&text[end..]);Ok(result)
     }
+}
+
+/// Append Java's expansion of `replacement` for one match (`caps`).
+fn expand_java(caps:&regex_automata::util::captures::Captures,text:&str,replacement:&str,out:&mut String)->std::result::Result<(),String> {
+    let group=|i:usize,out:&mut String| if let Some(sp)=caps.get_group(i) { out.push_str(&text[sp.start..sp.end]); };
+    let groups=caps.group_len();
+    let r:Vec<char>=replacement.chars().collect();
+    let mut i=0;
+    while i<r.len() {
+        match r[i] {
+            '\\'=>{
+                i+=1;
+                match r.get(i) { Some(c)=>{out.push(*c);i+=1;} None=>return Err("java.lang.IllegalArgumentException: character to be escaped is missing".into()) }
+            }
+            '$'=>{
+                i+=1;
+                match r.get(i) {
+                    None=>return Err("java.lang.IllegalArgumentException: Illegal group reference: group index is missing".into()),
+                    Some('{')=>{
+                        i+=1;
+                        let start=i;
+                        while i<r.len() && r[i].is_ascii_alphanumeric() { i+=1; }
+                        if i==start { return Err("java.lang.IllegalArgumentException: named capturing group has 0 length name".into()); }
+                        if r.get(i)!=Some(&'}') { return Err("java.lang.IllegalArgumentException: named capturing group is missing trailing '}'".into()); }
+                        let name:String=r[start..i].iter().collect();
+                        i+=1;
+                        if !r[start].is_ascii_alphabetic() { return Err("java.lang.IllegalArgumentException: capturing group name {".to_string()+&name+"} starts with digit character"); }
+                        match caps.group_info().to_index(regex_automata::PatternID::ZERO,&name) {
+                            Some(g)=>group(g,out),
+                            None=>return Err(format!("java.lang.IllegalArgumentException: No group with name {{{name}}}")),
+                        }
+                    }
+                    Some(c) if c.is_ascii_digit()=>{
+                        let mut n=c.to_digit(10).unwrap() as usize;
+                        if n>=groups { return Err(format!("java.lang.IndexOutOfBoundsException: No group {n}")); }
+                        i+=1;
+                        // Further digits while they still name a group.
+                        while let Some(d)=r.get(i).and_then(|c|c.to_digit(10)) {
+                            let next=n*10+d as usize;
+                            if next>=groups { break; }
+                            n=next;i+=1;
+                        }
+                        group(n,out);
+                    }
+                    Some(_)=>return Err("java.lang.IllegalArgumentException: Illegal group reference".into()),
+                }
+            }
+            c=>{out.push(c);i+=1;}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct Captures {

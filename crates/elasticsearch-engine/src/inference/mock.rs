@@ -245,7 +245,9 @@ pub fn dense_embedding(input: &str, dims: usize, element_type: &str, similarity:
     }
     let rest = len - out.len();
     out.extend_from_slice(&bytes[..rest]);
-    if similarity == "dot_product" {
+    // Byte and bit embeddings are whole byte values (ES's test service
+    // builds them as bytes); only float ones are normalized.
+    if similarity == "dot_product" && element_type != "byte" && element_type != "bit" {
         let mag = out.iter().fold(0f32, |a, b| a + b * b).sqrt();
         out = out.into_iter().map(|v| v / mag).collect();
     }

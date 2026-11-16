@@ -7,6 +7,8 @@ use crate::error::{EsError, Result};
 use crate::mapping::{EsType, ResolvedField, SOURCE_FIELD};
 use crate::values;
 use rustic_core::fieldtypes::completion::{analyze, top_suggestions, CompletionEntry, CompletionIndex};
+use rustic_core::query::LeafReader;
+use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 const SEP: char = '\u{1f}';
@@ -221,23 +223,25 @@ pub fn completion(text: &str, regex: bool, c: &Map<String, Value>, targets: &[Su
         if !defs.is_empty() && wanted.iter().all(|(_, v)| v.is_empty()) {
             return Err(EsError::illegal_argument("Missing mandatory contexts in context query"));
         }
+        // The field's analyzers (`simple`, the default, is the built-in one).
+        let named = |key: &str| f.ext.as_ref().and_then(|e| e.str(key)).map(str::to_string);
+        let index_name = named("analyzer").unwrap_or_else(|| "simple".into());
+        let search_name = named("search_analyzer").unwrap_or_else(|| index_name.clone());
+        let resolve = |name: &str| if name == "simple" { None } else { t.lookup.registry.analyzer(name) };
+        let (index_an, search_an) = (resolve(&index_name), resolve(&search_name));
         for (li, leaf) in t.leaves.iter().enumerate() {
-            let live = leaf.live_docs();
-            let mut entries = Vec::new();
-            for d in 0..leaf.num_docs() {
-                if !live(d) {
-                    continue;
-                }
-                for enc in leaf.keyword_values(id, d) {
-                    if let Some((input, weight, contexts)) = decode_entry(&enc) {
-                        entries.push(CompletionEntry { doc: d, input, weight, contexts });
-                    }
-                }
-            }
-            if entries.is_empty() {
+            // The leaf's completion index: built once per immutable segment
+            // and kept with it (admitted, cancellable while building);
+            // memtables build theirs per request.
+            let build = || build_completion_index(leaf, id, index_an.as_deref(), preserve, max_len);
+            let idx: Arc<CompletionCache> = match leaf {
+                LeafReader::Segment(s) => s.derived(&format!("completion#{id}#{index_name}#{preserve}#{max_len}"), build)?,
+                LeafReader::Memtable(..) => Arc::new(build()?),
+            };
+            let idx = &idx.index;
+            if idx.is_empty() {
                 continue;
             }
-            let idx = CompletionIndex::build(entries, |s| analyze(s, preserve, max_len));
             let mut hits = match &regex_re {
                 Some(re) => (0..idx.len())
                     .filter(|&i| {
@@ -246,8 +250,12 @@ pub fn completion(text: &str, regex: bool, c: &Map<String, Value>, targets: &[Su
                     })
                     .map(|i| (i, 1.0f32))
                     .collect(),
-                None => idx.lookup(&analyze(text, preserve, max_len), fuzzy),
+                None => idx.lookup(&analyze_completion(text, search_an.as_deref(), preserve, max_len), fuzzy),
             };
+            let live = leaf.live_docs();
+            hits.retain(|&(i, _)| live(idx.entry(i).doc));
+            // The request's candidate workspace is admitted before use.
+            let _candidates = rustic_core::admission::shared().reserve((hits.len() * 48) as u64, "completion suggester candidates")?;
             // Matched contexts per doc (ES groups the contexts of every hit path of a doc).
             let mut matched: std::collections::HashMap<rustic_core::types::DocId, Vec<(String, String)>> = std::collections::HashMap::new();
             if !defs.is_empty() {
@@ -281,7 +289,9 @@ pub fn completion(text: &str, regex: bool, c: &Map<String, Value>, targets: &[Su
                     })
                     .collect();
             }
-            for (sug, score) in top_suggestions(&idx, &hits, size, false) {
+            // Per leaf, `size` distinct inputs when duplicates are skipped:
+            // a cut of non-distinct ones could leave out the next winners.
+            for (sug, score) in top_suggestions(idx, &hits, size, skip_dup) {
                 let cx = matched.get(&sug.doc).cloned().unwrap_or_default();
                 all.push((score, sug.input, t.index.to_string(), ti, li, sug.doc, cx));
             }
@@ -451,5 +461,131 @@ mod java_order_tests {
         assert_eq!(order(&["title", "plain", "body", "tag"]), ["tag", "body", "title", "plain"]);
         assert_eq!(order(&["alpha", "beta", "gamma", "delta", "zeta", "omega"]), ["zeta", "alpha", "delta", "beta", "gamma", "omega"]);
         assert_eq!(order(&["cat", "loc"]), ["loc", "cat"]);
+    }
+}
+
+/// A leaf's completion index and the admission of its memory.
+pub(crate) struct CompletionCache {
+    index: CompletionIndex,
+    _memory: rustic_core::admission::Reservation,
+}
+
+/// The completion form of `input` under the field's analyzer (`None`: the
+/// built-in `simple`): its tokens joined by the separator (or concatenated
+/// without `preserve_separators`), from at most `max_len` chars.
+fn analyze_completion(input: &str, analyzer: Option<&rustic_core::analysis::Analyzer>, preserve: bool, max_len: usize) -> String {
+    let Some(a) = analyzer else { return analyze(input, preserve, max_len) };
+    let truncated: String = input.chars().take(max_len).collect();
+    let toks: Vec<String> = a.analyze(&truncated).into_iter().map(|t| t.text).collect();
+    if preserve {
+        toks.join(&rustic_core::fieldtypes::completion::TOKEN_SEP.to_string())
+    } else {
+        toks.concat()
+    }
+}
+
+/// Build a leaf's completion index from the field's doc values, admitting
+/// its memory as it grows (refused past the budget) and stopping when the
+/// search is cancelled.
+fn build_completion_index(leaf: &LeafReader<'_>, field: u16, analyzer: Option<&rustic_core::analysis::Analyzer>, preserve: bool, max_len: usize) -> Result<CompletionCache> {
+    #[cfg(test)]
+    COMPLETION_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let label = "completion suggester index";
+    let mut memory = rustic_core::admission::shared().reserve(0, label)?;
+    // Every doc's entries (deletions change; requests filter live docs).
+    let mut entries = Vec::new();
+    for d in 0..leaf.num_docs() {
+        if d % 4096 == 0 && rustic_core::cancel::is_cancelled() {
+            return Err(EsError::new(400, "task_cancelled_exception", rustic_core::cancel::reason().unwrap_or_else(|| "cancelled".into())));
+        }
+        for enc in leaf.keyword_values(field, d) {
+            if let Some((input, weight, contexts)) = decode_entry(&enc) {
+                // The entry, its analyzed form and its FST key.
+                let bytes = 3 * input.len() as u64 + contexts.iter().map(|(a, b)| (a.len() + b.len() + 48) as u64).sum::<u64>() + 128;
+                memory.grow(bytes, label)?;
+                entries.push(CompletionEntry { doc: d, input, weight, contexts });
+            }
+        }
+    }
+    let index = CompletionIndex::build(entries, |s| analyze_completion(s, analyzer, preserve, max_len));
+    Ok(CompletionCache { index, _memory: memory })
+}
+
+#[cfg(test)]
+static COMPLETION_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+
+    fn setup() -> (tempfile::TempDir, Arc<crate::node::Node>, Arc<crate::index::IndexService>) {
+        let d = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(d.path()).unwrap();
+        let svc = node.create_index("c", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0,
+            "analysis": {"analyzer": {"fold": {"tokenizer": "standard", "filter": ["lowercase", "asciifolding"]}}}},
+            "mappings": {"properties": {"folded": {"type": "completion", "analyzer": "fold"}, "plain": {"type": "completion"}, "dup": {"type": "completion"}}}})).unwrap();
+        let docs = [
+            ("1", json!({"folded": "Café", "plain": "Café", "dup": {"input": "apple", "weight": 10}})),
+            ("2", json!({"dup": {"input": "apple", "weight": 10}})),
+            ("3", json!({"dup": {"input": "apricot", "weight": 5}})),
+        ];
+        let reqs: Vec<WriteReq> = docs.iter().map(|(id, d)| WriteReq::Index { id: Some(id.to_string()), source: d.to_string(), routing: None, cond: WriteCond::default() }).collect();
+        assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+        svc.refresh().unwrap();
+        svc.flush().unwrap();
+        (d, node, svc)
+    }
+
+    fn suggest(node: &crate::node::Node, field: &str, prefix: &str, extra: Value) -> Vec<String> {
+        let mut c = json!({"field": field, "size": 2});
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            c[k] = v.clone();
+        }
+        let r = crate::ml::search(node, "c", &json!({"suggest": {"s": {"prefix": prefix, "completion": c}}})).unwrap();
+        r["suggest"]["s"][0]["options"].as_array().unwrap().iter().map(|o| o["text"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// #260: the field's analyzer applies to inputs and prefixes (folding
+    /// here); the default `simple` analyzer is the control.
+    #[test]
+    fn completion_uses_the_field_analyzer() {
+        let (_d, node, _svc) = setup();
+        assert_eq!(suggest(&node, "folded", "cafe", json!({})), vec!["Café"]);
+        assert!(suggest(&node, "plain", "cafe", json!({})).is_empty(), "simple keeps é");
+    }
+
+    /// #261: skip_duplicates keeps `size` distinct inputs in each leaf.
+    #[test]
+    fn skip_duplicates_fills_the_size() {
+        let (_d, node, _svc) = setup();
+        assert_eq!(suggest(&node, "dup", "ap", json!({"skip_duplicates": true})), vec!["apple", "apricot"]);
+        assert_eq!(suggest(&node, "dup", "ap", json!({})), vec!["apple", "apple"], "control: duplicates kept");
+    }
+
+    /// #263: a segment's completion index is built once and reused; its
+    /// build is admitted (a budget it does not fit refuses it) and stops
+    /// when the search is cancelled.
+    #[test]
+    fn completion_index_is_cached_admitted_and_cancellable() {
+        let (_d, node, svc) = setup();
+        suggest(&node, "dup", "ap", json!({}));
+        let builds = COMPLETION_BUILDS.load(std::sync::atomic::Ordering::SeqCst);
+        suggest(&node, "dup", "ap", json!({}));
+        suggest(&node, "dup", "apr", json!({}));
+        assert_eq!(COMPLETION_BUILDS.load(std::sync::atomic::Ordering::SeqCst), builds, "reused for the segment");
+        let field = svc.lookup().get("dup").unwrap().core_id.unwrap();
+        let shard = svc.local_shards()[0].clone();
+        let view = shard.shard.reader_view();
+        let leaves = view.leaves();
+        {
+            let _budget = rustic_core::admission::private_shared(64);
+            let e = build_completion_index(&leaves[0], field, None, true, 50).err().expect("refused");
+            assert!(e.status == 429 || e.kind.contains("circuit_breaking") || e.reason.contains("completion suggester index"), "{e:?}");
+        }
+        let cancelled = rustic_core::cancel::with_search(Some(rustic_core::cancel::Token::cancelled_with("stop")), || build_completion_index(&leaves[0], field, None, true, 50).err());
+        assert_eq!(cancelled.map(|e| e.kind), Some("task_cancelled_exception".to_string()));
+        assert!(build_completion_index(&leaves[0], field, None, true, 50).is_ok());
     }
 }

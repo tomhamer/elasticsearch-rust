@@ -8,7 +8,13 @@
 # What it does:
 #   1. creates a kind cluster with 3 workers labelled zone-a/b/c
 #   2. builds (or reuses) the node image and loads it into kind
-#   3. installs the chart: 3 dedicated masters + 2 data nodes, zone awareness
+#   3. installs the chart with its secure defaults (authentication, HTTPS,
+#      transport TLS; chart-generated CA, certificates and elastic password):
+#      3 dedicated masters + 2 data nodes, zone awareness. Every request of
+#      this test is HTTPS, verified against the chart's CA, as `elastic`.
+#      Checks that anonymous requests, a wrong password, plain HTTP and
+#      unverified TLS are refused and that the transport port speaks TLS
+#      with a certificate from the chart's CA
 #   4. waits for green; indexes documents into 3 indices (1 replica)
 #      and checks the node logs carry no ANSI colour codes
 #   5. force-kills the elected master while a writer indexes documents;
@@ -49,7 +55,7 @@ TIMEOUT="${TIMEOUT:-600}"
 NS=es-e2e
 RELEASE=e2e
 ES_NAME=e2e                      # clusterName -> client Service "e2e"
-URL="http://${ES_NAME}:9200"
+URL="https://${ES_NAME}:9200"      # the client Service; its name is in the HTTP certificate
 CLIENT_POD=es-e2e-client
 INDICES=(e2e-a e2e-b e2e-c)
 WRITE_INDEX=e2e-w                # written to while pods are killed / upgraded
@@ -109,10 +115,17 @@ trap 'fail "interrupted"' INT TERM
 
 # ------------------------------------------------------------------ helpers
 # es <curl args...>: curl from a pod inside the cluster (survives pod kills,
-# unlike kubectl port-forward).
+# unlike kubectl port-forward), through the image's es-http-lib: HTTPS
+# verified with the chart's CA (ES_CA_CERT), as elastic (ELASTIC_PASSWORD
+# from the chart's Secret), the password passed to curl via a config fd.
 es() {
   "${KUBECTL[@]}" -n "$NS" exec -i "$CLIENT_POD" -- \
-    curl -sS --max-time 30 -H 'Content-Type: application/json' "$@"
+    bash -c '. /usr/share/elasticsearch/bin/es-http-lib && es_curl "$@"' es-curl \
+    -sS --max-time 30 -H 'Content-Type: application/json' "$@"
+}
+es_raw() {   # as es, without the default Content-Type
+  "${KUBECTL[@]}" -n "$NS" exec -i "$CLIENT_POD" -- \
+    bash -c '. /usr/share/elasticsearch/bin/es-http-lib && es_curl "$@"' es-curl -sS "$@"
 }
 
 client_sh() {
@@ -179,10 +192,11 @@ assert_doc_count() {
 # "<id> <http status>" per attempt. A 200/201 is an acknowledged write.
 install_writer() {
   client_sh 'cat > /tmp/writer.sh' <<EOF
+. /usr/share/elasticsearch/bin/es-http-lib
 i=0
 while [ ! -f /tmp/w-stop ]; do
   id="\$1-\$i"
-  code=\$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 10 -H 'Content-Type: application/json' \\
+  code=\$(es_curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 10 -H 'Content-Type: application/json' \\
     -X PUT "${URL}/${WRITE_INDEX}/_doc/\$id" -d "{\\"n\\":\$i,\\"phase\\":\\"\$1\\"}")
   echo "\$id \$code" >> /tmp/w-log
   i=\$((i + 1))
@@ -248,7 +262,7 @@ assert_same_on_all_pods() {
     [[ -n "$ip" ]] || fail "pod $pod has no IP"
     line=""
     for idx in "${INDICES[@]}" "$WRITE_INDEX"; do
-      c="$(es "http://$ip:9200/$idx/_count" < /dev/null | jq -r 'if ._shards.failed == 0 then .count else "ERR" end' 2>/dev/null)" || c=ERR
+      c="$(es --connect-to "::$ip:" "$URL/$idx/_count" < /dev/null | jq -r 'if ._shards.failed == 0 then .count else "ERR" end' 2>/dev/null)" || c=ERR
       line+="$idx=${c:-ERR} "
     done
     info "$pod: $line"
@@ -402,11 +416,53 @@ step "helm install (3 masters + 2 data nodes)"
 helm_deploy 2
 "${KUBECTL[@]}" -n "$NS" get pods -o wide
 "${KUBECTL[@]}" -n "$NS" delete pod "$CLIENT_POD" --ignore-not-found >/dev/null
-"${KUBECTL[@]}" -n "$NS" run "$CLIENT_POD" --image="$IMAGE" --image-pull-policy=Never --restart=Never \
-  --labels=app=es-e2e-client --command -- sleep 86400 >/dev/null
+# The client trusts only the chart's CA and authenticates with the password
+# from the chart's Secret.
+cat <<EOF | "${KUBECTL[@]}" -n "$NS" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${CLIENT_POD}
+  labels: { app: es-e2e-client }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: ${IMAGE}
+      imagePullPolicy: Never
+      command: [sleep, "86400"]
+      env:
+        - { name: ES_CA_CERT, value: /certs/ca.crt }
+        - name: ELASTIC_PASSWORD
+          valueFrom: { secretKeyRef: { name: ${ES_NAME}-credentials, key: password } }
+      volumeMounts:
+        - { name: ca, mountPath: /certs, readOnly: true }
+  volumes:
+    - name: ca
+      secret: { secretName: ${ES_NAME}-certs, items: [{ key: ca.crt, path: ca.crt }] }
+EOF
 "${KUBECTL[@]}" -n "$NS" wait --for=condition=Ready "pod/$CLIENT_POD" --timeout="${TIMEOUT}s" >/dev/null
 pass "client pod ready"
 wait_green
+step "security: authentication, HTTPS and transport TLS are enforced"
+anon="$(client_sh "curl -s -o /dev/null -w '%{http_code}' --cacert /certs/ca.crt '$URL/_cluster/health'" < /dev/null)"
+[[ "$anon" == 401 ]] || fail "anonymous request answered $anon, expected 401"
+pass "anonymous request -> 401"
+wrong="$(client_sh "curl -s -o /dev/null -w '%{http_code}' --cacert /certs/ca.crt -u elastic:wrong-password '$URL/_cluster/health'" < /dev/null)"
+[[ "$wrong" == 401 ]] || fail "wrong password answered $wrong, expected 401"
+pass "wrong password -> 401"
+plain="$(client_sh "curl -s -o /dev/null -w '%{http_code}' --max-time 10 'http://${ES_NAME}:9200/_cluster/health' || true" < /dev/null)"
+[[ "$plain" != 200 ]] || fail "plain HTTP answered 200"
+pass "plain HTTP refused (curl status ${plain})"
+if client_sh "curl -s -o /dev/null --max-time 10 '$URL/' 2>/dev/null" < /dev/null; then fail "TLS without the cluster CA was accepted"; fi
+pass "HTTPS without the chart's CA fails certificate verification"
+who="$(es "$URL/_security/_authenticate")"
+[[ "$(jq -r .username <<< "$who")" == elastic && "$(jq -r '.roles | index("superuser")' <<< "$who")" != null ]] || fail "authenticate: $who"
+pass "authenticated as elastic (superuser) with the chart-generated password over verified TLS"
+read -r tpod tip < <(es_pods | head -1)
+tls="$(client_sh "openssl s_client -connect ${tip}:9300 -CAfile /certs/ca.crt </dev/null 2>&1 | grep -E 'Verify return code|^issuer=' | head -2" < /dev/null)"
+grep -q 'Verify return code: 0 (ok)' <<< "$tls" || fail "transport port of $tpod: no TLS with a certificate from the chart's CA: $tls"
+pass "transport ($tpod:9300) speaks TLS; certificate verified against the chart's CA ($(grep issuer= <<< "$tls" | head -1))"
 es "$URL/_cat/nodes?v&h=name,node.role,master"
 attrs="$(es "$URL/_cat/nodeattrs?h=node,attr,value" | grep -c ' zone ' || true)"
 [[ "$attrs" -ge 5 ]] || fail "expected node.attr.zone on every node, found $attrs"
@@ -429,8 +485,7 @@ for idx in "${INDICES[@]}"; do
   for ((d = 0; d < DOCS; d++)); do
     printf '{"index":{"_id":"%s"}}\n{"n":%d,"title":"document %d of %s","tag":"t%d"}\n' "$d" "$d" "$d" "$idx" $((d % 7)) >> "$bulk"
   done
-  resp="$("${KUBECTL[@]}" -n "$NS" exec -i "$CLIENT_POD" -- curl -sS --max-time 60 \
-    -H 'Content-Type: application/x-ndjson' -X POST "$URL/$idx/_bulk?refresh=true" --data-binary @- < "$bulk")"
+  resp="$(es_raw --max-time 60 -H 'Content-Type: application/x-ndjson' -X POST "$URL/$idx/_bulk?refresh=true" --data-binary @- < "$bulk")"
   [[ "$(jq -r .errors <<< "$resp")" == "false" ]] || fail "bulk into $idx reported errors: $(jq -c '[.items[] | .[] | select(.error)][0]' <<< "$resp")"
 done
 EXPECTED_DOCS=$(( DOCS * ${#INDICES[@]} ))

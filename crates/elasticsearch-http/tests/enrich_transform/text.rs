@@ -22,6 +22,9 @@ async fn geoip_processor_with_databases() {
     let dir = tempfile::tempdir().unwrap();
     with_geoip_dbs(dir.path());
     let es = start(dir.path()).await;
+    // The fixture databases only: no download from the public endpoint.
+    let (st, v) = es.put("/_cluster/settings", json!({"persistent": {"ingest.geoip.downloader.enabled": false}})).await;
+    assert_eq!(st, 200, "{v}");
     let (st, v) = es.put("/_ingest/pipeline/g", json!({"processors": [{"geoip": {"field": "ip"}}]})).await;
     assert_eq!(st, 200, "{v}");
     let (st, v) = es.put("/t/_doc/1?pipeline=g", json!({"ip": "89.160.20.128"})).await;

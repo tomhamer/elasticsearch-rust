@@ -23,6 +23,10 @@ pub struct StoredScript {
 pub struct StoredScripts {
     path: PathBuf,
     scripts: RwLock<BTreeMap<String, StoredScript>>,
+    /// The catalog in memory is not (known to be) on disk: a persist failed.
+    /// The next [`StoredScripts::restore_cluster_state`] writes it again
+    /// even when the catalog did not change.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<StoredScripts>>> {
@@ -64,7 +68,7 @@ impl StoredScripts {
                 scripts.insert(id, StoredScript { lang, source, raw_source: v.get("raw_source").and_then(Value::as_str).map(str::to_owned), source_json, options: v.get("options").cloned() });
             }
         }
-        StoredScripts { path, scripts: RwLock::new(scripts) }
+        StoredScripts { path, scripts: RwLock::new(scripts), dirty: std::sync::atomic::AtomicBool::new(false) }
     }
 
     fn persist(&self, m: &BTreeMap<String, StoredScript>) -> Result<()> {
@@ -82,10 +86,16 @@ impl StoredScripts {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&Value::Object(o))?)?;
-        std::fs::rename(tmp, &self.path)?;
-        Ok(())
+        // Durable (fsync of the file and its directory); any failure leaves
+        // the catalog marked dirty, to be written again.
+        let written = crate::hooks::write_durable(&self.path, &serde_json::to_vec_pretty(&Value::Object(o))?);
+        self.dirty.store(written.is_err(), std::sync::atomic::Ordering::SeqCst);
+        written.map_err(|e| EsError::new(500, "io_exception", format!("failed to persist stored scripts to [{}]: {e}", self.path.display())))
+    }
+
+    /// Whether the catalog in memory is not yet persisted (a write failed).
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Internal cluster payload keeps raw JSON tokens as escaped strings.
@@ -93,12 +103,21 @@ impl StoredScripts {
         serde_json::to_value(&*self.scripts.read()).expect("stored script metadata")
     }
 
+    /// Install the committed catalog `state`. The catalog in memory (what
+    /// scripts execute) always becomes the committed one, so this node never
+    /// runs logic older than the cluster state it applies; then it is
+    /// persisted. A persist failure is returned (the caller must count the
+    /// application as failed, and retry it) and retried by the next call
+    /// even if the catalog is unchanged by then.
     pub fn restore_cluster_state(&self, state: &Value) -> Result<()> {
         let next: BTreeMap<String, StoredScript> = serde_json::from_value(state.clone())?;
         let mut current = self.scripts.write();
         if *current != next {
-            self.persist(&next)?;
             *current = next;
+            self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self.is_dirty() {
+            self.persist(&current)?;
         }
         Ok(())
     }
@@ -237,3 +256,43 @@ mod utf16_tests {
         assert!(StoredScripts::load(peer_dir.path()).get("raw").is_none());
     }
 }
+
+#[cfg(test)]
+mod persistence_failure_tests {
+    use super::*;
+
+    /// A follower whose catalog cannot be written still runs the committed
+    /// script (never the older one), reports the failure, and writes the
+    /// catalog once the disk recovers, without another change.
+    #[test]
+    fn a_failed_catalog_write_is_reported_retried_and_never_runs_stale_logic() {
+        let master_dir = tempfile::tempdir().unwrap();
+        let master = StoredScripts::load(master_dir.path());
+        let body = |n: i64| json!({"script": {"lang": "painless", "source": format!("ctx._source.n += {n}")}});
+        master.put("inc", &body(1), Some("update")).unwrap();
+        let follower_dir = tempfile::tempdir().unwrap();
+        let follower = StoredScripts::load(follower_dir.path());
+        follower.restore_cluster_state(&master.cluster_state()).unwrap();
+        let run = |scripts: &StoredScripts| {
+            let compiled = super::super::compile_json(&json!({"id": "inc"}), super::super::ScriptContext::Update, Some(scripts)).unwrap();
+            super::super::update::run_doc_script_source(&compiled, r#"{"n":0}"#, &super::super::update::DocMeta::default(), "index").unwrap().1
+        };
+        assert_eq!(run(&follower), r#"{"n":1}"#);
+        // The follower's catalog file cannot be replaced (a non-empty
+        // directory in its place).
+        let file = follower_dir.path().join("_state").join("scripts.json");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(file.join("blocker")).unwrap();
+        master.put("inc", &body(10), Some("update")).unwrap();
+        assert!(follower.restore_cluster_state(&master.cluster_state()).is_err(), "the failure is reported");
+        assert!(follower.is_dirty());
+        assert_eq!(run(&follower), r#"{"n":10}"#, "the committed script runs, never the older one");
+        // Retried with the same state once the disk recovers.
+        std::fs::remove_dir_all(&file).unwrap();
+        follower.restore_cluster_state(&master.cluster_state()).unwrap();
+        assert!(!follower.is_dirty());
+        let reloaded = StoredScripts::load(follower_dir.path());
+        assert_eq!(run(&reloaded), r#"{"n":10}"#, "persisted after the retry");
+    }
+}
+

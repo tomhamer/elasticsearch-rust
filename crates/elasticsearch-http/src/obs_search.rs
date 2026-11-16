@@ -99,6 +99,7 @@ fn with_index_ctx<T>(svc: &IndexService, f: impl FnOnce(&QueryContext, &[LeafRea
         allow_unmapped_fields: true,
         knn_prefilter: None,
         knn_prefilter_lookup: None,
+        dls_filter: None,
         allow_expensive_queries: svc.setting("index.search.allow_expensive_queries").map(|v| v != "false").unwrap_or(true),
         mappings: Some(&**svc),
     };
@@ -129,6 +130,7 @@ fn with_ctx<T>(svc: &elasticsearch_engine::index::IndexShard, f: impl FnOnce(&Qu
         allow_unmapped_fields: true,
         knn_prefilter: None,
         knn_prefilter_lookup: None,
+        dls_filter: None,
         allow_expensive_queries: svc.setting("index.search.allow_expensive_queries").map(|v| v != "false").unwrap_or(true),
         mappings: Some(&**svc),
     };

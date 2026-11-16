@@ -19,6 +19,30 @@ pub(crate) use num::Num;
 
 type CResult<T> = Result<T, ScriptErr>;
 
+/// A conditional's closure and static type. Painless `promoteConditional`:
+/// numeric branches of different types promote to their common type
+/// (int/long -> long, any double -> double), whichever branch is taken.
+/// Out of line: the recursive expression compiler's frame stays small.
+#[inline(never)]
+fn conditional(c: Box<dyn Fn(&mut Rt) -> SResult<bool> + Send + Sync>, x: ExprFn, sa: St, y: ExprFn, sb: St) -> (ExprFn, St) {
+    let numeric = |t: St| matches!(t, St::Int | St::Long | St::Double);
+    if sa != sb && numeric(sa) && numeric(sb) {
+        let to = if sa == St::Double || sb == St::Double { St::Double } else { St::Long };
+        let promote = move |v: Val| -> Val {
+            match (to, v) {
+                (St::Double, Val::Int(i)) => Val::Double(i as f64),
+                (St::Double, Val::Long(l)) => Val::Double(l as f64),
+                (St::Long, Val::Int(i)) => Val::Long(i as i64),
+                (_, v) => v,
+            }
+        };
+        (Box::new(move |rt| Ok(promote(if c(rt)? { x(rt)? } else { y(rt)? }))), to)
+    } else {
+        let st = if sa == sb { sa } else { St::Def };
+        (Box::new(move |rt| if c(rt)? { x(rt) } else { y(rt) }), st)
+    }
+}
+
 /// Light static type of an expression (only what literals / declarations
 /// tell us; everything else is `Def`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +50,9 @@ enum St {
     Def,
     Int,
     Long,
+    /// A primitive `float` (held as a `Val::Double` rounded to single
+    /// precision; float-promoted operations round as Java does).
+    Float,
     Double,
     Bool,
     Str,
@@ -47,7 +74,8 @@ impl St {
         match t {
             Ty::Int | Ty::Short | Ty::Byte | Ty::Char => St::Int,
             Ty::Long => St::Long,
-            Ty::Double | Ty::Float => St::Double,
+            Ty::Float => St::Float,
+            Ty::Double => St::Double,
             Ty::Boolean => St::Bool,
             Ty::String => St::Str,
             Ty::Ref(n) => match n.as_str() {
@@ -72,6 +100,7 @@ impl St {
             St::Def => "def",
             St::Int => "int",
             St::Long => "long",
+            St::Float => "float",
             St::Double => "double",
             St::Bool => "boolean",
             St::Str => "String",
@@ -83,7 +112,7 @@ impl St {
         }
     }
     fn is_num(&self) -> bool {
-        matches!(self, St::Int | St::Long | St::Double)
+        matches!(self, St::Int | St::Long | St::Float | St::Double)
     }
 }
 
@@ -112,6 +141,9 @@ struct Compiler {
     nbindings: usize,
     /// Binding slot per call site (keyed by its argument list's address).
     binding_slots: std::collections::HashMap<usize, usize>,
+    /// Lambdas being compiled (innermost last): the scope depth at their
+    /// entry and the outer slots their bodies read (their captures).
+    lambda_caps: std::cell::RefCell<Vec<(usize, Vec<usize>)>>,
 }
 
 pub fn compile_program(src: &str, ctx: ScriptContext) -> Result<Program, ScriptErr> {
@@ -119,6 +151,11 @@ pub fn compile_program(src: &str, ctx: ScriptContext) -> Result<Program, ScriptE
 }
 
 pub fn compile_program_literals(src: &str, ctx: ScriptContext, literals: &std::collections::HashMap<usize, Vec<u16>>) -> Result<Program, ScriptErr> {
+    // Parse and the recursive compile of the tree on the parse stack.
+    crate::parse_depth::guarded(|| compile_program_literals_unguarded(src, ctx, literals))
+}
+
+fn compile_program_literals_unguarded(src: &str, ctx: ScriptContext, literals: &std::collections::HashMap<usize, Vec<u16>>) -> Result<Program, ScriptErr> {
     let (ast, stmt_starts) = super::parser::parse_with_literals(src, literals)?;
     let mut c = Compiler {
         ctx,
@@ -136,6 +173,7 @@ pub fn compile_program_literals(src: &str, ctx: ScriptContext, literals: &std::c
         uses_score: false,
         nbindings: 0,
         binding_slots: std::collections::HashMap::new(),
+        lambda_caps: std::cell::RefCell::new(Vec::new()),
     };
     for (i, f) in ast.functions.iter().enumerate() {
         if c.fn_sigs[..i].iter().any(|s| s.0 == f.name && s.1.len() == f.params.len()) {
@@ -224,8 +262,15 @@ const EXCEPTIONS: &[&str] = &[
 
 impl Compiler {
     fn lookup(&self, name: &str) -> Option<(usize, Ty)> {
-        for s in self.scopes.iter().rev() {
+        for (depth, s) in self.scopes.iter().enumerate().rev() {
             if let Some((_, slot, t)) = s.iter().rev().find(|(n, _, _)| n == name) {
+                // A variable of a scope outside a lambda being compiled is
+                // one of its captures (of every enclosing lambda it crosses).
+                for (entry, caps) in self.lambda_caps.borrow_mut().iter_mut() {
+                    if depth < *entry && !caps.contains(slot) {
+                        caps.push(*slot);
+                    }
+                }
                 return Some((*slot, t.clone()));
             }
         }
@@ -536,7 +581,12 @@ impl Compiler {
                     let coll = it(rt)?;
                     let _copy = super::allocation::Allocation::iterable(&coll).map_err(at(pos))?;
                     let items = iter_values(&coll).map_err(at(pos))?;
+                    // The copy is built-in work; each iteration is a loop
+                    // iteration (ES `ForEachSubIterableNode` / `...ArrayNode`
+                    // decrement the loop counter like any other loop).
+                    rt.charge(items.len() as u64).map_err(at(pos))?;
                     for v in items {
+                        rt.tick().map_err(at(pos))?;
                         rt.set_local(slot, coerce(&ty, v).map_err(at(pos))?);
                         match b(rt)? {
                             Flow::Break => break,
@@ -591,7 +641,10 @@ impl Compiler {
                 Box::new(move |rt| match b(rt) {
                     Ok(f) => Ok(f),
                     Err(e) => {
-                        if e.kind == "painless_error" || e.breaker.is_some() {
+                        // Errors (loop limit, breaker, the search's deadline or
+                        // cancellation) are not catchable `Exception`s.
+                        // (`stack_overflow_error` is a Java `Error` as well.)
+                        if e.kind == "painless_error" || e.kind == "stack_overflow_error" || e.breaker.is_some() || e.kind == super::runtime::TIME_EXCEEDED {
                             return Err(e);
                         }
                         for (ty, kind, slot, f) in &cs {
@@ -834,7 +887,14 @@ impl Compiler {
                     return Err(cc(pat.pos, "Cannot cast from [java.lang.String] to [java.util.regex.Pattern].".to_string()));
                 }
                 let find = *find;
-                (Box::new(move |rt| super::regex::regex_op(find, &tf(rt)?, &pf(rt)?).map_err(at(pos))), St::Bool)
+                (Box::new(move |rt| {
+                    let r = super::regex::regex_op(find, &tf(rt)?, &pf(rt)?).map_err(at(pos));
+                    let work = super::regex::take_work();
+                    if work > 0 {
+                        rt.charge(work).map_err(at(pos))?;
+                    }
+                    r
+                }), St::Bool)
             }
             ExprKind::Utf16(units) => {
                 let units=units.clone();
@@ -880,6 +940,12 @@ impl Compiler {
                 (
                     Box::new(move |rt| {
                         let dims: Vec<i64> = ds.iter().map(|f| f(rt).and_then(|v| v.to_index())).collect::<SResult<_>>().map_err(at(pos))?;
+                        // Admit the whole nested allocation before any of it:
+                        // the per-dimension bound alone lets a product of
+                        // in-range dimensions allocate without limit.
+                        let total = array_cells(&dims).map_err(at(pos))?;
+                        drop(super::allocation::Allocation::values_checked(total).map_err(at(pos))?);
+                        rt.charge(total).map_err(at(pos))?;
                         fn build(ty: &Ty, dims: &[i64]) -> SResult<Val> {
                             let n = dims[0];
                             if n < 0 || n > MAX_LOOP as i64 {
@@ -931,8 +997,7 @@ impl Compiler {
                 let c = self.cond(c)?;
                 let (x, sa) = self.expr(a)?;
                 let (y, sb) = self.expr(b)?;
-                let st = if sa == sb { sa } else { St::Def };
-                (Box::new(move |rt| if c(rt)? { x(rt) } else { y(rt) }), st)
+                conditional(c, x, sa, y, sb)
             }
             ExprKind::Elvis(a, b) => {
                 let (x, _) = self.expr(a)?;
@@ -1036,7 +1101,7 @@ impl Compiler {
                     return Err(ScriptErr::compile(expr.pos, format!("Cannot cast null to a primitive type [{}].", ty.name())));
                 }
                 if (st == St::Str && matches!(ty, Ty::Int | Ty::Long | Ty::Double | Ty::Float | Ty::Boolean | Ty::Short | Ty::Byte))
-                    || (matches!(st, St::Int | St::Long | St::Double | St::Bool) && matches!(ty, Ty::String | Ty::Ref(_)))
+                    || (matches!(st, St::Int | St::Long | St::Float | St::Double | St::Bool) && matches!(ty, Ty::String | Ty::Ref(_)))
                     || (st == St::Str && matches!(ty, Ty::Ref(_)) && !matches!(ty, Ty::Ref(n) if matches!(n.as_str(), "Object" | "CharSequence" | "Comparable")))
                 {
                     return Err(cc(expr.pos, format!("Cannot cast from [{}] to [{}].", jname_st(st), fqn_ty(ty))));
@@ -1052,7 +1117,16 @@ impl Compiler {
             }
             ExprKind::Lambda { params, body } => {
                 let id = self.lambda(params, body, pos)?;
-                (Box::new(move |_| Ok(Val::Lambda(id))), St::Def)
+                let captures = self.lambdas[id as usize].as_ref().map(|l| l.captures.clone()).unwrap_or_default();
+                // The captured locals' values at evaluation (by value, as
+                // Painless passes captures to the lambda's synthetic method).
+                (
+                    Box::new(move |rt| {
+                        let captured: Box<[Val]> = captures.iter().map(|s| rt.local(*s).clone()).collect();
+                        Ok(Val::Lambda(Rc::new(super::value::Closure { id, captured })))
+                    }),
+                    St::Def,
+                )
             }
             ExprKind::MethodRef { class, method } => {
                 if class == "this" && !self.fn_sigs.iter().any(|f| f.0 == *method) {
@@ -1159,6 +1233,7 @@ impl Compiler {
             let (bad, bad_pos, other) = if matches!(sa, St::Str | St::Bool) { (sa, a.pos, sb) } else { (sb, b.pos, sa) };
             let target = match other {
                 St::Long => "long",
+                St::Float => "float",
                 St::Double => "double",
                 _ => "int",
             };
@@ -1170,6 +1245,8 @@ impl Compiler {
             _ if sa.is_num() && sb.is_num() => {
                 if sa == St::Double || sb == St::Double {
                     St::Double
+                } else if sa == St::Float || sb == St::Float {
+                    St::Float
                 } else if sa == St::Long || sb == St::Long {
                     St::Long
                 } else {
@@ -1178,6 +1255,23 @@ impl Compiler {
             }
             _ => St::Def,
         };
+        // Binary numeric promotion to `float` (a float operand, no double):
+        // both operands convert to float (int / long round), the operation
+        // runs on them and an arithmetic result rounds to float again. For
+        // + - * / % of two floats, computing in double and rounding once is
+        // exactly IEEE single-precision arithmetic.
+        let float_promoted = sa.is_num() && sb.is_num() && (sa == St::Float || sb == St::Float) && sa != St::Double && sb != St::Double;
+        if float_promoted && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            let f: ExprFn = Box::new(move |rt| {
+                let x = to_float(l.eval(rt)?);
+                let y = to_float(r.eval(rt)?);
+                match fast_num(op, x, y).map_err(at(pos))? {
+                    Val::Double(d) => Ok(Val::Double(d as f32 as f64)),
+                    other => Ok(other),
+                }
+            });
+            return Ok((f, st));
+        }
         let f: ExprFn = match op {
             // Hot shapes without the generic dispatch.
             BinOp::Add => Box::new(move |rt| {
@@ -1603,10 +1697,20 @@ impl Compiler {
                         }
                         (et, docs)
                     };
+                    // The full query x document product can be very large
+                    // (SIDE 013): every pair is charged to the execution
+                    // fuel (its dimensions), which polls the deadline and
+                    // cancellation at poll boundaries; float rows are
+                    // converted once, not per pair.
+                    rt.charge((qvs.iter().map(Vec::len).sum::<usize>() + docs.iter().map(Vec::len).sum::<usize>()) as u64).map_err(at(pos))?;
+                    let float = et == 0 && fname != "maxSimInvHamming";
+                    let q32s: Vec<Vec<f32>> = if float { qvs.iter().map(|v| v.iter().map(|x| *x as f32).collect()).collect() } else { Vec::new() };
+                    let d32s: Vec<Vec<f32>> = if float { docs.iter().map(|v| v.iter().map(|x| *x as f32).collect()).collect() } else { Vec::new() };
                     let mut total = 0.0f64;
-                    for qv in &qvs {
+                    for (qi, qv) in qvs.iter().enumerate() {
                         let mut best = f64::NEG_INFINITY;
-                        for d in &docs {
+                        for (di, d) in docs.iter().enumerate() {
+                            rt.charge(d.len().max(1) as u64).map_err(at(pos))?;
                             let s = if fname == "maxSimInvHamming" {
                                 if et == 0 {
                                     return Err(illegal_arg("hamming distance is only supported for byte or bit vectors").at(pos));
@@ -1639,9 +1743,7 @@ impl Compiler {
                                 if et == 1 {
                                     qv.iter().zip(d).map(|(a, b)| (*a as i64) * (*b as i64)).sum::<i64>() as f64
                                 } else {
-                                    let q32: Vec<f32> = qv.iter().map(|x| *x as f32).collect();
-                                    let d32: Vec<f32> = d.iter().map(|x| *x as f32).collect();
-                                    rustic_core::vector::dot(&q32, &d32) as f64
+                                    rustic_core::vector::dot(&q32s[qi], &d32s[di]) as f64
                                 }
                             };
                             best = best.max(s);
@@ -1750,8 +1852,8 @@ impl Compiler {
             for (i, a) in args.iter().enumerate().take(2) {
                 let st = self.info(a).1;
                 let bad = match (i, ty) {
-                    (1, "BigInteger") => matches!(st, St::Double | St::Bool | St::Str | St::List | St::Map | St::Cls(_)),
-                    _ => matches!(st, St::Int | St::Long | St::Double | St::Bool | St::List | St::Map | St::Cls(_)) || (i == 1 && st == St::Str),
+                    (1, "BigInteger") => matches!(st, St::Float | St::Double | St::Bool | St::Str | St::List | St::Map | St::Cls(_)),
+                    _ => matches!(st, St::Int | St::Long | St::Float | St::Double | St::Bool | St::List | St::Map | St::Cls(_)) || (i == 1 && st == St::Str),
                 };
                 if bad {
                     return Err(cc(self.lit_pos(a), format!("Cannot cast from [{}] to [{}].", jname_st(st), params[i])));
@@ -1832,6 +1934,7 @@ impl Compiler {
     fn lambda(&mut self, params: &[String], body: &LambdaBody, _pos: usize) -> CResult<u32> {
         let id = self.lambdas.len();
         self.lambdas.push(None);
+        self.lambda_caps.borrow_mut().push((self.scopes.len(), Vec::new()));
         self.scopes.push(Vec::new());
         let mut slots = Vec::new();
         for p in params {
@@ -1854,7 +1957,8 @@ impl Compiler {
         };
         self.loop_depth = saved_loop;
         self.scopes.pop();
-        self.lambdas[id] = Some(LambdaInfo { slots, body });
+        let (_, captures) = self.lambda_caps.borrow_mut().pop().unwrap_or_default();
+        self.lambdas[id] = Some(LambdaInfo { slots, captures, frame: self.next_slot, body });
         Ok(id as u32)
     }
 
@@ -1879,7 +1983,12 @@ impl Compiler {
                     let nv = match op {
                         None => coerce(&ty, v).map_err(at(pos))?,
                         Some(op) => {
-                            let r = binary(op, rt.local(slot), &v).map_err(at(pos))?;
+                            // A float target promotes both operands to float first.
+                            let r = if ty == Ty::Float {
+                                binary(op, &to_float(rt.local(slot).clone()), &to_float(v)).map_err(at(pos))?
+                            } else {
+                                binary(op, rt.local(slot), &v).map_err(at(pos))?
+                            };
                             if matches!(ty, Ty::Def | Ty::Ref(_)) { r } else { cast(&ty, r).map_err(at(pos))? }
                         }
                     };
@@ -2077,18 +2186,33 @@ fn fast_num(op: BinOp, x: Val, y: Val) -> SResult<Val> {
     Ok(r)
 }
 
+/// A float-promoted operand: int / long convert with one rounding to
+/// single precision; a float value is already exact; anything else (a
+/// `def` that is not numeric) is left to the operator's own checks.
+fn to_float(v: Val) -> Val {
+    match v {
+        Val::Int(i) => Val::Double(i as f32 as f64),
+        Val::Long(l) => Val::Double(l as f32 as f64),
+        Val::Char(c) => Val::Double(c as f32 as f64),
+        Val::Double(d) => Val::Double(d as f32 as f64),
+        other => other,
+    }
+}
+
 fn check_assign(ty: &Ty, st: St, pos: usize) -> CResult<()> {
     if st == St::Null && matches!(ty, Ty::Int | Ty::Short | Ty::Byte | Ty::Long | Ty::Double | Ty::Float | Ty::Boolean | Ty::Char) {
         return Err(ScriptErr::compile(pos, format!("Cannot cast null to a primitive type [{}].", ty.name())));
     }
     let bad = match ty {
-        Ty::Int | Ty::Short | Ty::Byte => matches!(st, St::Long | St::Double | St::Bool | St::Str),
-        Ty::Long => matches!(st, St::Double | St::Bool | St::Str),
-        Ty::Double | Ty::Float => matches!(st, St::Bool | St::Str),
-        Ty::Boolean => matches!(st, St::Int | St::Long | St::Double | St::Str),
-        Ty::String => matches!(st, St::Int | St::Long | St::Double | St::Bool),
+        Ty::Int | Ty::Short | Ty::Byte => matches!(st, St::Long | St::Float | St::Double | St::Bool | St::Str),
+        Ty::Long => matches!(st, St::Float | St::Double | St::Bool | St::Str),
+        // double to float narrows: Java requires an explicit cast.
+        Ty::Float => matches!(st, St::Double | St::Bool | St::Str),
+        Ty::Double => matches!(st, St::Bool | St::Str),
+        Ty::Boolean => matches!(st, St::Int | St::Long | St::Float | St::Double | St::Str),
+        Ty::String => matches!(st, St::Int | St::Long | St::Float | St::Double | St::Bool),
         // Boxed / reference targets accept no primitive (only `def` boxes implicitly).
-        Ty::Ref(_) => matches!(st, St::Int | St::Long | St::Double | St::Bool),
+        Ty::Ref(_) => matches!(st, St::Int | St::Long | St::Float | St::Double | St::Bool),
         _ => false,
     };
     if bad {
@@ -2258,4 +2382,28 @@ fn fields_api_values(rt: &mut Rt, slot: usize, name: &str) -> SResult<Vec<Val>> 
     }
     let vals = rt.doc.values(slot)?;
     iter_values(&vals)
+}
+
+/// Values a `new T[d0][d1]...` allocates across all its nested arrays
+/// (`d0 + d0*d1 + ...`), checked: an overflow or a total above Java's
+/// largest array cannot be allocated (`OutOfMemoryError`). Negative or
+/// over-limit single dimensions keep their own error in `build`.
+pub(crate) fn array_cells(dims: &[i64]) -> SResult<u64> {
+    let mut product: u64 = 1;
+    let mut total: u64 = 0;
+    for &d in dims {
+        if d < 0 || d > MAX_LOOP as i64 {
+            // Reported by `build` with Java's exception for that dimension.
+            return Ok(total);
+        }
+        if d == 0 {
+            return Ok(total);
+        }
+        product = product.checked_mul(d as u64).ok_or_else(|| super::allocation::out_of_memory("Java heap space"))?;
+        total = total.checked_add(product).ok_or_else(|| super::allocation::out_of_memory("Java heap space"))?;
+        if total > i32::MAX as u64 {
+            return Err(super::allocation::out_of_memory("Java heap space"));
+        }
+    }
+    Ok(total)
 }

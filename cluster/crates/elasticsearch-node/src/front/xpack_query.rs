@@ -48,6 +48,46 @@ fn state_missing(resp: &RestResp, closing: bool) -> bool {
                 && v["error"]["caused_by"]["type"] == "search_context_missing_exception")))
 }
 
+/// Whether a forwarded follow-up never reached a handler (the peer was
+/// unreachable): that peer is not known to hold the state, so the search
+/// for its owner goes on (review finding 613).
+fn peer_unreachable(resp: &RestResp) -> bool {
+    let Some(v) = resp.body_json() else { return false };
+    matches!(
+        v["error"]["type"].as_str().unwrap_or(""),
+        "node_not_connected_exception" | "connect_transport_exception" | "node_disconnected_exception" | "node_closed_exception"
+            | "receive_timeout_transport_exception" | "send_request_transport_exception" | "transport_exception"
+    )
+}
+
+/// A SQL follow-up's owner search over the nodes in `order` (the master
+/// first): `ask(id)` runs it on node `id` (`local`: this node). The first
+/// answer from a node that holds the state is the answer; a node that does
+/// not, or that cannot be reached (it is not known to own it), lets the
+/// search go on (review finding 613). With no owner found: an unreachable
+/// node's failure (it may hold it), else the missing-state answer.
+async fn follow_up<F, Fut>(order: Vec<String>, local: &str, closing: bool, ask: F) -> RestResp
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = RestResp>,
+{
+    let mut first: Option<RestResp> = None;
+    let mut unreachable: Option<RestResp> = None;
+    for id in order {
+        let remote = id != local;
+        let resp = ask(id).await;
+        if remote && peer_unreachable(&resp) {
+            unreachable.get_or_insert(resp);
+            continue;
+        }
+        if !state_missing(&resp, closing) {
+            return resp;
+        }
+        first.get_or_insert(resp);
+    }
+    unreachable.or(first).unwrap_or_else(|| RestResp::error(503, "master_not_discovered_exception", ""))
+}
+
 pub(super) async fn handle(node: &Arc<ClusterNode>, req: &RestReq, kind: Kind) -> RestResp {
     match kind {
         Kind::Sql => esql_on_copies(node, req).await,
@@ -57,21 +97,16 @@ pub(super) async fn handle(node: &Arc<ClusterNode>, req: &RestReq, kind: Kind) -
             let master = state.master_node_id.clone();
             let mut order: Vec<String> = master.iter().cloned().collect();
             order.extend(state.nodes.keys().filter(|id| Some(*id) != master.as_ref()).cloned());
-            let mut first: Option<RestResp> = None;
-            for id in order {
-                let resp = if id == node.local.id {
+            let local = node.local.id.clone();
+            follow_up(order, &local, closing, |id| async move {
+                if id == node.local.id {
                     local_canonical(node, req).await
                 } else {
                     let mut sub = req.clone();
                     if let Err(error) = sub.push_header(EXEC_LOCAL, "1") { return RestResp::json(error.status, &error.to_json()); }
                     forward(node, &id, &sub).await
-                };
-                if !state_missing(&resp, closing) {
-                    return resp;
                 }
-                first.get_or_insert(resp);
-            }
-            first.unwrap_or_else(|| RestResp::error(503, "master_not_discovered_exception", ""))
+            }).await
         }
     }
 }
@@ -116,5 +151,53 @@ mod tests {
         // EQL runs on the master (`classify`) and reads through the coordinator.
         assert_eq!(kind("POST", &segs("/logs/_eql/search"), b"{}"), None);
         assert_eq!(kind("POST", &segs("/_search"), b"{}"), None);
+    }
+
+    /// Review finding 613: a peer that cannot be reached is not the
+    /// cursor's owner; the owner's own errors still end the search.
+    #[test]
+    fn unreachable_peers_do_not_end_the_owner_search() {
+        use serde_json::json;
+        let down = RestResp::error(502, "node_not_connected_exception", "[n1] node not connected");
+        assert!(peer_unreachable(&down));
+        let timeout = RestResp::error(500, "receive_timeout_transport_exception", "timed out");
+        assert!(peer_unreachable(&timeout));
+        let owner_error = RestResp::json(400, &json!({"error": {"type": "illegal_argument_exception", "reason": "bad"}, "status": 400}));
+        assert!(!peer_unreachable(&owner_error));
+        assert!(!state_missing(&owner_error, false));
+    }
+
+    /// Review finding 613 across nodes: the master holds no cursor, an
+    /// earlier peer is disconnected, the owner answers its page. The
+    /// follow-up reaches the owner (each node asked once, in order); with
+    /// the owner itself down the peer's failure is the answer; with no
+    /// owner anywhere, the missing cursor.
+    #[tokio::test]
+    async fn follow_ups_reach_their_owner_past_an_unreachable_peer() {
+        use serde_json::json;
+        let missing = || RestResp::json(404, &json!({"error": {"type": "search_phase_execution_exception", "reason": "all shards failed", "caused_by": {"type": "search_context_missing_exception", "reason": "No search context found"}}, "status": 404}));
+        let down = || RestResp::error(502, "node_not_connected_exception", "[b] node not connected");
+        let page = || RestResp::json(200, &json!({"rows": [[1]], "cursor": "next"}));
+        let order = || vec!["m".to_string(), "b".to_string(), "c".to_string()];
+        let asked = std::sync::Mutex::new(Vec::new());
+        let r = follow_up(order(), "m", false, |id| {
+            asked.lock().unwrap().push(id.clone());
+            let resp = match id.as_str() { "m" => missing(), "b" => down(), _ => page() };
+            async move { resp }
+        }).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(*asked.lock().unwrap(), vec!["m", "b", "c"]);
+        // The owner down too: the unreachable failure, not "missing".
+        let r = follow_up(order(), "m", false, |id| { let resp = match id.as_str() { "m" => missing(), _ => down() }; async move { resp } }).await;
+        assert_eq!(r.status, 502);
+        // Nobody has it.
+        let r = follow_up(order(), "m", false, |_| async { missing() }).await;
+        assert_eq!(r.status, 404);
+        // An owner's own error ends the search.
+        let r = follow_up(order(), "m", false, |id| {
+            let resp = if id == "m" { RestResp::json(400, &json!({"error": {"type": "illegal_argument_exception", "reason": "bad page"}, "status": 400})) } else { page() };
+            async move { resp }
+        }).await;
+        assert_eq!(r.status, 400);
     }
 }

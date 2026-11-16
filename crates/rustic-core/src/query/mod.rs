@@ -28,7 +28,7 @@ pub mod searcher;
 pub mod scorer;
 pub mod segment_scorer;
 pub mod similarity;
-mod sort_fast;
+pub(crate) mod sort_fast;
 pub mod spans;
 pub mod stats;
 
@@ -39,7 +39,7 @@ pub use boolean::{
     calculate_min_should_match, MinShouldMatch, MinShouldMatchUnion, RequiredOptionalScorer, Union,
 };
 pub use explain::Explanation;
-pub use function_score::{BoostMode, DecayKind, FieldValueModifier, FunctionScoreScorer, Prepared as PreparedScoreFunction, ScoreFunction, ScoreMode};
+pub use function_score::{BoostMode, DecayKind, FactorAcc, FieldValueModifier, FunctionScoreScorer, MultiValueMode, Prepared as PreparedScoreFunction, ScoreFunction, ScoreMode};
 pub use multi_term::{Fuzziness, MultiTermRewrite};
 pub use geo_scorer::geo_pred_scorer;
 pub use numeric_dv::{GeoDv, NumericDv};
@@ -50,7 +50,7 @@ pub use similarity::{
 pub use spans::{IntervalsRule, SpanQuery, SpanScorer, Spans};
 pub use collector::{collect_top_k, collect_top_k_live, collect_top_k_sorted, count, compare_field_docs, CountCollector, FieldDoc, ScoredDoc, SortSpec, SortValue, TopFieldCollector, TopKCollector};
 pub use reader::{field_stats, term_stats, FieldStats, LeafReader, ShapeValues, TermStats};
-pub use query::{hits_scorer, shared_bits_scorer, BoolBuilder, Bound, CustomQuery, InnerHitsCursor, Query, RangeDate, ScoredDocs, SearchContext};
+pub use query::{hits_scorer, nested_scope_ord, shared_bits_scorer, BoolBuilder, Bound, CustomQuery, InnerHitsCursor, Query, RangeDate, ScoredDocs, SearchContext};
 pub use searcher::{
     Rescore, RescoreMode, SearchOptions, Searcher, SortField, SortKind, SortMissing, SortMode, TopDocs, TopHit, TotalHitsRelation, TrackTotalHits,
 };

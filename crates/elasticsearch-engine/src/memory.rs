@@ -110,6 +110,15 @@ fn physical_memory() -> u64 {
 
 fn cgroup_limit() -> Option<u64> {
     let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_limit_at(&cg, std::path::Path::new("/sys/fs/cgroup"))
+}
+
+/// The effective cgroup memory limit of a process whose
+/// `/proc/self/cgroup` reads `cg`, with the cgroup filesystems under
+/// `root`: the lowest hard limit of its group and every ancestor, in v2
+/// and v1 alike (production review #328: v1 read only the leaf, so an
+/// unlimited leaf under a limited parent counted the host's RAM).
+fn cgroup_limit_at(cg: &str, root: &std::path::Path) -> Option<u64> {
     let mut best: Option<u64> = None;
     let mut take = |v: Option<u64>| {
         if let Some(v) = v.filter(|v| *v > 0 && *v < (1u64 << 60)) {
@@ -121,23 +130,79 @@ fn cgroup_limit() -> Option<u64> {
         let (_, ctrl, path) = (parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         if ctrl.is_empty() {
             // cgroup v2: the limit of this group and of every ancestor.
-            let mut p = std::path::PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+            let mut p = root.join(path.trim_start_matches('/'));
             loop {
                 take(std::fs::read_to_string(p.join("memory.max")).ok().and_then(|s| s.trim().parse().ok()));
-                if !p.pop() || p == std::path::Path::new("/sys/fs") {
+                if !p.pop() || p == root.parent().unwrap_or(root) {
                     break;
                 }
             }
         } else if ctrl.split(',').any(|c| c == "memory") {
+            let mount = root.join("memory");
+            let read = |p: &std::path::Path| std::fs::read_to_string(p.join("memory.limit_in_bytes")).ok().and_then(|s| s.trim().parse::<u64>().ok());
             // A container without a cgroup namespace sees the host's path,
             // absent inside it: its own group is the mount's root (ES
             // `OsProbe` retries the hierarchy root the same way).
-            let p = std::path::PathBuf::from("/sys/fs/cgroup/memory").join(path.trim_start_matches('/'));
-            let read = |p: &std::path::Path| std::fs::read_to_string(p.join("memory.limit_in_bytes")).ok().and_then(|s| s.trim().parse().ok());
-            take(read(&p).or_else(|| read(std::path::Path::new("/sys/fs/cgroup/memory"))));
+            let leaf = mount.join(path.trim_start_matches('/'));
+            let mut p = if leaf.is_dir() { leaf } else { mount.clone() };
+            // The kernel's own effective figure for the group.
+            take(std::fs::read_to_string(p.join("memory.stat")).ok().and_then(|stat| {
+                stat.lines().find_map(|l| l.strip_prefix("hierarchical_memory_limit ").and_then(|v| v.trim().parse().ok()))
+            }));
+            // Every hard limit from the group up to the mount root.
+            loop {
+                take(read(&p));
+                if p == mount || !p.pop() || !p.starts_with(&mount) {
+                    break;
+                }
+            }
         }
     }
     best
+}
+
+#[cfg(test)]
+mod cgroup_tests {
+    use super::cgroup_limit_at;
+
+    fn write(root: &std::path::Path, rel: &str, file: &str, body: &str) {
+        let d = root.join(rel);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(file), body).unwrap();
+    }
+
+    /// Production review #328: cgroup v1 ancestors' hard limits bound the
+    /// budget, as v2's do.
+    #[test]
+    fn cgroup_v1_ancestor_limits_bound_the_budget() {
+        const UNLIMITED: &str = "9223372036854771712\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Unlimited leaf, 8 GiB parent, 16 GiB grandparent, unlimited mount root.
+        write(root, "memory", "memory.limit_in_bytes", UNLIMITED);
+        write(root, "memory/slice", "memory.limit_in_bytes", &format!("{}\n", 16u64 << 30));
+        write(root, "memory/slice/group", "memory.limit_in_bytes", &format!("{}\n", 8u64 << 30));
+        write(root, "memory/slice/group/leaf", "memory.limit_in_bytes", UNLIMITED);
+        let cg = "4:memory:/slice/group/leaf\n";
+        assert_eq!(cgroup_limit_at(cg, root), Some(8 << 30), "the lowest ancestor limit");
+        // A leaf limit below the ancestors wins.
+        write(root, "memory/slice/group/leaf", "memory.limit_in_bytes", &format!("{}\n", 2u64 << 30));
+        assert_eq!(cgroup_limit_at(cg, root), Some(2 << 30));
+        // The kernel's hierarchical figure counts too.
+        write(root, "memory/slice/group/leaf", "memory.limit_in_bytes", UNLIMITED);
+        write(root, "memory/slice/group/leaf", "memory.stat", &format!("cache 0\nhierarchical_memory_limit {}\n", 3u64 << 30));
+        assert_eq!(cgroup_limit_at(cg, root), Some(3 << 30));
+        // No namespace: the host path is absent, the mount root answers.
+        assert_eq!(cgroup_limit_at("4:memory:/not/here\n", root), None, "an unlimited root is no limit");
+        write(root, "memory", "memory.limit_in_bytes", &format!("{}\n", 4u64 << 30));
+        assert_eq!(cgroup_limit_at("4:memory:/not/here\n", root), Some(4 << 30));
+        // v2 parity: ancestors walked.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let r2 = tmp2.path().join("cg");
+        write(&r2, "a", "memory.max", &format!("{}\n", 6u64 << 30));
+        write(&r2, "a/b", "memory.max", "max\n");
+        assert_eq!(cgroup_limit_at("0::/a/b\n", &r2), Some(6 << 30));
+    }
 }
 
 /// The process's anonymous resident memory (what the budget covers:

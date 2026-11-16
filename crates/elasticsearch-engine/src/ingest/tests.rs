@@ -267,6 +267,8 @@ fn cluster_pipeline_restore_preserves_managed_dates() {
 fn inference_results_field_keeps_sparse_tokens_in_mapped_field() {
     let dir = tempfile::tempdir().unwrap();
     let service = std::sync::Arc::new(crate::inference::InferenceService::open(dir.path()));
+    // rustic has no ELSER: the test runs on the explicitly enabled stand-in.
+    service.set_builtin_fallback(true);
     crate::inference::scoped(Some(service), || {
         let pipeline = json!({"processors":[{"inference":{
             "model_id":".elser_model_2", "target_field":"ml",

@@ -13,7 +13,7 @@ use super::dsl::{parse_function, parse_query, QueryContext};
 use crate::error::{EsError, Result};
 use crate::mapping::EsType;
 use crate::values;
-use rustic_core::query::{BoostMode, CustomQuery, DecayKind, DocSet, GeoDv, NumericDv, PreparedScoreFunction, LeafReader, Query, ScoreFunction, ScoreMode, Scorer, SearchContext, TERMINATED};
+use rustic_core::query::{BoostMode, CustomQuery, DecayKind, FactorAcc, DocSet, GeoDv, NumericDv, PreparedScoreFunction, LeafReader, Query, ScoreFunction, ScoreMode, Scorer, SearchContext, TERMINATED};
 use rustic_core::types::DocId;
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -204,7 +204,7 @@ pub fn function_score_query(o: &Map<String, Value>, ctx: &QueryContext) -> Resul
                         }
                         None => None,
                     };
-                    funcs.push(Func::Geo { g, weight: fo.get("weight").and_then(Value::as_f64), filter });
+                    funcs.push(Func::Geo { g, weight: fo.get("weight").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))), filter });
                     return Ok(());
                 }
             }
@@ -235,7 +235,7 @@ pub fn function_score_query(o: &Map<String, Value>, ctx: &QueryContext) -> Resul
         "first" => ScoreMode::First,
         "max" => ScoreMode::Max,
         "min" => ScoreMode::Min,
-        other => return Err(EsError::parsing(format!("failed to parse [score_mode]. Illegal score_mode: {other}"))),
+        other => return Err(EsError::illegal_argument(format!("No enum constant org.elasticsearch.common.lucene.search.function.FunctionScoreQuery.ScoreMode.{}", other.to_ascii_uppercase()))),
     };
     let boost_mode = match o.get("boost_mode").and_then(Value::as_str).unwrap_or("multiply") {
         "multiply" => BoostMode::Multiply,
@@ -244,7 +244,7 @@ pub fn function_score_query(o: &Map<String, Value>, ctx: &QueryContext) -> Resul
         "avg" => BoostMode::Avg,
         "max" => BoostMode::Max,
         "min" => BoostMode::Min,
-        other => return Err(EsError::parsing(format!("failed to parse [boost_mode]. Illegal boost_mode: {other}"))),
+        other => return Err(EsError::illegal_argument(format!("No enum constant org.elasticsearch.common.lucene.search.function.CombineFunction.{}", other.to_ascii_uppercase()))),
     };
     let f32_of = |k: &str| o.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).map(|x| x as f32);
     Ok(Query::Custom(Arc::new(GeoFunctionScore {
@@ -364,47 +364,44 @@ struct GeoFsScorer {
     min_score: Option<f32>,
     boost: f32,
     cur: f32,
+    /// Where an invalid (negative or NaN) score is reported, as the generic
+    /// function_score scorer reports it.
+    invalid: std::sync::Arc<parking_lot::Mutex<Option<(DocId, f32)>>>,
 }
 
 impl GeoFsScorer {
+    /// The score of `d`: the (boosted) query score met by `boost_mode` with
+    /// the functions combined as the generic scorer combines them
+    /// ([`FactorAcc`]).
     fn compute(&mut self, d: DocId) -> f32 {
         let qs = self.inner.score();
-        let (mut acc, mut wsum): (Option<f64>, f64) = (None, 0.0);
+        let mut acc = FactorAcc::new(self.score_mode);
         for p in &self.preps {
             let Some((v, w)) = p.eval(d) else { continue };
-            wsum += w;
-            acc = Some(match (acc, self.score_mode) {
-                (None, _) => v,
-                (Some(a), ScoreMode::Multiply) => a * v,
-                (Some(a), ScoreMode::Sum | ScoreMode::Avg) => a + v,
-                (Some(a), ScoreMode::First) => a,
-                (Some(a), ScoreMode::Max) => a.max(v),
-                (Some(a), ScoreMode::Min) => a.min(v),
-            });
-            if self.score_mode == ScoreMode::First {
+            if !acc.push(v, w) {
                 break;
             }
         }
-        let f = match acc {
-            None => 1.0,
-            Some(a) if self.score_mode == ScoreMode::Avg => a / wsum,
-            Some(a) => a,
-        };
-        self.finish(qs, f)
+        let s = self.own_score(qs, acc.finish(self.max_boost));
+        if !(s >= 0.0) {
+            let mut slot = self.invalid.lock();
+            if slot.is_none() {
+                *slot = Some((d, s));
+            }
+        }
+        s
     }
 
-    fn finish(&self, qs: f32, f: f64) -> f32 {
-        let f = f.min(self.max_boost as f64);
-        let qd = qs as f64;
-        let s = match self.boost_mode {
-            BoostMode::Multiply => qd * f,
-            BoostMode::Replace => f,
-            BoostMode::Sum => qd + f,
-            BoostMode::Avg => (qd + f) / 2.0,
-            BoostMode::Max => qd.max(f),
-            BoostMode::Min => qd.min(f),
-        };
-        s as f32 * self.boost
+    /// The query score met with the (capped) factor by `boost_mode`.
+    fn own_score(&self, qs: f32, f: f64) -> f32 {
+        self.boost_mode.combine(qs as f64, f) as f32
+    }
+
+    /// The bulk top-k path's score of a lone decay's value (match_all: the
+    /// query score is the folded boost).
+    fn finish(&self, f: f64) -> f32 {
+        let f = if f.is_nan() { f } else { f.min(self.max_boost as f64) };
+        self.own_score(self.boost, f)
     }
 
     fn settle(&mut self, mut d: DocId) -> DocId {
@@ -443,7 +440,7 @@ impl DocSet for GeoFsScorer {
 
 impl Scorer for GeoFsScorer {
     fn collect_top_k_bulk(&mut self, k: usize, deleted: Option<&[u64]>) -> Option<(Vec<rustic_core::query::collector::ScoredDoc>, u64)> {
-        self.top_k.as_ref().map(|top| top.collect(k, deleted, |f| self.finish(1.0, f)))
+        self.top_k.as_ref().map(|top| top.collect(k, deleted, |f| self.finish(f)))
     }
 
     fn score(&mut self) -> f32 {
@@ -453,7 +450,17 @@ impl Scorer for GeoFsScorer {
 
 impl CustomQuery for GeoFunctionScore {
     fn scorer(&self, leaf: &LeafReader<'_>, ctx: &SearchContext) -> Option<Box<dyn Scorer>> {
-        let inner = self.inner.scorer(leaf, ctx)?;
+        self.scorer_b(leaf, ctx, 1.0)
+    }
+    /// ES folds the function_score's boost (and an enclosing one) into its
+    /// sub-query's weight: the functions and `boost_mode` combine with the
+    /// boosted query score, and `min_score` reads that combination.
+    fn absorbs_boost(&self) -> bool {
+        true
+    }
+    fn scorer_b(&self, leaf: &LeafReader<'_>, ctx: &SearchContext, outer: f32) -> Option<Box<dyn Scorer>> {
+        let boost = self.boost * outer;
+        let inner = self.inner.scorer_b(leaf, ctx, boost)?;
         let preps = self
             .funcs
             .iter()
@@ -471,7 +478,7 @@ impl CustomQuery for GeoFunctionScore {
             .collect();
         let top_k = match (&self.inner, self.funcs.as_slice(), leaf) {
             (Query::MatchAll, [Func::Geo { g, weight: None, filter: None }], LeafReader::Segment(segment))
-                if self.min_score.is_none() && self.boost.is_finite() && self.boost >= 0.0
+                if self.min_score.is_none() && boost.is_finite() && boost >= 0.0
                     && self.max_boost.is_finite() && self.max_boost >= 0.0
                     && g.scale.is_finite() && g.scale > 0.0 && g.offset.is_finite() && g.offset >= 0.0
                     && g.decay > 0.0 && g.decay < 1.0 => {
@@ -492,8 +499,9 @@ impl CustomQuery for GeoFunctionScore {
             boost_mode: self.boost_mode,
             max_boost: self.max_boost,
             min_score: self.min_score,
-            boost: self.boost,
+            boost,
             cur: 0.0,
+            invalid: ctx.invalid_score.clone(),
         }))
     }
     fn children(&self) -> Vec<&Query> {

@@ -93,9 +93,25 @@ fn parse_field(s: &str, lo: u32, hi: u32, names: &[&str], what: &str) -> std::re
             let v = val(range)?;
             (v, if part.contains('/') { hi } else { v })
         };
+        // ES `Cron.addToSet`: an overflowing range (`22-2`, `NOV-FEB`)
+        // wraps around the field's cycle; years never wrap.
+        let (b, cycle) = if b < a {
+            if lo == 1970 {
+                return Err("Start year must be less than stop year".into());
+            }
+            let cycle = hi - lo + 1;
+            (b + cycle, Some(cycle))
+        } else {
+            (b, None)
+        };
         let mut v = a;
         while v <= b {
-            out.push(v);
+            out.push(match cycle {
+                // 0-based fields (sec / min / hour) wrap to 0, 1-based
+                // fields (day / month / weekday) to 1.
+                Some(c) if v > hi => v - c,
+                _ => v,
+            });
             v += step;
         }
     }
@@ -480,7 +496,22 @@ pub fn execute(node: &Node, id: &str) -> Result<Value> {
         let mut ok = res.is_ok();
         let mut fail_details = None;
         match &res {
-            Ok(meta) if meta["state"].as_str() != Some("SUCCESS") && meta["state"].as_str() != Some("PARTIAL") => {
+            // ES `SnapshotLifecycleTask`: any failed shard (a PARTIAL
+            // snapshot) is a failed policy execution, its shard failures
+            // attached; the last success is kept (#586).
+            Ok(meta) if meta["shards"]["failed"].as_u64().unwrap_or(0) > 0 => {
+                ok = false;
+                let reason = format!(
+                    "[{repo}:{name}] failed to create snapshot successfully, {} out of {} total shards failed",
+                    meta["shards"]["failed"].as_u64().unwrap_or(0),
+                    meta["shards"]["total"].as_u64().unwrap_or(0)
+                );
+                let suppressed: Vec<Value> = meta["failures"].as_array().cloned().unwrap_or_default().iter()
+                    .map(|f| json!({"type": "snapshot_shard_failure", "reason": f["reason"].clone(), "index": f["index"].clone(), "shard": f["shard_id"].clone()}))
+                    .collect();
+                fail_details = Some(json!({"type": "snapshot_exception", "reason": reason, "stack_trace": format!("SnapshotException: {reason}"), "suppressed": suppressed}));
+            }
+            Ok(meta) if meta["state"].as_str() != Some("SUCCESS") => {
                 ok = false;
                 fail_details = Some(json!({"type": "snapshot_exception", "reason": format!("snapshot finished in state [{}]", meta["state"].as_str().unwrap_or("FAILED"))}));
             }
@@ -673,6 +704,36 @@ pub fn tick(node: &Node) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #586: a PARTIAL snapshot (failed shards) is a failed policy
+    /// execution: `last_failure` with the shard failures, the failure
+    /// counted, the earlier success kept.
+    #[test]
+    fn partial_snapshots_are_failed_executions() {
+        let (data, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let node = Node::open(data.path()).unwrap();
+        node.ilm.drive_externally();
+        node.snapshots.put_repository("r", &json!({"type": "fs", "settings": {"location": backups.path().to_string_lossy()}})).unwrap();
+        let good = node.create_index("good", &json!({"settings": {"number_of_shards": 1}})).unwrap();
+        good.write(vec![crate::index::WriteReq::Index { id: Some("1".into()), source: "{}".into(), routing: None, cond: Default::default() }], true);
+        let body = json!({"schedule": "0 0 0 1 1 ? 2099", "name": "<snap-{now/d}>", "repository": "r", "config": {"indices": ["good", "red"], "partial": true}});
+        put_policy(&node, "p", &body, &body.to_string()).unwrap();
+        let red = node.create_index("red", &json!({"settings": {"number_of_shards": 2}})).unwrap();
+        // First a clean success (red still whole), then a partial one.
+        execute(&node, "p").unwrap();
+        let first_success = node.ilm.st.read().slm["p"].last_success.clone().unwrap();
+        red.remove_shard(1, false).unwrap();
+        execute(&node, "p").unwrap();
+        let st = node.ilm.st.read();
+        let p = &st.slm["p"];
+        assert_eq!(p.stats.snapshots_taken, 1);
+        assert_eq!(p.stats.snapshots_failed, 1);
+        assert_eq!(p.last_success.as_ref(), Some(&first_success), "the earlier success is kept");
+        let details = p.last_failure.as_ref().unwrap()["details"].as_str().unwrap().to_string();
+        assert!(details.contains("failed to create snapshot successfully, 1 out of 3 total shards failed"), "{details}");
+        assert!(details.contains("\"index\":\"red\""), "{details}");
+        assert_eq!(st.slm_stats.total_snapshots_failed, 1);
+    }
 
     #[test]
     fn cron_next() {

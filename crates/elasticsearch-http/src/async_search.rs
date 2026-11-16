@@ -9,6 +9,10 @@ use elasticsearch_engine::node::{Node, ResolveOpts};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
+use crate::security::owner::Use;
+
+/// The status API's action: its privilege (`monitor`) reads any search's status.
+const STATUS_ACTION: &str = "cluster:monitor/async_search/status";
 
 fn time_param(req: &Req, name: &str, default: &str) -> Result<Duration> {
     let s = req.param(name).unwrap_or(default);
@@ -28,7 +32,7 @@ pub async fn handle(node: Arc<Node>, req: Req, index: Option<String>) -> R {
         ("", "", _) => method_not_allowed(&req, &["POST"]),
         ("status", id, &Method::GET) if index.is_none() && !id.is_empty() => {
             let id = id.to_string();
-            blocking(move || status(&node, &id)).await
+            blocking(move || status(&node, &req, &id)).await
         }
         (id, "", &Method::GET) if index.is_none() => {
             let id = id.to_string();
@@ -36,7 +40,7 @@ pub async fn handle(node: Arc<Node>, req: Req, index: Option<String>) -> R {
         }
         (id, "", &Method::DELETE) if index.is_none() => {
             let id = id.to_string();
-            blocking(move || delete(&node, &id)).await
+            blocking(move || delete(&node, &req, &id)).await
         }
         _ => crate::not_found_handler(&req),
     }
@@ -81,6 +85,7 @@ fn submit(node: &Arc<Node>, req: &Req, index: Option<&str>) -> R {
             .sum()
     };
     let s = AsyncSearch::new(shards, keep_alive);
+    s.set_owner(crate::security::owner::owner_of(node, req));
     let (n, s2, idx, access) = (node.clone(), s.clone(), index.map(str::to_string), req.access.clone());
     let worker_scope=elasticsearch_engine::memory::RequestScope::new("async search worker",elasticsearch_engine::memory::breakers());
     std::thread::Builder::new()
@@ -156,6 +161,8 @@ fn get(node: &Node, req: &Req, id: &str) -> R {
     }
     check_id(id)?;
     let s = node.async_search(id).ok_or_else(|| Node::async_search_missing(id))?;
+    // Only the submitter reads (and so extends) the result.
+    crate::security::owner::check(node, req, s.owner().as_ref(), Use::Read, || Node::async_search_missing(id))?;
     if let Some(_) = req.param("keep_alive") {
         s.extend(time_param(req, "keep_alive", "5d")?);
     }
@@ -169,15 +176,17 @@ fn get(node: &Node, req: &Req, id: &str) -> R {
     Ok(with_warnings(Resp::json(st, v), &s))
 }
 
-fn status(node: &Node, id: &str) -> R {
+fn status(node: &Node, req: &Req, id: &str) -> R {
     check_id(id)?;
     let s = node.async_search(id).ok_or_else(|| Node::async_search_missing(id))?;
+    crate::security::owner::check(node, req, s.owner().as_ref(), Use::Status(STATUS_ACTION), || Node::async_search_missing(id))?;
     Ok(Resp::ok(s.status()))
 }
 
-fn delete(node: &Node, id: &str) -> R {
+fn delete(node: &Node, req: &Req, id: &str) -> R {
     check_id(id)?;
-    let _ = node.async_search(id);
+    let s = node.async_search(id).ok_or_else(|| Node::async_search_missing(id))?;
+    crate::security::owner::check(node, req, s.owner().as_ref(), Use::Delete, || Node::async_search_missing(id))?;
     match node.async_searches.lock().remove(id) {
         Some(_) => Ok(Resp::ack()),
         None => Err(Node::async_search_missing(id)),

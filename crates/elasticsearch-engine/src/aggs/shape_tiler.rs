@@ -24,6 +24,153 @@ pub(crate) struct Bounds {
 }
 
 // ---------------------------------------------------------------------------
+// Admission and interruption of a tiling
+
+/// ES's largest cell array (`ArrayUtil.MAX_ARRAY_LENGTH`): more cells than
+/// this for one doc is `Tile aggregation array overflow`.
+const MAX_ARRAY_SIZE: u64 = i32::MAX as u64 - 8;
+
+/// Cells charged at least at a time (8 KiB): a reused buffer that already
+/// holds a doc's cells charges nothing more for the next doc.
+const MIN_CHARGE_CELLS: usize = 1024;
+
+/// Relations / cells between two cancellation and deadline polls.
+const POLL_STEPS: u32 = 1 << 12;
+
+/// Why a tiling stopped early.
+pub(crate) enum TileStop {
+    /// Breaker, cancellation, or array overflow: the request fails.
+    Error(crate::error::EsError),
+    /// The search's `timeout` passed: the aggregation keeps what it has.
+    Deadline,
+}
+
+impl From<crate::error::EsError> for TileStop {
+    fn from(e: crate::error::EsError) -> TileStop {
+        TileStop::Error(e)
+    }
+}
+
+type Tiled = std::result::Result<(), TileStop>;
+
+/// One cell buffer's admission (ES `GeoShapeCellValues.resizeCell`, which
+/// charges the request breaker through `circuitBreakerConsumer` before the
+/// cell array grows): cells are charged before they are written, a batch
+/// at a time (never per cell), and a fully covered coarse cell's
+/// descendants are counted and charged before any is written. The
+/// buffer's capacity stays charged while it is reused for the next docs.
+/// The tiling polls the search task's cancellation and `timeout` every
+/// few thousand relations or cells, so a runaway expansion stops promptly.
+pub(crate) struct TileBudget<'a> {
+    charge: &'a dyn Fn(u64) -> crate::error::Result<()>,
+    /// Cells of the buffer already charged.
+    cells: usize,
+    /// Relation memo entries already charged (H3 recursion).
+    memo: usize,
+    cancel: Option<std::sync::Arc<rustic_core::cancel::Token>>,
+    deadline: crate::search::AggDeadline,
+    polled: bool,
+    steps: u32,
+}
+
+impl<'a> TileBudget<'a> {
+    /// A budget charging `charge` (bytes), polling the search task's
+    /// `cancel` token and `deadline`.
+    pub(crate) fn new(charge: &'a dyn Fn(u64) -> crate::error::Result<()>, cancel: Option<std::sync::Arc<rustic_core::cancel::Token>>, deadline: crate::search::AggDeadline) -> TileBudget<'a> {
+        let polled = cancel.is_some() || deadline.is_set();
+        TileBudget { charge, cells: 0, memo: 0, cancel, deadline, polled, steps: 0 }
+    }
+
+    /// No breaker and no polls (benchmarks, tests).
+    #[cfg(test)]
+    pub(crate) fn unlimited() -> TileBudget<'static> {
+        static NONE: fn(u64) -> crate::error::Result<()> = |_| Ok(());
+        TileBudget::new(&NONE, None, crate::search::AggDeadline::default())
+    }
+
+    /// Bytes charged so far for the buffer and memo.
+    #[cfg(test)]
+    pub(crate) fn charged_bytes(&self) -> u64 {
+        self.cells as u64 * 8 + self.memo as u64 * MEMO_ENTRY_BYTES
+    }
+
+    /// Make room for `extra` more cells in `out`, charged first.
+    #[inline]
+    fn ensure(&mut self, out: &mut Vec<u64>, extra: u64) -> Tiled {
+        if out.len() as u64 + extra > self.cells as u64 {
+            self.grow(out, extra)?;
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, out: &mut Vec<u64>, extra: u64) -> Tiled {
+        let need = out.len() as u64 + extra;
+        if need > MAX_ARRAY_SIZE {
+            return Err(crate::error::EsError::illegal_argument("Tile aggregation array overflow").into());
+        }
+        let new = (need as usize).max(self.cells.saturating_mul(2)).max(MIN_CHARGE_CELLS).min(MAX_ARRAY_SIZE as usize);
+        (self.charge)((new - self.cells) as u64 * 8)?;
+        self.cells = new;
+        // A cancelled or timed-out search allocates nothing more.
+        self.poll()?;
+        if out.capacity() < new {
+            out.try_reserve_exact(new - out.len()).map_err(|e| crate::error::EsError::new(429, "circuit_breaking_exception", format!("[request] Data too large, tile cells could not be allocated: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Append one cell (charged first).
+    #[inline]
+    fn push(&mut self, out: &mut Vec<u64>, cell: u64) -> Tiled {
+        if out.len() >= self.cells {
+            self.grow(out, 1)?;
+        }
+        out.push(cell);
+        self.step()
+    }
+
+    /// One unit of work (a relation, a cell): polls now and then.
+    #[inline]
+    fn step(&mut self) -> Tiled {
+        self.steps += 1;
+        if self.steps >= POLL_STEPS {
+            self.steps = 0;
+            return self.poll();
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Tiled {
+        if !self.polled {
+            return Ok(());
+        }
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err(crate::search::task_cancelled().into());
+        }
+        if self.deadline.expired() {
+            return Err(TileStop::Deadline);
+        }
+        Ok(())
+    }
+
+    /// A relation memo about to hold `len + 1` entries: charged in batches.
+    #[inline]
+    fn memo_entry(&mut self, len: usize) -> Tiled {
+        if len >= self.memo {
+            let new = (len + 1).max(self.memo * 2).max(MIN_CHARGE_CELLS);
+            (self.charge)((new - self.memo) as u64 * MEMO_ENTRY_BYTES)?;
+            self.memo = new;
+        }
+        Ok(())
+    }
+}
+
+/// A `HashMap<u64, GeoRelation>` entry with its share of the table.
+const MEMO_ENTRY_BYTES: u64 = 32;
+
+// ---------------------------------------------------------------------------
 // GeoTileUtils
 
 const MAX_ZOOM: u32 = 29;
@@ -172,14 +319,13 @@ impl TileTiler {
     }
 
     /// `setValues`: the doc's tiles (unsorted, possibly repeated).
-    pub(crate) fn set_values(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>) {
-        let Some(b) = v.bounding_box() else { return };
+    pub(crate) fn set_values(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
+        let Some(b) = v.bounding_box() else { return Ok(()) };
         if b.bottom > normalized_lat_mask() || b.top < normalized_neg_lat_mask() {
-            return;
+            return Ok(());
         }
         if self.precision == 0 {
-            self.brute(v, 0, 0, 0, 0, out);
-            return;
+            return self.brute(v, 0, 0, 0, 0, out, g);
         }
         let tiles = self.tiles;
         let min_xt = get_x_tile(b.min_x(), tiles);
@@ -189,12 +335,13 @@ impl TileTiler {
         let count = (max_xt as i64 - min_xt as i64 + 1) * (max_yt as i64 - min_yt as i64 + 1);
         if count == 1 {
             if self.valid_tile(min_xt, min_yt, self.precision) {
-                out.push(long_encode_tiles(self.precision, min_xt, min_yt));
+                g.push(out, long_encode_tiles(self.precision, min_xt, min_yt))?;
             }
+            Ok(())
         } else if count <= 8 * self.precision as i64 {
-            self.brute(v, min_xt, min_yt, max_xt, max_yt, out);
+            self.brute(v, min_xt, min_yt, max_xt, max_yt, out, g)
         } else {
-            self.raster(0, 0, 0, v, out);
+            self.raster(0, 0, 0, v, out, g)
         }
     }
 
@@ -210,54 +357,55 @@ impl TileTiler {
         v.relate_tile(min_x, if max_x == i32::MAX { max_x } else { max_x - 1 }, if min_y == encoded_neg_lat_mask() { min_y } else { min_y + 1 }, max_y)
     }
 
-    fn brute(&self, v: &ShapeValue<'_>, min_x: u32, min_y: u32, max_x: u32, max_y: u32, out: &mut Vec<u64>) {
+    #[allow(clippy::too_many_arguments)]
+    fn brute(&self, v: &ShapeValue<'_>, min_x: u32, min_y: u32, max_x: u32, max_y: u32, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         for i in min_x..=max_x {
             for j in min_y..=max_y {
                 if self.relate_tile(v, i, j, self.precision) != GeoRelation::QueryDisjoint {
-                    out.push(long_encode_tiles(self.precision, i, j));
+                    g.push(out, long_encode_tiles(self.precision, i, j))?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn raster(&self, x: u32, y: u32, z: u32, v: &ShapeValue<'_>, out: &mut Vec<u64>) {
+    fn raster(&self, x: u32, y: u32, z: u32, v: &ShapeValue<'_>, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         let z = z + 1;
         for i in 0..2 {
             for j in 0..2 {
                 let (nx, ny) = (2 * x + i, 2 * y + j);
                 let r = self.relate_tile(v, nx, ny, z);
+                g.step()?;
                 if r == GeoRelation::QueryInside {
                     if z == self.precision {
-                        out.push(long_encode_tiles(z, nx, ny));
+                        g.push(out, long_encode_tiles(z, nx, ny))?;
                     } else {
-                        let _ = self.max_cells();
-                        self.fully_contained(nx, ny, z, out);
+                        self.fully_contained(nx, ny, z, out, g)?;
                     }
                 } else if r != GeoRelation::QueryDisjoint {
                     if z == self.precision {
-                        out.push(long_encode_tiles(z, nx, ny));
+                        g.push(out, long_encode_tiles(z, nx, ny))?;
                     } else {
-                        self.raster(nx, ny, z, v, out);
+                        self.raster(nx, ny, z, v, out, g)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
-    /// `setValuesForFullyContainedTile`.
-    fn fully_contained(&self, x: u32, y: u32, z: u32, out: &mut Vec<u64>) {
+    /// `setValuesForFullyContainedTile`: the covered tile's descendants at
+    /// the precision (ES `getNumTilesAtPrecision`: at most `4^(p - z)` and
+    /// the bounds' `maxCells`) are counted and charged before any is
+    /// written; the writes poll cancellation / the deadline by row.
+    fn fully_contained(&self, x: u32, y: u32, z: u32, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         let splits = 1i64 << (self.precision - z);
-        let push = |out: &mut Vec<u64>, min_y: i64, max_y: i64, min_x: i64, max_x: i64| {
-            for i in min_x..max_x {
-                for j in min_y..max_y {
-                    out.push(long_encode_tiles(self.precision, i as u32, j as u32));
-                }
-            }
-        };
-        match &self.pred {
+        let area = |r: (i64, i64, i64, i64)| ((r.1 - r.0).max(0) as u64).saturating_mul((r.3 - r.2).max(0) as u64);
+        // (min_y, max_y, min_x, max_x) ranges, half open.
+        let ranges: [(i64, i64, i64, i64); 2] = match &self.pred {
             None => {
                 let (min_x, min_y) = (x as i64 * splits, y as i64 * splits);
-                push(out, min_y, min_y + splits, min_x, min_x + splits);
+                [(min_y, min_y + splits, min_x, min_x + splits), (0, 0, 0, 0)]
             }
             Some(p) => {
                 let min_y = p.min_y.max(y as i64 * splits);
@@ -265,17 +413,32 @@ impl TileTiler {
                 if p.crosses {
                     let west_min_x = p.left_x.max(x as i64 * splits);
                     let west_max_x = x as i64 * splits + splits;
-                    push(out, min_y, max_y, west_min_x, west_max_x);
                     let east_max_x = west_min_x.min(p.right_x.min(x as i64 * splits + splits));
                     let east_min_x = x as i64 * splits;
-                    push(out, min_y, max_y, east_min_x, east_max_x);
+                    [(min_y, max_y, west_min_x, west_max_x), (min_y, max_y, east_min_x, east_max_x)]
                 } else {
                     let min_x = p.left_x.max(x as i64 * splits);
                     let max_x = p.right_x.min(x as i64 * splits + splits);
-                    push(out, min_y, max_y, min_x, max_x);
+                    [(min_y, max_y, min_x, max_x), (0, 0, 0, 0)]
+                }
+            }
+        };
+        let count = area(ranges[0]).saturating_add(area(ranges[1])).min(self.max_cells());
+        g.ensure(out, count)?;
+        for (min_y, max_y, min_x, max_x) in ranges {
+            for i in min_x..max_x {
+                // Charged above: plain pushes, polled once per column.
+                for j in min_y..max_y {
+                    out.push(long_encode_tiles(self.precision, i as u32, j as u32));
+                }
+                g.steps = g.steps.saturating_add((max_y - min_y).max(0).min(POLL_STEPS as i64) as u32);
+                if g.steps >= POLL_STEPS {
+                    g.steps = 0;
+                    g.poll()?;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -489,29 +652,29 @@ impl HashTiler {
         self.pred.as_ref().is_none_or(|p| p.valid_hash(h))
     }
 
-    pub(crate) fn set_values(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>) {
+    pub(crate) fn set_values(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         if self.precision == 0 {
-            return;
+            return Ok(());
         }
-        let Some(b) = v.bounding_box() else { return };
+        let Some(b) = v.bounding_box() else { return Ok(()) };
         let p = self.precision;
         if b.min_x() == b.max_x() && b.min_y() == b.max_y() {
-            self.set_value(v, &gh_string_encode(b.min_x(), b.min_y(), p), out);
-            return;
+            return self.set_value(v, &gh_string_encode(b.min_x(), b.min_y(), p), out, g);
         }
         let dx = ((b.max_x() - b.min_x()) / gh_lon_width(p)).ceil() as i64;
         let dy = ((b.max_y() - b.min_y()) / gh_lat_height(p)).ceil() as i64;
         if dx.saturating_mul(dy) <= 32 * p as i64 {
-            self.brute(v, &b, out);
+            self.brute(v, &b, out, g)
         } else {
-            self.raster("", v, out);
+            self.raster("", v, out, g)
         }
     }
 
-    fn set_value(&self, v: &ShapeValue<'_>, hash: &str, out: &mut Vec<u64>) {
+    fn set_value(&self, v: &ShapeValue<'_>, hash: &str, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         if self.relate_tile(v, hash) != GeoRelation::QueryDisjoint {
-            out.push(gh_long_encode(hash));
+            g.push(out, gh_long_encode(hash))?;
         }
+        Ok(())
     }
 
     fn relate_tile(&self, v: &ShapeValue<'_>, hash: &str) -> GeoRelation {
@@ -523,7 +686,7 @@ impl HashTiler {
         v.relate_tile(min_x, if max_x == i32::MAX { max_x } else { max_x - 1 }, min_y, if max_y == i32::MAX { max_y } else { max_y - 1 })
     }
 
-    fn brute(&self, v: &ShapeValue<'_>, b: &rustic_core::fieldtypes::shape_dv::BoundingBox, out: &mut Vec<u64>) {
+    fn brute(&self, v: &ShapeValue<'_>, b: &rustic_core::fieldtypes::shape_dv::BoundingBox, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         let p = self.precision;
         let stop = gh_string_encode(b.max_x(), b.max_y(), p);
         let move_down = |hash: Option<String>, x: f64, y: f64| -> Option<String> {
@@ -538,7 +701,7 @@ impl HashTiler {
         let mut guard = 0u64;
         loop {
             last_in_row = move_down(last_in_row, b.max_x(), b.min_y());
-            let Some(last) = last_in_row.clone() else { return };
+            let Some(last) = last_in_row.clone() else { return Ok(()) };
             let mut current: Option<String> = None;
             loop {
                 current = match current {
@@ -548,52 +711,60 @@ impl HashTiler {
                     }
                     Some(c) => gh_neighbor(&c, p as usize, 1, 0),
                 };
-                let Some(c) = current.clone() else { return };
-                self.set_value(v, &c, out);
+                let Some(c) = current.clone() else { return Ok(()) };
+                self.set_value(v, &c, out, g)?;
                 guard += 1;
                 if c == last || guard > 1 << 20 {
                     break;
                 }
             }
             if last == stop || guard > 1 << 20 {
-                return;
+                return Ok(());
             }
         }
     }
 
-    fn raster(&self, hash: &str, v: &ShapeValue<'_>, out: &mut Vec<u64>) {
+    fn raster(&self, hash: &str, v: &ShapeValue<'_>, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         for &c in BASE_32 {
             let mut s = hash.to_string();
             s.push(c as char);
             let r = self.relate_tile(v, &s);
+            g.step()?;
             if r == GeoRelation::QueryInside {
                 if s.len() as u32 == self.precision {
-                    out.push(gh_long_encode(&s));
+                    g.push(out, gh_long_encode(&s))?;
                 } else {
-                    self.fully_contained(&s, out);
+                    self.fully_contained(&s, out, g)?;
                 }
             } else if r != GeoRelation::QueryDisjoint {
                 if s.len() as u32 == self.precision {
-                    out.push(gh_long_encode(&s));
+                    g.push(out, gh_long_encode(&s))?;
                 } else {
-                    self.raster(&s, v, out);
+                    self.raster(&s, v, out, g)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn fully_contained(&self, hash: &str, out: &mut Vec<u64>) {
+    /// The covered hash's descendants at the precision: each level's 32
+    /// children charged before they are written.
+    fn fully_contained(&self, hash: &str, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
+        if hash.len() as u32 + 1 == self.precision {
+            g.ensure(out, BASE_32.len() as u64)?;
+        }
         for &c in BASE_32 {
             let mut s = hash.to_string();
             s.push(c as char);
             if self.valid_hash(&s) {
                 if s.len() as u32 == self.precision {
-                    out.push(gh_long_encode(&s));
+                    g.push(out, gh_long_encode(&s))?;
                 } else {
-                    self.fully_contained(&s, out);
+                    self.fully_contained(&s, out, g)?;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1305,15 +1476,14 @@ impl HexTiler {
         false
     }
 
-    pub(crate) fn set_values(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>) {
-        let Some(bb) = v.bounding_box() else { return };
+    pub(crate) fn set_values(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
+        let Some(bb) = v.bounding_box() else { return Ok(()) };
         if bb.max_x() - bb.min_x() < 180.0 {
             if let Some(single) = Self::bounds_in_same_cell(&bb, self.precision) {
-                self.from_point_resolution(single, v, out);
-                return;
+                return self.from_point_resolution(single, v, out, g);
             }
         }
-        self.by_recursion(v, &bb, out);
+        self.by_recursion(v, &bb, out, g)
     }
 
     fn bounds_in_same_cell(bb: &rustic_core::fieldtypes::shape_dv::BoundingBox, res: u32) -> Option<u64> {
@@ -1336,29 +1506,31 @@ impl HexTiler {
         (min > 0).then_some(min)
     }
 
-    fn maybe_add(h: u64, r: GeoRelation, out: &mut Vec<u64>) {
+    fn maybe_add(h: u64, r: GeoRelation, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         if r != GeoRelation::QueryDisjoint {
-            out.push(h);
+            g.push(out, h)?;
         }
+        Ok(())
     }
 
-    fn from_point_resolution(&self, h: u64, v: &ShapeValue<'_>, out: &mut Vec<u64>) {
+    fn from_point_resolution(&self, h: u64, v: &ShapeValue<'_>, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         let r = self.relate_tile(v, h);
-        Self::maybe_add(h, r, out);
+        Self::maybe_add(h, r, out, g)?;
         if r == GeoRelation::QueryContains {
-            return;
+            return Ok(());
         }
         for i in 0..hex_ring_size(h) {
             let n = hex_ring_pos(h, i);
             let r = self.relate_tile(v, n);
-            Self::maybe_add(n, r, out);
+            Self::maybe_add(n, r, out, g)?;
             if r == GeoRelation::QueryContains {
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 
-    fn by_recursion(&self, v: &ShapeValue<'_>, bb: &rustic_core::fieldtypes::shape_dv::BoundingBox, out: &mut Vec<u64>) {
+    fn by_recursion(&self, v: &ShapeValue<'_>, bb: &rustic_core::fieldtypes::shape_dv::BoundingBox, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         #[cfg(test)]
         HEX_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The doc's relation to each cell, once (the recursion asks again
@@ -1366,59 +1538,74 @@ impl HexTiler {
         let mut memo = std::collections::HashMap::new();
         if bb.max_x() - bb.min_x() < 180.0 {
             if let Some(single) = Self::bounds_in_same_cell(bb, 0) {
-                self.recurse(v, single, 0, out, &mut memo);
+                self.recurse(v, single, 0, out, &mut memo, g)?;
                 for i in 0..hex_ring_size(single) {
-                    self.recurse(v, hex_ring_pos(single, i), 0, out, &mut memo);
+                    self.recurse(v, hex_ring_pos(single, i), 0, out, &mut memo, g)?;
                 }
-                return;
+                return Ok(());
             }
         }
         for c in h3::res0_cells() {
-            self.recurse(v, c, 0, out, &mut memo);
+            self.recurse(v, c, 0, out, &mut memo, g)?;
         }
+        Ok(())
     }
 
-    fn recurse(&self, v: &ShapeValue<'_>, h: u64, precision: u32, out: &mut Vec<u64>, memo: &mut std::collections::HashMap<u64, GeoRelation>) {
-        let r = self.relate_memo(v, h, memo);
+    fn recurse(&self, v: &ShapeValue<'_>, h: u64, precision: u32, out: &mut Vec<u64>, memo: &mut std::collections::HashMap<u64, GeoRelation>, g: &mut TileBudget<'_>) -> Tiled {
+        let r = self.relate_memo(v, h, memo, g)?;
         if precision == self.precision {
-            Self::maybe_add(h, r, out);
-            return;
+            return Self::maybe_add(h, r, out, g);
         }
         if r != GeoRelation::QueryDisjoint {
             let mut i = 0;
             if r == GeoRelation::QueryInside {
                 let center = child_pos(h, i);
                 i += 1;
-                self.all_values(center, precision + 1, self.value_inside_bounds(v), out);
+                self.all_values(center, precision + 1, self.value_inside_bounds(v), out, g)?;
             }
             let n = children_size(h);
             while i < n {
-                self.recurse(v, child_pos(h, i), precision + 1, out, memo);
+                self.recurse(v, child_pos(h, i), precision + 1, out, memo, g)?;
                 i += 1;
             }
             for j in 0..not_intersecting_children_size(h) {
                 let no_child = no_child_intersecting_pos(h, j);
-                if no_child != 0 && self.relate_memo(v, h3_parent(no_child), memo) == GeoRelation::QueryDisjoint {
-                    self.recurse(v, no_child, precision + 1, out, memo);
+                if no_child != 0 && self.relate_memo(v, h3_parent(no_child), memo, g)? == GeoRelation::QueryDisjoint {
+                    self.recurse(v, no_child, precision + 1, out, memo, g)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn relate_memo(&self, v: &ShapeValue<'_>, h: u64, memo: &mut std::collections::HashMap<u64, GeoRelation>) -> GeoRelation {
-        *memo.entry(h).or_insert_with(|| self.relate_tile(v, h))
+    fn relate_memo(&self, v: &ShapeValue<'_>, h: u64, memo: &mut std::collections::HashMap<u64, GeoRelation>, g: &mut TileBudget<'_>) -> std::result::Result<GeoRelation, TileStop> {
+        if let Some(&r) = memo.get(&h) {
+            return Ok(r);
+        }
+        g.memo_entry(memo.len())?;
+        g.step()?;
+        let r = self.relate_tile(v, h);
+        memo.insert(h, r);
+        Ok(r)
     }
 
-    fn all_values(&self, h: u64, precision: u32, inside: bool, out: &mut Vec<u64>) {
+    /// Every descendant of a covered cell at the precision (within the
+    /// bounds): each level's children charged before they are written.
+    fn all_values(&self, h: u64, precision: u32, inside: bool, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> Tiled {
         if inside || self.h3_intersects_bounds(h) {
             if precision == self.precision {
-                out.push(h);
+                g.push(out, h)?;
             } else {
-                for i in 0..children_size(h) {
-                    self.all_values(child_pos(h, i), precision + 1, inside, out);
+                let n = children_size(h);
+                if precision + 1 == self.precision {
+                    g.ensure(out, n as u64)?;
+                }
+                for i in 0..n {
+                    self.all_values(child_pos(h, i), precision + 1, inside, out, g)?;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1440,16 +1627,41 @@ pub(crate) enum Tiler {
 
 impl Tiler {
     /// The doc's cells, sorted and distinct (`GeoShapeCellValues` sorted,
-    /// the aggregator skipping repeats).
+    /// the aggregator skipping repeats), with no breaker or polls
+    /// (benchmarks, tests): see [`Tiler::cells_within`].
+    #[cfg(test)]
     pub(crate) fn cells(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>) {
+        let _ = self.cells_within(v, out, &mut TileBudget::unlimited());
+    }
+
+    /// [`Tiler::cells`] admitted by `g` (`out` must be the buffer `g` has
+    /// accounted for): `Ok(false)` when the search's `timeout` passed
+    /// mid-tiling (`out` cleared: the doc's cells are incomplete); an error
+    /// when the request breaker tripped (`circuit_breaking_exception`, as
+    /// ES's `circuitBreakerConsumer` throws), the task was cancelled, or the
+    /// doc has more cells than an array holds.
+    pub(crate) fn cells_within(&self, v: &ShapeValue<'_>, out: &mut Vec<u64>, g: &mut TileBudget<'_>) -> crate::error::Result<bool> {
         out.clear();
-        match self {
-            Tiler::Tile(t) => t.set_values(v, out),
-            Tiler::Hash(t) => t.set_values(v, out),
-            Tiler::Hex(t) => t.set_values(v, out),
+        let r = match self {
+            Tiler::Tile(t) => t.set_values(v, out, g),
+            Tiler::Hash(t) => t.set_values(v, out, g),
+            Tiler::Hex(t) => t.set_values(v, out, g),
+        };
+        match r {
+            Ok(()) => {
+                out.sort_unstable();
+                out.dedup();
+                Ok(true)
+            }
+            Err(TileStop::Deadline) => {
+                out.clear();
+                Ok(false)
+            }
+            Err(TileStop::Error(e)) => {
+                out.clear();
+                Err(e)
+            }
         }
-        out.sort_unstable();
-        out.dedup();
     }
 
     pub(crate) fn key(&self, h: u64) -> String {
@@ -1474,15 +1686,15 @@ pub(crate) fn brute_force_cells(grid: &str, precision: u32, bounds: Option<&Boun
             }
             let t = TileTiler::new(precision, bounds);
             let tiles = 1u64 << precision;
-            t.brute(v, get_x_tile(b.min_x(), tiles), get_y_tile(b.max_y(), tiles), get_x_tile(b.max_x(), tiles), get_y_tile(b.min_y(), tiles), &mut cells);
+            let _ = t.brute(v, get_x_tile(b.min_x(), tiles), get_y_tile(b.max_y(), tiles), get_x_tile(b.max_x(), tiles), get_y_tile(b.min_y(), tiles), &mut cells, &mut TileBudget::unlimited());
             out.extend(cells.into_iter().map(tile_key));
         }
         _ => {
             let t = HashTiler::new(precision, bounds);
             if b.min_x() == b.max_x() && b.min_y() == b.max_y() {
-                t.set_value(v, &gh_string_encode(b.min_x(), b.min_y(), precision), &mut cells);
+                let _ = t.set_value(v, &gh_string_encode(b.min_x(), b.min_y(), precision), &mut cells, &mut TileBudget::unlimited());
             } else {
-                t.brute(v, &b, &mut cells);
+                let _ = t.brute(v, &b, &mut cells, &mut TileBudget::unlimited());
             }
             out.extend(cells.into_iter().map(gh_key));
         }
@@ -1503,6 +1715,144 @@ mod tests {
         assert_eq!(gh_key(gh_long_encode(&h)), h);
         assert_eq!(gh_neighbor("u", 1, 1, 0).as_deref(), Some("v"));
         assert_eq!(gh_neighbor("gcpvj0d", 7, 0, 1).map(|s| gh_bbox(&s).3), Some(max_y));
+    }
+
+    /// A polygon over (almost) the whole world, as indexed.
+    fn world() -> Vec<u8> {
+        let g = rustic_core::fieldtypes::shape::parse_wkt("POLYGON ((-179 -84, 179 -84, 179 84, -179 84, -179 -84))", &Default::default()).unwrap();
+        crate::aggs::geo_shape::runtime_shape_value(&g).unwrap()
+    }
+
+    fn tilers(tile: u32, hash: u32, hex: u32) -> [Tiler; 3] {
+        [Tiler::Tile(TileTiler::new(tile, None)), Tiler::Hash(HashTiler::new(hash, None)), Tiler::Hex(HexTiler::new(hex, None))]
+    }
+
+    /// A request breaker of `limit` bytes over what the budget charges.
+    fn breaker(limit: u64) -> (std::rc::Rc<std::cell::Cell<u64>>, impl Fn(u64) -> crate::error::Result<()>) {
+        let used = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let u = used.clone();
+        (used, move |b: u64| {
+            let n = u.get() + b;
+            if n > limit {
+                return Err(crate::error::EsError::new(429, "circuit_breaking_exception", format!("[request] Data too large, data for [<agg [g]>] would be [{n}], which is larger than the limit of [{limit}]")));
+            }
+            u.set(n);
+            Ok(())
+        })
+    }
+
+    /// Review #107: a world-spanning shape at a high precision is admitted
+    /// cell batch by cell batch: the breaker trips long before the cells
+    /// are allocated (the buffer never outgrows what was charged), promptly,
+    /// for every tiler.
+    #[test]
+    fn world_shape_trips_the_breaker_before_allocating() {
+        let dv = world();
+        let v = ShapeValue::new(&dv);
+        let limit = 1u64 << 20;
+        for t in tilers(14, 6, 7) {
+            let (used, charge) = breaker(limit);
+            let mut g = TileBudget::new(&charge, None, crate::search::AggDeadline::default());
+            let mut out = Vec::new();
+            let started = std::time::Instant::now();
+            let e = t.cells_within(&v, &mut out, &mut g).unwrap_err();
+            assert_eq!((e.status, e.kind.as_str()), (429, "circuit_breaking_exception"), "{}", e.reason);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+            assert!(used.get() <= limit && g.charged_bytes() <= limit);
+            assert!(out.capacity() as u64 * 8 <= limit, "allocated {} cells past the charge", out.capacity());
+            assert!(out.is_empty());
+        }
+    }
+
+    /// Review #107: ES's `getNumTilesAtPrecision` bound: a covered tile with
+    /// more descendants than an array holds fails before anything is
+    /// charged or allocated.
+    #[test]
+    fn covered_tile_past_the_array_limit_is_an_overflow() {
+        let (used, charge) = breaker(u64::MAX);
+        let mut g = TileBudget::new(&charge, None, crate::search::AggDeadline::default());
+        let mut out = Vec::new();
+        // A covered zoom-1 tile has 4^28 descendants at zoom 29.
+        let Err(TileStop::Error(e)) = TileTiler::new(29, None).fully_contained(0, 0, 1, &mut out, &mut g) else { panic!("expected an overflow") };
+        assert_eq!((e.status, e.reason.as_str()), (400, "Tile aggregation array overflow"));
+        assert_eq!(used.get(), 0);
+        assert_eq!(out.capacity(), 0);
+        // Within the limit: counted, charged once, then written.
+        let mut g = TileBudget::new(&charge, None, crate::search::AggDeadline::default());
+        assert!(TileTiler::new(12, None).fully_contained(1, 1, 2, &mut out, &mut g).is_ok());
+        assert_eq!(out.len(), 1 << 20);
+        assert_eq!(used.get(), 8 << 20);
+    }
+
+    /// Review #107: a search cancelled after its tiling started stops it
+    /// promptly (no breaker limit at all here), for every tiler.
+    #[test]
+    fn cancellation_interrupts_a_started_tiling() {
+        let dv = world();
+        let v = ShapeValue::new(&dv);
+        for t in tilers(12, 6, 9) {
+            let token = rustic_core::cancel::Token::new();
+            let tk = token.clone();
+            // The first charge happens once the tiling is under way.
+            let charge = move |_: u64| -> crate::error::Result<()> {
+                tk.cancel("by user request");
+                Ok(())
+            };
+            let mut g = TileBudget::new(&charge, Some(token), crate::search::AggDeadline::default());
+            let mut out = Vec::new();
+            let started = std::time::Instant::now();
+            let e = t.cells_within(&v, &mut out, &mut g).unwrap_err();
+            assert_eq!(e.kind, "task_cancelled_exception", "{}", e.reason);
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+            assert!(out.capacity() <= 1 << 16, "{}", out.capacity());
+        }
+    }
+
+    /// Review #107: the search's `timeout` stops a tiling too: the doc's
+    /// cells are dropped and the caller keeps what it grouped.
+    #[test]
+    fn deadline_stops_a_tiling() {
+        let dv = world();
+        let v = ShapeValue::new(&dv);
+        for t in tilers(12, 6, 9) {
+            let charge = |_: u64| -> crate::error::Result<()> { Ok(()) };
+            let mut g = TileBudget::new(&charge, None, crate::search::AggDeadline::new(Some(std::time::Instant::now())));
+            let mut out = Vec::new();
+            assert!(!t.cells_within(&v, &mut out, &mut g).unwrap());
+            assert!(out.is_empty());
+        }
+    }
+
+    /// Review #107 (perf): the common path charges in batches, not per
+    /// cell or per doc: many small shapes through one reused buffer charge
+    /// once, and their cells are what the unadmitted tiler yields.
+    #[test]
+    fn small_shapes_charge_once_per_buffer() {
+        let shapes: Vec<Vec<u8>> = (0..500)
+            .map(|i| {
+                let (x, y) = (-170.0 + (i % 50) as f64 * 6.0, -60.0 + (i / 50) as f64 * 10.0);
+                let wkt = format!("POLYGON (({x} {y}, {} {y}, {} {}, {x} {}, {x} {y}))", x + 2.5, x + 2.5, y + 2.5, y + 2.5);
+                crate::aggs::geo_shape::runtime_shape_value(&rustic_core::fieldtypes::shape::parse_wkt(&wkt, &Default::default()).unwrap()).unwrap()
+            })
+            .collect();
+        for t in tilers(9, 4, 4) {
+            let calls = std::cell::Cell::new(0u32);
+            let charge = |_: u64| -> crate::error::Result<()> {
+                calls.set(calls.get() + 1);
+                Ok(())
+            };
+            let mut g = TileBudget::new(&charge, None, crate::search::AggDeadline::default());
+            let (mut out, mut want) = (Vec::new(), Vec::new());
+            for dv in &shapes {
+                let v = ShapeValue::new(dv);
+                assert!(t.cells_within(&v, &mut out, &mut g).unwrap());
+                t.cells(&v, &mut want);
+                assert_eq!(out, want);
+                assert!(!out.is_empty());
+            }
+            // One batch for the cells (and, for H3, one for its relation memo).
+            assert!(calls.get() <= 2, "{} charges", calls.get());
+        }
     }
 
     #[test]

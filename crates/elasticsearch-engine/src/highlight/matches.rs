@@ -134,9 +134,10 @@ fn walk(q: &Query, boost: f32, cx: &mut Cx) {
             }
         }
         Query::Regexp { field, pattern, case_insensitive, .. } => {
-            let src = if *case_insensitive { format!("(?i)^(?:{pattern})$") } else { format!("^(?:{pattern})$") };
-            if let Ok(re) = regex::Regex::new(&src) {
-                single(cx, *field, boost, &|s| re.is_match(s));
+            // The query's own term matcher (intersections and complements included).
+            use rustic_core::automaton::TermMatcher;
+            if let Ok(m) = rustic_core::automaton::regexp::RegexpMatcher::new(pattern, rustic_core::automaton::regexp::RegexpFlags { case_insensitive: *case_insensitive }) {
+                single(cx, *field, boost, &|s| m.matches(s.as_bytes()));
             }
         }
         Query::Fuzzy { field, text, fuzziness, prefix_length, transpositions, .. } => {
@@ -238,31 +239,54 @@ pub fn within_edits(a: &str, b: &str, max: usize, prefix: usize, transpositions:
     if (a.len() as isize - b.len() as isize).unsigned_abs() > max {
         return false;
     }
+    if a == b {
+        return true;
+    }
+    // Only the diagonal band `|i - j| <= max` can stay within `max` edits:
+    // `O(len * max)` work and three rows of workspace, never a full matrix.
     let (n, m) = (a.len(), b.len());
-    let mut d = vec![vec![0usize; m + 1]; n + 1];
-    for (i, row) in d.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for j in 0..=m {
-        d[0][j] = j;
-    }
+    let inf = max + 1;
+    let mut prev2: Vec<usize> = vec![inf; m + 1];
+    let mut prev: Vec<usize> = (0..=m).map(|j| j.min(inf)).collect();
+    let mut cur: Vec<usize> = vec![inf; m + 1];
     for i in 1..=n {
-        for j in 1..=m {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+        let lo = i.saturating_sub(max).max(1);
+        let hi = (i + max).min(m);
+        cur[lo - 1] = if lo == 1 { i.min(inf) } else { inf };
+        let mut row_min = cur[lo - 1];
+        for j in lo..=hi {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
             if transpositions && i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                v = v.min(d[i - 2][j - 2] + 1);
+                v = v.min(prev2[j - 2] + 1);
             }
-            d[i][j] = v;
+            cur[j] = v.min(inf);
+            row_min = row_min.min(cur[j]);
         }
+        if hi < m {
+            cur[hi + 1] = inf;
+        }
+        if row_min > max {
+            return false;
+        }
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
     }
-    d[n][m] <= max
+    prev[m] <= max
 }
 
 /// Phrase (or multi-phrase) matches with `slop` over one field's tokens.
 fn phrase(cx: &mut Cx, field: u16, slots: &[Vec<String>], slop: u32, boost: f32) {
     let seq = cx.seq;
     cx.seq += 1;
+    // An empty slot is a hole (a removed stop word): it matches nothing and
+    // only keeps the later terms' distance (Lucene `MultiPhraseQuery`
+    // positions), so the phrase's terms carry their own query offsets.
+    let offsets: Vec<i64> = slots.iter().enumerate().filter(|(_, alts)| !alts.is_empty()).map(|(i, _)| i as i64).collect();
+    let slots: Vec<&Vec<String>> = slots.iter().filter(|alts| !alts.is_empty()).collect();
+    if slots.is_empty() {
+        return;
+    }
     for toks in toks_for(cx, field) {
         // candidate token indices per slot
         let cands: Vec<Vec<usize>> = slots.iter().map(|alts| (0..toks.len()).filter(|&i| alts.iter().any(|a| a == &toks[i].text)).collect()).collect();
@@ -270,9 +294,15 @@ fn phrase(cx: &mut Cx, field: u16, slots: &[Vec<String>], slop: u32, boost: f32)
             continue;
         }
         let mut found: Vec<Vec<usize>> = Vec::new();
+        // One work budget for the whole phrase over this field: the
+        // candidate tree of a long repetitive text is otherwise exponential.
+        let mut budget = PHRASE_WORK;
         for &first in &cands[0] {
+            if budget == 0 {
+                break;
+            }
             let mut chosen = vec![first];
-            if let Some(c) = best_combo(toks, &cands, 1, &mut chosen, slop as i64) {
+            if let Some(c) = best_combo(toks, &cands, &offsets, 1, &mut chosen, slop as i64, &mut budget) {
                 if !found.contains(&c) {
                     found.push(c);
                 }
@@ -285,10 +315,15 @@ fn phrase(cx: &mut Cx, field: u16, slots: &[Vec<String>], slop: u32, boost: f32)
 }
 
 /// Depth-first search for a combination whose spread
-/// `max(pos_i - i) - min(pos_i - i)` is within `slop` (Lucene sloppy phrase).
-fn best_combo(toks: &[Tok], cands: &[Vec<usize>], k: usize, chosen: &mut Vec<usize>, slop: i64) -> Option<Vec<usize>> {
+/// `max(pos_i - off_i) - min(pos_i - off_i)` is within `slop` (Lucene sloppy phrase).
+/// Combinations [`best_combo`] may try for one phrase over one field's
+/// tokens. ES's highlighter walks the phrase's matches in one pass; this
+/// search stops at its budget, keeping the best combinations found.
+pub(crate) const PHRASE_WORK: usize = 100_000;
+
+fn best_combo(toks: &[Tok], cands: &[Vec<usize>], offsets: &[i64], k: usize, chosen: &mut Vec<usize>, slop: i64, budget: &mut usize) -> Option<Vec<usize>> {
     let spread = |ch: &[usize]| {
-        let rel: Vec<i64> = ch.iter().enumerate().map(|(i, &t)| toks[t].pos as i64 - i as i64).collect();
+        let rel: Vec<i64> = ch.iter().enumerate().map(|(i, &t)| toks[t].pos as i64 - offsets[i]).collect();
         rel.iter().max().unwrap() - rel.iter().min().unwrap()
     };
     if k == cands.len() {
@@ -297,13 +332,17 @@ fn best_combo(toks: &[Tok], cands: &[Vec<usize>], k: usize, chosen: &mut Vec<usi
     let mut best: Option<(i64, Vec<usize>)> = None;
     let mut tried = 0;
     for &c in &cands[k] {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
         if chosen.iter().any(|&x| toks[x].pos == toks[c].pos) {
             continue;
         }
         chosen.push(c);
         if spread(chosen) <= slop {
             tried += 1;
-            if let Some(full) = best_combo(toks, cands, k + 1, chosen, slop) {
+            if let Some(full) = best_combo(toks, cands, offsets, k + 1, chosen, slop, budget) {
                 let s = spread(&full);
                 if best.as_ref().map(|b| s < b.0).unwrap_or(true) {
                     best = Some((s, full));
@@ -311,7 +350,8 @@ fn best_combo(toks: &[Tok], cands: &[Vec<usize>], k: usize, chosen: &mut Vec<usi
             }
         }
         chosen.pop();
-        if tried > 64 {
+        // A zero spread is the best any combination can do.
+        if tried > 64 || best.as_ref().is_some_and(|b| b.0 == 0) {
             break;
         }
     }
@@ -464,4 +504,63 @@ pub fn term_freqs(ms: &[Match]) -> HashMap<String, usize> {
         *m.entry(x.term.clone()).or_insert(0) += 1;
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The full-matrix distance the banded one replaces (reference).
+    fn full(a: &str, b: &str, transpositions: bool) -> usize {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let (n, m) = (a.len(), b.len());
+        let mut d = vec![vec![0usize; m + 1]; n + 1];
+        for (i, row) in d.iter_mut().enumerate() {
+            row[0] = i;
+        }
+        for j in 0..=m {
+            d[0][j] = j;
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                let cost = usize::from(a[i - 1] != b[j - 1]);
+                let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+                if transpositions && i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                    v = v.min(d[i - 2][j - 2] + 1);
+                }
+                d[i][j] = v;
+            }
+        }
+        d[n][m]
+    }
+
+    /// #324: the banded fuzzy check agrees with the full distance and
+    /// decides 16,000-char terms in linear work and space.
+    #[test]
+    fn banded_fuzzy_matches_full_distance() {
+        let mut seed = 5u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..3000 {
+            let a: String = (0..next() % 8).map(|_| (b'a' + (next() % 3) as u8) as char).collect();
+            let b: String = (0..next() % 8).map(|_| (b'a' + (next() % 3) as u8) as char).collect();
+            for tr in [false, true] {
+                for max in 0..3 {
+                    assert_eq!(within_edits(&a, &b, max, 0, tr), full(&a, &b, tr) <= max, "{a:?} {b:?} {max} {tr}");
+                }
+            }
+        }
+        let long: String = (0..16_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let mut near: Vec<char> = long.chars().collect();
+        near[15_000] = '#';
+        let near: String = near.into_iter().collect();
+        let started = std::time::Instant::now();
+        assert!(within_edits(&long, &long, 1, 0, true));
+        assert!(within_edits(&long, &near, 1, 0, true));
+        assert!(!within_edits(&long, &near, 0, 0, true));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 }

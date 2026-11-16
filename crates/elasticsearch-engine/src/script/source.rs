@@ -12,6 +12,8 @@ pub fn from_source(src: &Source) -> Val {
         Source::Array(a)=>Val::new_list(a.iter().map(from_source).collect()),
         // A string without escapes is its own text (what parsing gives).
         Source::Scalar(raw) if raw.get().len()>=2 && raw.get().starts_with('"') && !raw.get().contains('\\') => Val::str(&raw.get()[1..raw.get().len()-1]),
+        // An integer past `u64` (serde would round it): an exact `BigInteger`.
+        Source::Scalar(raw) if super::jbig::wide_integer_val(raw.get()).is_some() => super::jbig::wide_integer_val(raw.get()).expect("checked"),
         Source::Scalar(raw)=>match serde_json::from_str(raw.get()) {
             Ok(v)=>Val::from_json(&v),
             Err(_)=>Val::utf16(decode_string(raw.get())),
@@ -31,6 +33,8 @@ pub fn to_source(val: &Val) -> Result<Source> {
             Val::List(a)|Val::Set(a)=>Source::Array(a.ordered().iter().map(|v|walk(v,stack)).collect::<Result<_>>()?),
             Val::Array{items,..}=>Source::Array(items.borrow().iter().map(|v|walk(v,stack)).collect::<Result<_>>()?),
             Val::Str(s)=>Source::Scalar(serde_json::value::RawValue::from_string(serde_json::to_string(&**s).expect("string JSON")).expect("valid JSON")),
+            // A `BigInteger` is a JSON integer, exactly (ES's XContent writes its digits).
+            Val::Big(b) if b.is_integer() => Source::Scalar(serde_json::value::RawValue::from_string(b.integer_text()).expect("integer digits")),
             _=>match val.to_json() {
                 // A scalar's JSON text is its raw value (what parsing it back keeps).
                 json@(serde_json::Value::Null|serde_json::Value::Bool(_)|serde_json::Value::Number(_)|serde_json::Value::String(_))=>Source::Scalar(serde_json::value::RawValue::from_string(json.to_string()).expect("valid JSON")),
@@ -142,8 +146,9 @@ fn stable_scalar(t: &str) -> bool {
         Some(_) => {
             let digits = t.strip_prefix('-').unwrap_or(t);
             if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-                // An integer stays one while it fits `i64` (wider ones become doubles).
-                (digits == "0" || !digits.starts_with('0')) && t != "-0" && t.parse::<i64>().is_ok()
+                // An integer stays as written at any width (past `i64` it is
+                // a `BigInteger`, written back exactly).
+                (digits == "0" || !digits.starts_with('0')) && t != "-0"
             } else {
                 // A double stays as written when written as it formats.
                 // (Formatted into a stack buffer: no allocation per value.)

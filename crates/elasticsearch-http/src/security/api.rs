@@ -18,6 +18,9 @@ use std::sync::Arc;
 const P: &str = "cluster:admin/xpack/security";
 
 pub async fn handle(node: Arc<Node>, req: Req, authn: Authn) -> R {
+    // Body password grants: verified on the crypto pool (with the failed-
+    // authentication limiter) before the handler decides from the cache.
+    super::edge::preverify_password_grant(&node, &req.body).await?;
     blocking(move || {
         let perm = node.security.permission(&authn);
         let ctx = Ctx { node: &node, req: &req, a: &authn, perm: &perm };
@@ -87,6 +90,19 @@ impl<'a> Ctx<'a> {
         Err(denied(self.node, self.a, self.perm, action, None))
     }
 
+    /// `_security/{role,api_key,privilege,realm,service/.../token/...}/_clear_cache`:
+    /// ES nodes actions that invalidate the cache on every node. The cluster
+    /// layer supplies the fan-out ([`crate::SecurityCacheClear`]); a single
+    /// node clears its own caches.
+    fn clear_security_cache(&self, action: &str, kind: &str, names: Vec<String>, usernames: Vec<String>) -> R {
+        self.need(&format!("{P}/{action}"))?;
+        if let Some(fan_out) = self.req.extensions.get::<crate::SecurityCacheClear>() {
+            return Ok(Resp::ok((fan_out.0)(kind, names, usernames)?));
+        }
+        self.node.security.clear_cache(kind, &names, &usernames)?;
+        Ok(Resp::ok(self.nodes_response()))
+    }
+
     fn nodes_response(&self) -> Value {
         json!({"_nodes": {"total": 1, "successful": 1, "failed": 0}, "cluster_name": self.node.cluster_name, "nodes": {NODE_ID: {"name": self.node.name}}})
     }
@@ -138,10 +154,7 @@ impl<'a> Ctx<'a> {
                 (3, name, _) if put || post => self.put_role(name),
                 (3, name, _) if get => self.get_roles(Some(name)),
                 (3, name, _) if del => self.delete_role(name),
-                (4, _, "_clear_cache") if post => {
-                    self.need(&format!("{P}/roles/cache/clear"))?;
-                    Ok(Resp::ok(self.nodes_response()))
-                }
+                (4, names, "_clear_cache") if post => self.clear_security_cache("roles/cache/clear", "roles", names_of(names), vec![]),
                 _ => crate::not_found_handler(self.req),
             },
             "role_mapping" => match (n, s2.as_str()) {
@@ -158,10 +171,7 @@ impl<'a> Ctx<'a> {
                 (3, app, _) if get => self.get_privileges(Some(app), None),
                 (4, app, _) if get => self.get_privileges(Some(app), Some(&s3)),
                 (4, app, names) if del => self.delete_privileges(app, names),
-                (4, _, "_clear_cache") if post => {
-                    self.need(&format!("{P}/privilege/cache/clear"))?;
-                    Ok(Resp::ok(self.nodes_response()))
-                }
+                (4, apps, "_clear_cache") if post => self.clear_security_cache("privilege/cache/clear", "privileges", names_of(apps), vec![]),
                 _ => crate::not_found_handler(self.req),
             },
             "api_key" => match (n, s2.as_str(), s3.as_str()) {
@@ -172,10 +182,7 @@ impl<'a> Ctx<'a> {
                 (3, "clone", _) if post || put => self.clone_api_key(),
                 (3, "_bulk_update", _) if post => self.bulk_update_api_keys(),
                 (3, id, _) if put => self.update_api_key(id),
-                (4, _, "_clear_cache") if post => {
-                    self.need(&format!("{P}/api_key/clear_cache"))?;
-                    Ok(Resp::ok(self.nodes_response()))
-                }
+                (4, ids, "_clear_cache") if post => self.clear_security_cache("api_key/clear_cache", "api_keys", names_of(ids), vec![]),
                 _ => crate::not_found_handler(self.req),
             },
             "cross_cluster" => match (n, s2.as_str()) {
@@ -194,8 +201,8 @@ impl<'a> Ctx<'a> {
             }
             "service" => self.service(),
             "realm" if s3 == "_clear_cache" && post => {
-                self.need(&format!("{P}/realm/cache/clear"))?;
-                Ok(Resp::ok(self.nodes_response()))
+                let usernames = self.req.param("usernames").map(names_of).unwrap_or_default();
+                self.clear_security_cache("realm/cache/clear", "realms", names_of(&s2), usernames)
             }
             "profile" => self.profile(),
             "settings" => {
@@ -1231,14 +1238,15 @@ impl<'a> Ctx<'a> {
         has(r) && self.perm.limit.as_ref().map(|l| has(l)).unwrap_or(true)
     }
 
+    /// ES `ManageOwnApiKeyClusterPrivilege.checkIfUserIsOwnerOfApiKeys`:
+    /// an API key owns only itself ("API key cannot own any other API
+    /// key"); a user owns the keys created in its name and realm.
     fn owns(&self, k: &ApiKey) -> bool {
-        let me = self.a.effective();
         if let Some(id) = self.a.api_key_id() {
-            if k.id == id {
-                return true;
-            }
+            return k.id == id;
         }
-        k.username == me.username && (k.realm == me.realm_name || self.a.is_api_key())
+        let me = self.a.effective();
+        k.username == me.username && k.realm == me.realm_name
     }
 
     fn api_key_json(&self, k: &ApiKey, with_limited_by: bool) -> Value {
@@ -1310,27 +1318,22 @@ impl<'a> Ctx<'a> {
     }
 
     fn owner_descriptors(&self, owner: &Authn) -> Map<String, Value> {
-        if let Some(id) = owner.api_key_id() {
-            let st = self.node.security.state.read();
-            if let Some(k) = st.api_keys.get(id) {
-                return if k.role_descriptors.is_empty() { k.limited_by.clone() } else { k.role_descriptors.clone() };
-            }
-        }
-        if owner.is_service_account() {
-            let mut m = Map::new();
-            if let Some(d) = service_account(&owner.username) {
-                m.insert(owner.username.clone(), d);
-            }
-            return m;
-        }
-        self.node.security.user_descriptors(owner)
+        self.node.security.api_key_owner_descriptors(owner)
     }
 
     fn do_create_key(&self, owner: &Authn, body: &Value) -> R {
         let (name, expiration, rds, md) = self.parse_key_request(body, true)?;
         if owner.is_api_key() {
             if let Some(r) = &rds {
-                let any = r.values().any(|d| !d["cluster"].as_array().map(|a| a.is_empty()).unwrap_or(true) || !d["indices"].as_array().map(|a| a.is_empty()).unwrap_or(true) || !d["applications"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+                // Every privilege-bearing section, `run_as` and the remote
+                // ones included, must be empty (ES `RoleDescriptor.isEmpty`).
+                let nonempty = |v: &Value| match v {
+                    Value::Null => false,
+                    Value::Array(a) => !a.is_empty(),
+                    Value::Object(o) => !o.is_empty(),
+                    _ => true,
+                };
+                let any = r.values().any(|d| ["cluster", "indices", "applications", "run_as", "remote_indices", "remote_cluster", "global"].iter().any(|k| nonempty(&d[*k])));
                 if r.is_empty() || any {
                     return Err(EsError::illegal_argument("creating derived api keys requires an explicit role descriptor that is empty (has no privileges)"));
                 }
@@ -1570,7 +1573,7 @@ impl<'a> Ctx<'a> {
             Some("password") => {
                 let u = body["username"].as_str().ok_or_else(|| validation("[username] is required for grant_type [password]"))?;
                 let p = body["password"].as_str().ok_or_else(|| validation("[password] is required for grant_type [password]"))?;
-                self.node.security.authenticate_password(u, p).map_err(|_| EsError::new(401, "security_exception", format!("unable to authenticate user [{u}] for action [{P}/api_key/grant]")))?
+                super::edge::password_grant(&self.node.security, u, p).map_err(|_| EsError::new(401, "security_exception", format!("unable to authenticate user [{u}] for action [{P}/api_key/grant]")))?
             }
             Some("access_token") => {
                 let t = body["access_token"].as_str().ok_or_else(|| validation("[access_token] is required for grant_type [access_token]"))?;
@@ -1828,7 +1831,7 @@ impl<'a> Ctx<'a> {
         }
         let mut auth = authn.to_json();
         if let Some(o) = auth.as_object_mut() {
-            o.insert("authentication_type".into(), json!("realm"));
+            o.insert("authentication_type".into(), json!(if authn.is_api_key() { "api_key" } else { "realm" }));
         }
         m.insert("authentication".into(), auth);
         Value::Object(m)
@@ -1855,46 +1858,34 @@ impl<'a> Ctx<'a> {
                     return Err(EsError::action_validation(&errs));
                 }
                 let (u, p) = (u.unwrap_or(""), p.unwrap_or(""));
-                let user = sec.authenticate_password(u, p).map_err(|_| EsError::new(401, "security_exception", format!("unable to authenticate user [{u}] for action [{P}/token/create]")))?;
-                let doc = sec.create_token(&user, true)?;
+                let user = super::edge::password_grant(sec, u, p).map_err(|_| EsError::new(401, "security_exception", format!("unable to authenticate user [{u}] for action [{P}/token/create]")))?;
+                // The caller of the token API is the client the token is bound to.
+                let doc = sec.create_token(&user, true, self.a)?;
                 Ok(Resp::ok(self.token_response(&doc, &user)))
             }
             "client_credentials" => {
                 self.need(&format!("{P}/token/create"))?;
-                let doc = sec.create_token(self.a, false)?;
+                // ES `TransportCreateTokenAction`: service accounts cannot
+                // create OAuth2 tokens. Any other caller's whole
+                // authentication goes into the token: an API key stays an
+                // API key bounded by its owner's `limited_by` role, and a
+                // run-as keeps the authenticating subject (re-checked on use).
+                if self.a.is_service_account() {
+                    return Err(EsError::new(500, "exception", "OAuth2 token creation is not supported for service accounts"));
+                }
+                let doc = sec.create_token(self.a, false, self.a)?;
                 Ok(Resp::ok(self.token_response(&doc, self.a)))
             }
             "refresh_token" => {
                 self.need(&format!("{P}/token/refresh"))?;
                 let rt = body["refresh_token"].as_str().ok_or_else(|| validation("refresh_token is missing"))?.to_string();
-                let found = {
-                    let st = sec.state.read();
-                    st.tokens.values().find(|t| t.refresh_token.as_deref() == Some(rt.as_str())).cloned()
-                };
                 let invalid_grant = |why: &str| EsError::new(400, "security_exception", "invalid_grant").with("error_description", why);
-                let Some(old) = found else { return Err(invalid_grant("could not refresh the requested token")) };
-                if old.refresh_invalidated {
-                    return Err(invalid_grant("token has been invalidated"));
-                }
-                if old.refreshed {
-                    return Err(invalid_grant("token has already been refreshed"));
-                }
-                if old.creation + 24 * 3600 * 1000 < now_ms() {
-                    return Err(invalid_grant("refresh token is expired"));
-                }
-                {
-                    let mut st = sec.state.write();
-                    if let Some(t) = st.tokens.get_mut(&old.access_token) {
-                        t.refreshed = true;
-                    }
-                }
-                let s = &old.authn;
-                let user = sec.lookup_user(&s.username).unwrap_or_else(|| {
-                    let mut a = self.a.clone();
-                    a.username = s.username.clone();
-                    a
-                });
-                let doc = sec.create_token(&user, true)?;
+                // Checked and marked refreshed in one store write (a refresh
+                // token is used once); the new pair carries the original
+                // token's authentication.
+                // ES `checkClientCanRefresh`: only the creating client refreshes.
+                let user = sec.take_refresh(&rt, self.a).map_err(|why| invalid_grant(&why))?;
+                let doc = sec.create_token(&user, true, self.a)?;
                 Ok(Resp::ok(self.token_response(&doc, &user)))
             }
             "_kerberos" => Err(license_error("kerberos")),
@@ -1922,8 +1913,8 @@ impl<'a> Ctx<'a> {
         let (mut inv, mut prev) = (0, 0);
         let mut any = false;
         for t in st.tokens.values_mut() {
-            let hit = token.as_deref().map(|x| x == t.access_token).unwrap_or(false)
-                || refresh.as_deref().map(|x| Some(x) == t.refresh_token.as_deref()).unwrap_or(false)
+            // Stored ids are hashes: a raw token matches its hash.
+            let hit = (t.hashed && sec::Security::token_matches(t, token.as_deref(), refresh.as_deref()))
                 || (token.is_none() && refresh.is_none() && realm.as_deref().map(|r| r == t.authn.realm_name).unwrap_or(true) && username.as_deref().map(|u| u == t.authn.username).unwrap_or(true));
             if !hit {
                 continue;
@@ -2020,8 +2011,8 @@ impl<'a> Ctx<'a> {
         }
         let name = segs.get(6).map(|s| s.to_string());
         if n == 8 && segs[7] == "_clear_cache" && *m == Method::POST {
-            self.need(&format!("{P}/service_account/token/clear_cache"))?;
-            return Ok(Resp::ok(self.nodes_response()));
+            let tokens = names_of(segs[6]).into_iter().map(|t| format!("{account}/{t}")).collect();
+            return self.clear_security_cache("service_account/token/clear_cache", "service_tokens", tokens, vec![]);
         }
         let sec = &self.node.security;
         match *m {
@@ -2072,7 +2063,7 @@ impl<'a> Ctx<'a> {
                 let user = match body["grant_type"].as_str() {
                     Some("password") => {
                         let u = body["username"].as_str().unwrap_or("");
-                        sec.authenticate_password(u, body["password"].as_str().unwrap_or("")).map_err(|_| EsError::new(401, "security_exception", format!("unable to authenticate user [{u}] for action [{P}/profile/activate]")))?
+                        super::edge::password_grant(sec, u, body["password"].as_str().unwrap_or("")).map_err(|_| EsError::new(401, "security_exception", format!("unable to authenticate user [{u}] for action [{P}/profile/activate]")))?
                     }
                     Some("access_token") => sec.authenticate(sec::Credentials::Bearer(body["access_token"].as_str().unwrap_or("").to_string())).map_err(|_| EsError::new(401, "security_exception", "unable to authenticate with the provided access token"))?,
                     _ => return Err(validation("grant_type is missing")),

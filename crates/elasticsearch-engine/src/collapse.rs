@@ -89,6 +89,9 @@ pub fn expand(json: &str, req: &SearchRequest, run: &dyn Fn(&SearchRequest) -> R
         return Ok(None);
     }
     let mut cache: HashMap<(String, usize), Value> = HashMap::new();
+    // Each sub-search's `timed_out` / `_shards`, merged into the response
+    // once its hits are expanded (see [`merge_completeness`]).
+    let mut completeness: Vec<Value> = Vec::new();
     for h in hits.iter_mut() {
         let group = h.pointer(&format!("/fields/{}", field.replace('~', "~0").replace('/', "~1"))).and_then(|v| v.get(0)).cloned().unwrap_or(Value::Null);
         let key = group.to_string();
@@ -101,6 +104,7 @@ pub fn expand(json: &str, req: &SearchRequest, run: &dyn Fn(&SearchRequest) -> R
                     let sub = sub_request(req, field, &group, ih)?;
                     let s = run(&sub)?;
                     let v: Value = sources.parse_lazy(s.as_bytes())?;
+                    completeness.push(json!({ "timed_out": v.get("timed_out").cloned().unwrap_or(Value::Null), "_shards": v.get("_shards").cloned().unwrap_or(Value::Null) }));
                     let hv = v.get("hits").cloned().unwrap_or(Value::Null);
                     cache.insert((key.clone(), i), hv.clone());
                     hv
@@ -112,10 +116,48 @@ pub fn expand(json: &str, req: &SearchRequest, run: &dyn Fn(&SearchRequest) -> R
             m.insert("inner_hits".into(), Value::Object(inner));
         }
     }
+    for c in &completeness {
+        merge_completeness(&mut out, c);
+    }
     // Aggregations as the shard rendered them (raw scripted envelopes kept):
     // the tree render only when a part needed it.
     let bytes = sources.render_lazy(&out).unwrap_or_else(|| sources.render(&out));
     Ok(Some(String::from_utf8(bytes).expect("JSON text is UTF-8")))
+}
+
+/// Carry an expand sub-search's incompleteness into the search response
+/// `resp` (the expand phase runs when partial results are allowed; a
+/// sub-search that fails outright fails the request): a timed out
+/// sub-search times the response out, and the shard failures it reports
+/// join the response's `_shards` (once per shard, counted as failed), so
+/// inner hits missing a failed shard's documents are never presented as
+/// complete.
+pub fn merge_completeness(resp: &mut Value, sub: &Value) {
+    if sub.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        if let Some(o) = resp.as_object_mut() {
+            o.insert("timed_out".into(), Value::Bool(true));
+        }
+    }
+    let Some(failures) = sub.pointer("/_shards/failures").and_then(Value::as_array).filter(|f| !f.is_empty()) else { return };
+    let Some(shards) = resp.get_mut("_shards").and_then(Value::as_object_mut) else { return };
+    let shard_of = |f: &Value| (f.get("index").cloned().unwrap_or(Value::Null), f.get("shard").cloned().unwrap_or(Value::Null));
+    let mut list: Vec<Value> = shards.get("failures").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut added = 0u64;
+    for f in failures {
+        if !list.iter().any(|x| shard_of(x) == shard_of(f)) {
+            list.push(f.clone());
+            added += 1;
+        }
+    }
+    if added == 0 {
+        return;
+    }
+    let total = shards.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let failed = shards.get("failed").and_then(Value::as_u64).unwrap_or(0).saturating_add(added).min(total.max(1));
+    let successful = shards.get("successful").and_then(Value::as_u64).unwrap_or(0).saturating_sub(added);
+    shards.insert("successful".into(), json!(successful));
+    shards.insert("failed".into(), json!(failed));
+    shards.insert("failures".into(), Value::Array(list));
 }
 
 fn sub_request(req: &SearchRequest, field: &str, group: &Value, ih: &Map<String, Value>) -> Result<SearchRequest> {
@@ -159,5 +201,62 @@ pub fn group_key(vals: &[Value]) -> String {
     match vals.first() {
         None => "null".to_string(),
         Some(v) => v.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(index: &str, shard: u64) -> Value {
+        json!({"shard": shard, "index": index, "node": "n", "reason": {"type": "illegal_state_exception", "reason": "boom"}})
+    }
+
+    /// Finding 265: an expand sub-search that lost a shard (or timed out)
+    /// marks the response incomplete; a complete one changes nothing.
+    #[test]
+    fn expand_carries_sub_search_failures_into_the_response() {
+        let first = json!({
+            "took": 1, "timed_out": false,
+            "_shards": {"total": 2, "successful": 2, "skipped": 0, "failed": 0},
+            "hits": {"total": {"value": 2, "relation": "eq"}, "max_score": null, "hits": [
+                {"_index": "i", "_id": "1", "_score": null, "fields": {"g": ["a"]}},
+                {"_index": "i", "_id": "2", "_score": null, "fields": {"g": ["b"]}}
+            ]}
+        });
+        let req = crate::search::parse_request(&json!({"collapse": {"field": "g", "inner_hits": {"name": "top"}}}), &HashMap::new()).unwrap();
+        let sub = |partial: bool| {
+            move |_: &SearchRequest| -> Result<String> {
+                let (shards, timed_out) = if partial {
+                    (json!({"total": 2, "successful": 1, "skipped": 0, "failed": 1, "failures": [failure("i", 1)]}), true)
+                } else {
+                    (json!({"total": 2, "successful": 2, "skipped": 0, "failed": 0}), false)
+                };
+                Ok(json!({"took": 1, "timed_out": timed_out, "_shards": shards, "hits": {"total": {"value": 1, "relation": "eq"}, "max_score": 1.0, "hits": []}}).to_string())
+            }
+        };
+        // All healthy: unchanged completeness.
+        let out: Value = serde_json::from_str(&expand(&first.to_string(), &req, &sub(false)).unwrap().unwrap()).unwrap();
+        assert_eq!(out["_shards"], first["_shards"]);
+        assert_eq!(out["timed_out"], false);
+        assert!(out["hits"]["hits"][0]["inner_hits"]["top"]["hits"].is_object());
+        // A shard of the expansion failed (both groups' sub-searches): one
+        // failure for that shard, counted once.
+        let out: Value = serde_json::from_str(&expand(&first.to_string(), &req, &sub(true)).unwrap().unwrap()).unwrap();
+        assert_eq!(out["timed_out"], true);
+        assert_eq!(out["_shards"]["failed"], 1, "{}", out["_shards"]);
+        assert_eq!(out["_shards"]["successful"], 1);
+        assert_eq!(out["_shards"]["failures"].as_array().map(Vec::len), Some(1));
+        assert_eq!(out["_shards"]["failures"][0]["shard"], 1);
+    }
+
+    #[test]
+    fn merge_completeness_keeps_existing_failures_once() {
+        let mut resp = json!({"timed_out": false, "_shards": {"total": 3, "successful": 2, "skipped": 0, "failed": 1, "failures": [failure("i", 0)]}});
+        merge_completeness(&mut resp, &json!({"timed_out": false, "_shards": {"total": 3, "successful": 1, "failed": 2, "failures": [failure("i", 0), failure("i", 2)]}}));
+        assert_eq!(resp["_shards"]["failed"], 2);
+        assert_eq!(resp["_shards"]["successful"], 1);
+        assert_eq!(resp["_shards"]["failures"].as_array().map(Vec::len), Some(2));
+        assert_eq!(resp["timed_out"], false);
     }
 }

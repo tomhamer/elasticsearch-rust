@@ -65,6 +65,7 @@ use super::{Metric, Similarity};
 mod mutable;
 #[cfg(feature = "mutable-hnsw-poc")]
 pub(crate) use mutable::{beam_workers, SharedQuantized};
+pub use mutable::{set_spill_dir, spilled_bytes};
 pub use mutable::{PreparedNodeFilter, PendingMutableCheckpoint, RawRows, RawRowsSnapshot, CapturedMutableVectorRead, MutableVectorCheckpoint, MutableVectorOwner, MutableVectorRead, MutableCommitBatch, InsertReservation, MutableArrayMemory, MutableStorageMemory, MutableHnsw, MutableHnswLimits, MutableHnswSnapshot, MutableHnswStats, MutableSearchMode, MutableSearchResult, MutableQueryScorer, MutableVectorSource, NodeHandle, PreparedMutableInsert, ReclaimedNode, VespaFilterEstimate, VespaFilterFirstParams, VespaPlainParams};
 
 /// Native POC instrumentation for the existing immutable search baseline.

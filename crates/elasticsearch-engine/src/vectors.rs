@@ -1015,28 +1015,72 @@ struct QuantThreshold {
     bits: u8,
 }
 
+#[cfg(test)]
+static CENTROID_PASSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The mean of `n` rows (`row(i, f)` calls `f` with row `i`, or returns
+/// false when it has none), each ES-unit-normalised when `unit`: the OSQ
+/// centroid Lucene fits a segment's quantizer around, in one streaming
+/// pass with one row of workspace. `None` when `stopped` (polled every
+/// 1024 rows) or no row has a vector.
+fn streamed_centroid(n: u32, unit: bool, mut row: impl FnMut(u32, &mut dyn FnMut(&[f32])) -> bool, stopped: impl Fn() -> bool) -> Option<Vec<f32>> {
+    use rustic_core::vector::es_quant::es_unit;
+    #[cfg(test)]
+    CENTROID_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut sum: Option<Vec<f32>> = None;
+    let mut count = 0usize;
+    for i in 0..n {
+        if i % 1024 == 0 && stopped() {
+            return None;
+        }
+        row(i, &mut |v: &[f32]| {
+            let v = if unit { es_unit(v) } else { std::borrow::Cow::Borrowed(v) };
+            let s = sum.get_or_insert_with(|| vec![0f32; v.len()]);
+            for (a, x) in s.iter_mut().zip(v.iter()) {
+                *a += *x;
+            }
+            count += 1;
+        });
+    }
+    let mut c = sum?;
+    for a in c.iter_mut() {
+        *a /= count as f32;
+    }
+    Some(c)
+}
+
 impl QuantThreshold {
     /// Per-leaf filter: keep the hits whose Lucene-quantized score reaches
     /// `threshold` (ES checks `similarity` against the quantized index's
-    /// scores). The quantizer is fitted on the leaf's vectors the way Lucene
-    /// fits a segment's (cosine: on the unit vectors).
-    fn filter(&self, leaf: &LeafReader<'_>, hits: Vec<(DocId, f32)>, threshold: f32) -> Vec<(DocId, f32)> {
-        use rustic_core::vector::es_quant::{EsQuant, EsQuantScorer};
-        let n = leaf.num_docs();
-        let sample: Vec<Vec<f32>> = (0..n).filter_map(|d| leaf.vector(self.field, d)).collect();
-        if sample.is_empty() {
-            return hits;
-        }
-        // ES 9 scores int8 / int4 with OSQ (`ES94ScalarQuantizedVectorsFormat`).
-        let spec = EsQuant { bits: self.bits, confidence_interval: self.confidence_interval, osq: true };
-        let q = spec.fit(self.similarity, sample.len(), |i| sample[i].as_slice());
+    /// scores). ES 9 scores int8 / int4 with OSQ
+    /// (`ES94ScalarQuantizedVectorsFormat`), fitted around the segment's
+    /// centroid (cosine: of the unit vectors): computed in one streaming
+    /// pass (no copy of the rows), once per immutable segment, polling the
+    /// search's deadline / cancellation. `None` when the search stopped.
+    fn filter(&self, leaf: &LeafReader<'_>, hits: Vec<(DocId, f32)>, threshold: f32, ctx: &SearchContext) -> Option<Vec<(DocId, f32)>> {
+        use rustic_core::vector::es_quant::{EsQuantScorer, EsQuantizer};
+        use rustic_core::vector::osq::{OsqQuantizer, OsqSim};
+        let unit = self.similarity == rustic_core::vector::Similarity::Cosine;
+        let compute = || streamed_centroid(leaf.num_docs(), unit, |d, f| leaf.with_vector(self.field, d, |v| f(v)).is_some(), || ctx.stopped());
+        let centroid = match leaf {
+            LeafReader::Segment(s) => s.vector_centroid(self.field, unit, compute).map(|c| c.as_ref().clone()),
+            LeafReader::Memtable(..) => compute(),
+        };
+        let Some(centroid) = centroid else {
+            if ctx.stopped() {
+                return None;
+            }
+            return Some(hits);
+        };
+        let query_bits = if self.bits <= 4 { 4 } else { self.bits };
+        let q = EsQuantizer::Osq(Arc::new(OsqQuantizer::from_centroid(OsqSim::of(self.similarity), centroid, self.bits, query_bits)));
         let mut scorer = EsQuantScorer::new(q, self.similarity, &self.query);
-        hits.into_iter()
-            .filter(|(d, exact)| match leaf.vector(self.field, *d) {
-                Some(v) => scorer.score(&v) >= threshold,
+        Some(hits.into_iter()
+            .filter(|(d, exact)| match leaf.with_vector(self.field, *d, |v| scorer.score(v)) {
+                Some(s) => s >= threshold,
                 None => *exact >= threshold,
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -1097,7 +1141,12 @@ impl CustomQuery for MappedKnn {
                 }
                 hits.push((d, inner.score()));
             }
-            let hits: Vec<(DocId, f32)> = qt.filter(leaf, hits, t).into_iter().map(|(d, s)| (d, s * self.boost)).collect();
+            let Some(kept) = qt.filter(leaf, hits, t, ctx) else {
+                // Stopped (deadline / cancellation) while calibrating.
+                ctx.vector_timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            };
+            let hits: Vec<(DocId, f32)> = kept.into_iter().map(|(d, s)| (d, s * self.boost)).collect();
             if hits.is_empty() {
                 return None;
             }
@@ -1391,7 +1440,16 @@ fn lookup_query_vector(o: &Map<String, Value>, spec: &Value, ctx: &QueryContext)
     };
     let routing = get("routing");
     let lookup = ctx.terms_lookup.ok_or_else(|| EsError::illegal_argument("[lookup] query vector builder is not available here"))?;
-    let values = lookup(&index, &id, &path, routing.as_deref())?;
+    // The reference index's vector values (ES `LookupQueryVectorBuilder`:
+    // doc values of the reference field, source disabled), SIDE 016; a
+    // lookup that does not resolve vectors answers the source values.
+    let vector_lookup = lookup(&index, &id, &encode_vector_lookup(&path), routing.as_deref());
+    let resolved_vector = matches!(&vector_lookup, Ok(v) if !v.is_empty());
+    let values = match vector_lookup {
+        Ok(v) if !v.is_empty() => v,
+        Err(e) if e.reason.contains("for lookup query vector builder") => return Err(e),
+        _ => lookup(&index, &id, &path, routing.as_deref())?,
+    };
     if values.is_empty() {
         let reason = if ctx.lookup.get(&path).is_some() || index != ctx.index_name {
             format!("Document with id [{id}] not found in index [{index}] for lookup query vector builder.")
@@ -1400,7 +1458,9 @@ fn lookup_query_vector(o: &Map<String, Value>, spec: &Value, ctx: &QueryContext)
         };
         return Err(EsError::new(404, "status_exception", reason));
     }
-    if let Some(f) = ctx.lookup.get(&path) {
+    // The searched index's mapping of the path says nothing about another
+    // reference index's field.
+    if let Some(f) = ctx.lookup.get(&path).filter(|_| !resolved_vector && index == ctx.index_name) {
         if f.ty != EsType::DenseVector {
             let class = match values.first() {
                 Some(Value::String(_)) | None => "java.lang.String",
@@ -1426,6 +1486,20 @@ fn lookup_query_vector(o: &Map<String, Value>, spec: &Value, ctx: &QueryContext)
     out.shift_remove("query_vector_builder");
     out.insert("query_vector".into(), qv);
     Ok(out)
+}
+
+/// Marks a terms-lookup path as a vector lookup: the callback answers the
+/// reference document's vector values (doc values, not `_source`).
+const VECTOR_LOOKUP_MARK: &str = "\u{0}vector-lookup\u{0}";
+
+/// The terms-lookup path of a vector lookup of `path`.
+pub fn encode_vector_lookup(path: &str) -> String {
+    format!("{VECTOR_LOOKUP_MARK}{path}")
+}
+
+/// The reference field of a vector-lookup terms-lookup path.
+pub fn decode_vector_lookup(path: &str) -> Option<&str> {
+    path.strip_prefix(VECTOR_LOOKUP_MARK)
 }
 
 fn int_param(o: &Map<String, Value>, k: &str) -> Result<Option<i64>> {
@@ -1638,6 +1712,11 @@ pub fn parse_knn(o: &Map<String, Value>, ctx: &QueryContext, default_k: Option<u
         (ElementType::Byte, "dot_product") => Some(ScoreMap::ByteDot { dims: dims as f32 }),
         _ => None,
     };
+    // No request `rescore_vector`: the mapping's current one (ES reads the
+    // field type's `index_options` per query, so a `rescore_vector` changed
+    // by a mapping update applies at once); the shard's vector store keeps
+    // the options it was created with.
+    let oversample = oversample.or_else(|| if quantization(index_type(&f).as_deref()).is_quantized() { mapped_oversample(&f).map(|o| o as f32) } else { None });
     if let Some(path) = f.nested_path.clone() {
         let all_children = o.get("_inner_hits_children").and_then(Value::as_bool).unwrap_or(false);
         let similarity = rustic_core::codec::vectors::similarity_by_name(&core_similarity(et, &sim_name));
@@ -1699,8 +1778,11 @@ fn might_match_non_nested(q: &Value, path: &str, lookup: &crate::mapping::FieldL
         match &f.nested_path {
             None => true,
             Some(p) if !p.starts_with(path) => true,
-            // Not `include_in_parent` / `include_in_root` here.
-            Some(p) if p == path => false,
+            // A field of the vector's own nested object reaches the parent
+            // (or root) document too when the object copies it there
+            // (`include_in_parent` / `include_in_root`, ES `NestedHelper`,
+            // SIDE 002): such a filter is a parent filter.
+            Some(p) if p == path => lookup.objects.get(p).is_some_and(|o| o.include_in_parent || o.include_in_root),
             Some(_) => true,
         }
     };
@@ -1787,6 +1869,19 @@ fn nested_knn(
         Ok(bits)
     }).transpose()?;
     let total_children: usize = leaves.iter().map(|l| l.num_docs() as usize).sum();
+    // The documents candidates are diversified (and parent-filtered) at
+    // (SIDE 001), as ES `KnnVectorQueryBuilder` picks its parent filter: the
+    // roots for a top-level kNN; inside a `nested` query the scope one level
+    // above that query's (`NestedScope.previousLevel()`, the roots for a
+    // first-level `nested`), not the vector's immediate parent: with
+    // `groups.items.v`, two groups of one root are one candidate.
+    let outer = if top_level { None } else { crate::query::dsl::outer_nested_scope() };
+    let join_depth = |info: &rustic_core::nested::NestedInfo, _d: DocId| -> Option<u16> {
+        match &outer {
+            Some(p) => info.path_ord(p).map(|o| info.ord_depth(o)),
+            None => Some(0),
+        }
+    };
     let mut kc = num_candidates.max(k).saturating_mul(4).max(64);
     // (score, leaf, child, parent)
     let cands: Vec<(f32, usize, DocId, DocId)> = loop {
@@ -1818,7 +1913,7 @@ fn nested_knn(
                 if leaf.is_deleted(d) {
                     continue;
                 }
-                let Some(p) = info.parent(d) else { continue };
+                let Some(p) = join_depth(info, d).and_then(|depth| info.ancestor_at(d, depth)).filter(|p| *p != d) else { continue };
                 if let Some(fb) = &fbits {
                     if fb[li].get(p as usize / 64).is_none_or(|w| (w >> (p % 64)) & 1 == 0) {
                         continue;
@@ -1943,5 +2038,65 @@ mod default_index_options_tests {
                 assert_eq!(ty, if dims >= BBQ_DIMS_DEFAULT_THRESHOLD { "bbq_hnsw" } else { "int8_hnsw" }, "{dims} dims");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod quant_threshold_tests {
+    use super::*;
+    use rustic_core::vector::es_quant::{EsQuant, EsQuantScorer, EsQuantizer};
+    use rustic_core::vector::osq::{OsqQuantizer, OsqSim};
+    use rustic_core::vector::Similarity;
+
+    fn rows(n: usize, dims: usize) -> Vec<Vec<f32>> {
+        let mut x = 11u64;
+        (0..n).map(|_| (0..dims).map(|_| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((x >> 40) % 1000) as f32 / 250.0 - 2.0 }).collect()).collect()
+    }
+
+    /// #225: the streamed centroid gives exactly the quantizer (and so the
+    /// scores) of the full-copy fit it replaces; a stopped search stops it.
+    #[test]
+    fn streamed_centroid_matches_the_full_fit() {
+        let data = rows(3000, 16);
+        let query = rows(1, 16).remove(0);
+        for sim in [Similarity::Cosine, Similarity::L2, Similarity::DotProduct] {
+            for bits in [7u8, 4] {
+                let full = EsQuant { bits, confidence_interval: None, osq: true }.fit(sim, data.len(), |i| data[i].as_slice());
+                let unit = sim == Similarity::Cosine;
+                let c = streamed_centroid(data.len() as u32, unit, |i, f| { f(&data[i as usize]); true }, || false).unwrap();
+                let streamed = EsQuantizer::Osq(Arc::new(OsqQuantizer::from_centroid(OsqSim::of(sim), c, bits, if bits <= 4 { 4 } else { bits })));
+                let (mut a, mut b) = (EsQuantScorer::new(full, sim, &query), EsQuantScorer::new(streamed, sim, &query));
+                for r in &data[..200] {
+                    assert_eq!(a.score(r).to_bits(), b.score(r).to_bits(), "{sim:?} {bits}");
+                }
+            }
+        }
+        let polls = std::cell::Cell::new(0);
+        assert!(streamed_centroid(data.len() as u32, false, |i, f| { f(&data[i as usize]); true }, || { polls.set(polls.get() + 1); polls.get() > 1 }).is_none(), "stopped at the next poll");
+        assert_eq!(polls.get(), 2);
+    }
+
+    /// #225: a threshold query on an `int8_hnsw` field calibrates each
+    /// immutable segment once: a second query reuses it.
+    #[test]
+    fn segment_calibration_is_reused() {
+        let data = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(data.path()).unwrap();
+        let svc = node.create_index("vq", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {"properties": {"v": {"type": "dense_vector", "dims": 8, "index": true, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw"}}}}})).unwrap();
+        let reqs: Vec<crate::index::WriteReq> = rows(300, 8).into_iter().enumerate().map(|(i, v)| crate::index::WriteReq::Index { id: Some(i.to_string()), source: json!({"v": v}).to_string(), routing: None, cond: crate::shard::WriteCond::default() }).collect();
+        assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+        svc.refresh().unwrap();
+        svc.flush().unwrap();
+        let body = json!({"knn": {"field": "v", "query_vector": rows(1, 8).remove(0), "k": 5, "num_candidates": 50, "similarity": 100.0}, "size": 5});
+        let passes = || CENTROID_PASSES.load(std::sync::atomic::Ordering::Relaxed);
+        let before = passes();
+        let first = crate::ml::search(&node, "vq", &body).unwrap();
+        let after_first = passes();
+        let second = crate::ml::search(&node, "vq", &body).unwrap();
+        assert!(after_first > before, "the first query calibrated");
+        assert_eq!(passes(), after_first, "the second query reused the segment's calibration");
+        assert_eq!(first["hits"]["hits"], second["hits"]["hits"]);
+        assert!(!first["hits"]["hits"].as_array().unwrap().is_empty());
     }
 }

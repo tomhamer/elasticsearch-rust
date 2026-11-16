@@ -139,8 +139,7 @@ impl Tokenizer for MlTokenizer {
                 text: chars[start..start + length].iter().map(|x| x.1).collect(),
                 position: pos as u32,
                 offset_from: byte_at(start),
-                offset_to: byte_at(start + length),
-            });
+                offset_to: byte_at(start + length), keyword: false });
         }
         out
     }

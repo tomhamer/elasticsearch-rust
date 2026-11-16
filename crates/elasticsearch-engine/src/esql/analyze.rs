@@ -47,6 +47,11 @@ pub fn dissect_names(pattern: &str) -> Vec<String> {
 
 /// Output names of a `GROK` pattern (`%{PATTERN:name[:type]}`).
 pub fn grok_names(pattern: &str) -> Vec<String> {
+    // The captures of the expanded pattern (nested ones of built-in
+    // patterns included), as GROK produces them.
+    if let Ok(g) = crate::ingest::grok::Grok::compile_es(pattern, crate::ingest::grok::bank_es(true)) {
+        return g.esql_fields().into_iter().map(|(n, _)| n).collect();
+    }
     let mut out = Vec::new();
     let mut rest = pattern;
     while let Some(s) = rest.find("%{") {

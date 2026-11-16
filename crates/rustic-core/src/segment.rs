@@ -358,6 +358,12 @@ pub struct SegmentData {
     terms_len: u64,
     /// Immutable point-map offsets, parsed once instead of per filter/hit.
     point_directory: OnceLock<Vec<(u16, usize, u32)>>,
+    /// Per (vector field, unit-normalised): the mean of the segment's
+    /// vectors, computed once on first use ([`Segment::vector_centroid`]).
+    vector_centroids: parking_lot::Mutex<std::collections::HashMap<(u16, bool), Arc<Vec<f32>>>>,
+    /// Structures derived from this immutable segment on first use and kept
+    /// with it ([`Segment::derived`]), by key.
+    derived: parking_lot::Mutex<std::collections::HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
     projection_id: u64,
     /// Fast-field column directory, parsed once at open (read side).
     fast_dir: Vec<ColumnEntry>,
@@ -365,9 +371,13 @@ pub struct SegmentData {
     keyword_tables: std::collections::HashMap<u16, OnceLock<Option<KeywordTable>>>,
     /// Single-valued numeric columns whose presence ranks were validated.
     numeric_checks: crate::codec::fastfields::NumericChecks,
+    /// Constant norms columns expanded on first use (owned and admitted here).
+    const_norms: crate::codec::fastfields::ConstNorms,
     /// Shared zero-copy norms of every field that has them, built on first
     /// use (scorers clone the `Arc` instead of re-resolving the column).
-    norms_cache: OnceLock<Vec<(u16, Arc<Norms>)>>,
+    /// Per field with norms, its scorer norms, built on first use (a
+    /// constant column is expanded only when a query scores its field).
+    norms_cache: OnceLock<Vec<(u16, OnceLock<Arc<Norms>>)>>,
     /// The stored-fields chunk table, parsed on first fetch (re-parsing it
     /// per document would walk every chunk entry on every hit).
     store_table: OnceLock<crate::admission::Allocation<StoreTable>>,
@@ -735,18 +745,30 @@ impl Segment {
 
     fn open_inner_admitted(dir: &dyn Directory, id: u32, budget: &Arc<crate::admission::Budget>) -> Result<Self> {
         let data = dir.open_read(&segment_file_name(id))?;
-        let file = open_segment_file(data, false)?;
-        let terms_len = file.terms.len() as u64;
+        let file = open_segment_file(data, verify_on_open())?;
+        // An interleaved dictionary's section overlaps the postings section
+        // (format v38+ merges): the bytes they share count once.
+        let overlap = {
+            let (t, p) = (file.terms.as_slice(), file.postings.as_slice());
+            let (t0, p0) = (t.as_ptr() as usize, p.as_ptr() as usize);
+            (t0 + t.len()).min(p0 + p.len()).saturating_sub(t0.max(p0)) as u64
+        };
+        let terms_len = file.terms.len() as u64 - overlap;
         let terms = Arc::new(TermDictReader::open_versioned(file.terms, file.version)?);
         let mut deletions = BitSet::new_admitted(file.num_docs, budget)?;
         let del_name = deletes_file_name(id);
         if dir.exists(&del_name) {
             let del = dir.open_read(&del_name)?;
-            deletions.load_words(del.as_slice());
+            deletions.load_words(&deletion_words(del.as_slice(), id, file.num_docs)?);
         }
-        let fast_dir = parse_column_directory(file.fast.as_slice()).unwrap_or_default();
+        // A damaged column directory is corruption, not "no columns".
+        let fast_dir = parse_column_directory(file.fast.as_slice())?;
+        if !file.vectors.as_slice().is_empty() {
+            PointMapReader::open(file.vectors.as_slice())?;
+        }
         let keyword_tables = fast_dir.iter().filter(|c| c.tag == TAG_KEYWORD).map(|c| (c.field, OnceLock::new())).collect();
         let numeric_checks = crate::codec::fastfields::numeric_checks(&fast_dir);
+        let const_norms = crate::codec::fastfields::const_norms(&fast_dir);
         let mut nested = None;
         let mut geo = Vec::new();
         let mut shapes: Vec<(u16, crate::fieldtypes::shape_field::ShapeFieldData)> = Vec::new();
@@ -835,6 +857,7 @@ impl Segment {
                 fast_dir,
                 keyword_tables,
                 numeric_checks,
+                const_norms,
                 postings_data: file.postings,
                 fast_data: file.fast,
                 store_data: file.store,
@@ -842,6 +865,8 @@ impl Segment {
                 extra_data: file.extra.clone(),
                 terms_len,
                 point_directory: OnceLock::new(),
+                vector_centroids: Default::default(),
+                derived: Default::default(),
                 projection_id: {
                     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                     NEXT.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| n.checked_add(1)).expect("segment identity exhausted")
@@ -907,9 +932,29 @@ impl Segment {
     /// of stored bytes is estimated, and only past `max_chunks` chunks (a
     /// 330 GB index decoded every stored document).
     pub fn disk_usage_sampled(&self, max_chunks: usize) -> Result<SegmentDiskUsage> {
+        // An interleaved dictionary (v38+ merges): its blocks sit between
+        // the postings runs, its other bytes after them.
+        let gaps = self.terms.gap_bytes();
+        let (terms_bytes, postings_bytes) = if gaps > 0 {
+            (self.terms_len + (self.postings_data.len() as u64).saturating_sub(gaps), gaps)
+        } else {
+            (self.terms_len, self.postings_data.len() as u64)
+        };
+        let runs = if gaps > 0 { self.terms.block_runs() } else { Vec::new() };
+        let mut prefix = Vec::with_capacity(runs.len());
+        let mut sum = 0u64;
+        for &(s, e) in &runs { prefix.push(sum); sum += e - s; }
+        // Dictionary bytes before `x`, and in `[a, b)`, of the postings section.
+        let dict_upto = |x: u64| -> u64 {
+            let k = runs.partition_point(|&(s, _)| s < x);
+            if k == 0 { return 0; }
+            let (s, e) = runs[k - 1];
+            prefix[k - 1] + x.min(e) - s
+        };
+        let dict_within = |a: u64, b: u64| -> u64 { if b <= a { 0 } else { dict_upto(b) - dict_upto(a) } };
         let mut out = SegmentDiskUsage {
-            terms: self.terms_len,
-            postings: self.postings_data.len() as u64,
+            terms: terms_bytes,
+            postings: postings_bytes,
             fast: self.fast_data.len() as u64,
             store: self.store_data.len() as u64,
             vectors: self.vectors_data.len() as u64,
@@ -922,7 +967,7 @@ impl Segment {
         // written in term order, so a list ends where the next term's starts.
         let mut prev: Option<(u16, u64)> = None;
         let mut ordered = true;
-        let total_postings = out.postings;
+        let total_postings = self.postings_data.len() as u64;
         let mut per: std::collections::BTreeMap<u16, (u64, u64, u64)> = std::collections::BTreeMap::new();
         let unattributed = self.terms.for_each_term_bytes(|key, bytes, loc| {
             let field = key.get(..2).map_or(u16::MAX, |k| u16::from_le_bytes([k[0], k[1]]));
@@ -933,12 +978,12 @@ impl Segment {
             if loc.offset & crate::term_dictionary::INLINE_POSTINGS != 0 { return; }
             if let Some((pf, poff)) = prev {
                 if loc.offset < poff { ordered = false; }
-                per.entry(pf).or_default().2 += loc.offset.saturating_sub(poff);
+                per.entry(pf).or_default().2 += loc.offset.saturating_sub(poff).saturating_sub(dict_within(poff, loc.offset));
             }
             prev = Some((field, loc.offset));
         })?;
         if let Some((pf, poff)) = prev {
-            per.entry(pf).or_default().2 += total_postings.saturating_sub(poff);
+            per.entry(pf).or_default().2 += total_postings.saturating_sub(poff).saturating_sub(dict_within(poff, total_postings));
         }
         out.field(u16::MAX).terms += unattributed;
         for (field, (bytes, count, postings)) in per {
@@ -948,7 +993,7 @@ impl Segment {
             if ordered { f.postings += postings; }
         }
         if !ordered {
-            out.field(u16::MAX).postings += total_postings;
+            out.field(u16::MAX).postings += postings_bytes;
         }
         // Columns.
         let fast = self.fast_data.as_slice();
@@ -1490,26 +1535,54 @@ impl Segment {
     }
 
     /// Persist the deletion bitmap (no-op if nothing is deleted and no file exists).
-    pub fn write_deletions(&self, dir: &dyn Directory) -> Result<()> {
+    /// Returns the deletions written.
+    pub fn write_deletions(&self, dir: &dyn Directory) -> Result<u64> {
         let d = self.deletions.read().latest.clone();
         self.write_deletions_of(dir, &d)
     }
 
     /// Write `d` as this segment's deletion file (a commit's point-in-time
     /// deletions, see `CommitJob::with_deletions`).
-    pub fn write_deletions_of(&self, dir: &dyn Directory, d: &BitSet) -> Result<()> {
+    /// The file ([`DELETES_MAGIC`]) names its segment and doc count, holds
+    /// the bitmap's exact words and their count of deletions, under a
+    /// checksum: a truncated, foreign or damaged file is refused at open.
+    /// Returns the deletions written (the commit records them).
+    pub fn write_deletions_of(&self, dir: &dyn Directory, d: &BitSet) -> Result<u64> {
         let name = deletes_file_name(self.id);
         if d.is_empty() {
             if dir.exists(&name) {
                 dir.delete(&name)?;
             }
-            return Ok(());
+            return Ok(0);
         }
-        let mut bytes = Vec::with_capacity(d.words().len() * 8);
+        let deleted = d.count() as u64;
+        if crate::codec::write_version() < crate::codec::INTEGRITY_SINCE {
+            // Older readers in the cluster read bare words.
+            let mut bytes = Vec::with_capacity(d.words().len() * 8);
+            for w in d.words() {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            dir.write(&name, &bytes)?;
+            return Ok(deleted);
+        }
+        let mut bytes = Vec::with_capacity(28 + d.words().len() * 8);
+        bytes.extend_from_slice(DELETES_MAGIC);
+        bytes.extend_from_slice(&self.id.to_le_bytes());
+        bytes.extend_from_slice(&self.num_docs.to_le_bytes());
+        bytes.extend_from_slice(&deleted.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
         for w in d.words() {
             bytes.extend_from_slice(&w.to_le_bytes());
         }
-        dir.write(&name, &bytes)
+        let crc = crate::codec::crc32(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        dir.write(&name, &bytes)?;
+        Ok(deleted)
+    }
+
+    /// Deleted docs (the committed bitmap and later in-memory deletions).
+    pub fn num_deleted(&self) -> u64 {
+        self.deletions.read().latest.count() as u64
     }
 
     pub fn term_dict(&self) -> &TermDictReader {
@@ -1553,7 +1626,7 @@ impl Segment {
 
     /// Fast fields reader (free: the column directory is parsed at open).
     pub fn fast_fields(&self) -> FastFieldsReader<'_> {
-        FastFieldsReader::with_segment_tables(self.fast_data.as_slice(), &self.fast_dir, &self.keyword_tables, &self.numeric_checks)
+        FastFieldsReader::with_segment_tables(self.fast_data.as_slice(), &self.fast_dir, &self.keyword_tables, &self.numeric_checks).with_const_norms(&self.const_norms)
     }
 
     /// Bounded, single-valued keyword metadata for vector graph partitions.
@@ -1572,8 +1645,9 @@ impl Segment {
         // high-cardinality field, plus eight column descriptors. Row/vector
         // headers are reserved before construction, then string/tuple growth
         // is admitted from borrowed column values before any owned copy.
-        let base = (self.num_docs as u64).saturating_mul(128).saturating_add(65536);
-        let mut memory = budget.reserve(base, "vector partition payload rows")?;
+        // The scan's scratch first; the rows are charged once it is known
+        // whether any field qualifies (see below).
+        let mut memory = budget.reserve(65536, "vector partition payload rows")?;
         let ff = self.fast_fields();
         let mut fields = Vec::with_capacity(8);
         for entry in self.fast_dir.iter().filter(|c| c.tag == TAG_KEYWORD).take(8) {
@@ -1593,6 +1667,17 @@ impl Segment {
             memory.grow(bytes, "vector partition payload values")?;
             fields.push(entry.field);
         }
+        if fields.is_empty() {
+            // No partition field (the common case: none, or only
+            // high-cardinality keywords such as ids): every document shares
+            // one empty row, a pointer each, where a row allocation per
+            // document charged 128 bytes for nothing.
+            memory.grow((self.num_docs as u64).saturating_mul(8), "vector partition payload rows")?;
+            let empty = Arc::new(VectorPayloadRow { values: Vec::new(), _memory: Arc::new(memory) });
+            let _ = self.vector_payload.set(vec![empty; self.num_docs as usize]);
+            return Ok(());
+        }
+        memory.grow((self.num_docs as u64).saturating_mul(128), "vector partition payload rows")?;
         let memory = Arc::new(memory);
         let mut rows: Vec<Vec<(u16, Arc<str>)>> = vec![Vec::new(); self.num_docs as usize];
         // Partition fields have at most 64 distinct values each. Intern their
@@ -1678,7 +1763,13 @@ impl Segment {
     /// when its memory is not admitted.
     fn derived_keyword_reader(&self, field: u16) -> Option<crate::codec::fastfields::KeywordReader<'_>> {
         let cell = self.derived_keywords.get(&field)?;
-        let (bytes, table) = cell.get_or_init(|| self.derive_keyword_column(field).ok()).as_ref()?;
+        // Only a built column is kept: a refused admission is tried again
+        // on the next use, never cached as "no column".
+        if cell.get().is_none() {
+            let built = self.derive_keyword_column(field).ok()?;
+            let _ = cell.set(Some(built));
+        }
+        let (bytes, table) = cell.get()?.as_ref()?;
         Some(crate::codec::fastfields::KeywordReader::with_table(bytes, table))
     }
 
@@ -1971,17 +2062,13 @@ impl Segment {
     /// [`Segment::norms_shared`] behind a per-segment cached `Arc`.
     pub fn norms_arc(&self, field: u16) -> Arc<Norms> {
         let cache = self.norms_cache.get_or_init(|| {
-            let mut fields: Vec<u16> = self.fast_dir.iter().map(|e| e.field).collect();
+            let mut fields: Vec<u16> = self.fast_dir.iter().filter(|e| crate::codec::fastfields::is_norms_tag(e.tag)).map(|e| e.field).collect();
             fields.sort_unstable();
             fields.dedup();
-            fields
-                .into_iter()
-                .filter(|&f| self.norms(f).is_some())
-                .map(|f| (f, Arc::new(self.norms_shared(f))))
-                .collect()
+            fields.into_iter().map(|f| (f, OnceLock::new())).collect()
         });
         match cache.iter().find(|(f, _)| *f == field) {
-            Some((_, n)) => n.clone(),
+            Some((_, n)) => n.get_or_init(|| Arc::new(self.norms_shared(field))).clone(),
             None => unit_norms(),
         }
     }
@@ -1993,8 +2080,8 @@ impl Segment {
         };
         let bytes = n.lengths_bytes();
         if let Some(run) = n.constant_run() {
-            // A run shared by the process, not in the segment's mapping.
-            return Norms::constant(run, n.avg());
+            // The segment's admitted run, not in its mapping.
+            return Norms::constant_shared(run, n.avg());
         }
         let base = self.fast_data.as_slice().as_ptr() as usize;
         let off = bytes.as_ptr() as usize - base;
@@ -2478,6 +2565,35 @@ impl Segment {
         self.point_map().get(field, doc)
     }
 
+    /// The mean of `field`'s vectors in this segment (`unit`: of their ES
+    /// unit vectors), as `compute` returns it, computed once: the segment is
+    /// immutable, so later callers reuse it. `compute` returning `None`
+    /// (stopped) caches nothing. Concurrent first callers wait for one
+    /// computation.
+    pub fn vector_centroid(&self, field: u16, unit: bool, compute: impl FnOnce() -> Option<Vec<f32>>) -> Option<Arc<Vec<f32>>> {
+        let mut cache = self.vector_centroids.lock();
+        if let Some(c) = cache.get(&(field, unit)) {
+            return Some(c.clone());
+        }
+        let c = Arc::new(compute()?);
+        cache.insert((field, unit), c.clone());
+        Some(c)
+    }
+
+    /// A structure derived from this segment under `key`, built by `build`
+    /// once (concurrent first callers wait for one build; a failed build is
+    /// not kept) and dropped with the segment: the segment is immutable, so
+    /// what it derives never goes stale.
+    pub fn derived<T: Send + Sync + 'static, E>(&self, key: &str, build: impl FnOnce() -> std::result::Result<T, E>) -> std::result::Result<Arc<T>, E> {
+        let mut cache = self.derived.lock();
+        if let Some(v) = cache.get(key).cloned().and_then(|v| v.downcast::<T>().ok()) {
+            return Ok(v);
+        }
+        let v = Arc::new(build()?);
+        cache.insert(key.to_string(), v.clone());
+        Ok(v)
+    }
+
     /// The vector of `doc` in `field`, if any.
     pub fn vector(&self, field: u16, doc: DocId) -> Option<Vec<f32>> {
         self.with_vector(field, doc, <[f32]>::to_vec)
@@ -2831,8 +2947,11 @@ impl SegmentWriter {
         let Some(first) = parts.first() else { return false };
         let compact = first.store_compact.first().copied();
         parts.iter().all(|w| {
-            w.vectors.is_empty() && w.vector_reservations.is_empty() && w.geo.is_empty() && w.shapes.is_empty()
-                && w.nested.as_ref().is_none_or(|n| !n.has_nested())
+            // Geo points, shapes and nested blocks are permuted with their
+            // docs (the caller's order keeps each nested block before its
+            // root); vectors keep their two-pass seal.
+            w.vectors.is_empty() && w.vector_reservations.is_empty()
+                && w.geo.values().all(|g| g.as_slice().is_some())
                 && w.schema_key == first.schema_key && w.store_compression == first.store_compression && w.synthetic_id == first.synthetic_id
                 && w.store_compact.iter().all(|&c| Some(c) == compact)
                 && w.store_starts.len() == w.store_chunks.len() && w.store_locs.len() == w.num_docs as usize
@@ -2901,7 +3020,54 @@ impl SegmentWriter {
         out.default_analyzer = first.default_analyzer.clone();
         out.multi_fields = multi_fields;
         out.aggs = aggs;
+        Self::union_spatial_and_nested(parts, order, &mut out);
         Some(out)
+    }
+
+    /// [`SegmentWriter::sorted_union`]'s geo points, shapes and nested path
+    /// ordinals: each doc's, renumbered to its place in `order`.
+    fn union_spatial_and_nested(parts: &[&SegmentWriter], order: &[(usize, DocId)], out: &mut SegmentWriter) {
+        let geo_fields: std::collections::BTreeSet<u16> = parts.iter().flat_map(|w| w.geo.keys().copied()).collect();
+        for field in geo_fields {
+            let sources: Vec<Option<&GeoValues>> = parts.iter().map(|w| w.geo.get(&field)).collect();
+            let mut values = GeoValues::default();
+            for (new, &(p, old)) in order.iter().enumerate() {
+                if let Some(g) = sources[p] {
+                    for i in g.doc_range(old) {
+                        values.push_entry(crate::geo::GeoPointEntry { doc: new as DocId, ..g.entry(i) });
+                    }
+                }
+            }
+            out.geo.insert(field, values);
+        }
+        let shape_fields: std::collections::BTreeSet<u16> = parts.iter().flat_map(|w| w.shapes.keys().copied()).collect();
+        for field in shape_fields {
+            let sources: Vec<Option<&crate::fieldtypes::shape_field::ShapeBuf>> = parts.iter().map(|w| w.shapes.get(&field)).collect();
+            let mut buf = crate::fieldtypes::shape_field::ShapeBuf::default();
+            for (new, &(p, old)) in order.iter().enumerate() {
+                if let Some(s) = sources[p] {
+                    let tris = s.triangles(old).unwrap_or(&[]);
+                    let value = s.raw_value(old);
+                    if !tris.is_empty() || value.is_some() {
+                        buf.push(new as DocId, tris, value);
+                    }
+                }
+            }
+            out.shapes.insert(field, buf);
+        }
+        if parts.iter().any(|w| w.nested.is_some()) {
+            let mut nested = NestedInfo::default();
+            for (new, &(p, old)) in order.iter().enumerate() {
+                if let Some(n) = &parts[p].nested {
+                    if !n.is_root(old) {
+                        let ord = nested.intern(n.path(old), n.depth(old));
+                        nested.set(new as DocId, ord);
+                    }
+                }
+            }
+            nested.resize(order.len() as u32);
+            out.nested = Some(nested);
+        }
     }
 
     /// [`SegmentWriter::sorted_union`]'s postings: every term of every
@@ -3048,11 +3214,24 @@ impl SegmentWriter {
                     }
                 }};
             }
-            numeric!(get_i64, get_multi_i64, i64_column_mut, multi_i64_column_mut);
+            // A boolean field multi-valued in some part: every part's
+            // booleans go to the multi-valued 0/1 column, in doc order.
+            let bool_multi = ffs.iter().any(|ff| ff.get_bool(field).is_some()) && ffs.iter().any(|ff| ff.get_multi_i64(field).is_some());
+            if bool_multi {
+                let mut values: Vec<(DocId, i64)> = Vec::new();
+                for (new, &(p, old)) in order.iter().enumerate() {
+                    if let Some(c) = ffs[p].get_bool(field) { if c.has_value(old) { values.push((new as DocId, c.get(old) as i64)); } }
+                    if let Some(c) = ffs[p].get_multi_i64(field) { for &v in c.values(old) { values.push((new as DocId, v)); } }
+                }
+                let col = out.multi_i64_column_mut(field);
+                for (doc, v) in values { col.push(doc, v); }
+            } else {
+                numeric!(get_i64, get_multi_i64, i64_column_mut, multi_i64_column_mut);
+            }
             numeric!(get_u64, get_multi_u64, u64_column_mut, multi_u64_column_mut);
             numeric!(get_f64, get_multi_f64, f64_column_mut, multi_f64_column_mut);
             let bools: Vec<_> = ffs.iter().map(|ff| ff.get_bool(field)).collect();
-            if bools.iter().any(Option::is_some) {
+            if !bool_multi && bools.iter().any(Option::is_some) {
                 let col = out.bool_column_mut(field);
                 if bools.iter().flatten().any(|c| !c.presence_known()) {
                     col.set_presence_unknown();
@@ -3604,6 +3783,17 @@ impl SegmentWriter {
                     if let Some(v) = col.get(d) {
                         self.fast_fields.multi_i64_column_mut(field).push(d, v);
                     }
+                }
+            }
+        }
+        self.mark_multi(field);
+    }
+
+    fn promote_bool(&mut self, field: u16) {
+        if let Some(col) = self.fast_fields.take_bool_column(field) {
+            for d in 0..=self.num_docs {
+                if col.has_value(d) {
+                    self.fast_fields.multi_i64_column_mut(field).push(d, col.get(d) as i64);
                 }
             }
         }
@@ -4294,7 +4484,17 @@ impl SegmentWriter {
                             self.add_key_posting(field_id, &[v as u8], doc_id);
                         }
                         if field.fast {
-                            self.fast_fields.bool_column_mut(field_id).set(doc_id, v);
+                            // A doc with several booleans (an array) keeps them
+                            // all: the field becomes a multi-valued 0/1 column,
+                            // as ES keeps sorted-numeric boolean doc values.
+                            if self.is_multi(field_id) {
+                                self.fast_fields.multi_i64_column_mut(field_id).push(doc_id, v as i64);
+                            } else if bump(&mut self.fast_counts, field_id, 1) >= 1 {
+                                self.promote_bool(field_id);
+                                self.fast_fields.multi_i64_column_mut(field_id).push(doc_id, v as i64);
+                            } else {
+                                self.fast_fields.bool_column_mut(field_id).set(doc_id, v);
+                            }
                         }
                     }
                 }
@@ -4496,6 +4696,14 @@ impl SegmentWriter {
         // their chunks without exposing them to optimizer deletion cleanup.
         if any_deleted {
             segment.write_deletions(dir)?;
+        }
+        #[cfg(all(test, feature = "mutable-hnsw-poc"))]
+        if let (false, Some(st)) = (unreserved.is_empty(), store) {
+            let hook = {
+                let mut slot = SEAL_UNRESERVED_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.as_ref().is_some_and(|(owner, _)| *owner == Arc::as_ptr(st) as usize) { slot.take() } else { None }
+            };
+            if let Some((_, hook)) = hook { hook(); }
         }
         if let Some(st) = store {
             st.attach_prepared(&segment, &mut prepared_vectors, hidden);
@@ -5748,6 +5956,66 @@ mod tests {
     /// Docs without a value in a fast column (and a geo field) stay absent
     /// after the memtable is flushed: `exists` presence, range hits and geo
     /// queries on the sealed segment match the memtable's.
+    /// A sorted seal's union memtable carries each doc's geo points, shape
+    /// triangles and nested path with it (nested blocks kept before their
+    /// roots), from several memtables, and is written as any memtable.
+    #[test]
+    fn sorted_union_moves_geo_points_shapes_and_nested_blocks_with_their_docs() {
+        let schema = vec![
+            Field::new(0, "k", FieldType::Keyword),
+            Field::new(1, "n", FieldType::I64),
+            Field::new(6, "g#geo", FieldType::GeoPoint),
+            Field::new(7, "s", FieldType::Keyword).with_shape(true),
+        ];
+        let mut parts = vec![SegmentWriter::new(0), SegmentWriter::new(1)];
+        for (p, w) in parts.iter_mut().enumerate() {
+            for d in 0..6u32 {
+                let g = p as u32 * 10 + d;
+                let mut doc = Document::new();
+                doc.add_keyword(0, &format!("k{g:02}"));
+                doc.add_geo_point(6, g as f64, 1.0);
+                if d % 2 == 0 {
+                    doc.add_shape_triangles(7, vec![[g as i32, 0, 1, 1, 2, 2, 0]]);
+                }
+                if d % 3 == 0 {
+                    let mut child = Document::new();
+                    child.add_i64(1, g as i64);
+                    doc.add_nested(if p == 0 { "kids" } else { "other" }, child);
+                }
+                w.add_document(&doc, &schema);
+            }
+        }
+        let refs: Vec<&SegmentWriter> = parts.iter().collect();
+        assert!(SegmentWriter::sorted_union_supported(&refs));
+        // Roots in reverse arrival order, each block before its root.
+        let mut roots: Vec<(usize, DocId)> = refs.iter().enumerate()
+            .flat_map(|(p, w)| (0..w.num_docs).filter(move |&d| w.nested_info().is_none_or(|n| n.is_root(d))).map(move |d| (p, d))).collect();
+        roots.reverse();
+        let mut order = Vec::new();
+        for (p, root) in roots {
+            let start = refs[p].nested_info().map_or(root, |n| n.block_start(root));
+            order.extend((start..=root).map(|d| (p, d)));
+        }
+        let union = SegmentWriter::sorted_union(&refs, &order, 9).expect("supported");
+        let points = |w: &SegmentWriter, d: DocId| -> Vec<(i32, i32)> {
+            let g = &w.geo[&6];
+            g.doc_range(d).map(|i| { let e = g.entry(i); (e.lat, e.lon) }).collect()
+        };
+        let tris = |w: &SegmentWriter, d: DocId| w.shapes.get(&7).and_then(|s| s.triangles(d)).map(<[_]>::to_vec);
+        let path = |w: &SegmentWriter, d: DocId| w.nested_info().map_or((String::new(), 0), |n| (n.path(d).to_string(), n.depth(d)));
+        for (new, &(p, old)) in order.iter().enumerate() {
+            let new = new as DocId;
+            assert_eq!(points(&union, new), points(refs[p], old), "doc {new}");
+            assert_eq!(tris(&union, new), tris(refs[p], old), "doc {new}");
+            assert_eq!(path(&union, new), path(refs[p], old), "doc {new}");
+        }
+        assert!(points(&union, 0).len() == 1 && union.nested_info().is_some_and(|n| n.has_nested()));
+        let dir = RamDirectory::new();
+        let seg = union.write_to(&dir).unwrap();
+        assert_eq!(seg.num_docs as usize, order.len());
+        assert!(seg.geo_index(6).is_some() && seg.shape_data(7).is_some() && seg.nested_info().is_some());
+    }
+
     #[test]
     fn flushed_segment_keeps_sparse_doc_values() {
         use crate::query::reader::LeafReader;
@@ -6438,5 +6706,135 @@ mod batched_doc_tests {
             assert_eq!(got[i].as_ref().map(|g| format!("{:?}", g.fields)), want.as_ref().map(|w| format!("{:?}", w.fields)), "doc {d}");
         }
         assert!(got[docs.len() - 2].is_none());
+    }
+}
+
+/// Header of a deletion file (`.del`): this tag, the segment id, its doc
+/// count, its deletions (little-endian) and 4 reserved bytes, then the
+/// bitmap words and a CRC-32 of everything before it. Older files hold
+/// bare words.
+pub(crate) const DELETES_MAGIC: &[u8; 8] = b"RDEL\x01\0\0\0";
+
+/// The bitmap words of segment `id`'s deletion file (`num_docs` docs),
+/// validated: its header names this segment and doc count, its length is
+/// exact, its checksum and deletion count hold. A legacy file (bare words)
+/// must have exactly the words of `num_docs` docs. Anything else is
+/// corruption, never "nothing deleted".
+fn deletion_words(bytes: &[u8], id: u32, num_docs: u32) -> Result<Vec<u8>> {
+    let words = (num_docs as usize).div_ceil(64) * 8;
+    let bad = |why: &str| crate::error::RusticError::Corrupted(format!("deletion file of segment {id}: {why}"));
+    if !bytes.starts_with(DELETES_MAGIC) {
+        if bytes.len() != words {
+            return Err(bad(&format!("{} bytes, expected {words}", bytes.len())));
+        }
+        return Ok(bytes.to_vec());
+    }
+    if bytes.len() != 28 + words + 4 {
+        return Err(bad(&format!("{} bytes, expected {}", bytes.len(), 28 + words + 4)));
+    }
+    let (body, crc) = bytes.split_at(bytes.len() - 4);
+    if crate::codec::crc32(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
+        return Err(bad("checksum mismatch"));
+    }
+    let file_id = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let file_docs = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let deleted = u64::from_le_bytes(body[16..24].try_into().unwrap());
+    if file_id != id || file_docs != num_docs {
+        return Err(bad(&format!("written for segment {file_id} of {file_docs} docs")));
+    }
+    let bits = &body[28..];
+    let ones: u64 = bits.chunks_exact(8).map(|w| u64::from_le_bytes(w.try_into().unwrap()).count_ones() as u64).sum();
+    if ones != deleted {
+        return Err(bad(&format!("{ones} deletions, header says {deleted}")));
+    }
+    Ok(bits.to_vec())
+}
+
+thread_local! {
+    static VERIFY_ON_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether segments (text and vector) opened on this thread verify their
+/// whole-file checksums ([`with_verified_open`]).
+pub(crate) fn verify_on_open() -> bool {
+    VERIFY_ON_OPEN.with(|v| v.get())
+}
+
+/// Test seam (#294): runs once in the seal of the store it names (by
+/// address), after the seal reserved points for rows stored without a graph
+/// reservation and before it inserts them into the field's graph.
+#[cfg(all(test, feature = "mutable-hnsw-poc"))]
+#[allow(clippy::type_complexity)]
+pub(crate) static SEAL_UNRESERVED_HOOK: std::sync::Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>> = std::sync::Mutex::new(None);
+
+/// Run `f` with segment checksum verification on (`verify`): every segment
+/// and vector segment it opens is read in full and refused on a mismatch
+/// (ES `index.shard.check_on_startup`).
+pub fn with_verified_open<T>(verify: bool, f: impl FnOnce() -> T) -> T {
+    let previous = VERIFY_ON_OPEN.with(|v| v.replace(verify));
+    let out = f();
+    VERIFY_ON_OPEN.with(|v| v.set(previous));
+    out
+}
+
+#[cfg(test)]
+mod derived_and_filter_tests {
+    use super::*;
+    use crate::codec::directory::RamDirectory;
+    use crate::types::{Document, Field, FieldType, Term};
+
+    fn segment(dir: &RamDirectory) -> Segment {
+        let schema = vec![Field::new(0, "_id", FieldType::Keyword).with_column_from_postings(true), Field::new(1, "body", FieldType::Text)];
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(crate::codec::VERSION));
+        let mut w = SegmentWriter::new(1);
+        for d in 0..2000u32 {
+            let mut doc = Document::new();
+            doc.add_keyword(0, &format!("id-{:05}", 1999 - d));
+            doc.add_text(1, "x");
+            w.add_document(&doc, &schema);
+        }
+        let s = w.write_to(dir).unwrap();
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+        s
+    }
+
+    /// #310: a derived id column refused by the budget is not cached as
+    /// "no column": the next use (with room) builds it, and the fast sort
+    /// path declines (the normal collector sorts) rather than treating the
+    /// field as absent.
+    #[test]
+    fn refused_derived_column_is_retried() {
+        let dir = RamDirectory::new();
+        let seg = segment(&dir);
+        assert!(seg.keyword_from_postings(0));
+        {
+            let _budget = crate::admission::private_shared(1024);
+            assert!(seg.keyword_reader(0).is_none(), "refused under pressure");
+            let leaf = crate::query::reader::LeafReader::Segment(&seg);
+            let sf = crate::query::searcher::SortField::field(0, crate::query::searcher::SortKind::Keyword);
+            assert!(crate::query::sort_fast::LeafSort::new(&leaf, &sf).is_none(), "no fast plan over a refused column");
+        }
+        let reader = seg.keyword_reader(0).expect("built once there is room");
+        assert_eq!(reader.get(0).map(|v| v.into_owned()), Some("id-01999".to_string()));
+    }
+
+    /// #311: the id negative-lookup filter is admitted: refused, lookups
+    /// stay exact (and it is tried again); with room it is kept, charged.
+    #[test]
+    fn id_lookup_filter_is_admitted() {
+        let dir = RamDirectory::new();
+        let seg = segment(&dir);
+        let present = Term::new_text(0, "id-00042");
+        let absent = Term::new_text(0, "nope");
+        {
+            let _budget = crate::admission::private_shared(64);
+            assert!(seg.term_dict().may_contain_unique_term(&present));
+            assert!(seg.term_dict().may_contain_unique_term(&absent), "no filter: the exact lookup decides");
+            assert_eq!(crate::admission::shared().used(), 0);
+        }
+        let _budget = crate::admission::private_shared(1 << 30);
+        assert!(seg.term_dict().may_contain_unique_term(&present));
+        assert!(crate::admission::shared().used() > 0, "the built filter is charged");
+        assert!(!seg.term_dict().may_contain_unique_term(&absent), "the filter rules the term out");
     }
 }

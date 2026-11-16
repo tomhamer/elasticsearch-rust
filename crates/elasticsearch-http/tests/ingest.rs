@@ -396,3 +396,403 @@ async fn verbose_simulate_keeps_status_conditions_and_lossless_documents() {
     assert_eq!(entries[2]["doc"]["_source"]["raw"], "raw-unit");
     assert_eq!(entries[3]["status"], "dropped");
 }
+
+async fn bulk(es: &Es, lines: &[Value]) -> Value {
+    let body = lines.iter().map(|l| l.to_string() + "\n").collect::<String>();
+    let r = es.c.post(format!("{}/_bulk?refresh=true", es.base)).header("content-type", "application/x-ndjson").body(body).send().await.unwrap();
+    r.json().await.unwrap()
+}
+
+/// Version metadata a pipeline sets applies to the write (ES
+/// `IngestService.updateIndexRequestMetadata`): an external version taken
+/// from the event makes an older event conflict (409) and keeps the newer
+/// document; the pipeline sees the request's own version and version type.
+#[tokio::test]
+async fn pipeline_version_metadata_applies_to_the_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let (st, v) = es.put("/_ingest/pipeline/ext", json!({"processors": [
+        {"set": {"field": "_version", "copy_from": "seq"}},
+        {"set": {"field": "_version_type", "value": "external"}},
+    ]})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/ev/_doc/1?pipeline=ext", json!({"seq": 10, "state": "newer"})).await;
+    assert_eq!((st, &v["_version"]), (201, &json!(10)), "{v}");
+    // An older event conflicts and leaves version 10 in place.
+    let (st, v) = es.put("/ev/_doc/1?pipeline=ext", json!({"seq": 9, "state": "older"})).await;
+    assert_eq!(st, 409, "{v}");
+    assert_eq!(v["error"]["type"], "version_conflict_engine_exception", "{v}");
+    let (_, v) = es.get("/ev/_doc/1").await;
+    assert_eq!((&v["_version"], &v["_source"]["state"]), (&json!(10), &json!("newer")), "{v}");
+    let (st, v) = es.put("/ev/_doc/1?pipeline=ext", json!({"seq": 11, "state": "newest"})).await;
+    assert_eq!((st, &v["_version"]), (200, &json!(11)), "{v}");
+    // The same through bulk: per item.
+    let v = bulk(&es, &[
+        json!({"index": {"_index": "ev", "_id": "1", "pipeline": "ext"}}), json!({"seq": 5, "state": "stale"}),
+        json!({"index": {"_index": "ev", "_id": "2", "pipeline": "ext"}}), json!({"seq": 3, "state": "first"}),
+    ]).await;
+    assert_eq!(v["items"][0]["index"]["status"], 409, "{v}");
+    assert_eq!(v["items"][1]["index"]["status"], 201, "{v}");
+    assert_eq!(v["items"][1]["index"]["_version"], 3, "{v}");
+    let (_, v) = es.get("/ev/_doc/1").await;
+    assert_eq!((&v["_version"], &v["_source"]["state"]), (&json!(11), &json!("newest")), "{v}");
+    // Pipelines read the request's version and version type.
+    es.put("/_ingest/pipeline/seen", json!({"processors": [
+        {"set": {"field": "v", "copy_from": "_version"}},
+        {"set": {"field": "vt", "copy_from": "_version_type"}},
+    ]})).await;
+    let (st, v) = es.put("/seen/_doc/1?pipeline=seen&version=7&version_type=external", json!({})).await;
+    assert_eq!((st, &v["_version"]), (201, &json!(7)), "{v}");
+    assert_eq!(es.source("seen", "1").await, json!({"v": 7, "vt": "external"}));
+    es.put("/seen/_doc/2?pipeline=seen", json!({})).await;
+    assert_eq!(es.source("seen", "2").await, json!({"v": -3, "vt": "internal"}));
+}
+
+/// Sequence-number conditions a pipeline sets apply to the write: a stale
+/// `_if_seq_no` conflicts (409) on the index API and in bulk.
+#[tokio::test]
+async fn pipeline_seq_no_conditions_apply_to_the_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let (st, v) = es.put("/cas/_doc/1", json!({"n": 1})).await;
+    assert_eq!(st, 201, "{v}");
+    let (seq, term) = (v["_seq_no"].as_i64().unwrap(), v["_primary_term"].as_i64().unwrap());
+    let (st, v) = es.put("/_ingest/pipeline/cas", json!({"processors": [
+        {"set": {"field": "_if_seq_no", "copy_from": "expect_seq"}},
+        {"set": {"field": "_if_primary_term", "copy_from": "expect_term"}},
+        {"remove": {"field": ["expect_seq", "expect_term"]}},
+    ]})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/cas/_doc/1?pipeline=cas", json!({"n": 2, "expect_seq": seq + 5, "expect_term": term})).await;
+    assert_eq!(st, 409, "{v}");
+    assert_eq!(v["error"]["type"], "version_conflict_engine_exception", "{v}");
+    let v = bulk(&es, &[json!({"index": {"_index": "cas", "_id": "1", "pipeline": "cas"}}), json!({"n": 3, "expect_seq": seq + 5, "expect_term": term})]).await;
+    assert_eq!(v["items"][0]["index"]["status"], 409, "{v}");
+    assert_eq!(es.source("cas", "1").await, json!({"n": 1}));
+    // The current sequence number and term pass.
+    let (st, v) = es.put("/cas/_doc/1?pipeline=cas", json!({"n": 4, "expect_seq": seq, "expect_term": term})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(es.source("cas", "1").await, json!({"n": 4}));
+}
+
+/// `field_access_pattern: flexible` (ES 9 `IngestDocument`, FLEXIBLE):
+/// paths match literal dotted keys at any level, writes into a missing path
+/// add one dotted key to the deepest existing object, and the pattern is
+/// the running pipeline's own (a classic pipeline it calls stays classic).
+#[tokio::test]
+async fn flexible_field_access_pattern() {
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let shapes = [
+        ("normalized", json!({"a": {"b": {"c": {"d": 0}}}})),
+        ("dotted_only", json!({"a.b.c.d": 0})),
+        ("split_dots", json!({"a.b": {"c.d": 0}})),
+        ("middle_dot", json!({"a": {"b.c": {"d": 0}}})),
+    ];
+    let flexible = |processors: Value| json!({"field_access_pattern": "flexible", "processors": processors});
+    // Writes.
+    es.put("/_ingest/pipeline/w", flexible(json!([{"set": {"field": "a.b.c.d", "value": "1"}}]))).await;
+    es.put("/fx/_doc/none?pipeline=w", json!({"foo": "bar"})).await;
+    assert_eq!(es.source("fx", "none").await, json!({"foo": "bar", "a.b.c.d": "1"}));
+    for ((id, doc), want) in shapes.iter().zip([json!({"a": {"b": {"c": {"d": "1"}}}}), json!({"a.b.c.d": "1"}), json!({"a.b": {"c.d": "1"}}), json!({"a": {"b.c": {"d": "1"}}})]) {
+        let (st, v) = es.put(&format!("/fx/_doc/w_{id}?pipeline=w"), doc.clone()).await;
+        assert!(st == 201, "{id}: {v}");
+        assert_eq!(es.source("fx", &format!("w_{id}")).await, want, "{id}");
+    }
+    // Reads (copy_from), existence (rename without override), removal.
+    es.put("/_ingest/pipeline/r", flexible(json!([{"set": {"field": "result", "copy_from": "a.b.c.d"}}]))).await;
+    es.put("/_ingest/pipeline/x", flexible(json!([{"rename": {"field": "foo", "target_field": "a.b.c.d", "override": false}}]))).await;
+    es.put("/_ingest/pipeline/d", flexible(json!([{"remove": {"field": "a.b.c.d"}}]))).await;
+    for (id, doc) in &shapes {
+        es.put(&format!("/fx/_doc/r_{id}?pipeline=r"), doc.clone()).await;
+        assert_eq!(es.source("fx", &format!("r_{id}")).await["result"], 0, "{id}");
+        let mut with_foo = doc.clone();
+        with_foo["foo"] = json!("bar");
+        let (st, v) = es.put(&format!("/fx/_doc/x_{id}?pipeline=x"), with_foo.clone()).await;
+        assert_eq!(st, 400, "{id}: {v}");
+        assert_eq!(v["error"]["root_cause"][0]["reason"], "field [a.b.c.d] already exists", "{id}");
+        let (st, v) = es.put(&format!("/fx/_doc/d_{id}?pipeline=d"), with_foo).await;
+        assert_eq!(st, 201, "{id}: {v}");
+        let src = es.source("fx", &format!("d_{id}")).await;
+        assert_eq!(src["foo"], "bar", "{id}");
+        assert!(!src.to_string().contains("\"d\":0") && !src.to_string().contains(":0"), "{id}: {src}");
+    }
+    // Missing fields: ignore_missing still skips, without it the dotted
+    // key it tried is named.
+    es.put("/_ingest/pipeline/m", flexible(json!([{"remove": {"field": "a.x.y", "ignore_missing": true}}, {"set": {"field": "copied", "copy_from": "a.x.y", "ignore_empty_value": true}}]))).await;
+    let (st, v) = es.put("/fx_missing/_doc/m?pipeline=m", json!({"a": {"b": 1}})).await;
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(es.source("fx_missing", "m").await, json!({"a": {"b": 1}}));
+    // The classic pattern (default) is unchanged: nested objects only.
+    es.put("/_ingest/pipeline/c", json!({"processors": [{"set": {"field": "a.b.c.d", "value": "1"}}]})).await;
+    es.put("/fx/_doc/classic?pipeline=c", json!({"a.b.c.d": 0})).await;
+    assert_eq!(es.source("fx", "classic").await, json!({"a.b.c.d": 0, "a": {"b": {"c": {"d": "1"}}}}));
+    // A classic pipeline called from a flexible one keeps its own pattern.
+    es.put("/_ingest/pipeline/outer", flexible(json!([{"pipeline": {"name": "c"}}, {"set": {"field": "x.y", "value": 2}}]))).await;
+    es.put("/fx/_doc/nested?pipeline=outer", json!({"k": 1})).await;
+    assert_eq!(es.source("fx", "nested").await, json!({"k": 1, "a": {"b": {"c": {"d": "1"}}}, "x.y": 2}));
+    // Lists cannot be indexed with the flexible pattern.
+    es.put("/_ingest/pipeline/l", flexible(json!([{"set": {"field": "arr.0", "value": 1}}]))).await;
+    let (st, v) = es.put("/fx/_doc/list?pipeline=l", json!({"arr": [0]})).await;
+    assert_eq!(st, 400, "{v}");
+    assert_eq!(v["error"]["root_cause"][0]["reason"], "path [arr.0] is not valid", "{v}");
+    // ES's validation of the option.
+    let (st, v) = es.put("/_ingest/pipeline/bad", json!({"field_access_pattern": "loose", "processors": []})).await;
+    assert_eq!(st, 400, "{v}");
+    assert_eq!(v["error"]["type"], "parse_exception", "{v}");
+    assert_eq!(v["error"]["reason"], "pipeline [bad] doesn't support value of [loose] for parameter [field_access_pattern]", "{v}");
+    // Simulate runs the pattern too.
+    let (st, v) = es.post("/_ingest/pipeline/_simulate", json!({"pipeline": flexible(json!([{"set": {"field": "out", "copy_from": "a.b.c.d"}}])), "docs": [{"_source": {"a.b": {"c.d": 5}}}]})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["docs"][0]["doc"]["_source"]["out"], 5, "{v}");
+}
+
+/// A PDF whose text is in a TrueType font with private codes that only its
+/// `ToUnicode` map decodes (LibreOffice writes these), one paragraph per
+/// text object; the stream lengths are indirect objects.
+fn tounicode_pdf(paragraphs: &[&str]) -> Vec<u8> {
+    let mut chars: Vec<char> = Vec::new();
+    for p in paragraphs {
+        for c in p.chars() {
+            if !chars.contains(&c) {
+                chars.push(c);
+            }
+        }
+    }
+    let code = |c: char| chars.iter().position(|x| *x == c).unwrap() + 1;
+    let mut content = String::new();
+    for (i, p) in paragraphs.iter().enumerate() {
+        let hex: String = p.chars().map(|c| format!("{:02X}", code(c))).collect();
+        content.push_str(&format!("q 0 0 0 rg\nBT\n56.8 {} Td /F1 18 Tf<{hex}>Tj\nET\nQ\n", 769.0 - 63.6 * i as f64));
+    }
+    let mut cmap = format!("/CIDInit/ProcSet findresource begin\n12 dict begin\nbegincmap\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n{} beginbfchar\n", chars.len());
+    for c in &chars {
+        cmap.push_str(&format!("<{:02X}> <{:04X}>\n", code(*c), *c as u32));
+    }
+    cmap.push_str("endbfchar\nendcmap\nend\nend\n");
+    let deflate = |s: &str| {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(s.as_bytes()).unwrap();
+        z.finish().unwrap()
+    };
+    let (content, cmap) = (deflate(&content), deflate(&cmap));
+    let mut out = b"%PDF-1.4\n%\xe4\xfc\xf6\n".to_vec();
+    out.extend_from_slice(b"2 0 obj\n<</Length 3 0 R/Filter/FlateDecode>>\nstream\n");
+    out.extend_from_slice(&content);
+    out.extend_from_slice(format!("\nendstream\nendobj\n3 0 obj\n{}\nendobj\n", content.len()).as_bytes());
+    out.extend_from_slice(b"8 0 obj\n<</Length 6 0 R/Filter/FlateDecode>>\nstream\n");
+    out.extend_from_slice(&cmap);
+    out.extend_from_slice(format!("\nendstream\nendobj\n6 0 obj\n{}\nendobj\n", cmap.len()).as_bytes());
+    out.extend_from_slice(b"9 0 obj\n<</Type/Font/Subtype/TrueType/BaseFont/BAAAAA+LiberationSerif/FirstChar 0/LastChar 40/ToUnicode 8 0 R>>\nendobj\n");
+    out.extend_from_slice(b"10 0 obj\n<</F1 9 0 R>>\nendobj\n11 0 obj\n<</Font 10 0 R/ProcSet[/PDF/Text]>>\nendobj\n");
+    out.extend_from_slice(b"1 0 obj\n<</Type/Page/Parent 4 0 R/Resources 11 0 R/MediaBox[0 0 595 842]/Contents 2 0 R>>\nendobj\n");
+    out.extend_from_slice(b"4 0 obj\n<</Type/Pages/Resources 11 0 R/Kids[ 1 0 R ]/Count 1>>\nendobj\n");
+    out.extend_from_slice(b"12 0 obj\n<</Type/Catalog/Pages 4 0 R>>\nendobj\n");
+    out.extend_from_slice(b"13 0 obj\n<</Creator<FEFF005700720069007400650072>/CreationDate(D:20160930151958+02'00')>>\nendobj\n");
+    out.extend_from_slice(b"trailer\n<</Size 14/Root 12 0 R/Info 13 0 R>>\nstartxref\n0\n%%EOF\n");
+    out
+}
+
+/// The attachment processor extracts the text of PDF, Word (docx and doc)
+/// documents, which is then searchable; a document it cannot parse fails
+/// with ES's `parse_exception` and keeps its binary (`ignore_failure`),
+/// never indexing an attachment without its text.
+#[tokio::test]
+async fn attachment_extracts_binary_documents_or_fails() {
+    use base64::Engine;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    const DOCX: &[u8] = include_bytes!("../../elasticsearch-engine/src/ingest/attachment_fixtures/sample.docx");
+    const DOC: &[u8] = include_bytes!("../../elasticsearch-engine/src/ingest/attachment_fixtures/sample.doc");
+    let text = "Rustic attachment fixture\n\nThe quick brown fox jumps over the lazy dog.";
+    let pdf = tounicode_pdf(&["Rustic attachment fixture", "The quick brown fox jumps over the lazy dog."]);
+    let (st, v) = es.put("/_ingest/pipeline/att", json!({"processors": [{"attachment": {"field": "data", "remove_binary": true}}]})).await;
+    assert_eq!(st, 200, "{v}");
+    for (id, bytes, content_type) in [
+        ("docx", DOCX, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("doc", DOC, "application/msword"),
+        ("pdf", &pdf[..], "application/pdf"),
+    ] {
+        let (st, v) = es.put(&format!("/docs/_doc/{id}?pipeline=att&refresh=true"), json!({"data": b64(bytes)})).await;
+        assert_eq!(st, 201, "{id}: {v}");
+        let src = es.source("docs", id).await;
+        assert_eq!(src["attachment"]["content"], text, "{id}: {src}");
+        assert_eq!(src["attachment"]["content_type"], content_type, "{id}: {src}");
+        assert!(src.get("data").is_none(), "{id}: the binary is removed only after extraction");
+    }
+    let src = es.source("docs", "pdf").await;
+    assert_eq!((&src["attachment"]["date"], &src["attachment"]["creator_tool"]), (&json!("2016-09-30T13:19:58Z"), &json!("Writer")), "{src}");
+    let (st, v) = es.post("/docs/_search", json!({"query": {"match": {"attachment.content": "fox"}}})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["hits"]["total"]["value"], 3, "{v}");
+    // Damaged binaries fail the document; nothing is indexed.
+    for (id, bytes) in [("bad_pdf", &b"%PDF-1.7\nnot a pdf body"[..]), ("bad_docx", &DOCX[..DOCX.len() / 2]), ("bad_doc", &DOC[..2048])] {
+        let (st, v) = es.put(&format!("/docs/_doc/{id}?pipeline=att"), json!({"data": b64(bytes)})).await;
+        assert_eq!(st, 400, "{id}: {v}");
+        assert_eq!(v["error"]["root_cause"][0]["type"], "parse_exception", "{id}: {v}");
+        assert_eq!(v["error"]["root_cause"][0]["reason"], "Error parsing document in field [data]", "{id}: {v}");
+        let (st, _) = es.get(&format!("/docs/_doc/{id}")).await;
+        assert_eq!(st, 404, "{id}");
+    }
+    // Bulk: the item fails, its neighbours index.
+    let v = bulk(&es, &[
+        json!({"index": {"_index": "docs", "_id": "bulk_bad", "pipeline": "att"}}), json!({"data": b64(b"%PDF-1.4 broken")}),
+        json!({"index": {"_index": "docs", "_id": "bulk_ok", "pipeline": "att"}}), json!({"data": b64(DOCX)}),
+    ]).await;
+    assert_eq!(v["items"][0]["index"]["status"], 400, "{v}");
+    assert_eq!(v["items"][0]["index"]["error"]["type"], "parse_exception", "{v}");
+    assert_eq!(v["items"][1]["index"]["status"], 201, "{v}");
+    // `ignore_failure`: the document is indexed with its binary intact and
+    // no attachment; `ignore_missing`: a document without the field passes.
+    es.put("/_ingest/pipeline/lenient", json!({"processors": [{"attachment": {"field": "data", "remove_binary": true, "ignore_failure": true, "ignore_missing": true}}]})).await;
+    let broken = b64(b"%PDF-1.4 broken");
+    let (st, v) = es.put("/docs/_doc/kept?pipeline=lenient", json!({"data": broken})).await;
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(es.source("docs", "kept").await, json!({"data": broken}));
+    let (st, v) = es.put("/docs/_doc/absent?pipeline=lenient", json!({"other": 1})).await;
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(es.source("docs", "absent").await, json!({"other": 1}));
+}
+
+/// A ZIP of stored (uncompressed) entries.
+fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let (mut out, mut central) = (Vec::new(), Vec::new());
+    for (name, body) in files {
+        let local = out.len() as u32;
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(body);
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&[0; 12]);
+        central.extend_from_slice(&local.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let at = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// Finding 113: `indexed_chars` bounds the extraction of a workbook whose
+/// cells all refer to one long shared string (default, 0, small positive);
+/// the text stops there and the document indexes.
+#[tokio::test]
+async fn attachment_indexed_chars_bounds_shared_string_fan_out() {
+    use base64::Engine;
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let shared = format!("<sst><si><t>{}</t></si></sst>", "y".repeat(32_767));
+    let row = format!("<row>{}</row>", "<c t=\"s\"><v>0</v></c>".repeat(100));
+    let sheet = format!("<worksheet><sheetData>{}</sheetData></worksheet>", row.repeat(200));
+    let book = stored_zip(&[
+        ("xl/workbook.xml", br#"<workbook><sheets><sheet name="S"/></sheets></workbook>"#),
+        ("xl/sharedStrings.xml", shared.as_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+    ]);
+    let data = base64::engine::general_purpose::STANDARD.encode(&book);
+    for (id, limit, want) in [("default", None, 100_000usize), ("zero", Some(0), 0), ("small", Some(25), 25)] {
+        let mut processor = json!({"field": "data", "remove_binary": true});
+        if let Some(l) = limit {
+            processor["indexed_chars"] = json!(l);
+        }
+        es.put(&format!("/_ingest/pipeline/x_{id}"), json!({"processors": [{"attachment": processor}]})).await;
+        let (st, v) = es.put(&format!("/books/_doc/{id}?pipeline=x_{id}"), json!({"data": data})).await;
+        assert_eq!(st, 201, "{id}: {v}");
+        let src = es.source("books", id).await;
+        assert_eq!(src["attachment"]["content_length"], want, "{id}");
+        assert_eq!(src["attachment"]["content"].as_str().map_or(0, |c| c.chars().count()), want, "{id}");
+        assert_eq!(src["attachment"]["content_type"], "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "{id}");
+    }
+}
+
+/// Old finding 73: an extraction that would be incomplete (an archive entry
+/// that cannot be read, a PDF page that cannot be decoded) fails the
+/// document like an unreadable one, so `remove_binary` never discards a
+/// binary whose text was only partly extracted.
+#[tokio::test]
+async fn attachment_partial_extraction_fails_and_keeps_the_binary() {
+    use base64::Engine;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    es.put("/_ingest/pipeline/att", json!({"processors": [{"attachment": {"field": "data", "remove_binary": true}}]})).await;
+    es.put("/_ingest/pipeline/lenient", json!({"processors": [{"attachment": {"field": "data", "remove_binary": true, "ignore_failure": true}}]})).await;
+    // An archive whose second entry has an unsupported compression method.
+    let mut zip = stored_zip(&[("a.txt", b"alpha text"), ("b.txt", b"beta text")]);
+    // The last central directory record is b.txt's; its method is at +10.
+    let b_central = memchr::memmem::rfind(&zip, b"PK\x01\x02").unwrap();
+    zip[b_central + 10] = 99;
+    // A PDF whose second page's content stream cannot be decoded.
+    let pdf = {
+        let good = tounicode_pdf(&["readable page"]);
+        let mut p = good.clone();
+        let at = memchr::memmem::find(&p, b"/Kids[ 1 0 R ]").unwrap();
+        p.splice(at..at + 14, b"/Kids[ 1 0 R 20 0 R ]".iter().copied());
+        let at = memchr::memmem::find(&p, b"trailer").unwrap();
+        p.splice(at..at, b"20 0 obj\n<</Type/Page/Parent 4 0 R/Resources 11 0 R/Contents 21 0 R>>\nendobj\n21 0 obj\n<</Length 8/Filter/LZWDecode>>\nstream\n\x80\x0b\x60\x50\x22\x0c\x0c\x85\nendstream\nendobj\n".iter().copied());
+        p
+    };
+    for (id, bytes) in [("partial_zip", &zip[..]), ("partial_pdf", &pdf[..])] {
+        let (st, v) = es.put(&format!("/parts/_doc/{id}?pipeline=att"), json!({"data": b64(bytes)})).await;
+        assert_eq!(st, 400, "{id}: {v}");
+        assert_eq!(v["error"]["root_cause"][0]["type"], "parse_exception", "{id}: {v}");
+        assert_eq!(v["error"]["root_cause"][0]["reason"], "Error parsing document in field [data]", "{id}: {v}");
+        let (st, _) = es.get(&format!("/parts/_doc/{id}")).await;
+        assert_eq!(st, 404, "{id}");
+        // With ignore_failure the document indexes with its binary intact.
+        let (st, v) = es.put(&format!("/parts/_doc/{id}_kept?pipeline=lenient"), json!({"data": b64(bytes)})).await;
+        assert_eq!(st, 201, "{id}: {v}");
+        assert_eq!(es.source("parts", &format!("{id}_kept")).await, json!({"data": b64(bytes)}), "{id}");
+    }
+    // The same document without the unreadable part extracts in full.
+    let whole = stored_zip(&[("a.txt", b"alpha text"), ("b.txt", b"beta text")]);
+    let (st, v) = es.put("/parts/_doc/whole?pipeline=att", json!({"data": b64(&whole)})).await;
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(es.source("parts", "whole").await["attachment"]["content"], "a.txt\nalpha text\nb.txt\nbeta text");
+}
+
+/// Old review finding 72: a reindex's destination pipeline sees the
+/// destination request's version conditions and the ones it sets apply to
+/// the write (ES `updateIndexRequestMetadata`), as for the index API.
+#[tokio::test]
+async fn reindex_applies_pipeline_write_conditions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let (st, v) = es.put("/_ingest/pipeline/ver", json!({"processors": [
+        {"set": {"field": "_version", "value": 7}},
+        {"set": {"field": "_version_type", "value": "external"}}
+    ]})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, _) = es.put("/src/_doc/1?refresh=true", json!({"n": 1})).await;
+    assert_eq!(st, 201);
+    let (st, v) = es.post("/_reindex?refresh=true", json!({"source": {"index": "src"}, "dest": {"index": "dst", "pipeline": "ver"}})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["created"], 1, "{v}");
+    let (st, v) = es.get("/dst/_doc/1").await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["_version"], 7, "the pipeline's external version applies: {v}");
+    // A second run with the same external version is a conflict (as the
+    // index API with that pipeline would be), not a silent overwrite.
+    let (st, v) = es.post("/_reindex?refresh=true", json!({"conflicts": "proceed", "source": {"index": "src"}, "dest": {"index": "dst", "pipeline": "ver"}})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["version_conflicts"], 1, "{v}");
+}

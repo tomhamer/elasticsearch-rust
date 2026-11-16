@@ -115,6 +115,12 @@ pub struct S3ClientSettings {
     pub secret_key: Option<String>,
     pub session_token: Option<String>,
     pub max_retries: Option<u32>,
+    /// `read_timeout` (time value, default 50s).
+    pub read_timeout: Option<String>,
+    /// `api_call_timeout` (time value; unset or 0: no whole-call limit).
+    pub api_call_timeout: Option<String>,
+    /// `connection_max_idle_time` (time value, default 60s).
+    pub connection_max_idle_time: Option<String>,
 }
 
 impl S3ClientSettings {
@@ -134,6 +140,11 @@ impl S3ClientSettings {
                 "secret_key" => c.secret_key = Some(v.clone()),
                 "session_token" => c.session_token = Some(v.clone()),
                 "max_retries" => c.max_retries = v.parse().ok(),
+                "read_timeout" => c.read_timeout = Some(v.clone()),
+                "api_call_timeout" => c.api_call_timeout = Some(v.clone()),
+                "connection_max_idle_time" => c.connection_max_idle_time = Some(v.clone()),
+                // `use_throttle_retries` is accepted and unused, as in ES 9
+                // (throttling backoff is always on).
                 _ => {}
             }
         }
@@ -409,8 +420,37 @@ pub async fn build_store(meta: &RepositoryMetadata, ctx: &RepositoryContext) -> 
                 }
                 cfg.buffer_size = b;
             }
-            if let Some(r) = client.max_retries {
+            // ES `S3ClientSettings.refine`: repository settings override
+            // the named client's timeouts and retries.
+            let max_retries = match meta.setting("max_retries") {
+                Some(v) => Some(v.parse::<u32>().map_err(|_| {
+                    SnapshotError::illegal_argument(format!("Failed to parse value [{v}] for setting [max_retries] must be >= 0"))
+                })?),
+                None => client.max_retries,
+            };
+            if let Some(r) = max_retries {
                 cfg.max_retries = r;
+            }
+            let time = |key: &str, client_value: &Option<String>| -> Result<Option<i64>> {
+                let Some(v) = meta.setting(key).or_else(|| client_value.clone()) else { return Ok(None) };
+                let full = format!("s3.client.{client_name}.{key}");
+                Ok(Some(crate::util::parse_time_value(&full, &v)?))
+            };
+            let positive = |key: &str, ms: i64| -> Result<std::time::Duration> {
+                if ms < 0 {
+                    return Err(SnapshotError::illegal_argument(format!("failed to parse setting [{key}]: must be >= 0")));
+                }
+                Ok(std::time::Duration::from_millis(ms as u64))
+            };
+            if let Some(ms) = time("read_timeout", &client.read_timeout)? {
+                cfg.read_timeout = positive("read_timeout", ms)?;
+            }
+            // ES default -1: no whole-call limit.
+            if let Some(ms) = time("api_call_timeout", &client.api_call_timeout)? {
+                cfg.api_call_timeout = (ms > 0).then(|| std::time::Duration::from_millis(ms as u64));
+            }
+            if let Some(ms) = time("connection_max_idle_time", &client.connection_max_idle_time)? {
+                cfg.max_idle_time = positive("connection_max_idle_time", ms)?;
             }
             // S3 default chunk_size 5tb; minimum 5mb.
             match rs.chunk_size {
@@ -459,6 +499,34 @@ mod tests {
         assert_eq!(m.endpoint.as_deref(), Some("localhost:9000"));
         assert_eq!(m.protocol.as_deref(), Some("http"));
         assert!(m.path_style_access);
+    }
+
+    #[tokio::test]
+    async fn s3_client_timeouts_and_retries() {
+        let mut flat = BTreeMap::new();
+        flat.insert("s3.client.default.read_timeout".to_string(), "7s".to_string());
+        flat.insert("s3.client.default.api_call_timeout".to_string(), "2m".to_string());
+        flat.insert("s3.client.default.max_retries".to_string(), "5".to_string());
+        flat.insert("s3.client.default.connection_max_idle_time".to_string(), "30s".to_string());
+        let ctx = RepositoryContext { s3_clients: S3ClientSettings::from_node_settings(&flat), ..Default::default() };
+        let meta = RepositoryMetadata::new("r", "s3", json!({"bucket": "b"}));
+        let (store, _) = build_store(&meta, &ctx).await.unwrap();
+        assert_eq!(store.kind(), "s3");
+        // Defaults: ES read_timeout 50s, max_retries 3, no whole-call limit.
+        let d = crate::blobstore::s3::S3Config::new("b");
+        assert_eq!((d.read_timeout.as_secs(), d.max_retries, d.api_call_timeout), (50, 3, None));
+        let mut flat2 = flat.clone();
+        flat2.insert("s3.client.default.read_timeout".to_string(), "soon".to_string());
+        let ctx = RepositoryContext { s3_clients: S3ClientSettings::from_node_settings(&flat2), ..Default::default() };
+        assert!(build_store(&meta, &ctx).await.is_err());
+        let c = &S3ClientSettings::from_node_settings(&flat)["default"];
+        assert_eq!((c.read_timeout.as_deref(), c.max_retries, c.api_call_timeout.as_deref()), (Some("7s"), Some(5), Some("2m")));
+        // Repository settings override the client's (ES `refine`).
+        let ctx = RepositoryContext { s3_clients: S3ClientSettings::from_node_settings(&flat2), ..Default::default() };
+        let meta = RepositoryMetadata::new("r", "s3", json!({"bucket": "b", "read_timeout": "3s", "api_call_timeout": "-1"}));
+        assert!(build_store(&meta, &ctx).await.is_ok());
+        let meta = RepositoryMetadata::new("r", "s3", json!({"bucket": "b", "max_retries": "many"}));
+        assert!(build_store(&meta, &ctx).await.is_err());
     }
 
     #[tokio::test]

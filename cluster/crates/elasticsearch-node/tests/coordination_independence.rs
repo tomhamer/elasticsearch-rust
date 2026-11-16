@@ -83,10 +83,6 @@ fn http_ports(nodes: &[Arc<ClusterNode>]) -> [u16; 2] {
     [ports::http_port(&nodes[0]), ports::http_port(&nodes[1])]
 }
 
-/// The nodes' bound transport ports.
-fn transport_ports(nodes: &[Arc<ClusterNode>]) -> [u16; 2] {
-    [ports::transport_port(&nodes[0]), ports::transport_port(&nodes[1])]
-}
 
 /// Start two master-eligible nodes and wait until one is the master and
 /// both are members.
@@ -775,7 +771,7 @@ async fn ilm_shrink_preserves_the_documents() {
     ok(st, &v);
     let (st, v) = call(&c, http, reqwest::Method::PUT, "/_ilm/policy/shrinker", Some(json!({"policy": {"phases": {"warm": {"min_age": "0ms", "actions": {"shrink": {"number_of_shards": 1}}}}}}))).await;
     ok(st, &v);
-    let (st, v) = call(&c, http, reqwest::Method::PUT, "/to-shrink", Some(json!({"settings": {"number_of_shards": 2, "number_of_replicas": 0, "index.lifecycle.name": "shrinker"}}))).await;
+    let (st, v) = call(&c, http, reqwest::Method::PUT, "/to-shrink", Some(json!({"settings": {"number_of_shards": 2, "number_of_replicas": 0}}))).await;
     ok(st, &v);
     let mut bulk = String::new();
     for i in 0..40 {
@@ -783,6 +779,12 @@ async fn ilm_shrink_preserves_the_documents() {
     }
     let r = c.post(format!("http://127.0.0.1:{http}/_bulk?refresh=true")).header("content-type", "application/x-ndjson").body(bulk).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["errors"], false, "{v}");
+    // The policy only once the documents are in: its read-only step would
+    // otherwise block part of the bulk.
+    let (st, v) = call(&c, http, reqwest::Method::PUT, "/to-shrink/_settings", Some(json!({"index.lifecycle.name": "shrinker"}))).await;
+    ok(st, &v);
     let deadline = Instant::now() + Duration::from_secs(120);
     let target = loop {
         let st = node.state();
@@ -845,43 +847,6 @@ async fn concurrent_engine_api_custom_changes_are_all_published() {
     }
 }
 
-/// Public API contract: self aliases cannot substitute a local leader before
-/// or after a mapping change (cross-cluster replication is not supported).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unsupported_ccr_self_alias_does_not_follow_mapping_changes() {
-    let node = spawn_node(settings("n0", "ccr-mapping", &[], &[], &[("xpack.license.self_generated.type", "trial")])).await;
-    let (http, transport) = (ports::http_port(&node), ports::transport_port(&node));
-    let _ = &node;
-    let c = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while call(&c, http, reqwest::Method::GET, "/_cluster/health?wait_for_status=green&timeout=1s", None).await.0 != 200 {
-        assert!(Instant::now() < deadline, "node did not start");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let ok = |st: u16, v: &Value| assert!((200..300).contains(&st), "{st} {v}");
-    let (st, v) = call(&c, http, reqwest::Method::PUT, "/_cluster/settings", Some(json!({"persistent": {"cluster.remote.self.seeds": [format!("127.0.0.1:{transport}")]}}))).await;
-    ok(st, &v);
-    let (st, v) = call(&c, http, reqwest::Method::PUT, "/leader", Some(json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"a": {"type": "keyword"}}}}))).await;
-    ok(st, &v);
-    let (st, v) = call(&c, http, reqwest::Method::PUT, "/leader/_doc/1?refresh=true", Some(json!({"a": "x"}))).await;
-    ok(st, &v);
-    for changed in [false, true] {
-        if changed {
-            let (st, v) = call(&c, http, reqwest::Method::PUT, "/leader/_doc/2?refresh=true", Some(json!({"a": "y", "b": 5}))).await;
-            ok(st, &v);
-        }
-        let (st, v) = call(&c, http, reqwest::Method::PUT, "/follower/_ccr/follow?wait_for_active_shards=1", Some(json!({"remote_cluster": "self", "leader_index": "leader"}))).await;
-        assert_eq!(st, 502, "{v}");
-        assert_eq!(v["error"]["type"], "connect_transport_exception");
-        assert_eq!(call(&c, http, reqwest::Method::GET, "/follower", None).await.0, 404);
-        assert!(!node.state().metadata.indices.contains_key("follower"));
-    }
-    let (st, value) = call(&c, http, reqwest::Method::GET, "/leader/_count", None).await;
-    assert_eq!(st, 200, "{value}");
-    assert_eq!(value["count"], 2);
-    assert!(node.state().metadata.indices["leader"].mappings["properties"].get("b").is_some());
-}
-
 /// A change made through a node that is not the master is visible on that
 /// node as soon as the request answers: the master acknowledges once every
 /// node applied the new state, and the coordinating node waits until it
@@ -914,75 +879,6 @@ async fn a_change_through_a_non_master_is_visible_there_at_once() {
         assert_eq!(v.as_array().map(Vec::len), Some(1 + replicas), "round {i}: {v}");
     }
     let _ = master;
-}
-
-/// Four real network nodes in two independent clusters. This is a rejection
-/// contract, not a CCS/CCR parity test: a configured seed must never make local
-/// documents masquerade as remote documents while remote transport is absent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn unsupported_remote_transport_never_reads_or_follows_local_indices() {
-    let license = [("xpack.license.self_generated.type", "trial")];
-    let _a = two_nodes("remote-reject-a", &license).await;
-    let _b = two_nodes("remote-reject-b", &license).await;
-    let (http_a, transport_a) = (http_ports(&_a), transport_ports(&_a));
-    let (http_b, transport_b) = (http_ports(&_b), transport_ports(&_b));
-    let client = reqwest::Client::new();
-    let (_, a) = call(&client, http_a[0], reqwest::Method::GET, "/", None).await;
-    let (_, b) = call(&client, http_b[0], reqwest::Method::GET, "/", None).await;
-    assert!(a["cluster_uuid"].as_str().is_some_and(|s| !s.is_empty() && s != "_na_"), "{a}");
-    assert!(b["cluster_uuid"].as_str().is_some_and(|s| !s.is_empty() && s != "_na_"), "{b}");
-    assert_ne!(a["cluster_uuid"], b["cluster_uuid"]);
-    for (http, marker) in [(http_a[0], "local-only"), (http_b[0], "remote-only")] {
-        let (status, body) = call(&client, http, reqwest::Method::PUT, "/remote-contract", Some(json!({
-            "settings": {"number_of_shards": 1, "number_of_replicas": 1}
-        }))).await;
-        assert_eq!(status, 200, "{body}");
-        let (status, body) = call(&client, http, reqwest::Method::PUT, "/remote-contract/_doc/1?refresh=true&wait_for_active_shards=all", Some(json!({"marker": marker}))).await;
-        assert_eq!(status, 201, "{body}");
-    }
-    let (status, body) = call(&client, http_a[0], reqwest::Method::PUT, "/_cluster/settings", Some(json!({"persistent": {
-        "cluster.remote.actual.seeds": [format!("127.0.0.1:{}", transport_b[0])],
-        "cluster.remote.actual.skip_unavailable": false,
-        "cluster.remote.self.seeds": [format!("127.0.0.1:{}", transport_a[0])],
-        "cluster.remote.self.skip_unavailable": false,
-        "cluster.remote.optional.seeds": [format!("127.0.0.1:{}", transport_b[1])],
-        "cluster.remote.optional.skip_unavailable": true
-    }}))).await;
-    assert_eq!(status, 200, "{body}");
-    // Probe both local coordinators, including the node that did not accept the
-    // settings update. Neither may infer connectivity from cluster membership.
-    for http in http_a {
-        let (_, info) = call(&client, http, reqwest::Method::GET, "/_remote/info", None).await;
-        for alias in ["actual", "self", "optional"] {
-            assert_eq!(info[alias]["connected"], false, "{info}");
-            assert_eq!(info[alias]["num_nodes_connected"], 0, "{info}");
-        }
-        for alias in ["actual", "self"] {
-            let (status, body) = call(&client, http, reqwest::Method::POST, &format!("/remote-contract,{alias}:remote-contract/_search"), Some(json!({"query": {"match_all": {}}}))).await;
-            assert_eq!(status, 502, "{body}");
-            assert_eq!(body["error"]["type"], "connect_transport_exception", "{body}");
-            assert!(body.get("hits").is_none(), "must not return local partial success: {body}");
-            for follower in ["new-follower", "remote-contract"] {
-                let (status, body) = call(&client, http, reqwest::Method::PUT, &format!("/{follower}/_ccr/follow"), Some(json!({"remote_cluster": alias, "leader_index": "remote-contract"}))).await;
-                assert_eq!(status, 502, "{body}");
-                assert_eq!(body["error"]["type"], "connect_transport_exception", "{body}");
-            }
-        }
-        let (status, body) = call(&client, http, reqwest::Method::POST, "/remote-contract,optional:remote-contract/_search", Some(json!({"query": {"match_all": {}}}))).await;
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(body["hits"]["total"]["value"], 1, "{body}");
-        assert_eq!(body["hits"]["hits"][0]["_source"]["marker"], "local-only", "{body}");
-        assert_eq!(body["_clusters"]["successful"], 1, "{body}");
-        assert_eq!(body["_clusters"]["skipped"], 1, "{body}");
-        assert_eq!(call(&client, http, reqwest::Method::GET, "/new-follower", None).await.0, 404);
-        let (status, body) = call(&client, http, reqwest::Method::GET, "/remote-contract/_doc/1", None).await;
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(body["_source"]["marker"], "local-only", "{body}");
-        let (_, mapping) = call(&client, http, reqwest::Method::GET, "/remote-contract/_settings", None).await;
-        assert_ne!(mapping["remote-contract"]["settings"]["index"]["xpack"]["ccr"]["following_index"], "true", "{mapping}");
-    }
-    let (_, remote) = call(&client, http_b[0], reqwest::Method::GET, "/remote-contract/_doc/1", None).await;
-    assert_eq!(remote["_source"]["marker"], "remote-only", "{remote}");
 }
 
 /// Managed resources must be committed at the metadata acknowledgement
@@ -1027,6 +923,10 @@ async fn registry_resources_are_published_before_health_barrier_and_auto_creatio
         assert_eq!(status,200,"{value}");
         let mapping=value.as_object().unwrap().values().next().unwrap();
         assert_eq!(mapping["mappings"]["properties"]["timestamp"]["properties"]["us"]["type"],"long","{value}");
+        // ES refuses to delete a composable template a data stream uses:
+        // the next round deletes the template again, so drop the stream.
+        let (status,value)=call(&client,peer,reqwest::Method::DELETE,&format!("/_data_stream/{name}"),None).await;
+        assert_eq!(status,200,"{value}");
     }
 }
 

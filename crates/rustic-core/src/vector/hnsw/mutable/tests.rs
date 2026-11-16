@@ -26,6 +26,72 @@ fn backfill_reserves_a_missing_key_below_the_watermark() {
     assert_eq!(graph.active_nodes(), 6);
 }
 
+/// Past the memory budget's spill threshold the large vector arrays (code
+/// plane chunks, array store slabs) map from disk-backed spill files
+/// instead of being charged: ingest under three quarters of the budget an
+/// all-resident build charged never refuses an insert, and searches return exactly what
+/// the all-resident build returns. Rows shed their f32 once durable, as
+/// ingestion's maintenance does (the f32 of unshed rows is per-row memory
+/// that never spills).
+#[test]
+fn ingest_past_the_memory_budget_spills_instead_of_refusing() {
+    super::huge::set_spill_dir(std::env::temp_dir().join("rustic-vector-spill-test")).unwrap();
+    super::huge::spill_on_this_thread(true);
+    let (n, dim) = (6000usize, 32usize);
+    let source = rows(n, dim);
+    let queries: Vec<Vec<f32>> = (0..20).map(|i| source.rows[i * 97 % n].iter().map(|x| x + 0.01).collect()).collect();
+    struct Durable(Arc<Vec<Vec<f32>>>);
+    impl RawRows for Durable {
+        fn snapshot(&self) -> Result<Option<Box<dyn RawRowsSnapshot>>> { Ok(Some(Box::new(Durable(self.0.clone())))) }
+    }
+    impl RawRowsSnapshot for Durable {
+        fn row(&self, key: u64) -> Option<&[f32]> { self.0.get(key as usize).map(Vec::as_slice) }
+    }
+    let durable = Arc::new(source.rows.clone());
+    // Single-threaded build (the private budget is this thread's) under
+    // `limit`: the peak bytes charged, the peak bytes spilled, the hits.
+    let build = |limit: u64| -> (u64, u64, Vec<Vec<(u64, f32)>>) {
+        let _budget = crate::admission::private_shared(limit);
+        let budget = crate::admission::shared();
+        let graph = Arc::new(MutableHnsw::new(dim as u32, Similarity::L2, HnswParams::default()));
+        let owner = Arc::new(MutableVectorOwner::new_quantized(graph.clone(),
+            Some(crate::vector::es_quant::EsQuant { bits: 7, osq: true, confidence_interval: None })).unwrap());
+        owner.set_raw_rows(Arc::new(Durable(durable.clone())));
+        let (mut charged, mut spilled) = (0, 0);
+        for k in 0..n as u64 {
+            let row = source.rows[k as usize].as_slice();
+            let reservation = graph.reserve_insert(k).unwrap_or_else(|e| panic!("insert {k} refused: {e}"));
+            let codes = owner.prepare_codes(&[row]).unwrap();
+            owner.install_prepared(&reservation, row, codes[0].as_ref()).unwrap_or_else(|e| panic!("insert {k} refused: {e}"));
+            let read = owner.pin().unwrap();
+            let prepared = graph.prepare(reservation, &read).unwrap_or_else(|e| panic!("insert {k} refused: {e}"));
+            graph.complete(prepared, &read).unwrap_or_else(|e| panic!("insert {k} refused: {e}"));
+            drop(read);
+            if k % 512 == 511 {
+                owner.commit().unwrap();
+                while owner.shed_some(4096).unwrap_or_else(|e| panic!("shed after {k} refused: {e}")) > 0 {}
+            }
+            charged = charged.max(budget.used());
+            spilled = spilled.max(super::huge::spilled_bytes());
+        }
+        owner.commit().unwrap();
+        let read = owner.pin().unwrap();
+        let hits = queries.iter().map(|q| graph.search(q, 10, 64, &read, |_| true).hits).collect();
+        (charged, spilled, hits)
+    };
+    let (charged, _, in_memory) = build(1 << 30);
+    // Less than keeping every array resident charged: without spilling,
+    // inserts would be refused part way. (What never spills: per-row
+    // allocations, node and directory slots, the unsealed code log.)
+    let limit = charged / 4 * 3;
+    let (small_charged, spilled, hits) = build(limit);
+    super::huge::spill_on_this_thread(false);
+    assert!(spilled > 0, "nothing spilled under a budget of {limit} (all resident: {charged})");
+    assert!(small_charged <= limit, "charged {small_charged} past the budget");
+    assert_eq!(hits, in_memory, "a spilled build answers as the resident one");
+    assert!(hits.iter().all(|h| h.len() == 10));
+}
+
 /// `complete_batch` publishes proposals in order under one writer hold. A
 /// failing completion leaves the earlier ones published (in `done`), and
 /// the failed and later reservations release when the caller drops them
@@ -556,6 +622,7 @@ fn mutable_construction_carries_all_upper_level_seeds_after_diversification() {
         None,
         1,
         &mut scratch.selected,
+        None,
     );
     assert_eq!(scratch.selected.len(), 1);
     assert_eq!(scratch.selected[0].id, internal_id(ids[0]));

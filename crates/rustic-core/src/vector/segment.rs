@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::codec::directory::{Directory, FileSlice};
 use crate::codec::vector_segment_file_name;
-use crate::codec::vectors::{open_vector_segment, write_vector_segment_streamed, VectorSegmentParts};
+use crate::codec::vectors::{open_vector_segment, write_vector_segment_rows, VectorSegmentParts};
 use crate::error::Result;
 use crate::types::DocId;
 
@@ -47,18 +47,27 @@ impl SealSpec {
     }
 }
 
-/// Transient payload-encoding bound of [`VectorSegment::write_with`]: the
-/// flattened f32 column (4 bytes per cell), plus for a quantized copy its
-/// per-row codes and encoded column (int8: 2 bytes per cell; int4: a
-/// normalized f32 copy and packed codes, 6), per-row metadata and writer
-/// buffers. Sources remain owned by the caller and are not released to
-/// satisfy this reservation. (It used to charge 32 bytes per cell whatever
-/// was encoded: a 67k-row 1536-d vector segment asked for 3.3 GB.)
-fn payload_workspace(budget: &Arc<crate::admission::Budget>, rows: usize, dim: u32, quantize: Quantization) -> Result<crate::admission::Reservation> {
-    let per_cell = 4 + match quantize { Quantization::Int8 => 2, Quantization::Int4 => 6, _ => 0 };
-    let bytes = (rows as u64).saturating_mul((dim as u64).saturating_mul(per_cell).saturating_add(128)).saturating_add(64 << 10);
-    budget.reserve(bytes, "vector payload encoding")
+/// Transient payload-encoding bound of [`VectorSegment::write_with`]: for a
+/// quantized copy its per-row codes and encoded column (int8: 2 bytes per
+/// cell; int4: a normalized f32 copy and packed codes, 6), per-row metadata
+/// (point ids) and writer buffers. The f32 column is streamed from the
+/// caller's rows, never flattened: it used to be copied whole first (4
+/// bytes per cell, 724 MB for a 176k-row 1024-d seal), which refused seals
+/// under memory pressure, so rows never became durable and their in-memory
+/// f32 was never shed. Sources remain owned by the caller. (Before that it
+/// charged 32 bytes per cell: a 67k-row 1536-d segment asked for 3.3 GB.)
+fn payload_workspace_bytes(rows: usize, dim: u32, quantize: Quantization) -> u64 {
+    let per_cell = match quantize { Quantization::Int8 => 2, Quantization::Int4 => 6, _ => 0 };
+    (rows as u64).saturating_mul((dim as u64).saturating_mul(per_cell).saturating_add(128)).saturating_add(64 << 10)
 }
+#[cfg(test)]
+fn payload_workspace(budget: &Arc<crate::admission::Budget>, rows: usize, dim: u32, quantize: Quantization) -> Result<crate::admission::Reservation> {
+    budget.reserve(payload_workspace_bytes(rows, dim, quantize), "vector payload encoding")
+}
+
+/// How long a compaction's payload workspace waits for the background
+/// share ([`crate::admission::Budget::reserve_background`]).
+const PAYLOAD_BACKGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where the `f32` column lives.
 enum Floats {
@@ -109,7 +118,7 @@ pub struct VectorSegment {
 impl VectorSegment {
     /// Open vector segment `id` from `dir`.
     pub fn open(dir: &dyn Directory, id: u32) -> Result<Self> {
-        let f = open_vector_segment(dir.open_read(&vector_segment_file_name(id))?, false)?;
+        let f = open_vector_segment(dir.open_read(&vector_segment_file_name(id))?, crate::segment::verify_on_open())?;
         let bytes = f.vectors.as_slice();
         let floats = if cfg!(target_endian = "little") && bytes.as_ptr().align_offset(4) == 0 {
             Floats::Mapped(f.vectors.clone())
@@ -146,16 +155,22 @@ impl VectorSegment {
         dir: &dyn Directory, id: u32, field: u16, similarity: Similarity,
         dim: u32, rows: &[(u64, &[f32])], spec: SealSpec,
     ) -> Result<Self> {
-        // Payload encoding keeps the source rows, flattened f32 column and
-        // encoded output alive together. Admit that peak before copying.
+        // Admit the encoding peak before building anything. A chunk is the
+        // write that makes a flush's rows durable (so a mutable field sheds
+        // their in-memory f32): it frees far more than it takes and is
+        // never refused (ES never fails a flush for memory). A compaction
+        // (seal, vacuum, merge) is background work: it waits for the
+        // background share like a segment merge rather than competing with
+        // resident data.
         let quantize = if matches!(spec.kind, SealKind::Chunk) { Quantization::None } else { spec.quantize };
-        let _workspace = payload_workspace(&crate::admission::shared(), rows.len(), dim, quantize)?;
+        let bytes = payload_workspace_bytes(rows.len(), dim, quantize);
+        let budget = crate::admission::shared();
+        let _workspace = match spec.kind {
+            SealKind::Chunk => crate::admission::forced(|| budget.reserve(bytes, "vector payload encoding"))?,
+            _ => budget.reserve_background(bytes, "vector payload encoding", PAYLOAD_BACKGROUND_WAIT)?,
+        };
         let points: Vec<u64> = rows.iter().map(|(p, _)| *p).collect();
-        let mut vectors = Vec::with_capacity(rows.len() * dim as usize);
-        for (_, v) in rows {
-            assert_eq!(v.len(), dim as usize, "vector dim mismatch");
-            vectors.extend_from_slice(v);
-        }
+        for (_, v) in rows { assert_eq!(v.len(), dim as usize, "vector dim mismatch"); }
         let hnsw: Option<Vec<u8>> = None;
         let n = rows.len();
         let row = |i: usize| rows[i].1;
@@ -181,7 +196,8 @@ impl VectorSegment {
             similarity,
             dim,
             points: &points,
-            vectors: &vectors,
+            // Streamed from `rows` (see `write_vector_segment_rows`).
+            vectors: &[],
             hnsw: hnsw.as_deref(),
             int8: int8.as_deref(),
             int4: int4.as_deref(),
@@ -190,11 +206,13 @@ impl VectorSegment {
         // Keep the historical allocation only for controlled POC comparisons.
         #[cfg(feature = "payload-hnsw-poc")]
         if std::env::var_os("RUSTIC_POC_BUFFERED_VECTOR_SEGMENT").is_some() {
+            let vectors: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            let parts = VectorSegmentParts { vectors: &vectors, ..parts };
             let bytes = crate::codec::vectors::encode_vector_segment(&parts);
             dir.write(&vector_segment_file_name(id), &bytes)?;
             return Self::open(dir, id);
         }
-        write_vector_segment_streamed(dir, &vector_segment_file_name(id), &parts)?;
+        write_vector_segment_rows(dir, &vector_segment_file_name(id), &parts, rows)?;
         Self::open(dir, id)
     }
 
@@ -785,10 +803,37 @@ mod workspace_admission_tests {
         let budget=crate::admission::Budget::new(1<<20);
         assert!(payload_workspace(&budget,10000,96,Quantization::Int4).is_err());
         assert_eq!(budget.used(),0);
-        let retained=budget.reserve(900000,"retained query cache").unwrap();
+        let retained=budget.reserve(950000,"retained query cache").unwrap();
         assert!(payload_workspace(&budget,100,96,Quantization::Int4).is_err());
         drop(retained);
         let encoding=payload_workspace(&budget,100,96,Quantization::Int4).unwrap();
         assert!(budget.used()>0);drop(encoding);assert_eq!(budget.used(),0);
+    }
+
+    /// Segment writes stream the f32 column from the caller's rows: a
+    /// chunk (forced) and a compaction (background share) of twice the
+    /// budget's size in f32 both write, under a budget mostly held, and
+    /// read back exactly. (The flattened copy charged 4 bytes per cell:
+    /// under memory pressure seals were refused and rows never shed.)
+    #[test]
+    fn segment_writes_stream_rows_without_charging_the_f32_column() {
+        let _budget = crate::admission::private_shared(1 << 20);
+        let held = crate::admission::shared().reserve(600 << 10, "resident data").unwrap();
+        // On disk: a RAM directory charges its files to the same budget.
+        let path = tempfile::tempdir().unwrap();
+        let dir = crate::codec::directory::MmapDirectory::open(path.path()).unwrap();
+        let dim = 256usize;
+        let rows: Vec<Vec<f32>> = (0..2048).map(|i| (0..dim).map(|d| (i * 31 + d) as f32 * 0.001).collect()).collect();
+        let refs: Vec<(u64, &[f32])> = rows.iter().enumerate().map(|(i, r)| (i as u64 * 3, r.as_slice())).collect();
+        for (id, spec) in [(1u32, SealSpec::chunk()), (2, SealSpec { kind: SealKind::Flat, quantize: Quantization::None, confidence_interval: None })] {
+            let segment = VectorSegment::write_with(&dir, id, 0, Similarity::L2, dim as u32, &refs, spec).unwrap();
+            assert_eq!(segment.len(), 2048);
+            for i in [0usize, 1, 1000, 2047] {
+                assert_eq!(segment.vector(i as u32), rows[i].as_slice());
+                assert_eq!(segment.points()[i], i as u64 * 3);
+            }
+            assert_eq!(crate::admission::shared().used(), 600 << 10, "the workspace is released");
+        }
+        drop(held);
     }
 }

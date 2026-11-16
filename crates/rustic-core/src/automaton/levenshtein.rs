@@ -54,6 +54,58 @@ pub fn edit_distance(a: &str, b: &str, transpositions: bool) -> usize {
     prev[m]
 }
 
+/// [`edit_distance`] capped at `max + 1`: only the diagonal band
+/// `|i - j| <= max` is computed (Lucene's bounded Levenshtein), so the work
+/// is linear in the term length for a fixed bound. Equal strings are 0
+/// without any DP. A distance above `max` is reported as `max + 1`.
+pub fn edit_distance_bounded(a: &str, b: &str, transpositions: bool, max: usize) -> usize {
+    if a == b {
+        return 0;
+    }
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    let over = max + 1;
+    if n.abs_diff(m) > max {
+        return over;
+    }
+    if n == 0 || m == 0 {
+        return n.max(m).min(over);
+    }
+    let mut prev2: Vec<usize> = vec![over; m + 1];
+    let mut prev: Vec<usize> = (0..=m).map(|j| j.min(over)).collect();
+    let mut cur = vec![over; m + 1];
+    for i in 1..=n {
+        let lo = i.saturating_sub(max).max(1);
+        let hi = (i + max).min(m);
+        // Cells outside the band are "too far".
+        if lo > 1 {
+            cur[lo - 1] = over;
+        }
+        cur[0] = i.min(over);
+        let mut best = cur[0].min(if lo > 1 { over } else { cur[0] });
+        for j in lo..=hi {
+            let mut cost = if a[i - 1] == b[j - 1] { prev[j - 1] } else { prev[j - 1] + 1 };
+            cost = cost.min(prev[j] + 1);
+            cost = cost.min(cur[j - 1] + 1);
+            if transpositions && i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                cost = cost.min(prev2[j - 2] + 1);
+            }
+            cur[j] = cost.min(over);
+            best = best.min(cur[j]);
+        }
+        if hi < m {
+            cur[hi + 1] = over;
+        }
+        if best >= over {
+            return over;
+        }
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m].min(over)
+}
+
 /// ES `fuzziness: AUTO` rule: 0 edits for terms of length <= 2, 1 for
 /// length 3..=5, 2 otherwise.
 pub fn auto_fuzziness(term_len_chars: usize) -> u8 {
@@ -290,5 +342,35 @@ mod tests {
         assert_eq!(m.literal_prefix(), "abc".as_bytes());
         let m = LevenshteinMatcher::new("abc", 1, 0, false);
         assert!(m.literal_prefix().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    /// Review finding 345: the banded distance equals the full one within
+    /// the bound (and reports `max + 1` beyond it), transpositions
+    /// included; equal long terms cost no DP.
+    #[test]
+    fn bounded_distance_matches_the_full_distance_within_the_bound() {
+        let words = ["", "a", "ab", "ba", "abc", "acb", "abcd", "abdc", "xabc", "abcx", "kitten", "sitting", "flaw", "lawn", "héllo", "hello", "ca", "abc"];
+        for a in words {
+            for b in words {
+                for tr in [false, true] {
+                    let full = edit_distance(a, b, tr);
+                    for max in 0..=3 {
+                        assert_eq!(edit_distance_bounded(a, b, tr, max), full.min(max + 1), "{a:?} {b:?} tr={tr} max={max}");
+                    }
+                }
+            }
+        }
+        let long = "x".repeat(40_000);
+        let mut one = long.clone();
+        one.replace_range(20_000..20_001, "y");
+        assert_eq!(edit_distance_bounded(&long, &long, true, 2), 0);
+        assert_eq!(edit_distance_bounded(&long, &one, true, 2), 1);
+        assert_eq!(edit_distance_bounded(&long, &format!("{long}zz"), false, 2), 2);
+        assert_eq!(edit_distance_bounded(&long, &format!("{long}zzz"), false, 2), 3);
     }
 }

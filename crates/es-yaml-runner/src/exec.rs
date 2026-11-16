@@ -1459,6 +1459,9 @@ fn check_warnings(api: &str, spec: &std::collections::HashMap<String, Vec<String
     // exact legacy-template warning in existing upstream YAML fixtures.
     // Keep the product warning and any explicit expectation intact.
     unexpected.retain(|warning| warning.as_str() != "Legacy index templates are deprecated in favor of composable templates.");
+    // The inference fixtures enable rustic's built-in model stand-in (ES's
+    // test clusters run the real ELSER); its warning is rustic's own signal.
+    unexpected.retain(|warning| !elasticsearch_engine::inference::backend::is_fallback_warning(warning));
     let mut missing: Vec<String> = exp.iter().filter(|e| !actual.contains(e)).cloned().collect();
     missing.extend(exp_re.iter().filter(|p| !actual.iter().any(|a| re_match(p, a))).map(|p| format!("/{p}/")));
     if unexpected.is_empty() && missing.is_empty() {
@@ -1542,6 +1545,12 @@ pub async fn run_test(specs: &Specs, file: &TestFile, steps: &[Value]) -> Outcom
         let (cfg, auth) = ccr_security_config();
         node.security.configure(cfg);
         auth_override = Some(auth);
+    }
+    if file.dir == "inference" {
+        // ES's inference test cluster downloads the real ELSER model for the
+        // default-endpoint tests; rustic has no ELSER, so the suite runs with
+        // the built-in stand-in enabled explicitly.
+        node.node_settings.write().insert(elasticsearch_engine::inference::backend::FALLBACK_SETTING.into(), serde_json::json!("lexical"));
     }
     if file.dir == "inference" && !DEFAULT_DISTRIBUTION.load(std::sync::atomic::Ordering::Relaxed) {
         let (cfg, auth) = inference_security_config();

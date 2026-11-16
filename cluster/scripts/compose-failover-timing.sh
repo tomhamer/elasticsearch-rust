@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Measure master failover in the docker compose deployment
-# (cluster/deploy/docker/docker-compose.yml) when the elected master is
+# (cluster/deploy/docker/docker-compose.insecure.yml) when the elected master is
 # killed with `docker compose kill` (SIGKILL; the container's IP vanishes,
 # so reconnects hang instead of being refused).
 #
@@ -21,9 +21,11 @@ TRIALS="${1:-3}"; WINDOW="${2:-90}"
 COMPOSE_DIR="$(cd "$(dirname "$0")/../deploy/docker" && pwd)"
 export ES_IMAGE="${ES_IMAGE:-elasticsearch-rs:dev}" ES_PORT="${ES_PORT:-30921}"
 OUT="${OUT_DIR:-$HOME/compose-fo}"
-dc() { docker compose -f "$COMPOSE_DIR/docker-compose.yml" "$@"; }
+# Failover timing over plain HTTP: the development-only insecure compose
+# file (no TLS, no authentication). COMPOSE_FILE overrides it.
+dc() { docker compose -f "${COMPOSE_FILE:-$COMPOSE_DIR/docker-compose.insecure.yml}" "$@"; }
 now() { date +%s.%N; }
-ip() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
+ip() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(dc ps -q "$1")"; }
 
 trial() {
   local t="$1" out="$OUT/trial-$1"; rm -rf "$out"; mkdir -p "$out"

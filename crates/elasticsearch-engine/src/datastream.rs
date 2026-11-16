@@ -691,6 +691,11 @@ impl Node {
     }
 
     /// The data stream a failure store index belongs to.
+    /// Whether a stream other than `ds` lists `index` (backing or failure).
+    pub fn index_listed_by_another_stream(&self, ds: &str, index: &str) -> bool {
+        self.data_streams.read().values().any(|d| d.name != ds && d.indices.iter().chain(d.failure_indices.iter()).any(|i| i == index))
+    }
+
     pub fn data_stream_of_failure_index(&self, index: &str) -> Option<String> {
         self.data_streams.read().values().find(|d| d.failure_indices.iter().any(|i| i == index)).map(|d| d.name.clone())
     }
@@ -1018,7 +1023,7 @@ impl Node {
         let name = backing_index_name(ds, generation, crate::date::now_millis());
         // Membership and DLM/ILM precedence are published by the caller.
         // The lifecycle executor initializes only after that context exists.
-        self.create_index_impl(&name, &json!({"settings": settings, "mappings": mappings}), None, false)
+        self.create_index_impl(&name, &json!({"settings": settings, "mappings": mappings}), None, false, true)
     }
 
     /// `DataStreamIndexSettingsProvider` for a time series backing index:
@@ -1071,7 +1076,7 @@ impl Node {
             flat.insert("index.refresh_interval".into(), json!(interval));
         }
         let name = failure_index_name(ds, generation, crate::date::now_millis());
-        self.create_index_impl(&name, &json!({"settings": crate::settings::unflatten(&flat), "mappings": failure_store_mappings()}), None, false)
+        self.create_index_impl(&name, &json!({"settings": crate::settings::unflatten(&flat), "mappings": failure_store_mappings()}), None, false, true)
     }
 
     /// Create the next failure store write index (generation + 1, or the
@@ -1096,6 +1101,11 @@ impl Node {
     /// Roll a data stream over to a new backing write index.
     pub fn roll_data_stream(&self, ds: &str) -> Result<Arc<IndexService>> {
         let _g = self.ds_create_lock.lock();
+        self.roll_data_stream_locked(ds)
+    }
+
+    /// [`Self::roll_data_stream`] with `ds_create_lock` held.
+    fn roll_data_stream_locked(&self, ds: &str) -> Result<Arc<IndexService>> {
         let d = self.data_stream(ds).ok_or_else(|| EsError::index_not_found(ds))?;
         let old = self.get_index(d.write_index());
         let created = self.create_backing_index(ds, d.generation + 1)?;
@@ -1120,11 +1130,22 @@ impl Node {
     /// The write index of a data stream, performing a pending lazy rollover.
     pub fn data_stream_write_index(&self, ds: &DataStream) -> Result<Arc<IndexService>> {
         if ds.rollover_on_write {
-            if let Some(d) = self.data_stream(&ds.name).filter(|d| d.rollover_on_write) {
-                let old = self.get_index(d.write_index());
-                let created = self.roll_data_stream(&d.name)?;
+            // Checked again under the rollover lock: of concurrent writers
+            // that all saw the pending lazy rollover, exactly one rolls the
+            // stream over; the others write to the index it created.
+            let rolled = {
+                let _g = self.ds_create_lock.lock();
+                match self.data_stream(&ds.name).filter(|d| d.rollover_on_write) {
+                    Some(d) => {
+                        let old = self.get_index(d.write_index());
+                        Some((self.roll_data_stream_locked(&d.name)?, old))
+                    }
+                    None => None,
+                }
+            };
+            if let Some((created, old)) = rolled {
                 if let Some(old) = old {
-                    crate::ilm::runner::record_rollover(self, &old, &d.name, &json!({}));
+                    crate::ilm::runner::record_rollover(self, &old, &ds.name, &json!({}));
                 }
                 return Ok(created);
             }
@@ -1138,7 +1159,9 @@ impl Node {
     pub fn failure_store_write_index(&self, ds: &str) -> Result<Arc<IndexService>> {
         let d = self.data_stream(ds).ok_or_else(|| EsError::index_not_found(ds))?;
         if !d.failure_needs_rollover() {
-            if let Some(svc) = d.failure_write_index().and_then(|n| self.get_index(n)) {
+            // Never another stream's index (#104): a shared one is rolled
+            // over to a failure index of this stream's own.
+            if let Some(svc) = d.failure_write_index().filter(|n| !self.index_listed_by_another_stream(ds, n)).and_then(|n| self.get_index(n)) {
                 return Ok(svc);
             }
         }
@@ -1200,6 +1223,17 @@ impl Node {
         if let Some(svc) = self.get_index(name) {
             return Err(EsError::index_already_exists(name, &svc.uuid));
         }
+        // ES `ProjectMetadata` validation: names are unique across indices,
+        // aliases and data streams; an index alias keeps its name (converting
+        // it is the migrate API's job).
+        let aliased: Vec<String> = self.all_indices().iter().filter(|s| s.aliases().contains_key(name)).map(|s| s.name.clone()).collect();
+        if !aliased.is_empty() {
+            return Err(EsError::new(
+                500,
+                "illegal_state_exception",
+                format!("index, alias, and data stream names need to be unique, but the following duplicates were found [{name} (alias of [{}]) conflicts with data stream]", aliased.join(", ")),
+            ));
+        }
         let (tname, tmpl) = {
             let t = self.templates.read();
             let best = t
@@ -1245,9 +1279,18 @@ impl Node {
             }
         }
         for n in names {
-            let ds = self.data_streams.write().remove(&n);
+            let (ds, others) = {
+                let mut streams = self.data_streams.write();
+                let ds = streams.remove(&n);
+                // Indices another stream also lists (a stream restored
+                // under a new name by an older version kept the original's
+                // failure indices) stay with that stream: deleting one
+                // stream never deletes another's data.
+                let others: std::collections::HashSet<String> = streams.values().flat_map(|d| d.indices.iter().chain(d.failure_indices.iter()).cloned()).collect();
+                (ds, others)
+            };
             if let Some(ds) = ds {
-                for i in ds.indices.iter().chain(ds.failure_indices.iter()) {
+                for i in ds.indices.iter().chain(ds.failure_indices.iter()).filter(|i| !others.contains(*i)) {
                     if self.get_index(i).is_some() {
                         self.delete_index(i)?;
                     }
@@ -1353,7 +1396,7 @@ impl Node {
             fs.insert("rollover_on_write".into(), json!(ds.failure_needs_rollover()));
             fs.insert("indices".into(), Value::Array(failure_indices));
             if let Some(lc) = &fs_lifecycle {
-                fs.insert("lifecycle".into(), self.render_failures_lifecycle(lc, include_defaults));
+                fs.insert("lifecycle".into(), self.render_failures_lifecycle(&ds.name, lc, include_defaults));
             }
             v.insert("failure_store".into(), Value::Object(fs));
             arr.push(Value::Object(v));
@@ -1374,7 +1417,10 @@ impl Node {
 
     /// Failures lifecycle as `GET _data_stream` renders it: effective
     /// retention falls back to `data_streams.lifecycle.retention.failures_default` (30d).
-    pub fn render_failures_lifecycle(&self, lc: &Value, include_defaults: bool) -> Value {
+    /// `ds_name`: the stream's name (an internal, dot-prefixed stream's
+    /// failure store keeps its own retention, never the global ones, as
+    /// `DataStreamLifecycle.getEffectiveDataRetentionWithSource`).
+    pub fn render_failures_lifecycle(&self, ds_name: &str, lc: &Value, include_defaults: bool) -> Value {
         let enabled = lc["enabled"].as_bool().unwrap_or(true);
         let mut m = Map::new();
         m.insert("enabled".into(), json!(enabled));
@@ -1389,6 +1435,7 @@ impl Node {
         let ms = |r: &str| crate::date::parse_time_value(r).unwrap_or(i64::MAX);
         let failures_default = crate::ilm::cluster_setting(self, "data_streams.lifecycle.retention.failures_default").filter(|s| !s.is_empty()).unwrap_or_else(|| "30d".into());
         let eff = match (own, max) {
+            (own, _) if ds_name.starts_with('.') => own.map(|r| (r, "data_stream_configuration")),
             (Some(r), Some(m)) if ms(&m) < ms(&r) => Some((m, "max_global_retention")),
             (Some(r), _) => Some((r, "data_stream_configuration")),
             (None, Some(m)) if ms(&m) < ms(&failures_default) => Some((m, "max_global_retention")),
@@ -1925,7 +1972,7 @@ impl Node {
         }
         mappings["_data_stream_timestamp"] = json!({"enabled": true});
         let name = backing_index_name(ds, generation, start);
-        let created = self.create_index_impl(&name, &json!({"settings": crate::settings::unflatten(&flat), "mappings": mappings}), None, false)?;
+        let created = self.create_index_impl(&name, &json!({"settings": crate::settings::unflatten(&flat), "mappings": mappings}), None, false, true)?;
         if let Some(w) = self.get_index(d.write_index()) {
             created.set_aliases(w.aliases())?;
         }
@@ -2116,7 +2163,11 @@ impl Node {
             return Ok(resp(&write.name, &new_name, false, &c));
         }
         let mut aliases = body.get("aliases").cloned().unwrap_or(json!({}));
-        aliases[target] = if explicit_flag { json!({"is_write_index": true}) } else { json!({}) };
+        // An explicit write alias moves in two steps below: the new index
+        // is created as a non-writer (an alias never has two write indices:
+        // `Node::check_write_aliases`), then it takes the flag before the
+        // old index gives it up, so the alias always has a write index.
+        aliases[target] = if explicit_flag { json!({"is_write_index": false}) } else { json!({}) };
         let mut create_body = json!({"aliases": aliases});
         for k in ["settings", "mappings"] {
             if let Some(v) = body.get(k) {
@@ -2124,6 +2175,13 @@ impl Node {
             }
         }
         self.create_index(&new_name, &create_body)?;
+        if explicit_flag {
+            if let Some(created) = self.get_index(&new_name) {
+                let mut new_aliases = created.aliases();
+                new_aliases.insert(target.to_string(), json!({"is_write_index": true}));
+                created.set_aliases(new_aliases)?;
+            }
+        }
         let mut old_aliases = write.aliases();
         if explicit_flag {
             if let Some(d) = old_aliases.get_mut(target) {
@@ -2231,6 +2289,27 @@ mod tests {
         assert_eq!(parse_size("1kb"), Some(1024));
     }
 
+    /// #104: deleting a stream never deletes an index another stream
+    /// lists (state a renamed restore left behind before the fix: the copy
+    /// shared the original's failure index).
+    #[test]
+    fn deleting_a_stream_keeps_indices_another_stream_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.templates.write().index.insert("logs".into(), json!({"index_patterns": ["logs-*"], "data_stream": {}, "priority": 100}));
+        let orig = node.create_data_stream_ext("logs-orig", true).unwrap();
+        let shared = orig.failure_indices[0].clone();
+        let copy = node.create_data_stream("logs-copy").unwrap();
+        node.data_streams.write().get_mut("logs-copy").unwrap().failure_indices = vec![shared.clone()];
+        node.delete_data_streams("logs-copy").unwrap();
+        assert!(node.get_index(&copy.indices[0]).is_none(), "the deleted stream's own backing index goes");
+        assert!(node.get_index(&shared).is_some(), "the surviving stream's failure index stays");
+        assert!(node.get_index(&orig.indices[0]).is_some());
+        let left = node.data_stream("logs-orig").unwrap();
+        assert_eq!(left.failure_indices, vec![shared]);
+        assert_eq!(left.indices, orig.indices);
+    }
+
     #[test]
     fn failure_store_refresh_template_and_node_override() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2288,6 +2367,70 @@ mod tests {
         let again = node.create_index("plain", &json!({})).unwrap();
         assert!(!node.is_registered_index("plain", &svc), "nor is the old copy of a recreated one");
         assert!(node.is_registered_index("plain", &again));
+    }
+
+    /// Review #85: a data stream alias resolves writes to the stream's
+    /// current write index after every rollover (its definition, write
+    /// flag included, is on every backing index).
+    #[test]
+    fn data_stream_alias_writes_follow_rollovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.templates.write().index.insert("t".into(), json!({"index_patterns": ["logs-*"], "data_stream": {}}));
+        node.create_data_stream("logs-a").unwrap();
+        node.create_data_stream("logs-b").unwrap();
+        node.update_aliases(&[json!({"add": {"index": "logs-a", "alias": "w", "is_write_index": true}}), json!({"add": {"index": "logs-b", "alias": "w"}})]).unwrap();
+        for _ in 0..3 {
+            let current = node.data_stream("logs-a").unwrap().write_index().to_string();
+            for auto_create in [false, true] {
+                assert_eq!(node.write_index("w", auto_create).unwrap().name, current);
+            }
+            assert_eq!(node.alias_write_data_stream("w").map(|d| d.name), Some("logs-a".to_string()));
+            node.rollover("logs-a", None, &json!({}), false).unwrap();
+            node.rollover("logs-b", None, &json!({}), false).unwrap();
+        }
+        let d = node.data_stream("logs-a").unwrap();
+        assert_eq!(d.indices.len(), 4);
+        assert_eq!(node.write_index("w", false).unwrap().name, d.write_index());
+        // A plain alias keeps the plain rules.
+        node.create_index("p1", &json!({"aliases": {"pa": {"is_write_index": true}}})).unwrap();
+        node.create_index("p2", &json!({"aliases": {"pa": {}}})).unwrap();
+        assert!(node.alias_write_data_stream("pa").is_none());
+        assert_eq!(node.write_index("pa", false).unwrap().name, "p1");
+    }
+
+    /// Review #86: an accepted lazy rollover is performed by the next write
+    /// that resolves the stream (by name or through its alias) exactly
+    /// once, however many writers race.
+    #[test]
+    fn lazy_rollover_happens_once_under_concurrent_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Arc::new(Node::open(tmp.path()).unwrap());
+        node.templates.write().index.insert("t".into(), json!({"index_patterns": ["logs-*"], "data_stream": {}}));
+        node.create_data_stream("logs-lazy").unwrap();
+        node.update_aliases(&[json!({"add": {"index": "logs-lazy", "alias": "lw", "is_write_index": true}})]).unwrap();
+        for (round, target) in ["logs-lazy", "lw"].into_iter().enumerate() {
+            let r = node.rollover_ext("logs-lazy", None, &json!({}), false, true).unwrap();
+            assert_eq!(r["rolled_over"], false, "{r}");
+            assert!(node.pending_lazy_rollover("logs-lazy") && node.pending_lazy_rollover("lw"));
+            assert_eq!(node.data_stream("logs-lazy").unwrap().indices.len(), round + 1);
+            // Without auto-create resolution (a cluster coordinator's local
+            // look-up) nothing rolls over.
+            assert_eq!(node.write_index(target, false).unwrap().name, node.data_stream("logs-lazy").unwrap().write_index());
+            let barrier = Arc::new(std::sync::Barrier::new(16));
+            let writers: Vec<_> = (0..16).map(|_| {
+                let (node, barrier) = (node.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    node.write_index(target, true).unwrap().name.clone()
+                })
+            }).collect();
+            let landed: Vec<String> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            let d = node.data_stream("logs-lazy").unwrap();
+            assert_eq!(d.indices.len(), round + 2, "exactly one generation advance: {:?}", d.indices);
+            assert!(!d.rollover_on_write && !node.pending_lazy_rollover(target));
+            assert!(landed.iter().all(|n| n == d.write_index()), "{landed:?}");
+        }
     }
 
     #[test]

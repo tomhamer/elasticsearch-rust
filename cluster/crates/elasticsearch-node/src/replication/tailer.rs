@@ -531,6 +531,15 @@ impl TranslogTailer {
             let gens = list_generations(&self.dir)?;
             let Some(&next) = gens.iter().find(|&&g| g > self.generation) else {
                 if corrupt {
+                    // A bad record with whole records after it is not an
+                    // append in progress: corruption, never skipped or
+                    // waited on for ever.
+                    if elasticsearch_engine::translog::bad_frame_followed_at(&self.dir.join(file_name(self.generation)), self.offset)? {
+                        return Err(ReplicationError::Corrupt {
+                            what: "translog".into(),
+                            detail: format!("generation {} has a corrupt record at offset {} followed by whole records", self.generation, self.offset),
+                        });
+                    }
                     // The active generation may be mid-write; retry later.
                     tracing::debug!("translog tail of gen {} not yet complete", self.generation);
                 }
@@ -1150,6 +1159,24 @@ mod bounded_frame_tests {
             let mut tail = TranslogTailer::open(tmp.path()).unwrap();
             assert!(matches!(tail.poll(), Err(ReplicationError::Corrupt { .. })));
             assert_eq!(tail.position().generation, 1);
+            assert_eq!(tail.position().offset, 0);
+        }
+    }
+
+    /// A bad record on the active generation with a whole record after it
+    /// is corruption (reported), not an append in progress (retried).
+    #[test]
+    fn corrupt_active_frame_followed_by_whole_frames_is_an_error() {
+        let good = encoded(&op(0));
+        let mut bad = good.clone();
+        bad[4] ^= 0x80;
+        let mut bytes = bad.clone();
+        bytes.extend_from_slice(&encoded(&op(1)));
+        let tmp = tempfile::tempdir().unwrap();
+        install_first(tmp.path(), &bytes);
+        let mut tail = TranslogTailer::open(tmp.path()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(tail.poll(), Err(ReplicationError::Corrupt { .. })));
             assert_eq!(tail.position().offset, 0);
         }
     }

@@ -185,9 +185,12 @@ struct AlignedBlock<E: ArrayElement>([UnsafeCell<E>; 8]);
 /// generation reclamation for retired arrays). No field for it: the
 /// descriptor's size feeds the allocator-rounded buffer sizes.
 struct AlignedElements<E: ArrayElement> {
-    blocks: Box<[AlignedBlock<E>]>,
+    /// Zeroed (untouched pages are not resident); past the memory budget's
+    /// spill threshold mapped from a spill file and not charged
+    /// (`huge::spill_block`).
+    blocks: super::huge::Slab<AlignedBlock<E>>,
     len: usize,
-    _memory: crate::admission::Reservation,
+    _memory: Option<crate::admission::Reservation>,
 }
 impl<E: ArrayElement> Drop for AlignedElements<E> {
     fn drop(&mut self) {
@@ -200,12 +203,16 @@ impl<E: ArrayElement> AlignedElements<E> {
         assert_eq!(size_of::<AlignedBlock<E>>(), 32);
         let count = len.div_ceil(8);
         let bytes = count.checked_mul(32).ok_or(StoreError::AllocationFailed)?;
-        let memory = budget.reserve(bytes as u64, "mutable vector slab").map_err(|_| StoreError::MemoryLimit)?;
-        let mut blocks = Vec::new();
-        blocks.try_reserve_exact(count).map_err(|_| StoreError::AllocationFailed)?;
-        blocks.resize_with(count, || AlignedBlock(std::array::from_fn(|_| UnsafeCell::new(E::from_value(0)))));
+        // Zero bytes are every element type's 0 (`E::from_value(0)`).
+        let (blocks, memory) = match super::huge::spill_block(bytes, budget) {
+            Some(block) => (super::huge::Slab::from_block(block, count), None),
+            None => {
+                let memory = budget.reserve(bytes as u64, "mutable vector slab").map_err(|_| StoreError::MemoryLimit)?;
+                (super::huge::Slab::zeroed(count).ok_or(StoreError::AllocationFailed)?, Some(memory))
+            }
+        };
         crate::accounting::add(E::ACCOUNT, (count * 32) as u64);
-        Ok(Self { blocks: blocks.into_boxed_slice(), len, _memory: memory })
+        Ok(Self { blocks, len, _memory: memory })
     }
     fn allocated_bytes(&self) -> usize { self.blocks.len() * 32 }
 }

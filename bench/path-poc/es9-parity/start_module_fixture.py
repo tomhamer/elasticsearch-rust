@@ -14,6 +14,7 @@ p.add_argument('--http-base',type=int,default=19560)
 p.add_argument('--transport-base',type=int,default=19660)
 p.add_argument('--nodes',type=int,default=2)
 p.add_argument('--binary',help='Immutable executable to test; defaults to root/target/fast/elasticsearch')
+p.add_argument('--setting',action='append',default=[],help='extra node setting key=value for every node (e.g. a remote cluster seed of a multi-cluster fixture)')
 a=p.parse_args()
 root=pathlib.Path(a.root);fixture=pathlib.Path(a.directory)
 if a.nodes<1:raise RuntimeError('At least one node is required')
@@ -69,6 +70,12 @@ settings.update({'cluster.name':'yaml-'+a.module,'network.host':'127.0.0.1','pat
  'indices.breaker.total.use_real_memory':'false','discovery.initial_state_timeout':'0s',
  'cluster.service.slow_task_logging_threshold':'5s','cluster.service.slow_master_task_logging_threshold':'5s',
  'discovery.seed_hosts':','.join(f'127.0.0.1:{a.transport_base+i}' for i in range(a.nodes))})
+# Fixture-specific settings from the caller (a querying cluster's remote
+# cluster address, known only once the fulfilling cluster runs).
+for kv in a.setting:
+ k,_,v=kv.partition('=')
+ if not k or not _:raise RuntimeError(f'--setting needs key=value, got {kv}')
+ settings[k]=v
 # Per-node settings (e.g. the stateless cluster's index / search roles);
 # only master-eligible nodes bootstrap the cluster.
 per_node=spec.get('per_node_settings') or []

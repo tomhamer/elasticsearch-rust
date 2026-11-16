@@ -12,6 +12,24 @@
 
 clusterName: prod
 
+# Security is on by default (values.yaml: authentication, HTTPS, transport
+# TLS); production only chooses where the secrets come from. For GitOps /
+# `helm template` rendering, which cannot `lookup` existing Secrets, use
+# cert-manager and a pre-created password Secret so that nothing is
+# regenerated on every render:
+security:
+  enabled: true
+  # elasticPassword:
+  #   existingSecret: prod-elastic-password   # kubectl create secret generic prod-elastic-password --from-literal=password=...
+  #   key: password
+  tls:
+    http:
+      enabled: true
+    # provider: cert-manager
+    # certManager:
+    #   issuerRef: { name: my-ca-issuer, kind: ClusterIssuer, group: cert-manager.io }
+    # extraDnsNames: [search.example.com]
+
 image:
   repository: registry.example.com/search/elasticsearch-rs
   tag: "0.1.0"

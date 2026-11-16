@@ -54,6 +54,13 @@ pub struct ExecState {
     pub snapshot_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shrink_index_name: Option<String>,
+    /// The index the `searchable_snapshot` action snapshots (the original,
+    /// or its force-merge clone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_index_name: Option<String>,
+    /// The `searchable_snapshot` action's force-merge clone (`fm-clone-*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_merge_clone_index_name: Option<String>,
 }
 
 impl ExecState {
@@ -76,6 +83,11 @@ pub struct IndexLifecycle {
     /// Rollover target (alias / data stream) → `{"met_conditions": {..}, "time": ms}`.
     #[serde(default)]
     pub rollover_info: BTreeMap<String, Value>,
+    /// ES's `data_stream_lifecycle` index metadata custom: `dlm_freeze_with`
+    /// names the repository a backing index is marked to be converted to a
+    /// frozen searchable snapshot with ([`super::frozen`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub data_stream_lifecycle: BTreeMap<String, String>,
 }
 
 pub fn load(node: &Node, svc: &IndexService) -> IndexLifecycle {
@@ -89,7 +101,7 @@ pub fn load(node: &Node, svc: &IndexService) -> IndexLifecycle {
 
 pub fn save(node: &Node, svc: &IndexService, lc: &IndexLifecycle) -> Result<()> {
     let old = node.ilm.exec.lock().insert(svc.uuid.clone(), lc.clone());
-    if old.is_none_or(|o| o.ilm != lc.ilm || o.rollover_info != lc.rollover_info) {
+    if old.is_none_or(|o| o.ilm != lc.ilm || o.rollover_info != lc.rollover_info || o.data_stream_lifecycle != lc.data_stream_lifecycle) {
         *node.ilm.exec_gen.lock().entry(svc.uuid.clone()).or_insert(0) += 1;
     }
     if !svc.path().exists() {
@@ -125,7 +137,17 @@ pub fn managed_by_ilm(node: &Node, svc: &IndexService) -> bool {
 }
 
 fn now() -> i64 {
+    #[cfg(test)]
+    if let Some(t) = TEST_NOW.with(|t| t.get()) {
+        return t;
+    }
     crate::date::now_millis()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test clock for time-gated steps.
+    static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 fn origination_or_lifecycle_date(svc: &IndexService, st: &ExecState) -> Option<i64> {
@@ -217,6 +239,8 @@ enum Outcome {
     SkipAction,
     /// The index was deleted (or replaced) by the step.
     Gone,
+    /// Branch: continue at this step of the same action.
+    Goto(&'static str),
 }
 
 fn retryable(step: &str) -> bool {
@@ -225,6 +249,10 @@ fn retryable(step: &str) -> bool {
         "check-rollover-ready" | "attempt-rollover" | "readonly" | "forcemerge" | "segment-count" | "shrink" | "delete" | "set_priority" | "update-settings" | "allocate"
             | "migrate" | "set-indexing-complete" | "update-rollover-lifecycle-date" | "wait-for-snapshot" | "set-single-node-allocation" | "aliases"
             | "close-index" | "open-index" | "generate-index-name" | "copy-execution-state"
+            | "pause-follower-index" | "close-follower-index" | "unfollow-follower-index" | "open-follower-index"
+            // searchable_snapshot (`isRetryable` in ES)
+            | "generate-snapshot-name" | "cleanup-snapshot" | "create-snapshot" | "mount-snapshot" | "copy-settings" | "swap-aliases"
+            | "clone" | "cleanup-generated-index" | "replace-datastream-backing-index" | "delete-force-merged-index"
     )
 }
 
@@ -312,6 +340,13 @@ fn java_date(millis: i64) -> String {
     crate::date::DateFormatter::new("EEE MMM dd HH:mm:ss 'UTC' yyyy").map(|f| f.format(millis, crate::date::Tz::UTC)).unwrap_or_else(|_| iso_date(millis))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the shrink alias step stops between persisting the
+    /// target's aliases and deleting the source (a process stop there).
+    static STOP_BEFORE_SOURCE_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn progress(p: super::StepProgress) -> Result<Outcome> {
     match p {
         super::StepProgress::Done => Ok(Outcome::Next),
@@ -321,7 +356,29 @@ fn progress(p: super::StepProgress) -> Result<Outcome> {
 }
 
 /// Before a shrink's source is deleted: the target holds its documents.
+/// The shrink target `target` must be the resize of exactly this source
+/// incarnation (`index.resize.source.uuid`): any other index under the
+/// name (a restored lifecycle state naming an old target, an unrelated
+/// index) is never adopted, deleted or swapped in.
+fn check_own_shrink_target(source: &IndexService, target: &IndexService) -> Result<()> {
+    let from = target.setting("index.resize.source.uuid").unwrap_or_default();
+    if from != source.uuid {
+        return Err(EsError::new(
+            500,
+            "illegal_state_exception",
+            format!(
+                "index [{}] ([{}]) exists but was not created by a resize of [{}] ([{}]; its resize source is [{from}]): it is neither reused nor deleted",
+                target.name, target.uuid, source.name, source.uuid
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn check_shrunk_docs(node: &Node, source: &str, target: &str) -> Result<Option<Outcome>> {
+    if let (Some(s), Some(t)) = (node.get_index(source), node.get_index(target)) {
+        check_own_shrink_target(&s, &t)?;
+    }
     let Some(steps) = node.ilm.cluster_steps() else { return Ok(None) };
     match progress(steps.holds_all_docs(source, target))? {
         Outcome::Next => Ok(None),
@@ -334,6 +391,11 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
     let cfg = &step.config;
     let name = svc.name.clone();
     let key = &step.key;
+    if key.action == "searchable_snapshot" {
+        if let Some(o) = searchable_snapshot_step(node, svc, lc, pname, step)? {
+            return Ok(Some(o));
+        }
+    }
     Ok(Some(match key.name.as_str() {
         "init" => {
             if lc.ilm.lifecycle_date.is_none() {
@@ -353,13 +415,41 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
             update_settings(svc, vec![("index.priority", v)])?;
             Outcome::Next
         }
-        "branch-check-unfollow-prerequisites" | "branch-freeze-check-prerequisites" | "branch-check-skip-action" | "branch-forcemerge-check-prerequisites" => {
-            if key.name == "branch-check-unfollow-prerequisites" {
-                Outcome::SkipAction
-            } else {
+        // ES `UnfollowAction`: only a CCR follower runs the action.
+        "branch-check-unfollow-prerequisites" => {
+            if svc.setting(crate::ccr::FOLLOWING_INDEX_SETTING).as_deref() == Some("true") {
                 Outcome::Next
+            } else {
+                Outcome::SkipAction
             }
         }
+        "branch-freeze-check-prerequisites" | "branch-check-skip-action" | "branch-forcemerge-check-prerequisites" => Outcome::Next,
+        // ES `WaitForIndexingCompleteStep`: the leader's rollover marks it
+        // complete (`index.lifecycle.indexing_complete`, replicated).
+        "wait-for-indexing-complete" => {
+            if !periodic {
+                return Ok(None);
+            }
+            if indexing_complete(svc) {
+                Outcome::Next
+            } else {
+                let current = svc.setting("index.lifecycle.indexing_complete").unwrap_or_else(|| "false".into());
+                Outcome::Wait(Some(json!({"message": format!("waiting for the [index.lifecycle.indexing_complete] setting to be set to true on the leader index, it is currently [{current}]"), "indexing_complete": false})))
+            }
+        }
+        "wait-for-follow-shard-tasks" if !periodic => return Ok(None),
+        "wait-for-follow-shard-tasks" | "pause-follower-index" | "close-follower-index" | "unfollow-follower-index" | "open-follower-index" => match node.ilm.cluster_steps() {
+            Some(steps) => progress(steps.unfollow_step(&name, &key.name))?,
+            None => match crate::ccr::ilm_unfollow_step(node, &name, &key.name)? {
+                None => Outcome::Next,
+                Some(info) => Outcome::Wait(Some(info)),
+            },
+        },
+        // ES `WaitForIndexColorStep` (yellow): every primary active.
+        "wait-for-yellow-step" => match node.ilm.cluster_steps() {
+            Some(steps) => progress(steps.primaries_active(&name))?,
+            None => Outcome::Next,
+        },
         "check-rollover-ready" => {
             if !periodic {
                 return Ok(None);
@@ -409,7 +499,7 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
                 return Ok(Some(Outcome::Next));
             }
             node.rollover(&target, None, &json!({}), false)?;
-            *lc = IndexLifecycle { ilm: lc.ilm.clone(), rollover_info: load(node, svc).rollover_info };
+            *lc = { let stored = load(node, svc); IndexLifecycle { ilm: lc.ilm.clone(), rollover_info: stored.rollover_info, data_stream_lifecycle: stored.data_stream_lifecycle } };
             Outcome::Next
         }
         // On a cluster these wait for the copies (the shrink needs one copy
@@ -434,7 +524,24 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
             let target = lc.ilm.shrink_index_name.clone().unwrap_or_default();
             progress(node.ilm.cluster_steps().expect("checked").primaries_active(&target))?
         }
-        "wait-for-active-shards" | "check-ts-end-time-passed" | "wait-for-shard-history-leases" | "cleanup-shrink-index" | "check-shrink-allocation"
+        // ES `WaitUntilTimeSeriesEndTimePassesStep`: a time series
+        // backing index that is not the write index waits until its
+        // `index.time_series.end_time` lapses: it still takes writes until
+        // then (production review #495: readonly, force merge, shrink and
+        // delete went ahead and blocked the stream's current interval).
+        "check-ts-end-time-passed" => {
+            let ts = node.data_stream_of_index(&name).and_then(|ds| node.data_stream(&ds)).filter(|d| d.write_index() != name).is_some()
+                && svc.setting("index.mode").as_deref() == Some("time_series");
+            let end = svc.setting("index.time_series.end_time").and_then(|e| crate::date::DateFormatter::new("strict_date_optional_time||epoch_millis").ok()?.parse(&e).ok());
+            match end {
+                Some(end) if ts && now() < end => Outcome::Wait(Some(json!({"message": format!(
+                    "The [index.time_series.end_time] setting for index [{name}] is [{end}]. Waiting until the index's time series end time lapses before proceeding with action [{}] as the index can still accept writes.",
+                    key.action
+                )}))),
+                _ => Outcome::Next,
+            }
+        }
+        "wait-for-active-shards" | "wait-for-shard-history-leases" | "cleanup-shrink-index" | "check-shrink-allocation"
         | "shrunk-shards-allocated" | "wait-for-index-color" | "is-shrunken-index" | "freeze" => Outcome::Next,
         "update-rollover-lifecycle-date" => {
             let (target, _) = rollover_target(node, svc).unwrap_or_default();
@@ -509,9 +616,6 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
             }
         }
         "branch-check-prerequisites" => {
-            if key.action == "searchable_snapshot" {
-                return Ok(Some(Outcome::SkipAction));
-            }
             // shrink: skip when the index already has the target shard count
             let src = logical_shards(svc);
             let target = shrink_target_shards(svc, cfg);
@@ -554,6 +658,11 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
             // On a cluster the step waits for the whole resize (the target
             // exists before its documents are copied).
             let cluster = node.ilm.cluster_steps().is_some();
+            if !cluster {
+                if let Some(t) = node.get_index(&target) {
+                    check_own_shrink_target(svc, &t)?;
+                }
+            }
             if cluster || node.get_index(&target).is_none() {
                 let shards = shrink_target_shards(svc, cfg);
                 let mut settings = json!({
@@ -623,8 +732,17 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
                 aliases.insert(a, def);
             }
             aliases.insert(name.clone(), json!({}));
-            node.delete_index(&name)?;
+            // The target's aliases are durable before the source goes (ES
+            // `SwapAliasesAndDeleteSourceIndexStep` does both in one
+            // request): stopping in between leaves the source in place
+            // with its own lifecycle step to redo, never a deleted source
+            // whose aliases were only in memory (production review #496).
             tsvc.set_aliases(aliases)?;
+            #[cfg(test)]
+            if STOP_BEFORE_SOURCE_DELETE.with(|s| s.get()) {
+                return Err(EsError::new(500, "exception", "stopped before the source deletion (test)"));
+            }
+            node.delete_index(&name)?;
             Outcome::Gone
         }
         "allocate" => {
@@ -646,6 +764,22 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
             svc.put_settings(flat, false)?;
             Outcome::Next
         }
+        // On a cluster: the routing table, against the allocation filters
+        // and tier preference (ES `AllocationRoutedStep` /
+        // `DataTierMigrationRoutedStep`).
+        "check-allocation" | "check-migration" if node.ilm.cluster_steps().is_some() => {
+            let steps = node.ilm.cluster_steps().expect("checked");
+            let settings: BTreeMap<String, String> = svc
+                .meta()
+                .settings
+                .iter()
+                .filter(|(k, _)| k.starts_with("index.routing.allocation.") || k.as_str() == "index.number_of_replicas")
+                .filter_map(|(k, v)| Some((k.clone(), super::setting_string(v)?)))
+                .collect();
+            progress(steps.allocation_routed(&name, &settings, key.name == "check-migration"))?
+        }
+        // A standalone node holds every primary and no replica: a replica
+        // is never allocated (the index stays yellow, as on a one-node ES).
         "check-allocation" | "check-migration" => match replicas_wait_info(svc) {
             Some(info) => Outcome::Wait(Some(info)),
             None => Outcome::Next,
@@ -671,16 +805,38 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
                 return Ok(None);
             }
             let p = cfg["policy"].as_str().unwrap_or_default().to_string();
-            let slm = node.ilm.st.read().slm.get(&p).cloned();
-            match slm {
+            // `WaitForSnapshotStep`: the policy's last success, from the
+            // authoritative SLM metadata, started at or after this action;
+            // that snapshot must still exist in the policy's repository,
+            // have succeeded and include this index. A success covering
+            // other indices only (or since deleted) fails the step with
+            // ES's reason (ERROR, retried on later passes): the index is
+            // never deleted unbacked.
+            match node.ilm.slm_last_success(&p) {
                 None => return Err(EsError::new(500, "illegal_state_exception", format!("configured policy '{p}' not found"))),
-                Some(sp) => {
+                Some(last) => {
                     let since = lc.ilm.action_time.unwrap_or_else(now);
-                    let done = sp.last_success.as_ref().and_then(|s| s["start_time"].as_i64()).map(|t| t > since).unwrap_or(false);
-                    if done {
-                        Outcome::Next
-                    } else {
-                        Outcome::Wait(Some(json!({"message": format!("waiting for policy '{p}' to be executed since {}", java_date(since))})))
+                    match last.filter(|s| s.start_time >= since) {
+                        None => Outcome::Wait(Some(json!({"message": format!("waiting for policy '{p}' to be executed since {}", java_date(since))}))),
+                        Some(s) => {
+                            let verdict = match node.ilm.cluster_steps() {
+                                Some(steps) => steps.snapshot_includes(&p, &s.repository, &s.snapshot_name, &name),
+                                None => {
+                                    let listing = node.snapshots.get_snapshots(&s.repository, &s.snapshot_name, false).unwrap_or_default();
+                                    match super::verify_snapshot_listing(&listing, &p, &s.repository, &s.snapshot_name, &name) {
+                                        Ok(()) => super::StepProgress::Done,
+                                        Err(reason) => super::StepProgress::Failed(reason),
+                                    }
+                                }
+                            };
+                            match verdict {
+                                super::StepProgress::Done => Outcome::Next,
+                                super::StepProgress::Pending(info) => Outcome::Wait(info),
+                                // ES `WaitForSnapshotStep`: the step fails (ERROR,
+                                // automatically retried), never advancing to the delete.
+                                super::StepProgress::Failed(reason) => return Err(EsError::new(500, "illegal_state_exception", reason)),
+                            }
+                        }
                     }
                 }
             }
@@ -695,6 +851,278 @@ fn exec_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pnam
             Outcome::Gone
         }
         _ => Outcome::Next,
+    }))
+}
+
+/// ES `Strings.stripDisallowedChars`: the characters a snapshot name may
+/// not hold (`\ / * ? " < > |`, space, `,`, `#`) removed.
+fn strip_disallowed_chars(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' | ',' | '#')).collect()
+}
+
+/// ES `SearchableSnapshotAction`'s steps (9.5.5 `toSteps`), on the shared
+/// snapshot primitives ([`super::snapshot_steps`]): `None` for the steps it
+/// shares with other actions (`check-not-write-index`,
+/// `wait-for-shard-history-leases`, `check-ts-end-time-passed`,
+/// `readonly`). The mounted index is `restored-{index}` (`partial-{index}`
+/// with `storage=shared_cache` in the frozen phase); it takes over the
+/// lifecycle (`copy-execution-state` / `copy-settings`) and the original's
+/// place (aliases or data stream) before the original is deleted.
+fn searchable_snapshot_step(node: &Node, svc: &Arc<IndexService>, lc: &mut IndexLifecycle, pname: &str, step: &Step) -> Result<Option<Outcome>> {
+    use super::snapshot_steps as ss;
+    let cfg = &step.config;
+    let key = &step.key;
+    let name = svc.name.clone();
+    let repository = cfg["snapshot_repository"].as_str().unwrap_or("").to_string();
+    let frozen = key.phase == "frozen";
+    let mounted = format!("{}{name}", if frozen { "partial-" } else { "restored-" });
+    // The index that is force-merged and snapshotted: the clone when there is one.
+    let merged = lc.ilm.force_merge_clone_index_name.clone().filter(|c| node.get_index(c).is_some()).unwrap_or_else(|| name.clone());
+    let fail = |m: String| EsError::new(500, "illegal_state_exception", m);
+    Ok(Some(match key.name.as_str() {
+        "branch-check-prerequisites" => {
+            // Already a searchable snapshot of this repository and storage
+            // type: the action is skipped.
+            if crate::snapshot::is_searchable_snapshot(svc)
+                && svc.setting("index.store.snapshot.repository_name").as_deref() == Some(repository.as_str())
+                && crate::snapshot::is_partial_snapshot(svc) == frozen
+            {
+                Outcome::SkipAction
+            } else {
+                Outcome::Next
+            }
+        }
+        "branch-check-existing-snapshot" => {
+            let existing = match (&lc.ilm.snapshot_name, crate::snapshot::is_searchable_snapshot(svc)) {
+                (Some(_), _) => Some(lc.ilm.snapshot_repository.clone().unwrap_or_default()),
+                (None, true) => svc.setting("index.store.snapshot.repository_name"),
+                (None, false) => None,
+            };
+            match existing {
+                None => Outcome::Next,
+                Some(r) if r != repository => {
+                    return Err(EsError::illegal_argument("searchable snapshot indices may be converted only within the same repository"));
+                }
+                Some(_) => Outcome::Goto("wait-for-data-tier"),
+            }
+        }
+        "branch-skip-clone-check" => {
+            if svc.setting("index.number_of_replicas").and_then(|r| r.parse::<u32>().ok()).unwrap_or(1) == 0 {
+                Outcome::Goto("forcemerge")
+            } else {
+                Outcome::Next
+            }
+        }
+        "cleanup-generated-index" => {
+            // A clone a previous attempt left (its resize source is this
+            // index) is deleted before cloning again.
+            if let Some(clone) = &lc.ilm.force_merge_clone_index_name {
+                if let Some(c) = node.get_index(clone) {
+                    if c.setting("index.resize.source.name").as_deref() == Some(name.as_str()) {
+                        drop(c);
+                        node.delete_index(clone)?;
+                    }
+                }
+            }
+            Outcome::Next
+        }
+        "generate-index-name" => {
+            if lc.ilm.force_merge_clone_index_name.is_none() {
+                lc.ilm.force_merge_clone_index_name = Some(format!("fm-clone-{}-{name}", random_alpha(4)));
+            }
+            Outcome::Next
+        }
+        "clone" => {
+            let clone = lc.ilm.force_merge_clone_index_name.clone().ok_or_else(|| fail(format!("no force merge clone name was generated for index [{name}]")))?;
+            progress(ss::clone_index(node, &name, &clone, &json!({"index.number_of_replicas": 0, "index.auto_expand_replicas": null})))?
+        }
+        "wait-for-index-color-cloned-index" => {
+            let clone = lc.ilm.force_merge_clone_index_name.clone().unwrap_or_default();
+            progress(ss::primaries_active(node, &clone))?
+        }
+        "forcemerge" => progress(ss::force_merge(node, &merged, 1))?,
+        "segment-count" => match node.ilm.cluster_steps() {
+            Some(_) => Outcome::Next,
+            None => {
+                let target = node.get_index(&merged).ok_or_else(|| EsError::index_not_found(&merged))?;
+                let segs = target.local_shards().iter().map(|s| s.shard.core.read().num_segments()).max().unwrap_or(0);
+                if segs <= 1 {
+                    Outcome::Next
+                } else {
+                    Outcome::Wait(Some(json!({"message": "Waiting for at least [1] shards to force merge", "shards_left_to_merge": 1})))
+                }
+            }
+        },
+        "generate-snapshot-name" => {
+            if ss::repository_readonly(node, &repository).is_none() {
+                return Err(fail(format!(
+                    "repository [{repository}] is missing. [{pname}] policy for index [{name}] cannot continue until the repository is created or the policy is changed"
+                )));
+            }
+            lc.ilm.snapshot_index_name = Some(merged.clone());
+            lc.ilm.snapshot_repository = Some(repository.clone());
+            if lc.ilm.snapshot_name.is_none() {
+                // GenerateSnapshotNameStep: `<{now/d}-{index}-{policy}>`, lowercased, plus a uuid.
+                let prefix = format!("<{{now/d}}-{name}-{}>", strip_disallowed_chars(pname)).to_lowercase();
+                let base = crate::node::resolve_date_math(&prefix).unwrap_or(prefix);
+                lc.ilm.snapshot_name = Some(format!("{base}-{}", crate::index::new_uuid().to_lowercase()));
+            }
+            Outcome::Next
+        }
+        "cleanup-snapshot" => match (&lc.ilm.snapshot_repository, &lc.ilm.snapshot_name) {
+            (Some(r), Some(n)) if !r.is_empty() && !n.is_empty() => {
+                if ss::repository_readonly(node, r).is_none() {
+                    return Err(fail(format!("repository [{r}] is missing. [{pname}] policy for index [{name}] cannot continue until the repository is created")));
+                }
+                progress(ss::delete_snapshot(node, r, n))?
+            }
+            _ => Outcome::Next,
+        },
+        "create-snapshot" => {
+            let r = lc.ilm.snapshot_repository.clone().filter(|r| !r.is_empty()).ok_or_else(|| fail(format!("snapshot repository is not present for policy [{pname}] and index [{name}]")))?;
+            let n = lc.ilm.snapshot_name.clone().filter(|n| !n.is_empty()).ok_or_else(|| fail(format!("snapshot name was not generated for policy [{pname}] and index [{name}]")))?;
+            let target = lc.ilm.snapshot_index_name.clone().unwrap_or_else(|| merged.clone());
+            progress(ss::snapshot_index(node, &r, &n, &target, &Value::Null))?
+        }
+        // Standalone nodes hold every tier; a cluster's allocation places
+        // the mounted copies by their tier preference.
+        "wait-for-data-tier" => Outcome::Next,
+        "mount-snapshot" => {
+            if node.get_index(&mounted).is_some() {
+                Outcome::Next
+            } else {
+                let (r, n) = if crate::snapshot::is_searchable_snapshot(svc) && lc.ilm.snapshot_name.is_none() {
+                    (svc.setting("index.store.snapshot.repository_name").unwrap_or_default(), svc.setting("index.store.snapshot.snapshot_name").unwrap_or_default())
+                } else {
+                    (
+                        lc.ilm.snapshot_repository.clone().filter(|r| !r.is_empty()).ok_or_else(|| fail(format!("snapshot repository is not present for policy [{pname}] and index [{name}]")))?,
+                        lc.ilm.snapshot_name.clone().filter(|n| !n.is_empty()).ok_or_else(|| fail(format!("snapshot name was not generated for policy [{pname}] and index [{name}]")))?,
+                    )
+                };
+                let in_snapshot = lc.ilm.snapshot_index_name.clone().or_else(|| svc.setting("index.store.snapshot.index_name")).unwrap_or_else(|| name.clone());
+                let mut settings = Map::new();
+                if key.phase == "hot" {
+                    settings.insert("index.routing.allocation.include._tier_preference".into(), json!("data_hot"));
+                }
+                if let Some(t) = cfg.get("total_shards_per_node").filter(|v| !v.is_null()) {
+                    settings.insert("index.routing.allocation.total_shards_per_node".into(), json!(t.to_string()));
+                }
+                if cfg.get("replicate_for").is_some_and(|v| !v.is_null()) {
+                    settings.insert("index.number_of_replicas".into(), json!(1));
+                }
+                let mut ignore = vec!["index.lifecycle.name"];
+                if frozen && cfg.get("total_shards_per_node").is_none_or(Value::is_null) {
+                    ignore.push("index.routing.allocation.total_shards_per_node");
+                }
+                progress(ss::mount_snapshot(node, &r, &n, &in_snapshot, &mounted, &settings, &ignore, frozen))?
+            }
+        }
+        "wait-for-index-color" => progress(ss::primaries_active(node, &mounted))?,
+        "copy-execution-state" => {
+            // The mounted index continues the policy where the action ends
+            // (or at the replicate_for wait).
+            let tsvc = node.get_index(&mounted).ok_or_else(|| {
+                fail(format!("unable to copy execution state from [{name}] to [{mounted}] as target index does not exist"))
+            })?;
+            let pm = node.ilm.policy(pname).ok_or_else(|| EsError::illegal_argument(format!("policy [{pname}] does not exist")))?;
+            let all = steps_of(&lc.ilm, &pm, &key.phase);
+            let next = if cfg.get("replicate_for").is_some_and(|v| !v.is_null()) {
+                Some(StepKey::new(&key.phase, &key.action, "check-replicate-for-time-passed"))
+            } else {
+                let i = all.iter().position(|s| s.key == *key).unwrap_or(0);
+                all[i..].iter().find(|s| s.key.action != key.action).map(|s| s.key.clone())
+            };
+            let mut tlc = load(node, &tsvc);
+            let mut st = lc.ilm.clone();
+            if let Some(n) = next {
+                st.phase = Some(n.phase);
+                st.action = Some(n.action);
+                st.step = Some(n.name);
+            }
+            st.step_time = Some(now());
+            tlc.ilm = st;
+            save(node, &tsvc, &tlc)?;
+            if tsvc.setting("index.lifecycle.skip").is_some() {
+                update_settings(&tsvc, vec![("index.lifecycle.skip", Value::Null)])?;
+            }
+            Outcome::Next
+        }
+        "copy-settings" => {
+            let tsvc = node.get_index(&mounted).ok_or_else(|| {
+                fail(format!("index [{mounted}] is being referenced by ILM action [{}] on step [{}] but it doesn't exist", key.action, key.name))
+            })?;
+            update_settings(&tsvc, vec![("index.lifecycle.name", json!(pname))])?;
+            if cfg["force_merge_index"].as_bool() != Some(false) {
+                Outcome::Goto("branch-delete-force-merged-index")
+            } else {
+                Outcome::Goto("branch-on-datastream-check")
+            }
+        }
+        // Only the mounted index runs these (its copied state starts here).
+        "check-replicate-for-time-passed" => {
+            let wait = cfg["replicate_for"].as_str().and_then(super::parse_time_millis).unwrap_or(0);
+            let since = lc.ilm.action_time.unwrap_or_else(now);
+            if now() >= since + wait {
+                Outcome::Next
+            } else {
+                Outcome::Wait(Some(json!({"message": format!("Waiting [{}] until the replicate_for time [{}] has elapsed for index [{name}] before removing replicas.", super::human_time(since + wait - now()), cfg["replicate_for"].as_str().unwrap_or(""))})))
+            }
+        }
+        "update-settings" => {
+            update_settings(svc, vec![("index.number_of_replicas", json!("0"))])?;
+            Outcome::SkipAction
+        }
+        "branch-delete-force-merged-index" => match &lc.ilm.force_merge_clone_index_name {
+            Some(c) if node.get_index(c).is_some() => Outcome::Next,
+            _ => Outcome::Goto("branch-on-datastream-check"),
+        },
+        "delete-force-merged-index" => {
+            if let Some(c) = lc.ilm.force_merge_clone_index_name.clone() {
+                if node.get_index(&c).is_some() {
+                    node.delete_index(&c)?;
+                }
+            }
+            Outcome::Next
+        }
+        "branch-on-datastream-check" => {
+            if node.data_stream_of_index(&name).is_some() {
+                Outcome::Goto("replace-datastream-backing-index")
+            } else {
+                Outcome::Goto("swap-aliases")
+            }
+        }
+        "replace-datastream-backing-index" => {
+            let ds = node.data_stream_of_index(&name).ok_or_else(|| fail(format!("index [{name}] is not part of a data stream")))?;
+            if node.get_index(&mounted).is_none() {
+                return Err(fail(format!("target index [{mounted}] doesn't exist. stopping execution of lifecycle [{pname}] for index [{name}]")));
+            }
+            super::dlm::replace_backing_index(node, &ds, &name, &mounted)?;
+            Outcome::Next
+        }
+        "delete" => {
+            node.delete_index(&name)?;
+            Outcome::Gone
+        }
+        "swap-aliases" => {
+            // SwapAliasesAndDeleteSourceIndexStep: the original's aliases
+            // (without is_write_index) and an alias of its name move to the
+            // mounted index, then the original is deleted.
+            let tsvc = node.get_index(&mounted).ok_or_else(|| {
+                fail(format!("target index [{mounted}] doesn't exist. stopping execution of lifecycle [{pname}] for index [{name}]"))
+            })?;
+            let mut aliases = tsvc.aliases();
+            for (a, mut def) in svc.aliases() {
+                if let Some(o) = def.as_object_mut() {
+                    o.remove("is_write_index");
+                }
+                aliases.insert(a, def);
+            }
+            aliases.insert(name.clone(), json!({}));
+            tsvc.set_aliases(aliases)?;
+            node.delete_index(&name)?;
+            Outcome::Gone
+        }
+        _ => return Ok(None),
     }))
 }
 
@@ -738,14 +1166,36 @@ fn parse_origination_date(name: &str) -> Result<i64> {
 /// Run the lifecycle of one index. `periodic` also evaluates async wait
 /// steps (`indices.lifecycle.poll_interval`).
 pub fn run_index(node: &Node, svc: &Arc<IndexService>, periodic: bool, history: &mut Vec<Value>) {
+    run_index_in(node, svc, periodic, history, false)
+}
+
+/// The unsafe action an index is inside while ILM is STOPPING (it must
+/// finish before ILM can stop: ES `IndexLifecycleService` keeps running
+/// it, #596).
+fn in_unsafe_action(st: &ExecState) -> bool {
+    st.action.as_deref() == Some("shrink") && st.step.as_deref() != Some("ERROR")
+}
+
+/// [`run_index`]; `stopping`: ILM is STOPPING, so only the steps of an
+/// unsafe action already under way run, up to its end.
+fn run_index_in(node: &Node, svc: &Arc<IndexService>, periodic: bool, history: &mut Vec<Value>, stopping: bool) {
     let pname = match policy_name(svc) {
         Some(p) => p,
         None => return,
     };
-    if !svc.is_open() || !managed_by_ilm(node, svc) {
+    if !managed_by_ilm(node, svc) {
         return;
     }
     let mut lc = load(node, svc);
+    // A closed index runs only inside `unfollow` (which closes the follower
+    // itself and reopens it, as ES runs those steps on the closed index), or
+    // while ILM itself holds it closed: the force-merge codec change's
+    // close-index / update-settings / open-index sequence (or its ERROR
+    // step), so an interruption between close and reopen resumes instead of
+    // stranding the index closed (#574).
+    if !svc.is_open() && lc.ilm.action.as_deref() != Some("unfollow") && !ilm_closed(&lc.ilm) {
+        return;
+    }
     let pm = match node.ilm.policy(&pname) {
         Some(p) => p,
         None => {
@@ -782,6 +1232,9 @@ pub fn run_index(node: &Node, svc: &Arc<IndexService>, periodic: bool, history: 
             Some(k) => k,
             None => break,
         };
+        if stopping && !in_unsafe_action(&lc.ilm) {
+            break;
+        }
         if key.name == "ERROR" {
             let auto = lc.ilm.is_auto_retryable_error == Some(true);
             if periodic && auto {
@@ -863,6 +1316,15 @@ pub fn run_index(node: &Node, svc: &Arc<IndexService>, periodic: bool, history: 
                         gone = true;
                         break;
                     }
+                    Ok(Some(Outcome::Goto(target))) => {
+                        match steps.iter().find(|s| s.key.action == key.action && s.key.name == target).map(|s| s.key.clone()) {
+                            Some(n) => {
+                                move_to(&mut lc.ilm, &pm, &pname, &n, false, true);
+                                history.push(history_item(svc, &pname, &lc.ilm, None));
+                            }
+                            None => break,
+                        }
+                    }
                     Err(e) => {
                         move_to_error(&mut lc.ilm, &pm, &pname, &key, &e);
                         history.push(history_item(svc, &pname, &lc.ilm, Some(&e)));
@@ -880,6 +1342,14 @@ pub fn run_index(node: &Node, svc: &Arc<IndexService>, periodic: bool, history: 
     if lc.ilm != before || !svc.path().join(LIFECYCLE_FILE).exists() {
         let _ = save(node, svc, &lc);
     }
+}
+
+/// The index's lifecycle is inside the steps that hold it closed (the
+/// force-merge codec change between `close-index` and `open-index`).
+fn ilm_closed(st: &ExecState) -> bool {
+    let Some(key) = st.key() else { return false };
+    let step = if key.name == "ERROR" { st.failed_step.clone().unwrap_or_default() } else { key.name.clone() };
+    key.action == "forcemerge" && matches!(step.as_str(), "close-index" | "update-settings" | "open-index")
 }
 
 fn move_to_error(st: &mut ExecState, pm: &PolicyMeta, pname: &str, key: &StepKey, e: &EsError) {
@@ -927,11 +1397,16 @@ pub fn run_all(node: &Node, periodic: bool) {
     let _g = node.ilm.run_lock.lock();
     let mode = node.ilm.mode();
     if mode == STOPPING {
-        // Safe to stop once no index is inside an unsafe action (shrink).
-        let unsafe_any = node.all_indices().iter().any(|s| {
-            let lc = load(node, s);
-            lc.ilm.action.as_deref() == Some("shrink") && lc.ilm.step.as_deref() != Some("ERROR")
-        });
+        // An unsafe action under way (shrink) keeps running to its end;
+        // ILM is stopped once no index is inside one.
+        let mut history = Vec::new();
+        for svc in node.all_indices() {
+            if policy_name(&svc).is_some() && in_unsafe_action(&load(node, &svc).ilm) {
+                run_index_in(node, &svc, periodic, &mut history, true);
+            }
+        }
+        write_history(node, history);
+        let unsafe_any = node.all_indices().iter().any(|s| in_unsafe_action(&load(node, s).ilm));
         if !unsafe_any {
             node.ilm.st.write().mode = STOPPED.into();
             let _ = node.ilm.persist();
@@ -1074,7 +1549,14 @@ fn write_history(node: &Node, items: Vec<Value>) {
 
 /// `GET /{index}/_ilm/explain`.
 pub fn explain(node: &Node, expr: &str, opts: ResolveOpts, only_managed: bool, only_errors: bool) -> Result<Value> {
-    let targets = node.resolve(expr, opts)?;
+    // ES `ExplainLifecycleRequest` (`strictExpandOpen`): a closed index
+    // named explicitly is explained (lifecycle steps run on closed
+    // indices, e.g. `unfollow`); wildcards expand to open indices only.
+    let explicit_closed = !expr.contains(['*', '?']) && !expr.split(',').any(|p| p.trim().starts_with('-'));
+    let targets = match node.resolve(expr, opts) {
+        Err(e) if e.kind == "index_closed_exception" && explicit_closed => node.resolve(expr, ResolveOpts { expand_closed: true, ..opts })?,
+        other => other?,
+    };
     let names: Vec<String> = targets.iter().map(|t| t.svc.name.clone()).collect();
     // A host that drives lifecycle runs steps only in its own passes:
     // explain is a read (on a cluster, a step run here would change an
@@ -1156,6 +1638,9 @@ fn explain_index(node: &Node, svc: &IndexService, only_managed: bool, only_error
     }
     if let Some(s) = &st.shrink_index_name {
         m.insert("shrink_index_name".into(), json!(s));
+    }
+    if let Some(s) = &st.force_merge_clone_index_name {
+        m.insert("force_merge_clone_index_name".into(), json!(s));
     }
     if let Some(i) = st.step_info.as_ref().filter(|i| !i.is_null()) {
         m.insert("step_info".into(), i.clone());
@@ -1457,4 +1942,447 @@ mod tests {
         assert_eq!(keys[0], "{\"phase\":\"warm\",\"action\":\"migrate\",\"name\":\"branch-check-skip-action\"}");
         assert_eq!(svc.setting("index.blocks.write").as_deref(), Some("true"));
     }
+
+    /// A `searchable_snapshot` action whose repository is missing stops in
+    /// ERROR at `generate-snapshot-name` (ES's message): the index is never
+    /// deleted as if it had been snapshotted and mounted.
+    #[test]
+    fn searchable_snapshot_without_its_repository_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.ilm.drive_externally();
+        let p = policy::parse_put_body(&json!({"policy": {"phases": {
+            "cold": {"min_age": "0ms", "actions": {"searchable_snapshot": {"snapshot_repository": "repo"}}},
+            "delete": {"min_age": "0ms", "actions": {"delete": {"delete_searchable_snapshot": false}}}}}}))
+        .unwrap();
+        node.ilm.put_policy(&node, "ss", p).unwrap();
+        node.create_index("archived", &json!({"settings": {"index.lifecycle.name": "ss", "index.number_of_replicas": 0}})).unwrap();
+        for _ in 0..5 {
+            run_all(&node, true);
+        }
+        let svc = node.get_index("archived").expect("the index is never deleted");
+        let st = load(&node, &svc).ilm;
+        assert_eq!((st.phase.as_deref(), st.action.as_deref(), st.step.as_deref()), (Some("cold"), Some("searchable_snapshot"), Some("ERROR")), "{st:?}");
+        assert_eq!(st.failed_step.as_deref(), Some("generate-snapshot-name"));
+        assert!(st.step_info.as_ref().unwrap()["reason"].as_str().unwrap().contains("repository [repo] is missing"), "{st:?}");
+    }
+
+    fn ss_node(tmp: &std::path::Path, backups: &std::path::Path, phases: Value) -> std::sync::Arc<Node> {
+        let node = Node::open(tmp).unwrap();
+        node.ilm.drive_externally();
+        node.snapshots.put_repository("repo", &json!({"type": "fs", "settings": {"location": backups.to_string_lossy()}})).unwrap();
+        let p = policy::parse_put_body(&json!({"policy": {"phases": phases}})).unwrap();
+        node.ilm.put_policy(&node, "ss-policy", p).unwrap();
+        node
+    }
+
+    fn fill(node: &Node, index: &str, n: usize) {
+        let svc = node.get_index(index).unwrap();
+        let w: Vec<_> = (0..n).map(|i| crate::index::WriteReq::Index { id: Some(format!("d{i}")), source: json!({"n": i}).to_string(), routing: None, cond: Default::default() }).collect();
+        for (i, r) in svc.write(w, false).into_iter().enumerate() {
+            r.unwrap();
+            if i % 3 == 0 {
+                svc.refresh().unwrap();
+            }
+        }
+        svc.refresh().unwrap();
+    }
+
+    fn count(node: &Node, target: &str) -> u64 {
+        let r = crate::ml::search(node, target, &json!({"size": 0, "track_total_hits": true})).unwrap();
+        r["hits"]["total"]["value"].as_u64().unwrap()
+    }
+
+    /// ES 9.5.5 `SearchableSnapshotAction` (cold, an index with replicas):
+    /// clone without replicas, force-merge the clone, snapshot it as
+    /// `<now/d>-{index}-{policy}-{uuid}`, mount it fully as
+    /// `restored-{index}`, move the lifecycle and the aliases (plus the
+    /// original's name) to it, delete the clone and the original.
+    #[test]
+    fn searchable_snapshot_action_mounts_and_swaps() {
+        let (tmp, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let node = ss_node(tmp.path(), backups.path(), json!({
+            "cold": {"min_age": "0ms", "actions": {"searchable_snapshot": {"snapshot_repository": "repo"}}}}));
+        node.create_index("logs-1", &json!({"settings": {"index.lifecycle.name": "ss-policy", "index.number_of_replicas": 1}, "aliases": {"logs": {}}})).unwrap();
+        fill(&node, "logs-1", 10);
+        for _ in 0..10 {
+            run_all(&node, true);
+            if node.get_index("logs-1").is_none() {
+                break;
+            }
+        }
+        assert!(node.get_index("logs-1").is_none(), "the original is deleted");
+        let mounted = node.get_index("restored-logs-1").expect("the mounted index");
+        assert!(crate::snapshot::is_searchable_snapshot(&mounted));
+        assert!(!crate::snapshot::is_partial_snapshot(&mounted), "cold mounts a full copy");
+        assert_eq!(mounted.setting("index.lifecycle.name").as_deref(), Some("ss-policy"));
+        let snapshot = mounted.setting("index.store.snapshot.snapshot_name").unwrap();
+        let day = chrono::Utc::now().format("%Y.%m.%d").to_string();
+        assert!(snapshot.starts_with(&format!("{day}-logs-1-ss-policy-")), "{snapshot}");
+        // The clone was the snapshotted (and force-merged) index, then deleted.
+        let in_snapshot = mounted.setting("index.store.snapshot.index_name").unwrap();
+        assert!(in_snapshot.starts_with("fm-clone-") && in_snapshot.ends_with("-logs-1"), "{in_snapshot}");
+        assert!(node.get_index(&in_snapshot).is_none());
+        let aliases = mounted.aliases();
+        assert!(aliases.contains_key("logs") && aliases.contains_key("logs-1"), "{aliases:?}");
+        assert_eq!(count(&node, "logs"), 10);
+        assert_eq!(count(&node, "logs-1"), 10);
+        // The mounted index carries on with the lifecycle (cold phase done).
+        let st = load(&node, &mounted).ilm;
+        assert_eq!(st.snapshot_name.as_deref(), Some(snapshot.as_str()), "{st:?}");
+        assert_ne!(st.action.as_deref(), Some("searchable_snapshot"), "{st:?}");
+    }
+
+    /// The frozen phase mounts `partial-{index}` (`storage=shared_cache`);
+    /// with `force_merge_index: false` nothing is cloned or merged; a data
+    /// stream backing index is replaced in its stream.
+    #[test]
+    fn searchable_snapshot_action_frozen_data_stream() {
+        let (tmp, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let node = ss_node(tmp.path(), backups.path(), json!({
+            "hot": {"actions": {"rollover": {"max_docs": 1}}},
+            "frozen": {"min_age": "0ms", "actions": {"searchable_snapshot": {"snapshot_repository": "repo", "force_merge_index": false}}}}));
+        node.templates.write().index.insert("t".into(), json!({"index_patterns": ["metrics-*"], "data_stream": {}, "template": {
+            "settings": {"index.lifecycle.name": "ss-policy", "index.number_of_replicas": "0"}, "mappings": {"properties": {"@timestamp": {"type": "date"}}}}}));
+        node.create_data_stream("metrics-a").unwrap();
+        let first = node.data_stream("metrics-a").unwrap().write_index().to_string();
+        let svc = node.get_index(&first).unwrap();
+        for r in svc.write(vec![crate::index::WriteReq::Index { id: Some("1".into()), source: json!({"@timestamp": "2026-01-01T00:00:00Z"}).to_string(), routing: None, cond: Default::default() }], false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        drop(svc);
+        node.rollover("metrics-a", None, &json!({}), false).unwrap();
+        for _ in 0..10 {
+            run_all(&node, true);
+            if node.get_index(&first).is_none() {
+                break;
+            }
+        }
+        assert!(node.get_index(&first).is_none());
+        let mounted_name = format!("partial-{first}");
+        let mounted = node.get_index(&mounted_name).expect("partially mounted");
+        assert!(crate::snapshot::is_partial_snapshot(&mounted));
+        assert_eq!(mounted.setting("index.store.snapshot.index_name").as_deref(), Some(first.as_str()), "no clone without force merge");
+        let ds = node.data_stream("metrics-a").unwrap();
+        assert!(ds.indices.contains(&mounted_name) && !ds.indices.contains(&first), "{:?}", ds.indices);
+        assert_eq!(count(&node, "metrics-a"), 1);
+    }
+
+    /// `wait_for_snapshot` resolves the SLM policy and its last success from
+    /// the cluster's SLM metadata (the local catalog is not consulted once a
+    /// host replicates it): a success that started before the wait keeps
+    /// it waiting, one that started when the wait did releases it.
+    #[test]
+    fn wait_for_snapshot_reads_the_cluster_slm_metadata() {
+        use crate::ilm::{ClusterSlm, SlmSuccess};
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.ilm.drive_externally();
+        let cluster = |last: Option<SlmSuccess>| ClusterSlm { mode: "RUNNING".into(), policies: BTreeMap::from([("nightly".to_string(), last)]) };
+        node.ilm.restore_cluster_slm(cluster(None));
+        let body = |slm: &str| {
+            policy::parse_put_body(&json!({"policy": {"phases": {"delete": {"min_age": "0ms", "actions": {"wait_for_snapshot": {"policy": slm}, "delete": {}}}}}})).unwrap()
+        };
+        let e = node.ilm.put_policy(&node, "w-missing", body("missing")).unwrap_err();
+        assert!(e.reason.contains("no such snapshot lifecycle policy [missing]"), "{}", e.reason);
+        node.ilm.put_policy(&node, "w", body("nightly")).unwrap();
+        node.create_index("backed-up", &json!({"settings": {"index.lifecycle.name": "w", "index.number_of_replicas": 0}})).unwrap();
+        run_all(&node, true);
+        let svc = node.get_index("backed-up").unwrap();
+        let st = load(&node, &svc).ilm;
+        assert_eq!(st.step.as_deref(), Some("wait-for-snapshot"), "{st:?}");
+        assert!(st.step_info.as_ref().is_some_and(|i| i["message"].as_str().unwrap_or_default().starts_with("waiting for policy 'nightly' to be executed since")), "{st:?}");
+        let since = st.action_time.unwrap();
+        drop(svc);
+        node.ilm.restore_cluster_slm(cluster(Some(SlmSuccess { repository: "backup".into(), snapshot_name: "old".into(), start_time: since - 1 })));
+        run_all(&node, true);
+        let svc = node.get_index("backed-up").expect("a snapshot from before the wait does not release it");
+        assert_eq!(load(&node, &svc).ilm.step.as_deref(), Some("wait-for-snapshot"));
+        drop(svc);
+        let repo = tmp.path().join("repo");
+        node.snapshots.put_repository("backup", &json!({"type": "fs", "settings": {"location": repo.to_str().unwrap()}})).unwrap();
+        node.snapshots.create_snapshot(&node, "backup", "new", &json!({"indices": "backed-up"})).unwrap();
+        node.ilm.restore_cluster_slm(cluster(Some(SlmSuccess { repository: "backup".into(), snapshot_name: "new".into(), start_time: since })));
+        run_all(&node, true);
+        assert!(node.get_index("backed-up").is_none(), "the snapshot taken after the wait started releases it");
+        // A policy deleted from the cluster SLM metadata fails the step.
+        node.ilm.restore_cluster_slm(ClusterSlm { mode: "RUNNING".into(), policies: BTreeMap::new() });
+        node.create_index("orphan", &json!({"settings": {"index.lifecycle.name": "w", "index.number_of_replicas": 0}})).unwrap();
+        run_all(&node, true);
+        let st = load(&node, &node.get_index("orphan").unwrap()).ilm;
+        assert_eq!((st.step.as_deref(), st.failed_step.as_deref()), (Some("ERROR"), Some("wait-for-snapshot")), "{st:?}");
+    }
+
+    /// `WaitForSnapshotStep` checks the policy's last successful snapshot
+    /// itself: a success that covers only another index, or one since
+    /// deleted from the repository, fails the step (retryable ERROR with
+    /// ES's reason) and the index is never deleted; a snapshot that exists,
+    /// succeeded and includes the index releases it.
+    #[test]
+    fn wait_for_snapshot_requires_the_snapshot_to_include_the_index() {
+        use crate::ilm::{ClusterSlm, SlmSuccess};
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.ilm.drive_externally();
+        let repo = tmp.path().join("repo");
+        node.snapshots.put_repository("backup", &json!({"type": "fs", "settings": {"location": repo.to_str().unwrap()}})).unwrap();
+        let cluster = |last: Option<SlmSuccess>| ClusterSlm { mode: "RUNNING".into(), policies: BTreeMap::from([("nightly".to_string(), last)]) };
+        let success = |snap: &str, start: i64| cluster(Some(SlmSuccess { repository: "backup".into(), snapshot_name: snap.into(), start_time: start }));
+        node.ilm.restore_cluster_slm(cluster(None));
+        let body = policy::parse_put_body(&json!({"policy": {"phases": {"delete": {"min_age": "0ms", "actions": {"wait_for_snapshot": {"policy": "nightly"}, "delete": {}}}}}})).unwrap();
+        node.ilm.put_policy(&node, "w", body).unwrap();
+        node.create_index("a", &json!({"settings": {"index.lifecycle.name": "w", "index.number_of_replicas": 0}})).unwrap();
+        node.create_index("b", &json!({"settings": {"index.number_of_replicas": 0}})).unwrap();
+        run_all(&node, true);
+        let since = load(&node, &node.get_index("a").unwrap()).ilm.action_time.unwrap();
+        // ES: the step fails into a retryable ERROR carrying the reason.
+        let waiting = |why: &str| {
+            let svc = node.get_index("a").expect("index [a] must not be deleted");
+            let st = load(&node, &svc).ilm;
+            assert_eq!((st.step.as_deref(), st.failed_step.as_deref()), (Some("ERROR"), Some("wait-for-snapshot")), "{st:?}");
+            assert_eq!(st.is_auto_retryable_error, Some(true), "{st:?}");
+            let info = st.step_info.clone().unwrap_or_default();
+            assert_eq!(info["type"], "illegal_state_exception", "{info}");
+            let msg = info["reason"].as_str().unwrap_or_default().to_string();
+            assert!(msg.contains(why), "step info {msg:?} should contain {why:?}");
+        };
+        // The policy's success after the wait started snapshotted [b] only.
+        node.snapshots.create_snapshot(&node, "backup", "snap-b", &json!({"indices": "b"})).unwrap();
+        node.ilm.restore_cluster_slm(success("snap-b", since));
+        run_all(&node, true);
+        waiting("the last successful snapshot of policy 'nightly' does not include index 'a'");
+        run_all(&node, true);
+        waiting("does not include index 'a'");
+        // A qualifying snapshot deleted from the repository releases nothing.
+        node.snapshots.create_snapshot(&node, "backup", "snap-a", &json!({"indices": "a"})).unwrap();
+        node.snapshots.delete_snapshots("backup", "snap-a").unwrap();
+        node.ilm.restore_cluster_slm(success("snap-a", since));
+        run_all(&node, true);
+        waiting("unexpected number of snapshots retrieved for repository 'backup' and snapshot 'snap-a' (expected 1, found 0)");
+        // A recorded success in another (unknown) repository neither.
+        node.ilm.restore_cluster_slm(cluster(Some(SlmSuccess { repository: "elsewhere".into(), snapshot_name: "snap-b".into(), start_time: since })));
+        run_all(&node, true);
+        waiting("expected 1, found 0");
+        // Positive control: an existing successful snapshot including [a].
+        node.snapshots.create_snapshot(&node, "backup", "snap-ab", &json!({"indices": "a,b"})).unwrap();
+        node.ilm.restore_cluster_slm(success("snap-ab", since));
+        run_all(&node, true);
+        assert!(node.get_index("a").is_none(), "a verified snapshot including [a] releases the delete");
+        assert!(node.get_index("b").is_some());
+    }
+
+    /// The listing check: one snapshot, `SUCCESS`, the index included.
+    #[test]
+    fn snapshot_listing_verdicts() {
+        use crate::ilm::verify_snapshot_listing as v;
+        let ok = json!({"snapshot": "s", "state": "SUCCESS", "indices": ["a", "b"]});
+        assert!(v(&[ok.clone()], "p", "r", "s", "a").is_ok());
+        assert!(v(&[], "p", "r", "s", "a").unwrap_err().contains("(expected 1, found 0)"));
+        assert!(v(&[ok.clone()], "p", "r", "s", "c").unwrap_err().contains("does not include index 'c'"));
+        let partial = json!({"snapshot": "s", "state": "PARTIAL", "indices": ["a"]});
+        assert!(v(&[partial], "p", "r", "s", "a").unwrap_err().contains("[PARTIAL]"));
+        let progress = json!({"snapshot": "s", "state": "IN_PROGRESS", "indices": ["a"]});
+        assert!(v(&[progress], "p", "r", "s", "a").is_err());
+    }
+
+    /// Review finding 128 (engine side): a shrink target is the source's
+    /// only if that source incarnation's resize created it; an unrelated
+    /// index under the name, or the resize of an earlier incarnation of the
+    /// source name, is refused before anything is adopted or deleted.
+    #[test]
+    fn shrink_targets_must_be_the_sources_own_resize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let blocked = json!({"settings": {"index.number_of_shards": 2, "index.number_of_replicas": 0, "index.blocks.write": true}});
+        node.create_index("src", &blocked).unwrap();
+        let body = json!({"settings": {"index.number_of_shards": 1}});
+        super::super::resize::resize(&node, "src", "own", super::super::resize::ResizeType::Shrink, &body).unwrap();
+        node.create_index("foreign", &json!({"settings": {"index.number_of_replicas": 0}})).unwrap();
+        let src = node.get_index("src").unwrap();
+        assert!(check_own_shrink_target(&src, &node.get_index("own").unwrap()).is_ok());
+        let e = check_own_shrink_target(&src, &node.get_index("foreign").unwrap()).unwrap_err();
+        assert!(e.reason.contains("was not created by a resize of [src]"), "{}", e.reason);
+        assert!(check_shrunk_docs(&node, "src", "foreign").is_err());
+        // A re-created source name is another incarnation: its old target is foreign.
+        drop(src);
+        node.delete_index("src").unwrap();
+        node.create_index("src", &blocked).unwrap();
+        assert!(check_own_shrink_target(&node.get_index("src").unwrap(), &node.get_index("own").unwrap()).is_err());
+        assert!(node.get_index("own").is_some() && node.get_index("foreign").is_some(), "nothing deleted");
+        // The conditioned delete removes only the incarnation it names.
+        let own = node.get_index("own").unwrap().uuid.clone();
+        assert_eq!(node.delete_index_if_uuid("foreign", &own).unwrap_err().status, 409);
+        assert!(node.get_index("foreign").is_some());
+        node.delete_index_if_uuid("own", &own).unwrap();
+        assert!(node.get_index("own").is_none());
+    }
+
+    /// Production review #496: a stop between the alias transfer and the
+    /// source deletion leaves every name resolvable after a restart, and
+    /// the redone step finishes the swap.
+    fn place_at(node: &Node, index: &str, policy: &str, key: StepKey) {
+        let svc = node.get_index(index).unwrap();
+        let pm = node.ilm.policy(policy).unwrap();
+        let mut lc = load(node, &svc);
+        move_to(&mut lc.ilm, &pm, policy, &key, true, false);
+        lc.ilm.lifecycle_date = Some(0);
+        save(node, &svc, &lc).unwrap();
+    }
+
+    /// #574: an index ILM closed for a codec change (interrupted before
+    /// open-index, here by a restart, or in ERROR at update-settings) is
+    /// resumed by ILM: reopened with the codec, its lifecycle moving on.
+    #[test]
+    fn ilm_resumes_its_own_closed_codec_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = policy::parse_put_body(&json!({"policy": {"phases": {"hot": {"actions": {"forcemerge": {"max_num_segments": 1, "index_codec": "best_compression"}}}}}})).unwrap();
+        {
+            let node = Node::open(tmp.path()).unwrap();
+            node.ilm.drive_externally();
+            node.ilm.put_policy(&node, "codec", p).unwrap();
+            node.create_index("c1", &json!({"settings": {"index.lifecycle.name": "codec", "index.number_of_replicas": 0}})).unwrap();
+            node.create_index("c2", &json!({"settings": {"index.lifecycle.name": "codec", "index.number_of_replicas": 0}})).unwrap();
+            // c1: closed by close-index, then the process stops before
+            // the state advanced (still at close-index), as a crash would.
+            place_at(&node, "c1", "codec", StepKey::new("hot", "forcemerge", "close-index"));
+            node.get_index("c1").unwrap().set_open(false).unwrap();
+            // c2: closed, then update-settings failed (ERROR).
+            let svc = node.get_index("c2").unwrap();
+            place_at(&node, "c2", "codec", StepKey::new("hot", "forcemerge", "update-settings"));
+            let pm = node.ilm.policy("codec").unwrap();
+            let mut lc = load(&node, &svc);
+            move_to_error(&mut lc.ilm, &pm, "codec", &StepKey::new("hot", "forcemerge", "update-settings"), &EsError::illegal_argument("transient"));
+            save(&node, &svc, &lc).unwrap();
+            svc.set_open(false).unwrap();
+        }
+        let node = Node::open(tmp.path()).unwrap();
+        node.ilm.drive_externally();
+        assert!(!node.get_index("c1").unwrap().is_open());
+        for _ in 0..5 {
+            run_all(&node, true);
+        }
+        for name in ["c1", "c2"] {
+            let svc = node.get_index(name).unwrap();
+            assert!(svc.is_open(), "{name} reopened by ILM");
+            assert_eq!(svc.setting("index.codec").as_deref(), Some("best_compression"), "{name}");
+            let st = load(&node, &svc).ilm;
+            assert!(!matches!(st.step.as_deref(), Some("close-index" | "update-settings" | "open-index" | "ERROR")), "{name}: {st:?}");
+        }
+        // A manually closed managed index elsewhere in its lifecycle is
+        // still left alone.
+        node.create_index("c3", &json!({"settings": {"index.lifecycle.name": "codec", "index.number_of_replicas": 0}})).unwrap();
+        place_at(&node, "c3", "codec", StepKey::new("hot", "forcemerge", "forcemerge"));
+        node.get_index("c3").unwrap().set_open(false).unwrap();
+        run_all(&node, true);
+        assert!(!node.get_index("c3").unwrap().is_open());
+    }
+
+    /// #596: ILM stopping while a shrink is under way keeps running the
+    /// shrink to its end, then reports STOPPED; no new action starts.
+    #[test]
+    fn stopping_finishes_a_shrink_then_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.ilm.drive_externally();
+        let p = policy::parse_put_body(&json!({"policy": {"phases": {"warm": {"actions": {"shrink": {"number_of_shards": 1}, "forcemerge": {"max_num_segments": 1}}}}}})).unwrap();
+        node.ilm.put_policy(&node, "sh", p).unwrap();
+        node.create_index("big", &json!({"settings": {"index.lifecycle.name": "sh", "index.number_of_shards": 2, "index.number_of_replicas": 0}})).unwrap();
+        place_at(&node, "big", "sh", StepKey::new("warm", "shrink", "check-not-write-index"));
+        node.ilm.set_mode(false).unwrap();
+        assert_eq!(node.ilm.mode(), STOPPING);
+        for _ in 0..10 {
+            run_all(&node, true);
+            if node.ilm.mode() == STOPPED {
+                break;
+            }
+        }
+        assert_eq!(node.ilm.mode(), STOPPED, "the shrink finished and ILM stopped");
+        let shrunk = node.all_indices().into_iter().find(|s| s.name.starts_with("shrink-")).expect("the shrunken index");
+        let st = load(&node, &shrunk).ilm;
+        assert_ne!(st.action.as_deref(), Some("shrink"), "{st:?}");
+        assert_ne!(st.step.as_deref(), Some("segment-count"), "no later action ran while stopping: {st:?}");
+    }
+
+    #[test]
+    fn shrink_alias_swap_survives_a_stop_before_the_source_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let node = Node::open(tmp.path()).unwrap();
+            node.ilm.drive_externally();
+            node.create_index("src", &json!({"settings": {"index.number_of_shards": 2, "index.number_of_replicas": 0}, "aliases": {"logs": {"filter": {"term": {"k": "a"}}, "routing": "r1"}}})).unwrap();
+            let src = node.get_index("src").unwrap();
+            src.write(vec![crate::index::WriteReq::Index { id: Some("1".into()), source: json!({"k": "a"}).to_string(), routing: Some("r1".into()), cond: Default::default() }], true);
+            update_settings(&src, vec![("index.blocks.write", json!("true"))]).unwrap();
+            super::super::resize::resize(&node, "src", "own", super::super::resize::ResizeType::Shrink, &json!({"settings": {"index.number_of_shards": 1}})).unwrap();
+            let mut lc = load(&node, &src);
+            lc.ilm.shrink_index_name = Some("own".into());
+            let step = Step { key: StepKey::new("warm", "shrink", "aliases"), kind: StepKind::Act, config: json!({}) };
+            STOP_BEFORE_SOURCE_DELETE.with(|s| s.set(true));
+            let r = exec_step(&node, &src, &mut lc, "p", &step, false);
+            STOP_BEFORE_SOURCE_DELETE.with(|s| s.set(false));
+            assert!(r.is_err(), "the seam stops the step");
+        }
+        // "Restart": the source and the target with every alias survive.
+        let node = Node::open(tmp.path()).unwrap();
+        node.ilm.drive_externally();
+        let src = node.get_index("src").expect("the source was not deleted before the aliases were durable");
+        let own = node.get_index("own").unwrap();
+        let aliases = own.aliases();
+        assert_eq!(aliases["logs"]["filter"], json!({"term": {"k": "a"}}), "{aliases:?}");
+        assert!(aliases.contains_key("src"), "{aliases:?}");
+        // The redone step completes the swap.
+        let mut lc = load(&node, &src);
+        lc.ilm.shrink_index_name = Some("own".into());
+        let step = Step { key: StepKey::new("warm", "shrink", "aliases"), kind: StepKind::Act, config: json!({}) };
+        assert!(matches!(exec_step(&node, &src, &mut lc, "p", &step, false).unwrap(), Some(Outcome::Gone)));
+        drop(src);
+        assert!(node.get_index("src").is_none());
+        let t = node.resolve("src", ResolveOpts::default()).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].svc.name, "own");
+    }
+
+
+    /// Production review #495: after a rollover, a time series backing
+    /// index still inside its interval waits (it still takes writes); once
+    /// its end time passes, the action proceeds. The write index never
+    /// waits.
+    #[test]
+    fn time_series_end_time_gate_waits_for_the_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.ilm.drive_externally();
+        node.templates.write().index.insert(
+            "metrics".into(),
+            json!({"index_patterns": ["metrics-*"], "data_stream": {}, "template": {
+                "settings": {"index.mode": "time_series", "index.routing_path": ["host"], "index.number_of_replicas": "0"},
+                "mappings": {"properties": {"@timestamp": {"type": "date"}, "host": {"type": "keyword", "time_series_dimension": true}}}}}),
+        );
+        node.create_data_stream("metrics-a").unwrap();
+        let first = node.data_stream("metrics-a").unwrap().write_index().to_string();
+        node.rollover("metrics-a", None, &json!({}), false).unwrap();
+        let write = node.data_stream("metrics-a").unwrap().write_index().to_string();
+        assert_ne!(first, write);
+        let step = Step { key: StepKey::new("hot", "readonly", "check-ts-end-time-passed"), kind: StepKind::Wait, config: json!({}) };
+        let old = node.get_index(&first).unwrap();
+        let mut lc = load(&node, &old);
+        match exec_step(&node, &old, &mut lc, "p", &step, true).unwrap() {
+            Some(Outcome::Wait(Some(info))) => {
+                let m = info["message"].as_str().unwrap_or_default();
+                assert!(m.contains("Waiting until the index's time series end time lapses before proceeding with action [readonly]"), "{m}");
+            }
+            _ => panic!("the old backing index did not wait for its end time"),
+        }
+        let w = node.get_index(&write).unwrap();
+        let mut wlc = load(&node, &w);
+        assert!(matches!(exec_step(&node, &w, &mut wlc, "p", &step, true).unwrap(), Some(Outcome::Next)));
+        // Once the clock passes the end time, the action proceeds.
+        let end = crate::date::DateFormatter::new("strict_date_optional_time||epoch_millis").unwrap().parse(&old.setting("index.time_series.end_time").unwrap()).unwrap();
+        TEST_NOW.with(|t| t.set(Some(end + 1)));
+        let after = exec_step(&node, &old, &mut lc, "p", &step, true).unwrap();
+        TEST_NOW.with(|t| t.set(None));
+        assert!(matches!(after, Some(Outcome::Next)));
+    }
+
 }

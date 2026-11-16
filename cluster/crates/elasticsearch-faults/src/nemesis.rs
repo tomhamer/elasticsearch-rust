@@ -28,6 +28,44 @@ pub const SCENARIOS: &[(&str, &str)] = &[
     ("chaos", "random overlapping mix of all of the above (+ data wipe, + netem when enabled)"),
 ];
 
+/// Whether a run actually exercised its scenario (production review #460):
+/// every requested fault action succeeded and the scenario's defining
+/// fault happened at least once (a kill-during-recovery kill was mid
+/// recovery). `Err` names what is missing.
+pub fn scenario_coverage(scenario: &str, events: &[Event]) -> Result<(), String> {
+    let failed: Vec<String> = events.iter().filter(|e| matches!(e.kind.as_str(), "partition-failed" | "wipe-failed" | "netem-failed" | "start-failed" | "heal-failed" | "unknown-scenario")).map(|e| format!("{} ({})", e.kind, e.detail)).collect();
+    if !failed.is_empty() {
+        return Err(format!("fault actions failed: {}", failed.join("; ")));
+    }
+    let has = |kind: &str| events.iter().any(|e| e.kind == kind);
+    let required: &[&str] = match scenario {
+        "kill-primary" => &["kill"],
+        // `full-restart` kills (or stops) every node at once: `kill-all` /
+        // `stop-all` (it never logs a single `kill`).
+        "full-restart" => {
+            if !events.iter().any(|e| e.kind == "kill-all" || e.kind == "stop-all") {
+                return Err(format!("scenario [{scenario}] never applied its fault ([kill-all] / [stop-all] event missing)"));
+            }
+            &[]
+        }
+        "pause-primary" => &["pause"],
+        "isolate-master" | "majority-minority" | "bridge" | "asymmetric" | "flapping" => &["partition"],
+        "rolling-restart" => &["start"],
+        "kill-during-recovery" => {
+            let observed = events.iter().any(|e| e.kind == "recovery" && e.detail.ends_with(": true"));
+            if !observed {
+                return Err("no copy was observed INITIALIZING before a kill: the recovery was never interrupted".into());
+            }
+            &["kill"]
+        }
+        _ => &[],
+    };
+    match required.iter().find(|k| !has(k)) {
+        Some(k) => Err(format!("scenario [{scenario}] never applied its fault ([{k}] event missing)")),
+        None => Ok(()),
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
     pub t: f64,
@@ -115,6 +153,11 @@ impl Nemesis {
             }
         }
         r
+    }
+
+    /// A running node to send an admin request to.
+    fn any_running(&self) -> usize {
+        self.cluster.running().first().copied().unwrap_or(0)
     }
 
     pub async fn kill(&self, i: usize, why: &str) {
@@ -423,6 +466,10 @@ impl Nemesis {
                 }
             }
             "kill-during-recovery" => {
+                // Recoveries slow enough to be caught INITIALIZING: the
+                // preloaded copies take a few seconds to copy at this rate.
+                let throttle = |rate: Option<&str>| serde_json::json!({"transient": {"indices.recovery.max_bytes_per_sec": rate}}).to_string();
+                let _ = self.api.send(self.any_running(), "PUT", "/_cluster/settings", Some(throttle(Some("2mb"))), Duration::from_secs(30)).await;
                 while self.now() < end {
                     self.sleep_s(end, 1.0, 2.0, rng).await;
                     let ix = self.random_index(rng);
@@ -433,9 +480,14 @@ impl Nemesis {
                     self.wipe(r);
                     self.start(r);
                     // Wait for the wiped node's copy of `ix` to start recovering.
+                    // A wiped node rejoins under a new node id, so the replica
+                    // waits out `index.unassigned.node_left.delayed_timeout`
+                    // (ES: the delay holds the copy for the node that left,
+                    // not for a new one) before it is allocated to it.
                     let t_wait = self.now();
                     let mut recovering = false;
-                    while self.now() - t_wait < 30.0 {
+                    let window = if self.params.short { 5.0 } else { 60.0 } + 30.0;
+                    while self.now() - t_wait < window {
                         if let Some(rt) = self.api.routing().await {
                             if rt.initializing.get(&ix).map(|v| v.contains(&r)).unwrap_or(false) {
                                 recovering = true;
@@ -444,9 +496,18 @@ impl Nemesis {
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
+                    self.log("recovery", vec![r], vec![], format!("observed INITIALIZING copy of {ix} on n{}: {recovering}", r + 1));
+                    if !recovering {
+                        // Not a mid-recovery kill: try again rather than
+                        // certify an ordinary restart (production review #460).
+                        match self.api.wait_converged(n, Duration::from_secs(120)).await {
+                            Ok(s) => self.log("green", vec![], vec![], format!("after {s:.1}s")),
+                            Err(e) => self.log("not-green", vec![], vec![], e),
+                        }
+                        continue;
+                    }
                     let kill_source = rng.gen_bool(0.6);
                     let victim = if kill_source { p } else { r };
-                    self.log("recovery", vec![r], vec![], format!("observed INITIALIZING copy of {ix} on n{}: {recovering}", r + 1));
                     self.kill(victim, if kill_source { "recovery source (primary) mid-recovery" } else { "recovery target mid-recovery" }).await;
                     self.hold(3.0, 8.0, rng).await;
                     self.start(victim);
@@ -455,6 +516,7 @@ impl Nemesis {
                         Err(e) => self.log("not-green", vec![], vec![], e),
                     }
                 }
+                let _ = self.api.send(self.any_running(), "PUT", "/_cluster/settings", Some(throttle(None)), Duration::from_secs(30)).await;
             }
             "chaos" => {
                 while self.now() < end {

@@ -8,6 +8,9 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// ES URL repository `http_max_retries` default.
+const HTTP_MAX_RETRIES: u32 = 5;
+
 enum Backend {
     File(FsBlobStore),
     Http { base: String, client: reqwest::Client },
@@ -28,7 +31,14 @@ impl UrlBlobStore {
             if !base.ends_with('/') {
                 base.push('/');
             }
-            Backend::Http { base, client: reqwest::Client::new() }
+            // ES URL repository defaults: `http_socket_timeout` 50s (here
+            // the limit between response reads), `http_max_retries` 5.
+            let client = reqwest::Client::builder()
+                .connect_timeout(super::s3::CONNECT_TIMEOUT)
+                .read_timeout(super::s3::DEFAULT_READ_TIMEOUT)
+                .build()
+                .map_err(|e| SnapshotError::io("building url repository client", e))?;
+            Backend::Http { base, client }
         } else {
             return Err(SnapshotError::illegal_argument(format!("unsupported url protocol in [{url}]")));
         };
@@ -50,8 +60,29 @@ impl UrlBlobStore {
             }
             req = req.header("Range", format!("bytes={}-{}", off, off + len - 1));
         }
-        let resp = req.send().await.map_err(|e| SnapshotError::io(format!("GET [{url}]"), e))?;
-        let status = resp.status().as_u16();
+        let mut attempt = 0u32;
+        let (status, body) = loop {
+            attempt += 1;
+            let r = req.try_clone().expect("GET has no streaming body").send().await;
+            let r = match r {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if !(200..300).contains(&status) {
+                        Ok((status, Bytes::new()))
+                    } else {
+                        resp.bytes().await.map(|b| (status, b))
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Ok((s, _)) if s >= 500 && attempt <= HTTP_MAX_RETRIES => {}
+                Ok(v) => break v,
+                Err(e) if attempt <= HTTP_MAX_RETRIES => tracing::debug!("GET {url} failed, retrying: {e}"),
+                Err(e) => return Err(SnapshotError::io(format!("GET [{url}]"), e)),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100u64 << attempt.min(6))).await;
+        };
         if status == 404 {
             return Err(SnapshotError::no_such_blob(key));
         }
@@ -61,7 +92,6 @@ impl UrlBlobStore {
         if !(200..300).contains(&status) {
             return Err(SnapshotError::io(format!("GET [{url}]"), format!("HTTP status {status}")));
         }
-        let body = resp.bytes().await.map_err(|e| SnapshotError::io(format!("GET [{url}]"), e))?;
         // Server ignored the Range header: slice locally.
         if let (Some((off, len)), 200) = (range, status) {
             let start = (off as usize).min(body.len());

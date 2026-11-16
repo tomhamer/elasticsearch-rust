@@ -15,13 +15,33 @@ use std::collections::{BTreeMap, HashMap};
 /// The composite aggregation name used for paging.
 const COMPOSITE: &str = "_transform";
 
+/// Hits a runtime-sorted latest bucket returns as candidates.
+const LATEST_CANDIDATES: usize = 100;
+
+/// A latest bucket whose candidates may not include its latest document
+/// (more source documents than candidates): its position in `Page::docs`,
+/// its unique key and the group's maximum sort value.
+pub struct Unresolved {
+    pub pos: usize,
+    pub key: Map<String, Value>,
+    pub max: f64,
+}
+
 /// One page of results.
 pub struct Page {
     /// `(id, document)` per bucket.
     pub docs: Vec<(String, Map<String, Value>)>,
+    /// The ids older encodings gave the page's groups, deleted when a
+    /// transform on an older encoding is rebuilt.
+    pub legacy_ids: Vec<String>,
     /// Source documents covered by the page (sum of bucket doc counts).
     pub docs_processed: u64,
+    /// The composite continuation cursor, whatever survived bucket
+    /// pipelines (a `bucket_selector` may filter a whole page while later
+    /// pages still hold eligible groups).
     pub after_key: Option<Value>,
+    /// Latest buckets to look up (see [`Unresolved`]).
+    pub unresolved: Vec<Unresolved>,
 }
 
 /// Resolve the source indices (missing concrete names → `no such index`).
@@ -65,8 +85,11 @@ pub fn page_body(cfg: &Config, query: &Value, size: usize, after: Option<&Value>
     let subs = match &cfg.function {
         Function::Pivot { aggs, .. } => Value::Object(aggs.clone()),
         Function::Latest { sort, .. } if is_runtime(cfg, sort) => {
-            // Runtime sort fields: pick the maximum client-side from the field values.
-            json!({"_top_hits": {"top_hits": {"size": 100, "fields": [sort]}}})
+            // Runtime sort fields: pick the maximum client-side from the
+            // field values of up to 100 hits; the group's true maximum
+            // (`_latest_max`) tells whether a larger group needs the
+            // follow-up lookup of `Page::unresolved`.
+            json!({"_top_hits": {"top_hits": {"size": LATEST_CANDIDATES, "fields": [sort]}}, "_latest_max": {"max": {"field": sort}}})
         }
         Function::Latest { sort, .. } => json!({"_top_hits": {"top_hits": {"size": 1, "sort": [{ sort.clone(): {"order": "desc"} }]}}}),
     };
@@ -97,7 +120,9 @@ fn cmp_json(a: &Value, b: &Value) -> std::cmp::Ordering {
 pub fn search(node: &Node, targets: &[Target], body: &Value) -> Result<Value> {
     let req = search::parse_request(body, &HashMap::new())?;
     let out = search::execute(targets, &req, &ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets().max(65_536), scroll_id: None, pit_id: None })?;
-    serde_json::from_str(&out.json).map_err(|e| EsError::internal(e.to_string()))
+    let resp: Value = serde_json::from_str(&out.json).map_err(|e| EsError::internal(e.to_string()))?;
+    check_complete(&resp)?;
+    Ok(resp)
 }
 
 /// Source field types (first mapping wins), runtime fields included.
@@ -413,10 +438,22 @@ fn murmur3_x64_128(data: &[u8], seed: u64) -> (u64, u64) {
     (h1, h2)
 }
 
-fn id_bytes(v: &Value) -> Vec<u8> {
+/// Destination id encoding of this build: 3, ES 9.5.5's `IDGenerator`
+/// byte for byte (see [`doc_id`]), except for the key tuples ES itself
+/// encodes ambiguously, which get a typed id of a different length.
+/// Encoding 1 (rustic's first transform ids) was ES's scheme with a shorter
+/// prefix and no buffer padding, encoding 2 the typed scheme for every
+/// tuple. A transform whose stored state is on an older encoding rebuilds
+/// its destination on its next checkpoint, deleting both older ids of every
+/// group (see `TransformService::checkpoint`).
+pub const ID_ENCODING: u32 = 3;
+
+/// ES `IDGenerator.getBytes`: the bytes of one key value as ES sees the
+/// composite key object (`Long` for integers, `Double` for floating point
+/// keys, a one-byte `Boolean`, UTF-8 strings, `"__NULL_VALUE__"` for null).
+fn es_id_bytes(v: &Value) -> Vec<u8> {
     match v {
         Value::Null => b"__NULL_VALUE__".to_vec(),
-        Value::String(s) if s.is_empty() => b"__EMPTY_VALUE__".to_vec(),
         Value::String(s) => s.as_bytes().to_vec(),
         Value::Number(n) => match n.as_i64() {
             Some(i) => i.to_be_bytes().to_vec(),
@@ -427,13 +464,111 @@ fn id_bytes(v: &Value) -> Vec<u8> {
     }
 }
 
-/// ES `IdGenerator`: keys sorted by name, values joined with `$`, murmur3
-/// (seed 19) appended to the first byte of the first values, base64url.
+/// Lucene `ArrayUtil.oversize(min, 1)` on a 64-bit JVM.
+fn lucene_oversize(min: usize) -> usize {
+    if min == 0 {
+        return 0;
+    }
+    let extra = (min >> 3).max(3);
+    (min + extra + 7) & !7
+}
+
+/// Lucene `BytesRefBuilder`: appends grow the backing array with
+/// `ArrayUtil.grow`; `bytes()` is the whole backing array (zero padded).
+#[derive(Default)]
+struct JavaBytesRefBuilder {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl JavaBytesRefBuilder {
+    fn grow(&mut self, capacity: usize) {
+        if self.bytes.len() < capacity {
+            self.bytes.resize(lucene_oversize(capacity), 0);
+        }
+    }
+    fn append(&mut self, b: &[u8]) {
+        self.grow(self.len + b.len());
+        self.bytes[self.len..self.len + b.len()].copy_from_slice(b);
+        self.len += b.len();
+    }
+}
+
+/// Whether ES's encoding is ambiguous for this tuple: a string value that
+/// contains the `$` delimiter, or equals the null/empty markers, can share
+/// ES's hash input with a different tuple (`("x$x","x")` and
+/// `("x","x$x")` both hash `x$x$x$`; null and `"__NULL_VALUE__"` both
+/// hash `__NULL_VALUE__$`), and ES then overwrites one group's document
+/// with the other's.
+fn es_ambiguous(keys: &BTreeMap<String, Value>) -> bool {
+    keys.values().any(|v| matches!(v, Value::String(s) if s.contains('$') || s == "__NULL_VALUE__" || s == "__EMPTY_VALUE__"))
+}
+
+/// The ES `IDGenerator` id of a tuple: keys in name order, each value's
+/// bytes (empty ones as `"__EMPTY_VALUE__"`) followed by `$`, murmur3 x64
+/// 128 (seed 19) of that buffer appended to the first byte of the first
+/// six values, and the builder's whole backing array (zero padded, as
+/// `BytesRefBuilder.bytes()` returns it) in base64url without padding.
+/// Always 24 bytes, so 32 characters.
+pub fn es_doc_id(keys: &BTreeMap<String, Value>) -> String {
+    let mut buffer = JavaBytesRefBuilder::default();
+    let mut hashed = JavaBytesRefBuilder::default();
+    for v in keys.values() {
+        let mut b = es_id_bytes(v);
+        if b.is_empty() {
+            b = b"__EMPTY_VALUE__".to_vec();
+        }
+        buffer.append(&b);
+        buffer.append(b"$");
+        if hashed.len <= 5 {
+            hashed.append(&b[..1]);
+        }
+    }
+    let (h1, h2) = murmur3_x64_128(&buffer.bytes[..buffer.len], 19);
+    hashed.append(&h1.to_be_bytes());
+    hashed.append(&h2.to_be_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hashed.bytes)
+}
+
+/// Destination document id of a group: ES's id ([`es_doc_id`]), so a
+/// transform writes the same `_id`s as Elasticsearch, except for a tuple
+/// ES encodes ambiguously ([`es_ambiguous`]), which gets the typed,
+/// length-delimited id ([`typed_doc_id`]) instead: it is never 32
+/// characters long, so it cannot meet an ES-shaped id.
 pub fn doc_id(keys: &BTreeMap<String, Value>) -> String {
+    if es_ambiguous(keys) {
+        typed_doc_id(keys)
+    } else {
+        es_doc_id(keys)
+    }
+}
+
+/// Encoding-1 bytes of one key value.
+fn legacy_id_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Null => b"__NULL_VALUE__".to_vec(),
+        Value::String(s) if s.is_empty() => b"__EMPTY_VALUE__".to_vec(),
+        other => es_id_bytes(other),
+    }
+}
+
+/// The unpadded id shape: prefix bytes, then the murmur3 x64 128 (seed 19)
+/// of `buf`, base64url without padding.
+fn id_of(prefix: Vec<u8>, buf: &[u8]) -> String {
+    let mut out = prefix;
+    let (h1, h2) = murmur3_x64_128(buf, 19);
+    out.extend_from_slice(&h1.to_be_bytes());
+    out.extend_from_slice(&h2.to_be_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(out)
+}
+
+/// Encoding-1 id: kept only to find and delete the documents an encoding-1
+/// transform wrote, when it is rebuilt.
+pub fn legacy_doc_id(keys: &BTreeMap<String, Value>) -> String {
     let mut buf = Vec::new();
     let mut prefix = Vec::new();
     for v in keys.values() {
-        let b = id_bytes(v);
+        let b = legacy_id_bytes(v);
         if prefix.len() < 5 {
             if let Some(f) = b.first() {
                 prefix.push(*f);
@@ -442,10 +577,80 @@ pub fn doc_id(keys: &BTreeMap<String, Value>) -> String {
         buf.extend_from_slice(&b);
         buf.push(b'$');
     }
-    let (h1, h2) = murmur3_x64_128(&buf, 19);
-    prefix.extend_from_slice(&h1.to_be_bytes());
-    prefix.extend_from_slice(&h2.to_be_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(prefix)
+    id_of(prefix, &buf)
+}
+
+/// One length-delimited field: `tag`, 4-byte big-endian length, bytes.
+fn put_field(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
+    out.push(tag);
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Type tag and bytes of one key value: every JSON type has its own tag, so
+/// null, `""`, `"__NULL_VALUE__"`, `1`, `1.0` and `"1"` all differ.
+fn typed_value(v: &Value) -> (u8, Vec<u8>) {
+    match v {
+        Value::Null => (0, Vec::new()),
+        Value::Bool(b) => (1, vec![*b as u8]),
+        Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+            (Some(i), _) => (2, i.to_be_bytes().to_vec()),
+            (None, Some(u)) => (3, u.to_be_bytes().to_vec()),
+            _ => (4, n.as_f64().unwrap_or(0.0).to_bits().to_be_bytes().to_vec()),
+        },
+        Value::String(s) => (5, s.as_bytes().to_vec()),
+        other => (6, other.to_string().into_bytes()),
+    }
+}
+
+/// The typed, length-delimited id (encoding 2 for every tuple; encoding 3
+/// for the tuples ES encodes ambiguously): keys in name order, each written
+/// as its length-delimited name and its typed, length-delimited value, so
+/// no two distinct tuples share the hash input. At most 21 bytes (28
+/// characters), never an ES id's 32.
+pub fn typed_doc_id(keys: &BTreeMap<String, Value>) -> String {
+    let mut buf = Vec::new();
+    let mut prefix = Vec::new();
+    for (name, v) in keys {
+        let (tag, bytes) = typed_value(v);
+        put_field(&mut buf, b'k', name.as_bytes());
+        put_field(&mut buf, tag, &bytes);
+        if prefix.len() < 5 {
+            prefix.push(bytes.first().copied().unwrap_or(tag));
+        }
+    }
+    id_of(prefix, &buf)
+}
+
+/// The ids older encodings gave a group (deleted when its transform is
+/// rebuilt; the current id is never among them).
+pub fn older_doc_ids(keys: &BTreeMap<String, Value>) -> Vec<String> {
+    let current = doc_id(keys);
+    let mut out: Vec<String> = [legacy_doc_id(keys), typed_doc_id(keys)].into_iter().filter(|i| *i != current).collect();
+    out.dedup();
+    out
+}
+
+/// A source search response that is not complete fails the checkpoint (ES
+/// runs transform searches with `allow_partial_search_results=false` and
+/// retries the checkpoint): a shard failure or a timeout would otherwise
+/// complete it without the groups of the missing data.
+pub fn check_complete(resp: &Value) -> Result<()> {
+    let shards = &resp["_shards"];
+    let failed = shards["failed"].as_u64().unwrap_or(0);
+    if failed > 0 {
+        let total = shards["total"].as_u64().unwrap_or(0);
+        let mut e = EsError::new(503, "search_phase_execution_exception", format!("Partial shards failure ({failed} of {total} shards failed); the transform checkpoint needs complete source results"));
+        if let Some(f) = shards["failures"].as_array().and_then(|a| a.first()) {
+            let reason = &f["reason"];
+            e = e.caused_by(EsError::from_error_json(f["status"].as_u64().unwrap_or(503) as u16, reason));
+        }
+        return Err(e);
+    }
+    if resp["timed_out"].as_bool() == Some(true) {
+        return Err(EsError::new(503, "search_phase_execution_exception", "Search timed out; the transform checkpoint needs complete source results"));
+    }
+    Ok(())
 }
 
 /// Turn a composite response into documents.
@@ -453,6 +658,8 @@ pub fn convert_page(cfg: &Config, resp: &Value, types: &HashMap<String, String>)
     let comp = &resp["aggregations"][COMPOSITE];
     let buckets = comp["buckets"].as_array().cloned().unwrap_or_default();
     let mut docs = Vec::with_capacity(buckets.len());
+    let mut legacy_ids = Vec::with_capacity(buckets.len());
+    let mut unresolved = Vec::new();
     let mut processed = 0u64;
     let epoch = cfg.settings.dates_as_epoch_millis;
     for b in &buckets {
@@ -461,6 +668,7 @@ pub fn convert_page(cfg: &Config, resp: &Value, types: &HashMap<String, String>)
         let key = b["key"].as_object().cloned().unwrap_or_default();
         let id_keys: BTreeMap<String, Value> = key.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let id = doc_id(&id_keys);
+        legacy_ids.extend(older_doc_ids(&id_keys));
         let doc = match &cfg.function {
             Function::Pivot { groups, aggs, .. } => {
                 let mut d = Map::new();
@@ -479,6 +687,11 @@ pub fn convert_page(cfg: &Config, resp: &Value, types: &HashMap<String, String>)
             }
             Function::Latest { sort, .. } => {
                 let hits = b["_top_hits"]["hits"]["hits"].as_array().cloned().unwrap_or_default();
+                if is_runtime(cfg, sort) && dc as usize > hits.len() {
+                    if let Some(max) = b["_latest_max"]["value"].as_f64() {
+                        unresolved.push(Unresolved { pos: docs.len(), key: key.clone(), max });
+                    }
+                }
                 let hit = if is_runtime(cfg, sort) {
                     hits.iter().max_by(|x, y| cmp_json(&x["fields"][sort.as_str()][0], &y["fields"][sort.as_str()][0])).cloned().unwrap_or(Value::Null)
                 } else {
@@ -492,8 +705,49 @@ pub fn convert_page(cfg: &Config, resp: &Value, types: &HashMap<String, String>)
         };
         docs.push((id, doc));
     }
-    let after_key = if buckets.is_empty() { None } else { comp.get("after_key").cloned() };
-    Ok(Page { docs, docs_processed: processed, after_key })
+    // The cursor is kept even when every bucket of the page was filtered.
+    let after_key = comp.get("after_key").cloned().filter(|a| !a.is_null());
+    Ok(Page { docs, legacy_ids, docs_processed: processed, after_key, unresolved })
+}
+
+/// Whether a pivot filters its buckets (`bucket_selector`): a short or empty
+/// page then says nothing about later pages.
+pub fn filters_buckets(cfg: &Config) -> bool {
+    match &cfg.function {
+        Function::Pivot { aggs, .. } => aggs.values().any(|d| agg_kind(d).as_deref() == Some("bucket_selector")),
+        Function::Latest { .. } => false,
+    }
+}
+
+/// The search finding the latest document of an [`Unresolved`] bucket: its
+/// unique key, at the group's maximum sort value.
+pub fn latest_lookup(cfg: &Config, query: &Value, u: &Unresolved) -> Option<Value> {
+    let Function::Latest { sort, .. } = &cfg.function else { return None };
+    let mut filters = vec![query.clone()];
+    for (field, v) in &u.key {
+        filters.push(if v.is_null() { json!({"bool": {"must_not": {"exists": {"field": field}}}}) } else { json!({"term": {field.clone(): v}}) });
+    }
+    let is_date = cfg.runtime_mappings.as_ref().and_then(|m| m.get(sort.as_str())).and_then(|d| d.get("type")).and_then(Value::as_str) == Some("date");
+    let range = if is_date {
+        let ms = u.max as i64;
+        json!({"range": {sort.clone(): {"gte": ms, "lte": ms, "format": "epoch_millis"}}})
+    } else {
+        json!({"range": {sort.clone(): {"gte": u.max, "lte": u.max}}})
+    };
+    filters.push(range);
+    let mut body = json!({"size": 1, "track_total_hits": false, "query": {"bool": {"filter": filters}}});
+    if let Some(rm) = &cfg.runtime_mappings {
+        body["runtime_mappings"] = rm.clone();
+    }
+    Some(body)
+}
+
+/// The destination document of a latest hit (its `_source` without
+/// metadata fields).
+pub fn latest_doc(hit: &Value) -> Option<Map<String, Value>> {
+    let mut d = hit["_source"].as_object().cloned()?;
+    d.retain(|k, _| !k.starts_with('_'));
+    Some(d)
 }
 
 /// Mapping type of a source field.
@@ -621,4 +875,95 @@ pub fn check_latest_keys(cfg: &Config, types: &HashMap<String, String>) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    fn keys(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn delimiter_inside_values_no_longer_collides() {
+        let a = keys(&[("a", json!("x$x")), ("b", json!("x"))]);
+        let b = keys(&[("a", json!("x")), ("b", json!("x$x"))]);
+        assert_eq!(legacy_doc_id(&a), legacy_doc_id(&b), "encoding 1 was ambiguous for these keys");
+        assert_eq!(es_doc_id(&a), es_doc_id(&b), "so is ES's");
+        assert_ne!(doc_id(&a), doc_id(&b));
+    }
+
+    #[test]
+    fn null_is_not_the_null_marker_string_and_types_are_distinct() {
+        let null = keys(&[("a", Value::Null)]);
+        let marker = keys(&[("a", json!("__NULL_VALUE__"))]);
+        assert_eq!(legacy_doc_id(&null), legacy_doc_id(&marker), "encoding 1 was ambiguous for these keys");
+        assert_ne!(doc_id(&null), doc_id(&marker));
+        let empty = keys(&[("a", json!(""))]);
+        let empty_marker = keys(&[("a", json!("__EMPTY_VALUE__"))]);
+        assert_ne!(doc_id(&empty), doc_id(&empty_marker));
+        let variants = [json!(1), json!(1.0), json!("1"), json!(true), json!(null), json!(""), json!([1])];
+        let ids: std::collections::HashSet<String> = variants.iter().map(|v| doc_id(&keys(&[("a", v.clone())]))).collect();
+        assert_eq!(ids.len(), variants.len());
+    }
+
+    /// `_id`s Elasticsearch 9.5.5 wrote for these groups (batch pivot
+    /// transforms run on a real 9.5.5 node, 9 Nov 2026).
+    #[test]
+    fn ids_are_the_ids_elasticsearch_writes() {
+        let cases: Vec<(BTreeMap<String, Value>, &str)> = vec![
+            (keys(&[("a", json!("")), ("b", json!("e"))]), "X2X1ntn1ERb7y1eSYGEe5f62AAAAAAAA"),
+            (keys(&[("a", json!("foo")), ("b", json!("bar"))]), "ZmKcNTRLxPl7G_pBVjBEFPK9AAAAAAAA"),
+            (keys(&[("a", json!("\u{e9}t\u{e9}")), ("b", json!("z"))]), "w3rDu5_tv8fyvHsy4JlGobAFAAAAAAAA"),
+            // long, double, boolean, date_histogram (epoch millis), histogram.
+            (keys(&[("bo", json!(true)), ("d", json!(0.0)), ("dh", json!(0)), ("h", json!(0.0)), ("l", json!(36))]), "AQAAAAAeV7qEQHy9WPK6apOqCP-DAAAA"),
+            (keys(&[("bo", json!(true)), ("d", json!(1.5)), ("dh", json!(1_487_379_600_000i64)), ("h", json!(0.0)), ("l", json!(42))]), "AT8AAAAsfPIvxC5blRKYQOolRSsJAAAA"),
+            (keys(&[("bo", json!(false)), ("d", json!(12.0)), ("dh", json!(1_487_386_800_000i64)), ("h", json!(10.0)), ("l", json!(-7))]), "AEAAQP8u1b9NfC2Xp544UGp1aZExAAAA"),
+            // Seven keys: the prefix holds the first byte of the first six.
+            (keys(&[("k1", json!("1")), ("k2", json!("2")), ("k3", json!("3")), ("k4", json!("4")), ("k5", json!("5")), ("k6", json!("6")), ("k7", json!("7"))]), "MTIzNDU2MqkKF3Hy97xKJBHAnD-o8gAA"),
+            (keys(&[("k1", json!("b")), ("k2", json!("cc")), ("k3", json!("ddd")), ("k4", json!("eeee")), ("k5", json!("fffff")), ("k6", json!("gggggg")), ("k7", json!("hhhhhhh"))]), "YmNkZWZnlyEJupH6M3u-l9SiTdwGyAAA"),
+        ];
+        for (k, es) in &cases {
+            assert_eq!(es_doc_id(k), *es, "{k:?}");
+            assert_eq!(doc_id(k), *es, "an unambiguous tuple gets the id ES writes: {k:?}");
+        }
+    }
+
+    /// The same run shows ES itself merging distinct groups: it wrote one
+    /// document for `("x$x","x")` and `("x","x$x")`, and one for null and
+    /// `"__NULL_VALUE__"`. `es_doc_id` reproduces those ids exactly; `doc_id`
+    /// keeps the groups apart with typed ids no ES id can equal.
+    #[test]
+    fn tuples_es_merges_keep_their_own_documents() {
+        let a = keys(&[("a", json!("x$x")), ("b", json!("x"))]);
+        let b = keys(&[("a", json!("x")), ("b", json!("x$x"))]);
+        assert_eq!(es_doc_id(&a), "eHjktIEmGEbxkJ82sNFdqgw2AAAAAAAA");
+        assert_eq!(es_doc_id(&b), "eHjktIEmGEbxkJ82sNFdqgw2AAAAAAAA");
+        let null = keys(&[("a", Value::Null), ("b", json!("n"))]);
+        let marker = keys(&[("a", json!("__NULL_VALUE__")), ("b", json!("n"))]);
+        assert_eq!(es_doc_id(&null), "X27T7iu6vNuvZt4nWKq_a3PsAAAAAAAA");
+        assert_eq!(es_doc_id(&marker), "X27T7iu6vNuvZt4nWKq_a3PsAAAAAAAA");
+        let ids: std::collections::HashSet<String> = [&a, &b, &null, &marker].iter().map(|k| doc_id(k)).collect();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(doc_id(&null), es_doc_id(&null), "null itself keeps the ES id");
+        for k in [&a, &b, &marker] {
+            assert_ne!(doc_id(k).len(), 32, "a typed id never has an ES id's length");
+        }
+        // Rebuilds delete the older encodings' ids, never the current one.
+        for k in [&a, &b, &null, &marker] {
+            assert!(!older_doc_ids(k).contains(&doc_id(k)));
+        }
+    }
+
+    #[test]
+    fn partial_or_timed_out_source_results_are_rejected() {
+        assert!(check_complete(&json!({"_shards": {"total": 2, "successful": 2, "failed": 0}, "timed_out": false})).is_ok());
+        let e = check_complete(&json!({"_shards": {"total": 2, "successful": 1, "failed": 1, "failures": [{"shard": 1, "status": 503, "reason": {"type": "no_shard_available_action_exception", "reason": "gone"}}]}})).unwrap_err();
+        assert_eq!(e.status, 503);
+        assert_eq!(e.kind, "search_phase_execution_exception");
+        assert_eq!(e.caused_by.as_ref().map(|c| c.kind.as_str()), Some("no_shard_available_action_exception"));
+        let e = check_complete(&json!({"_shards": {"total": 1, "successful": 1, "failed": 0}, "timed_out": true})).unwrap_err();
+        assert_eq!(e.status, 503);
+    }
 }

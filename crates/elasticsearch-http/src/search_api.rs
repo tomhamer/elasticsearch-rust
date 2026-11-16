@@ -143,16 +143,20 @@ fn scroll_body(req: &Req, allow_array: bool) -> Result<Value> {
 /// of the lookup index: it needs the read privilege and honours its DLS/FLS.
 fn terms_lookup<'a>(node: &'a Node, access: Option<&'a ReadAccess>) -> impl Fn(&str, &str, &str, Option<&str>) -> Result<Vec<Value>> + Sync + 'a {
     move |idx: &str, id: &str, path: &str, routing: Option<&str>| {
+        // A `lookup` runtime field on a target field other than `_id`.
+        if let Some((field, fetch)) = elasticsearch_engine::script::decode_term_lookup(path) {
+            return lookup_term_search(node, access, idx, &field, id, &fetch);
+        }
+        // A kNN `query_vector_builder.lookup`: the reference document's
+        // vector, from its index's vector values (as the coordinator).
+        if let Some(field) = elasticsearch_engine::vectors::decode_vector_lookup(path) {
+            return lookup_vector(node, access, idx, id, field, routing);
+        }
         let svc = node.write_index(idx, false)?;
         let acc = match access {
             Some(a) => a.lookup_access(&svc.name, idx)?,
             None => None,
         };
-        if let Some(acc) = &acc {
-            if !search::doc_visible(&svc, id, acc, false)? {
-                return Ok(vec![]);
-            }
-        }
         // The lookup document lives on the shard its routing (or id) selects.
         let Some(g) = (match routing {
             Some(r) => svc.get_routed(id, Some(r), true)?,
@@ -160,12 +164,77 @@ fn terms_lookup<'a>(node: &'a Node, access: Option<&'a ReadAccess>) -> impl Fn(&
         }) else {
             return Ok(vec![]);
         };
+        // DLS judges exactly the fetched document (its shard and version).
+        if let Some(acc) = &acc {
+            if !search::fetched_doc_visible(&svc, id, routing, &g, acc, false)? {
+                return Ok(vec![]);
+            }
+        }
         let mut src: Value = g.source.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
         if let Some(fa) = acc.as_ref().and_then(|a| a.fields.as_ref()) {
             src = fa.filter_source(&src);
         }
         Ok(source_values(&src, path).into_iter().cloned().collect())
     }
+}
+
+/// A `lookup` runtime field's term lookup (ES `LookupField.toSearchRequest`:
+/// a `term` query on `field`, size 1, no `_source`, the fetch fields
+/// through the fields API), searched as the caller (its read privilege and
+/// DLS/FLS on the target index apply): the matching doc's fields as one
+/// object, nothing when no doc matches or none of them has a value.
+fn lookup_term_search(node: &Node, access: Option<&ReadAccess>, index: &str, field: &str, value: &str, fetch: &[String]) -> Result<Vec<Value>> {
+    // The lookup search is the caller's search of the target index (ES
+    // runs it through the security filter): it needs the read privilege
+    // there, whether or not the caller has any DLS/FLS ([`restrict`] only
+    // stamps document- and field-level security).
+    if let Some(a) = access {
+        a.authorize_names(node, "indices:data/read/search", &[index.to_string()])?;
+    }
+    let targets = restrict(access, node.resolve(index, ResolveOpts::default())?)?;
+    let body = json!({"query": {"term": {field: value}}, "size": 1, "_source": false, "fields": fetch});
+    let req = search::parse_request(&body, &HashMap::new())?;
+    let out = search::execute(&targets, &req, &ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None })?;
+    let v: Value = serde_json::from_str(&out.json).map_err(|e| EsError::internal(e.to_string()))?;
+    Ok(v.pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.get("fields").filter(|f| f.as_object().is_some_and(|o| !o.is_empty())).cloned())
+        .collect())
+}
+
+/// The vector of field `field` of document `id` in reference index `index`
+/// (ES `LookupQueryVectorBuilder`: a search of the reference index fetching
+/// the field's vector values, `_source` off), under the caller's access.
+/// A reference field that is not a `dense_vector` is refused with ES's
+/// error; a missing document or field answers no values.
+fn lookup_vector(node: &Node, access: Option<&ReadAccess>, index: &str, id: &str, field: &str, routing: Option<&str>) -> Result<Vec<Value>> {
+    let targets = apply_search_routing(restrict(access, node.resolve(index, ResolveOpts::default())?)?, routing);
+    if let Some(f) = targets.iter().find_map(|t| t.svc.lookup().fields.get(field).cloned()) {
+        if f.ty != elasticsearch_engine::mapping::EsType::DenseVector {
+            let class = match f.ty.name() {
+                "boolean" => "java.lang.Boolean",
+                "long" | "integer" | "short" | "byte" | "unsigned_long" => "java.lang.Long",
+                "double" | "float" | "half_float" | "scaled_float" => "java.lang.Double",
+                _ => "java.lang.String",
+            };
+            return Err(EsError::illegal_argument(format!("Field [{field}] in document with id [{id}] is of unsupported type [{class}] for lookup query vector builder.")));
+        }
+    }
+    // The vector values (doc values, not `_source`, which may be disabled);
+    // a document without the vector answers nothing (the caller reports it
+    // missing).
+    let body = json!({"query": {"ids": {"values": [id]}}, "size": 1, "_source": false, "docvalue_fields": [field]});
+    let req = search::parse_request(&body, &HashMap::new())?;
+    let Ok(out) = search::execute(&targets, &req, &ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None }) else { return Ok(Vec::new()) };
+    let v: Value = serde_json::from_str(&out.json).map_err(|e| EsError::internal(e.to_string()))?;
+    let vals = v["hits"]["hits"][0]["fields"].get(field).and_then(Value::as_array).cloned().unwrap_or_default();
+    // One vector: a flat list of components (or one nested list).
+    Ok(match vals.as_slice() {
+        [Value::Array(inner)] => inner.clone(),
+        _ => vals,
+    })
 }
 
 /// Stamp the resolved targets with the caller's DLS/FLS (default-deny on failure).
@@ -333,7 +402,8 @@ fn run_search_ext(node: &Node, body: &Value, params: &HashMap<String, String>, i
     if let Some(expr) = index.filter(|e| crate::ccs::has_remote(e)) {
         // Validate the source before resolving remote index expressions.
         search::parse_request(body, params)?;
-        let plan = crate::ccs::resolve(node, expr, resolve)?;
+        let rank_plan = ext.and_then(|e| e.get::<crate::InternalRankPlan>()) == Some(&crate::InternalRankPlan::Plan);
+        let plan = if rank_plan { crate::ccs::resolve_keeping_remotes(node, expr, resolve)? } else { crate::ccs::resolve(node, expr, resolve)? };
         let start = Instant::now();
         let result = run_search_inner(node, body, params, index, resolve, access, ext, Some(&plan));
         node.ccs_stats.lock().record(start.elapsed().as_millis() as u64, &plan.aliases, &plan.skipped, result.is_ok(), params.get("ccs_minimize_roundtrips").is_none_or(|v| v != "false"), expr.contains(['*', '?']));
@@ -402,6 +472,8 @@ fn run_search_inner(node: &Node, body: &Value, params: &HashMap<String, String>,
     } else {
         parsed
     };
+    // Internal resize copy (#485): hits carry the indexing input.
+    req.recovery_source = ext.is_some_and(|e| e.get::<crate::InternalRecoverySource>().is_some());
     req.raw_script_fields = ext.and_then(|e|e.get::<elasticsearch_engine::source_json::Source>()).and_then(|s|s.get("script_fields")).cloned();
     req.raw_runtime_mappings = ext.and_then(|e|e.get::<elasticsearch_engine::source_json::Source>()).and_then(|s|s.get("runtime_mappings")).cloned();
     req.raw_search_scripts = ext.and_then(|e|e.get::<elasticsearch_engine::source_json::Source>()).map(elasticsearch_engine::source_json::search_scripts).unwrap_or_default();
@@ -474,13 +546,18 @@ fn run_search_inner(node: &Node, body: &Value, params: &HashMap<String, String>,
             ctx.expires = Instant::now() + ctx.keep_alive;
             (ctx.targets.clone(), ctx.lost.clone())
         };
+        // The point in time's indices are authorized for the caller (it may
+        // have been opened by another subject).
+        if let Some(a) = access {
+            a.authorize_targets(node, "indices:data/read/search", &targets)?;
+        }
         let targets = restrict(access, targets)?;
         if dfs_only {
             let stats = search::dfs_phase(&targets, &req, &ExecOpts { terms_lookup: Some(&lookup), cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None })?;
             return Ok(serde_json::to_string(&stats)?);
         }
         if !req.sort.is_empty() && !req.sort.iter().any(|s| s.field == "_shard_doc") {
-            req.sort.push(SortSpec { field: "_shard_doc".into(), descending: false, missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None });
+            req.sort.push(SortSpec { field: "_shard_doc".into(), descending: false, missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None, extra: None });
             // A search_after without the implicit tiebreaker value skips every hit equal on the user's sort.
             if let Some(sa) = req.search_after.as_mut() {
                 if sa.len() + 1 == req.sort.len() {
@@ -488,6 +565,8 @@ fn run_search_inner(node: &Node, body: &Value, params: &HashMap<String, String>,
                 }
             }
         }
+        let tags = req.sort.is_empty() && ext.is_some_and(|e| e.get::<crate::InternalPitShardTags>().is_some());
+        let _tags = search::ShardTagScope::enter(tags);
         let out = search::execute(&targets, &req, &ExecOpts { terms_lookup: Some(&lookup), cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: Some(id) })?;
         return Ok(elasticsearch_engine::node::report_lost_targets(out.json, &lost));
     }
@@ -525,10 +604,29 @@ fn run_search_inner(node: &Node, body: &Value, params: &HashMap<String, String>,
     if rank_mode == Some(crate::InternalRankPlan::Plan) && (req.retriever.is_some() || req.rank.is_some()) {
         let rest = ext.and_then(|e| e.get::<crate::ClusterRest>()).cloned().ok_or_else(|| EsError::internal("rank plan phase without a coordinator"))?;
         let many = ext.and_then(|e| e.get::<crate::ClusterRestMany>()).cloned();
-        let child = ClusterChildSearch { rest, many, uri: child_search_uri(index, params) };
+        // Children of a search over the coordinator's point in time read
+        // it: `/_search` (its targets are the point in time's).
+        let pit = ext.and_then(|e| e.get::<crate::InternalRankPit>()).map(|p| json!({"id": p.0, "keep_alive": "1m"})).or_else(|| body.get("pit").cloned());
+        let uri = if pit.is_some() {
+            const TARGETS: &[&str] = &["routing", "preference", "ignore_unavailable", "allow_no_indices", "expand_wildcards", "ignore_throttled"];
+            let kept: HashMap<String, String> = params.iter().filter(|(k, _)| !TARGETS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+            child_search_uri(None, &kept)
+        } else {
+            child_search_uri(index, params)
+        };
+        let child = ClusterChildSearch { rest, many, uri, pit, incomplete: Default::default() };
         let opts = ExecOpts { terms_lookup: Some(&lookup), cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None };
         let out = elasticsearch_engine::retriever::plan(&targets, &req, body, &opts, &child)?;
-        return Ok(json!({ "_rustic_final_body": out }).to_string());
+        // What the child searches missed (shard failures, timeouts): the
+        // ranking was computed without it, so the final answer reports it.
+        let (failures, timed_out) = std::mem::take(&mut *child.incomplete.lock().unwrap_or_else(|e| e.into_inner()));
+        if failures.is_empty() && !timed_out {
+            return Ok(json!({ "_rustic_final_body": out }).to_string());
+        }
+        let mut answer = serde_json::Map::new();
+        answer.insert("_rustic_final_body".into(), out);
+        answer.insert(CHILD_SHARDS_KEY.into(), json!({ "failures": failures, "timed_out": timed_out }));
+        return Ok(Value::Object(answer).to_string());
     }
     if let Some(sc) = params.get("scroll") {
         let ka = keep_alive(Some(sc))?;
@@ -536,7 +634,7 @@ fn run_search_inner(node: &Node, body: &Value, params: &HashMap<String, String>,
         if req.search_after.is_some() {
             return Err(EsError::action_validation(&["using [search_after] is not allowed in a scroll context"]));
         }
-        search_validate::check_scroll_contexts(node, targets.len().max(1))?;
+        let permit = search_validate::check_scroll_contexts(node, targets.len().max(1))?;
         let snap = node.snapshot(&targets)?;
         let id = new_ctx_id();
         let out = search::execute(&snap, &req, &ExecOpts { terms_lookup: Some(&lookup), cursors: None, max_buckets: node.max_buckets(), scroll_id: Some(id.clone()), pit_id: None })?;
@@ -553,7 +651,7 @@ fn run_search_inner(node: &Node, body: &Value, params: &HashMap<String, String>,
             }) == Some(true);
         let snap = if skipped_all { Vec::new() } else { snap };
         let accounting = Some(elasticsearch_engine::node::context_charge(&snap, out.cursors.len()));
-        node.scrolls.lock().insert(id, ScrollCtx { targets: snap, req: next, cursors: out.cursors, keep_alive: ka, expires: Instant::now() + ka, accounting, lost: Vec::new() });
+        node.scrolls.lock().insert(id, ScrollCtx { targets: snap, req: next, cursors: out.cursors, keep_alive: ka, expires: Instant::now() + ka, accounting, lost: Vec::new(), owner: access.map(|a| principal(a.user())), permit: Some(permit) });
         return Ok(out.json);
     }
     if qtf == Some(crate::InternalQtf::Query) {
@@ -647,6 +745,11 @@ fn with_leading_member(json: String, member: &str) -> String {
 /// subject (as ES's `SecurityContext` compares it: authentication type,
 /// user and realm or API key id, and a run-as target), the request's index
 /// expression and its cluster shard.
+/// The authenticated subject (user, realm, API key, run-as) as one key.
+pub(crate) fn principal(user: &elasticsearch_engine::security::Authn) -> String {
+    qtf_principal(user)
+}
+
 fn qtf_principal(user: &elasticsearch_engine::security::Authn) -> String {
     let id = |u: &elasticsearch_engine::security::Authn| {
         format!("{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}", u.auth_type, u.username, u.realm_name, u.realm_type, u.api_key_id().unwrap_or(""))
@@ -679,6 +782,41 @@ struct ClusterChildSearch {
     /// Several children at once, when the coordinator offers it.
     many: Option<crate::ClusterRestMany>,
     uri: String,
+    /// The search's point in time (the cluster's implicit one for compound
+    /// retrievers): every child reads it.
+    pit: Option<Value>,
+    /// The shard failures and timeouts of the child searches so far
+    /// (`_shards.failures`, `timed_out`): a partial child's candidates miss
+    /// what those shards held.
+    incomplete: std::sync::Mutex<(Vec<Value>, bool)>,
+}
+
+/// Member of a rank plan phase's answer: the child searches' shard
+/// failures and timeouts, which the coordinator adds to the final answer.
+pub const CHILD_SHARDS_KEY: &str = "_rustic_child_shards";
+
+impl ClusterChildSearch {
+    /// Record what a child search answer missed.
+    fn note(&self, answer: &Result<Value>) {
+        let Ok(v) = answer else { return };
+        let failures = v["_shards"]["failures"].as_array().filter(|f| !f.is_empty());
+        let timed_out = v["timed_out"].as_bool() == Some(true);
+        if failures.is_none() && !timed_out {
+            return;
+        }
+        let mut seen = self.incomplete.lock().unwrap_or_else(|e| e.into_inner());
+        seen.0.extend(failures.into_iter().flatten().cloned());
+        seen.1 |= timed_out;
+    }
+}
+
+impl ClusterChildSearch {
+    fn with_pit(&self, mut body: Value) -> Value {
+        if let (Some(pit), Some(o)) = (&self.pit, body.as_object_mut()) {
+            o.insert("pit".into(), pit.clone());
+        }
+        body
+    }
 }
 
 impl elasticsearch_engine::retriever::ChildSearch for ClusterChildSearch {
@@ -687,7 +825,10 @@ impl elasticsearch_engine::retriever::ChildSearch for ClusterChildSearch {
         // `_tasks/_cancel`): no further child search starts. A running
         // child is the client task's child and stops with it.
         elasticsearch_engine::search::check_cancelled()?;
-        (self.rest.0)("POST", &self.uri, Some(body))
+        let body = self.with_pit(body);
+        let answer = (self.rest.0)("POST", &self.uri, Some(body));
+        self.note(&answer);
+        answer
     }
 
     fn search_all(&self, bodies: Vec<Value>) -> Vec<Result<Value>> {
@@ -697,7 +838,11 @@ impl elasticsearch_engine::retriever::ChildSearch for ClusterChildSearch {
         if let Err(e) = elasticsearch_engine::search::check_cancelled() {
             return bodies.iter().map(|_| Err(e.clone())).collect();
         }
-        (many.0)(bodies.into_iter().map(|b| ("POST".to_string(), self.uri.clone(), Some(b))).collect())
+        let answers = (many.0)(bodies.into_iter().map(|b| ("POST".to_string(), self.uri.clone(), Some(self.with_pit(b)))).collect());
+        for a in &answers {
+            self.note(a);
+        }
+        answers
     }
 }
 
@@ -714,7 +859,10 @@ fn child_search_uri(index: Option<&str>, params: &HashMap<String, String>) -> St
         out
     }
     let mut q: Vec<String> = Vec::new();
-    for k in ["routing", "preference", "ignore_unavailable", "allow_no_indices", "expand_wildcards", "ignore_throttled"] {
+    // `allow_partial_search_results` too: a child must keep the request's
+    // completeness policy (a strict request fails when a child misses a
+    // shard, whatever the cluster default).
+    for k in ["routing", "preference", "ignore_unavailable", "allow_no_indices", "expand_wildcards", "ignore_throttled", "allow_partial_search_results"] {
         if let Some(v) = params.get(k) {
             q.push(format!("{k}={}", enc(v)));
         }
@@ -738,7 +886,7 @@ fn search(node: &Node, req: &Req, index: Option<&str>) -> R {
     let (body,raw)=match req.json_shared() {
         Ok(body)=>(body,None),
         Err(error)=>match std::str::from_utf8(req.body_text()).ok().and_then(|s|elasticsearch_engine::source_json::search_request(s).ok()) {
-            Some((parsed,raw))=>(Arc::new(parsed),Some(raw)), None=>return Err(error),
+            Some((parsed,raw))=>(Arc::new(parsed),raw), None=>return Err(error),
         }
     };
     // The request's own extensions unless a raw body joins them.
@@ -855,7 +1003,9 @@ fn scroll(node: &Node, req: &Req) -> R {
         if sc.get(&id).is_some_and(|ctx| ctx.expires <= Instant::now()) {
             sc.remove(&id);
         }
-        let ctx = sc.get_mut(&id).ok_or_else(|| {
+        // Another subject's scroll is not there for the caller.
+        let caller = req.access.as_deref().map(|a| principal(a.user()));
+        let ctx = sc.get_mut(&id).filter(|ctx| ctx.owner == caller).ok_or_else(|| {
             EsError::search_phase("", EsError::search_context_missing(&id)).with_status_404()
         })?;
         if let Some(k) = &ka {
@@ -869,6 +1019,11 @@ fn scroll(node: &Node, req: &Req) -> R {
         }
         (ctx.targets.clone(), ctx.req.clone(), ctx.cursors.clone(), ctx.lost.clone())
     };
+    // The scroll's indices are authorized for the caller (the id may come
+    // from another subject).
+    if let Some(a) = req.access.as_deref() {
+        a.authorize_targets(node, "indices:data/read/scroll", &targets)?;
+    }
     let lookup = terms_lookup(node, req.access.as_deref());
     let mut sreq = sreq;
     if req.param("rest_total_hits_as_int") == Some("true") {
@@ -927,13 +1082,16 @@ fn clear_scroll(node: &Node, req: &Req) -> R {
             elasticsearch_engine::search_ids::parse_scroll_id(id)?;
         }
     }
+    // Clearing every scroll is a cluster privilege (authorized before);
+    // a named scroll is cleared only by the subject that opened it.
+    let caller = req.access.as_deref().map(|a| principal(a.user()));
     let mut sc = node.scrolls.lock();
     let freed = if all {
         let n = sc.len();
         sc.clear();
         n
     } else {
-        ids.iter().filter(|i| sc.remove(*i).is_some()).count()
+        ids.iter().filter(|i| sc.get(*i).is_some_and(|ctx| ctx.owner == caller) && sc.remove(*i).is_some()).count()
     };
     let status = if !all && freed == 0 { 404 } else { 200 };
     Ok(Resp::json(status, json!({"succeeded": true, "num_freed": freed})))
@@ -1083,8 +1241,34 @@ fn count(node: &Node, req: &Req, index: Option<&str>) -> R {
         resp.insert("terminated_early".into(), json!(false));
     }
     resp.insert("count".into(), json!(out.total));
-    resp.insert("_shards".into(), json!({"total": n, "successful": n, "skipped": 0, "failed": 0}));
+    resp.insert("_shards".into(), count_shards(&out.json, n));
     Ok(Resp::ok(Value::Object(resp)))
+}
+
+/// An msearch header's per-search options (`routing`, `preference`,
+/// `search_type`, `request_cache`, `allow_partial_search_results`) as the
+/// search's parameters (ES `MultiSearchRequest.readMultiLineFormat`).
+pub(crate) fn project_msearch_header(header: &Value, params: &mut HashMap<String, String>) {
+    if let Some(o) = header.as_object() {
+        for (k, v) in o {
+            if matches!(k.as_str(), "routing" | "preference" | "search_type" | "request_cache" | "allow_partial_search_results") && !v.is_null() {
+                params.insert(k.clone(), elasticsearch_engine::query::dsl::scalar_string(v));
+            }
+        }
+    }
+}
+
+/// `_count`'s `_shards`: the search's own outcome (failed shards and their
+/// reasons qualify the count, #614) over the `n` shards counted.
+fn count_shards(search_json: &str, n: usize) -> Value {
+    let shards = serde_json::from_str::<Value>(search_json).ok().map(|v| v["_shards"].clone()).unwrap_or(Value::Null);
+    let failed = shards["failed"].as_u64().unwrap_or(0).min(n as u64);
+    let skipped = shards["skipped"].as_u64().unwrap_or(0);
+    let mut out = json!({"total": n, "successful": n as u64 - failed, "skipped": skipped, "failed": failed});
+    if let Some(f) = shards.get("failures").filter(|f| f.as_array().is_some_and(|a| !a.is_empty())) {
+        out["failures"] = f.clone();
+    }
+    out
 }
 
 fn msearch(node: &Node, req: &Req, index: Option<&str>) -> R {
@@ -1143,6 +1327,9 @@ fn msearch(node: &Node, req: &Req, index: Option<&str>) -> R {
                 }
             }
         }
+        // The header's shard selection and execution options apply to its
+        // search, as the URL parameters of a single search would (#334).
+        project_msearch_header(&header, &mut params);
         let resolve = ResolveOpts::from_params(&hp);
         // ES parses every sub-request body up front: a structural error fails the whole request.
         let mut sub_params = params.clone();

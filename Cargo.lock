@@ -1036,6 +1036,7 @@ dependencies = [
  "fancy-regex 0.19.2",
  "flate2",
  "getrandom 0.2.17",
+ "icu_normalizer",
  "indexmap",
  "libm",
  "lru",
@@ -1047,9 +1048,12 @@ dependencies = [
  "parking_lot",
  "pbkdf2",
  "rayon",
+ "rcgen",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "rustic-core",
+ "rustls-native-certs",
  "ryu",
  "serde",
  "serde_json",
@@ -1058,7 +1062,9 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tracing",
+ "unicode-segmentation",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1148,10 +1154,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "chrono",
  "futures",
  "k8s-openapi",
  "kube",
+ "rand 0.8.8",
+ "rcgen",
  "reqwest",
+ "rustls-pki-types",
+ "rustls-webpki",
  "schemars",
  "serde",
  "serde_json",
@@ -1178,6 +1190,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "http-body",
  "lz4_flex",
  "md-5",
  "parking_lot",
@@ -1205,6 +1218,7 @@ dependencies = [
  "hmac",
  "md-5",
  "pbkdf2",
+ "rcgen",
  "rustls",
  "sha1",
  "sha2",
@@ -1231,6 +1245,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

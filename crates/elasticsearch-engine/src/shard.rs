@@ -56,24 +56,19 @@ const PUBLISH_SEAL_WAIT: std::time::Duration = std::time::Duration::from_secs(1)
 /// their memtables, keeps searches on segments: a search over a large
 /// published memtable builds its read structures first.
 const IN_FLIGHT_SEAL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Longest the refresh a search on a search-idle copy the scheduler serves
-/// runs waits for the core and for completed writes' hand-off, before the
-/// search reads the last published view
-/// ([`Shard::before_search`]). A large backlog's seal is the refresh's own
-/// work and is not bounded by it. As a background worker's deferred refresh
-/// ([`DEFERRED_REFRESH_WAIT`]): at 1 s, searches on copies whose core a
-/// merge install or a write batch held kept taking just over a second
-/// (the c28q wiki mixed load with a replica: idle phase 146 searches over
-/// 1 s, max 1.8 s).
-const IDLE_SEARCH_REFRESH_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// Longest the first search on a search-idle copy with pending changes
+/// waits for the refresh it needs ([`Shard::before_search`]): for the core
+/// and completed writes' hand-off, and for the searches already waiting on
+/// that refresh. ES waits for the scheduled refresh without a limit
+/// (`IndexShard.awaitShardSearchActive`); this bound only stops a wedged
+/// holder from parking searches for ever. A 100 ms bound under sustained
+/// bulk indexing (core held by write batches) let a `_count` read an
+/// hours-old reader: 775k of 1.5B docs (c32y github_archive).
+const IDLE_SEARCH_REFRESH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// A merge install, or a search-idle search's refresh, taking at least this
 /// long is logged with its parts ("slow merge install", "slow search-idle
 /// refresh").
 const SLOW_INSTALL: std::time::Duration = std::time::Duration::from_millis(200);
-/// Longest a search on a search-idle copy the scheduler serves waits for
-/// the refresh another search is running (which may be sealing a backlog)
-/// before reading the last published view ([`Shard::before_search`]).
-const IDLE_SEARCH_OTHER_REFRESH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Seal work a refresh may find waiting on a copy: the copy's unsealed
 /// backlog is capped at what its measured seal throughput writes in this
 /// long ([`backlog_limit`]), so the first refresh after a large ingest with
@@ -102,6 +97,11 @@ fn backlog_limit(memory: u64, seal_rate: u64) -> u64 {
 const MUTABLE_TEXT_CHUNK_DOCS: usize = 4096;
 const STATE_FILE: &str = "shard_state.json";
 const TRANSLOG_DIR: &str = "translog";
+/// A cluster replica copy's write-ahead log, kept in the shard path
+/// (`elasticsearch-node` `replication::wal`): the replica's translog. As ES
+/// reports a replica's translog, its bytes count under `translog`, never
+/// under `store`.
+pub const REPLICA_WAL_DIR: &str = "cluster-replica-wal";
 
 // Hooks 3/4/5 (primary terms, replica apply, history, retention): see
 // `hooks/shard_ext.rs` and `docs/ENGINE_HOOKS_IMPL.md`.
@@ -157,6 +157,43 @@ pub struct VersionEntry {
     /// The primary term of the op (`0`: not known here, e.g. replayed):
     /// `if_primary_term` compares with it, never with an older copy's.
     pub primary_term: u64,
+    /// A delete tombstone's time on [`gc_clock_ms`] (ES
+    /// `DeleteVersionValue.time`): it expires `index.gc_deletes` later.
+    /// `0` for live entries.
+    pub deleted_at: u64,
+}
+
+/// Milliseconds on a monotonic clock (ES `relativeTimeInMillis`), never `0`.
+pub(crate) fn gc_clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// ES `index.gc_deletes` default (60s).
+pub(crate) const GC_DELETES_DEFAULT_MS: u64 = 60_000;
+
+/// The shard's `index.gc_deletes`, in millis (synced from the settings).
+pub(crate) struct GcDeletes(std::sync::atomic::AtomicU64);
+impl Default for GcDeletes {
+    fn default() -> Self { GcDeletes(std::sync::atomic::AtomicU64::new(GC_DELETES_DEFAULT_MS)) }
+}
+
+/// What decides whether a delete tombstone may be pruned (ES
+/// `LiveVersionMap.pruneTombstones(maxTimestampToPrune, maxSeqNoToPrune)`).
+pub(crate) struct TombstoneGc<'a> {
+    now: u64,
+    gc_ms: u64,
+    locks: &'a KeyedLocks,
+}
+
+impl TombstoneGc<'_> {
+    /// Older than `index.gc_deletes`, at or below the processed checkpoint
+    /// (no older op of the id can still arrive and be mistaken for new),
+    /// and its id not held by an in-flight operation (ES skips a tombstone
+    /// whose uid lock is held).
+    fn expired(&self, id: &str, e: &VersionEntry, checkpoint: i64) -> bool {
+        e.deleted && self.now.saturating_sub(e.deleted_at) > self.gc_ms && e.seq_no <= checkpoint && !self.locks.is_held(id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +235,11 @@ pub struct WriteCond {
     /// document can exist, so the write skips the version lookup (ES's
     /// `canOptimizeAddDocument` for auto-generated ids).
     pub append_only: bool,
+    /// ES `VersionType.INTERNAL` with an explicit version, as a reindex
+    /// builds its scripted deletes (`requestFromOp`): the current version
+    /// must equal it. Internal only (clients cannot send it: ES rejects
+    /// internal versioning for optimistic concurrency control).
+    pub version_eq: Option<u64>,
 }
 
 impl WriteCond {
@@ -321,6 +363,8 @@ pub struct Counters {
     /// Merges running now (background merges), and their docs.
     pub merge_current: AtomicU64,
     pub merge_current_docs: AtomicU64,
+    /// The running merges' input bytes (ES `merges.current_size_in_bytes`).
+    pub merge_current_bytes: AtomicU64,
     /// ES `indexing.throttle_time_in_millis`: time writes waited for the
     /// indexing throttle ([`Shard::merge_throttle`]), and whether it is on.
     pub index_throttle_nanos: AtomicU64,
@@ -339,7 +383,7 @@ impl Counters {
                 get_total, get_time_nanos, get_exists_total, get_exists_time_nanos, get_missing_total, get_missing_time_nanos, get_current,
                 search_total, query_time_nanos, query_current, fetch_total, fetch_time_nanos, fetch_current, refresh_total, refresh_time_nanos,
                 flush_total, flush_time_nanos, merge_total, merge_time_nanos, merge_docs, merge_size_bytes, merge_current, merge_current_docs,
-                index_throttle_nanos, index_throttled);
+                merge_current_bytes, index_throttle_nanos, index_throttled);
         }
         out
     }
@@ -408,14 +452,14 @@ impl SharedTranslog {
     fn fail_next_appends(&self, count: usize) { self.0.lock().fail_next_appends(count) }
     fn append_many(&self, ops: &[TranslogOp]) -> Result<()> { self.0.lock().append_many(ops) }
     /// Append and take the sync point covering it, under one hold.
-    fn append_many_synced(&self, ops: &[TranslogOp]) -> Result<(Arc<std::fs::File>, u64)> {
+    fn append_many_synced(&self, ops: &[TranslogOp]) -> Result<(Arc<crate::translog::TranslogFile>, u64)> {
         // Serialize and compress before the lock: only the write is serialized.
         let encoded = Translog::encode_batch(ops)?;
         let mut translog = self.0.lock();
         translog.append_encoded(&encoded)?;
         Ok(translog.sync_point())
     }
-    fn sync_point(&self) -> (Arc<std::fs::File>, u64) { self.0.lock().sync_point() }
+    fn sync_point(&self) -> (Arc<crate::translog::TranslogFile>, u64) { self.0.lock().sync_point() }
     fn fsync(&self) -> Result<()> { self.0.lock().fsync() }
     fn roll(&self) -> Result<u64> { self.0.lock().roll() }
     fn fail(&self, reason: &str) { self.0.lock().fail(reason) }
@@ -514,22 +558,56 @@ impl WriteState {
     }
 
     /// Drop live version-map entries (they mirror what the id lookup finds
-    /// in the core), keeping delete tombstones and every entry a staged
-    /// bulk still relies on.
+    /// in the core), keeping every entry a staged bulk still relies on and
+    /// delete tombstones until `index.gc_deletes` expires them (`gc`).
     /// `unresolved`: ids with a buffered older-copy delete, kept (the version
     /// map answers for them until their older copies are gone).
-    fn prune_versions(&mut self, unresolved: &registry::Deletes) {
+    fn prune_versions(&mut self, unresolved: &registry::Deletes, gc: &TombstoneGc<'_>) {
         let keep_from = self.staged.keys().next().copied().unwrap_or(i64::MAX);
-        self.versions.retain(|id, e| e.deleted || e.seq_no >= keep_from || unresolved.contains_key(id.as_str()));
+        let checkpoint = self.hist.checkpoint;
+        self.versions.retain(|id, e| Self::keep_version(id, e, keep_from, checkpoint, unresolved, gc));
+        self.shrink_versions();
         self.prunes += 1;
     }
 
     /// [`WriteState::prune_versions`], handing the dropped entries back to
     /// be freed after the locks.
-    fn prune_versions_deferred(&mut self, unresolved: &registry::Deletes) -> Vec<registry::Removed<VersionEntry>> {
+    fn prune_versions_deferred(&mut self, unresolved: &registry::Deletes, gc: &TombstoneGc<'_>) -> Vec<registry::Removed<VersionEntry>> {
         let keep_from = self.staged.keys().next().copied().unwrap_or(i64::MAX);
+        let checkpoint = self.hist.checkpoint;
         self.prunes += 1;
-        self.versions.extract(|id, e| e.deleted || e.seq_no >= keep_from || unresolved.contains_key(id.as_str()))
+        let pruned = self.versions.extract(|id, e| Self::keep_version(id, e, keep_from, checkpoint, unresolved, gc));
+        self.shrink_versions();
+        pruned
+    }
+
+    /// Only the expired delete tombstones (ES `pruneDeletedTombstones`, run
+    /// by maintenance between refreshes); the number dropped.
+    fn prune_tombstones(&mut self, unresolved: &registry::Deletes, gc: &TombstoneGc<'_>) -> usize {
+        let keep_from = self.staged.keys().next().copied().unwrap_or(i64::MAX);
+        let checkpoint = self.hist.checkpoint;
+        let before = self.versions.len();
+        self.versions.retain(|id, e| !e.deleted || Self::keep_version(id, e, keep_from, checkpoint, unresolved, gc));
+        let dropped = before - self.versions.len();
+        if dropped > 0 {
+            self.shrink_versions();
+            self.prunes += 1;
+        }
+        dropped
+    }
+
+    fn keep_version(id: &str, e: &VersionEntry, keep_from: i64, checkpoint: i64, unresolved: &registry::Deletes, gc: &TombstoneGc<'_>) -> bool {
+        if e.seq_no >= keep_from || unresolved.contains_key(id) {
+            return true;
+        }
+        e.deleted && !gc.expired(id, e, checkpoint)
+    }
+
+    /// Give back the table memory of pruned entries (the table keeps room
+    /// for the entries and the in-flight reservations).
+    fn shrink_versions(&mut self) {
+        let required = self.versions.len().saturating_add(self.version_inflight);
+        self.versions.shrink_for(required);
     }
 }
 
@@ -578,7 +656,7 @@ pub struct Shard {
     synced: Mutex<u64>,
     /// Newest translog sync point (file, mark), published after each append
     /// so the syncer never waits on the write lock.
-    tail: Mutex<Option<(Arc<std::fs::File>, u64)>>,
+    tail: Mutex<Option<(Arc<crate::translog::TranslogFile>, u64)>>,
     pub counters: Counters,
     last_flush_started: Mutex<std::time::Instant>,
     /// Mutable-graph save schedule ([`Shard::graph_save_due`]).
@@ -828,6 +906,10 @@ impl GraphSaves {
         }
         match self.seq_no {
             None => true,
+            // Link logs (segment format v40): a save writes only the edits
+            // since the last one, so every commit with ops saves (the
+            // unsaved edits stay bounded by the flush interval).
+            Some(saved) if rustic_core::codec::write_version() >= rustic_core::codec::GRAPH_LINK_LOG_SINCE => commit_seq > saved,
             Some(saved) => {
                 let since = commit_seq.saturating_sub(saved);
                 let geometric = (saved.max(0) as f64 * self.growth).min(i64::MAX as f64) as i64;
@@ -1450,6 +1532,11 @@ impl KeyedLocks {
         guard
     }
 
+    /// Whether an operation holds (or waits for) `id`'s lock.
+    pub(crate) fn is_held(&self, id: &str) -> bool {
+        self.shard(id).0.lock().get(id).is_some_and(|k| k.held || k.waiters > 0)
+    }
+
     /// Ids locked or waited for now (the table stays as small as that).
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -1575,6 +1662,10 @@ const STORE_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(
 /// claim) at a time and is held across the encoding.
 #[derive(Default)]
 pub(crate) struct Background {
+    /// `index.gc_deletes` ([`Shard::set_gc_deletes`]).
+    pub(crate) gc_deletes: GcDeletes,
+    /// [`gc_clock_ms`] of the last maintenance tombstone prune.
+    pub(crate) tombstones_pruned_at: AtomicU64,
     pub(crate) seal_lock: BgLock,
     /// One seal job encoding at a time (held across the encoding by
     /// background seals and by every foreground path that needs its own
@@ -1605,6 +1696,10 @@ pub(crate) struct Background {
     /// ES `IndexingThrottle`: one indexing request at a time while merges are
     /// behind ([`Shard::stall_if_behind`]).
     pub(crate) indexing_throttle: BgLock,
+    /// Indexing is throttled for merges now (ES
+    /// `ThreadPoolMergeScheduler.shouldThrottleIncomingMerges`: on and off
+    /// at different conditions, see [`merge_throttle_next`]).
+    pub(crate) merge_throttling: std::sync::atomic::AtomicBool,
     /// Serializes explicit force merges of the copy.
     pub(crate) force_lock: BgLock,
     /// Serializes flushes: a flush encodes its seal with `seal_lock`
@@ -1879,18 +1974,21 @@ fn seal_jobs() -> usize {
 
 
 /// Concurrent background merges of one shard copy (ES
-/// `index.merge.scheduler.max_thread_count`): `RUSTIC_MERGE_THREADS`, else
-/// `max(1, min(4, cores / 2))` (the merge pool's size).
-fn merge_threads() -> usize {
+/// `index.merge.scheduler.max_thread_count`, which overrides it per index):
+/// `RUSTIC_MERGE_THREADS`, else `max(1, min(4, cores / 2))`, ES 8's
+/// `ConcurrentMergeScheduler` default. Uncapped (ES 9's half the cores), a
+/// bulk load on two nodes sharing a box ran three times the merges at once:
+/// they spent ~50% more time throttled, merged ~30% slower and left ~20%
+/// more segments two minutes after the load.
+pub(crate) fn merge_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("RUSTIC_MERGE_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
-        // ES `index.merge.scheduler.max_thread_count` default, per copy.
-        .unwrap_or_else(|| (crate::processors::get() / 2).clamp(1, 4)))
+        .unwrap_or_else(|| (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).clamp(1, 4)))
 }
 
 /// Background merges the node runs at once, over every copy:
-/// `RUSTIC_NODE_MERGES`, else half the processors (at least 1); halved
-/// while the node searches.
+/// `RUSTIC_NODE_MERGES`, else half the processors (at least 1); a quarter
+/// of that while the node searches.
 fn node_merge_cap() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("RUSTIC_NODE_MERGES").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
@@ -1903,13 +2001,19 @@ fn node_merges() -> &'static BgSemaphore {
     S.get_or_init(|| BgSemaphore::new(node_merge_cap()))
 }
 
-/// ES `ThreadPoolMergeScheduler.checkMergeTaskThrottling`: indexing is
-/// throttled while the merges in flight (running and queued) exceed
-/// `max_merge_count`, and, with the auto IO throttle on, only once the merge
-/// IO rate is at its maximum (merges are no longer held back by the rate,
-/// and still cannot keep up).
-fn merge_throttle_due(in_flight: usize, max_merge_count: usize, auto_throttle: bool, io_rate_at_max: bool) -> bool {
-    in_flight > max_merge_count && (!auto_throttle || io_rate_at_max)
+/// ES `ThreadPoolMergeScheduler.checkMergeTaskThrottling`: whether indexing
+/// is throttled for merges, given whether it is now (`throttling`). It
+/// starts once the merges in flight (running and queued) exceed
+/// `max_merge_count` and, with the auto IO throttle on, the merge IO rate is
+/// at its maximum and merges still cannot keep up
+/// ([`rustic_core::merge::merge_auto_rate_at_max`]). It stops only once the merges in flight are back at
+/// `max_merge_count` or below, whatever the IO rate does meanwhile.
+fn merge_throttle_next(throttling: bool, in_flight: usize, max_merge_count: usize, auto_throttle: bool, io_rate_at_max: bool) -> bool {
+    if throttling {
+        in_flight > max_merge_count
+    } else {
+        in_flight > max_merge_count && (!auto_throttle || io_rate_at_max)
+    }
 }
 
 /// A shard copy's merge scheduler and policy (ES `MergeSchedulerConfig` and
@@ -2219,11 +2323,23 @@ pub(crate) struct MergeTask {
     _guard: SemGuard,
     job: rustic_core::index::MergeJob,
     docs: u64,
+    /// The inputs' bytes (counted in `merge_current_bytes` until installed).
+    bytes: u64,
     t0: std::time::Instant,
 }
 
+/// Test seam: called on the merge worker as a background or force merge
+/// starts its I/O (already counted in `merges.current`); a test holds
+/// merges mid-flight by blocking in it.
+#[doc(hidden)]
+pub static MERGE_RUN_HOOK: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = parking_lot::Mutex::new(None);
+
 impl MergeTask {
     pub(crate) fn run(self) -> MergeDone {
+        let hook = MERGE_RUN_HOOK.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         let merged = self.job.run();
         MergeDone { task: self, merged }
     }
@@ -3003,7 +3119,7 @@ impl Shard {
             // its `LiveVersionMap` on refresh): keep the delete tombstones, as
             // a flush does, so the map stays bounded by the memtables rather
             // than growing with every id written since the last flush.
-            ws.prune_versions(&self.unresolved.lock());
+            ws.prune_versions(&self.unresolved.lock(), &self.tombstone_gc());
         }
         if n_index + n_delete > 0 {
             self.sched.note_write();
@@ -3187,7 +3303,12 @@ impl Shard {
         let (max_merge_count, auto_throttle) = { let c = self.bg.merge_config.read(); (c.max_merge_count, c.auto_throttle) };
         let memory = self.bg.memory_throttled.load(Ordering::Acquire);
         let in_flight = self.bg.merge_backlog.load(Ordering::Acquire) + self.counters.merge_current.load(Ordering::Acquire) as usize;
-        let merges = merge_throttle_due(in_flight, max_merge_count, auto_throttle, rustic_core::merge::merge_auto_rate_at_max());
+        let throttling = self.bg.merge_throttling.load(Ordering::Acquire);
+        let merges = merge_throttle_next(throttling, in_flight, max_merge_count, auto_throttle, rustic_core::merge::merge_auto_rate_at_max());
+        if merges != throttling {
+            self.bg.merge_throttling.store(merges, Ordering::Release);
+            tracing::info!(path = %self.path.display(), in_flight, max_merge_count, "{} indexing throttle for merges", if merges { "now" } else { "stop" });
+        }
         if merges {
             self.bg.want_merge.store(true, Ordering::Release);
         }
@@ -3427,7 +3548,10 @@ impl Shard {
             core.try_finish_seal_captured(sealed).map(|r| r.map(|_| ()))
         }, true);
         let (bytes, encoded, concurrent) = (done.bytes, done.encoded, done.concurrent);
-        let installed = if done.forced { rustic_core::admission::forced(install) } else { install() };
+        // Installing a seal frees what it charges (the memtable it replaces):
+        // never refused for memory, as a flush is not (see `flush_then`).
+        let _ = done.forced;
+        let installed = rustic_core::admission::forced(install);
         match installed {
             // Jobs of the copy encode concurrently: the copy's throughput is
             // about this job's rate times the jobs running beside it.
@@ -3524,10 +3648,11 @@ impl Shard {
         // installs nothing, so it may overlap a flush (merges encode on their
         // own pool and never compete for the encode threads seals use).
         // A node-wide merge permit first: background merges of all copies
-        // together use at most half the cores, and half of that while the
-        // node searches (search latency first, as the encode pool).
+        // together use at most the cores (ES's merge pool), and a quarter
+        // of that while the node searches (search latency first, as the
+        // encode pool).
         let node = node_merges();
-        node.set_max(if rustic_core::searches_active() { (node_merge_cap() / 2).max(1) } else { node_merge_cap() });
+        node.set_max(if rustic_core::searches_active() { (node_merge_cap() / 4).max(1) } else { node_merge_cap() });
         let Some((node_guard, guard)) = node.try_acquire().and_then(|n| self.bg.merge_running.try_acquire().map(|g| (n, g))) else {
             // Every merge slot is busy: the request stays (a finishing merge
             // or the scheduler's next dispatch picks it up), and the backlog
@@ -3554,6 +3679,7 @@ impl Shard {
             if let Some(job) = &job {
                 self.counters.merge_current.fetch_add(1, Ordering::Relaxed);
                 self.counters.merge_current_docs.fetch_add(job.num_docs(), Ordering::Relaxed);
+                self.counters.merge_current_bytes.fetch_add(job.input_bytes(), Ordering::Relaxed);
             }
             (job, core.num_pending_merges(&policy))
         };
@@ -3564,8 +3690,8 @@ impl Shard {
         if backlog > 0 { self.bg.want_merge.store(true, Ordering::Release); }
         let mut job = job?;
         job.set_throttled(config.auto_throttle);
-        let docs = job.num_docs();
-        Some(MergeTask { _guard: guard, _node: node_guard, job, docs, t0: std::time::Instant::now() })
+        let (docs, bytes) = (job.num_docs(), job.input_bytes());
+        Some(MergeTask { _guard: guard, _node: node_guard, job, docs, bytes, t0: std::time::Instant::now() })
     }
 
     /// This copy's merges the policy wants that have not started.
@@ -3582,7 +3708,7 @@ impl Shard {
         // Running until installed (or released): a merge counted done before
         // its install let a force merge commit first and return with the
         // merge then installing uncommitted.
-        let _current = CurrentGuard(vec![(&self.counters.merge_current, 1), (&self.counters.merge_current_docs, task.docs)]);
+        let _current = CurrentGuard(vec![(&self.counters.merge_current, 1), (&self.counters.merge_current_docs, task.docs), (&self.counters.merge_current_bytes, task.bytes)]);
         let merged = match merged {
             Ok(m) => m,
             Err(e) => {
@@ -4134,7 +4260,7 @@ impl Shard {
                 let current = |ws: &WriteState, id: &str| -> Option<VersionEntry> {
                     match ws.versions.get(id) {
                         Some(e) => Some(*e),
-                        None => hit.as_ref().map(|&(_, v, s)| VersionEntry { version: v, seq_no: s, deleted: false, primary_term: 0 }),
+                        None => hit.as_ref().map(|&(_, v, s)| VersionEntry { version: v, seq_no: s, deleted: false, deleted_at: 0, primary_term: 0 }),
                     }
                 };
                 // `if_primary_term` compares with the term of the id's latest
@@ -4179,7 +4305,7 @@ impl Shard {
                         // An overwrite (of a live copy, or of a delete's
                         // tombstone) is an update for the MSU.
                         if cur.is_some() { self.note_update(seq_no); }
-                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, primary_term });
+                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, deleted_at: 0, primary_term });
                         log.push(TranslogOp::Index { id: id.clone(), source_json: source, seq_no: seq_no as u64, version, routing });
                         let res = WriteResult { id: id.clone(), version, seq_no, primary_term, result: if existed { "updated" } else { "created" } };
                         if !auto_id {
@@ -4207,7 +4333,7 @@ impl Shard {
                         let seq_no = ws.seq_no;
                         undo.push(ws.versions.get(&id).copied());
                         self.note_update(seq_no);
-                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, primary_term });
+                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, deleted_at: gc_clock_ms(), primary_term });
                         log.push(TranslogOp::Delete { id: id.clone(), seq_no: seq_no as u64, version });
                         let res = WriteResult { id: id.clone(), version, seq_no, primary_term, result: if existed { "deleted" } else { "not_found" } };
                         self.retry_note(&cond, &res, true);
@@ -4712,6 +4838,40 @@ impl Shard {
 
     /// Apply the index's merge settings (dynamic: the scheduler re-reads them;
     /// see [`MergeConfig::from_settings`]).
+    /// `index.gc_deletes` in millis (negative: `0`, prune at once).
+    pub fn set_gc_deletes(&self, millis: i64) {
+        self.bg.gc_deletes.0.store(millis.max(0) as u64, Ordering::Relaxed);
+    }
+
+    fn tombstone_gc(&self) -> TombstoneGc<'_> {
+        TombstoneGc { now: gc_clock_ms(), gc_ms: self.bg.gc_deletes.0.load(Ordering::Relaxed), locks: &self.id_locks }
+    }
+
+    /// Maintenance (ES `maybePruneDeletedTombstones`): drop the delete
+    /// tombstones `index.gc_deletes` expired, at most every quarter of it,
+    /// so a shard that deletes fresh ids without refreshing or flushing
+    /// still gives their memory back. Never waits for the write lock.
+    /// Returns the number dropped.
+    pub fn maybe_prune_tombstones(&self) -> usize {
+        let gc = self.tombstone_gc();
+        let last = self.bg.tombstones_pruned_at.load(Ordering::Relaxed);
+        if last != 0 && gc.now.saturating_sub(last) <= gc.gc_ms / 4 {
+            return 0;
+        }
+        let Some(mut ws) = self.write.try_lock() else { return 0 };
+        self.bg.tombstones_pruned_at.store(gc.now, Ordering::Relaxed);
+        let unresolved = self.unresolved.lock();
+        ws.prune_tombstones(&unresolved, &gc)
+    }
+
+    /// Version-map entries held now and the bytes of their table
+    /// (tests of tombstone expiry).
+    #[cfg(test)]
+    pub(crate) fn version_map_size(&self) -> (usize, u64) {
+        let ws = self.write.lock();
+        (ws.versions.len(), ws.versions.table_bytes())
+    }
+
     pub fn set_merge_config(&self, config: MergeConfig) {
         if *self.bg.merge_config.read() == config { return; }
         self.bg.merge_running.set_max(config.max_thread_count);
@@ -4894,7 +5054,7 @@ impl Shard {
             } else {
                 self.note_buffered(core.writing_bytes() as u64);
             }
-            ws.prune_versions(&self.unresolved.lock());
+            ws.prune_versions(&self.unresolved.lock(), &self.tombstone_gc());
         }
     }
 
@@ -4963,7 +5123,7 @@ impl Shard {
         // lookups missing the cache). The entries are freed with the
         // refresh's other drops, after the locks ([`CHECKIN_DROPS`]).
         if DEFER_CHECKIN_DROPS.with(|d| d.get()) {
-            let pruned = ws.prune_versions_deferred(&self.unresolved.lock());
+            let pruned = ws.prune_versions_deferred(&self.unresolved.lock(), &self.tombstone_gc());
             let n = pruned.len();
             if n > 0 { CHECKIN_DROPS.with(|c| { let mut c = c.borrow_mut(); c.0.push(Box::new(pruned)); c.1 += n; }); }
         }
@@ -5334,7 +5494,7 @@ impl Shard {
     /// and drop the dirty pages, so a retry that succeeds proves nothing):
     /// it fails the engine and closes the translog, and every waiter, the
     /// ones queued behind it included, fails from then on.
-    fn group_sync(&self, file: &std::fs::File, mark: u64) -> Result<()> {
+    fn group_sync(&self, file: &crate::translog::TranslogFile, mark: u64) -> Result<()> {
         // The indexing is done: the shard throttle does not cover the fsync
         // (ES takes its indexing throttle per operation, and syncs the
         // translog after), so throttled requests still share group commits.
@@ -5367,9 +5527,9 @@ impl Shard {
         #[cfg(not(test))]
         let injected = false;
         let r = if injected { Err(std::io::Error::other("injected translog fsync failure")) } else { match &tail {
-            Some((cur, _)) if std::ptr::eq(&**cur, file) => file.sync_data(),
-            Some((cur, _)) => cur.sync_data().and_then(|_| file.sync_data()),
-            None => file.sync_data(),
+            Some((cur, _)) if std::ptr::eq(&**cur, file) => file.sync_data_checkpointed(),
+            Some((cur, _)) => cur.sync_data_checkpointed().and_then(|_| file.sync_data_checkpointed()),
+            None => file.sync_data_checkpointed(),
         } };
         if let Err(error) = r {
             let reason = format!("translog fsync failed: {error}");
@@ -5390,7 +5550,7 @@ impl Shard {
         let found = Self::lookup(core, id);
         let entry = match ws.versions.get(id) {
             Some(e) => Some(*e),
-            None => found.map(|(_, v, s)| VersionEntry { version: v, seq_no: s, deleted: false, primary_term: 0 }),
+            None => found.map(|(_, v, s)| VersionEntry { version: v, seq_no: s, deleted: false, deleted_at: 0, primary_term: 0 }),
         };
         (found.map(|f| f.0), entry)
     }
@@ -5416,6 +5576,13 @@ impl Shard {
                 None => {
                     return Err(EsError::version_conflict(index, uuid, id, format!("version conflict, required seqNo [{s}], primary term [{t}]. but no document was found")));
                 }
+            }
+        }
+        if let Some(v) = cond.version_eq {
+            match live {
+                Some(e) if e.version == v => {}
+                Some(e) => return Err(EsError::version_conflict(index, uuid, id, format!("version conflict, current version [{}] is different than the one provided [{v}]", e.version))),
+                None => return Err(EsError::version_conflict(index, uuid, id, format!("version conflict, document does not exist (expected version [{v}])"))),
             }
         }
         match (cond.version_type.unwrap_or(VersionType::Internal), cond.version) {
@@ -5490,7 +5657,7 @@ impl Shard {
         #[cfg(not(feature = "mutable-hnsw"))]
         core.replace_document(addr.as_ref(), &doc)?;
         if !auto_id {
-            ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, primary_term });
+            ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, deleted_at: 0, primary_term });
         }
         log.push(TranslogOp::Index { id: id.clone(), source_json: source, seq_no: seq_no as u64, version, routing });
         let res = WriteResult { id, version, seq_no, primary_term, result: if existed { "updated" } else { "created" } };
@@ -5517,7 +5684,7 @@ impl Shard {
         if let Some(a) = addr {
             core.delete_doc(&a)?;
         }
-        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, primary_term: self.primary_term() });
+        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, deleted_at: gc_clock_ms(), primary_term: self.primary_term() });
         log.push(TranslogOp::Delete { id: id.clone(), seq_no: seq_no as u64, version });
         let res = WriteResult { id, version, seq_no, primary_term: self.primary_term(), result: if existed { "deleted" } else { "not_found" } };
         self.retry_note(&cond, &res, true);
@@ -5639,7 +5806,7 @@ impl Shard {
         for (op, version_key) in ops.iter().zip(version_keys) {
             ws.seq_no = ws.seq_no.max(op.seq_no);
             ws.hist.tombstones.remove(op.id);
-            ws.versions.insert(version_key, VersionEntry { version: op.version, seq_no: op.seq_no, deleted: false, primary_term: 0 });
+            ws.versions.insert(version_key, VersionEntry { version: op.version, seq_no: op.seq_no, deleted: false, deleted_at: 0, primary_term: 0 });
             ws.hist.mark(op.seq_no);
         }
         prepared.clear();
@@ -5672,7 +5839,7 @@ impl Shard {
                 self.note_buffered(core.writing_bytes() as u64);
                 // As after any seal: the version map stays bounded by the
                 // memtables, not by every id replayed since the last flush.
-                ws.prune_versions(&self.unresolved.lock());
+                ws.prune_versions(&self.unresolved.lock(), &self.tombstone_gc());
             }
             // The memtables stay as they are; the next chunk or the final
             // publish tries again.
@@ -5839,7 +6006,7 @@ impl Shard {
                         let older = !(first_copy && !ws.versions.contains_key(&id) && !ws.hist.tombstones.contains_key(&id));
                         if older && (live.is_some() || ws.versions.contains_key(&id)) { self.note_update(seq_no); }
                         ws.hist.tombstones.remove(&id);
-                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, primary_term: term });
+                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, deleted_at: 0, primary_term: term });
                         planned.push(Planned::Index { delete_key, id, seq_no, older, doc, version, term, source, routing, ignored,
                             #[cfg(feature = "mutable-hnsw")]
                             token });
@@ -5847,7 +6014,7 @@ impl Shard {
                     StagedReplay::Delete { id, seq_no, version } => {
                         self.note_update(seq_no);
                         let term = self.term_of_locked(&ws, seq_no);
-                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, primary_term: term });
+                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, deleted_at: gc_clock_ms(), primary_term: term });
                         ws.hist.tombstones.insert(id.clone(), (seq_no, version));
                         planned.push(Planned::Delete { id, seq_no });
                     }
@@ -5947,7 +6114,7 @@ impl Shard {
         ws.seq_no = ws.seq_no.max(seq_no);
         ws.hist.tombstones.remove(&id);
         let primary_term = self.term_of_locked(&ws, seq_no);
-        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, primary_term });
+        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, deleted_at: 0, primary_term });
         ws.hist.mark(seq_no);
         Ok(())
     }
@@ -5971,7 +6138,7 @@ impl Shard {
         }
         ws.seq_no = ws.seq_no.max(seq_no);
         let primary_term = self.term_of_locked(&ws, seq_no);
-        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, primary_term });
+        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, deleted_at: gc_clock_ms(), primary_term });
         ws.hist.tombstones.insert(id.to_string(), (seq_no, version));
         ws.hist.mark(seq_no);
         ws.hist.prune_tombstones();
@@ -6846,16 +7013,18 @@ impl Shard {
         // stale reader: data sealed after its last refresh): this search
         // refreshes it first, whether or not a scheduler tick already
         // skipped a refresh (a write just replicated to an idle replica).
-        if self.sched.idle.load(Ordering::SeqCst) && (self.sched.is_dirty() || self.reader_stale()) {
+        // A search-active copy (the hot path) checks nothing more.
+        let pending = self.sched.idle.load(Ordering::SeqCst) && (self.sched.is_dirty() || self.reader_stale());
+        if pending {
             self.sched.skipped.store(true, Ordering::SeqCst);
         }
         self.sched.note_search();
-        // A refresh API call or a scheduled refresh is under way (the first
-        // refresh after a refresh-disabled load, say): this search reads
-        // the last published reader, as every ES search does, instead of
-        // waiting for it or starting a second one beside it. A skipped
-        // refresh stays due for the next search or tick.
-        if self.bg.refreshing.load(Ordering::SeqCst) > 0 && !self.bg.idle_refreshing.load(Ordering::SeqCst) {
+        // A search-active copy with a refresh API call or a scheduled
+        // refresh under way reads the last published reader, as every ES
+        // search does. A search-idle copy with pending changes does not:
+        // its first search waits for a refresh that covers them (ES
+        // `awaitShardSearchActive`), whoever else is refreshing.
+        if !pending && self.bg.refreshing.load(Ordering::SeqCst) > 0 && !self.bg.idle_refreshing.load(Ordering::SeqCst) {
             return;
         }
         // `idle_refreshing` is raised before `skipped` is taken (both
@@ -6864,20 +7033,18 @@ impl Shard {
         if self.sched.skipped.load(Ordering::SeqCst) || self.bg.idle_refreshing.load(Ordering::SeqCst) {
             // ES: every search on a search-idle copy waits for the refresh
             // it triggers. The first one refreshes; the others arriving
-            // meanwhile wait here for it, then see its view.
-            // A copy the scheduler serves: a search waits for another
-            // search's refresh a bounded time only
-            // ([`IDLE_SEARCH_OTHER_REFRESH_WAIT`]), then reads the last
-            // published view, as a search on a search-active copy does.
-            // Waiting without bound queued every search behind whatever that
-            // refresh waited on (the core lock under a flush capture or merge
-            // install, completed writes' hand-off): after a 5M-document
-            // preload (wiki mixed load, c28j) every search of the 60 s idle
-            // phase took about 41 s. A copy no scheduler serves (tests,
-            // tools) has nobody else to refresh it and still waits.
+            // meanwhile wait here for it (one shared refresh, not one each),
+            // then see its view. The wait is bounded by
+            // [`IDLE_SEARCH_REFRESH_LIMIT`] on a copy the scheduler serves;
+            // one no scheduler serves (tests, tools) has nobody else to
+            // refresh it and waits.
             let served = self.bg.served.load(Ordering::Acquire);
-            let waiting = if served { self.bg.idle_refresh.try_lock_for(IDLE_SEARCH_OTHER_REFRESH_WAIT) } else { Some(self.bg.idle_refresh.lock()) };
-            let Some(_waiting) = waiting else { return };
+            let deadline = std::time::Instant::now() + IDLE_SEARCH_REFRESH_LIMIT;
+            let waiting = if served { self.bg.idle_refresh.try_lock_until(deadline) } else { Some(self.bg.idle_refresh.lock()) };
+            let Some(_waiting) = waiting else {
+                tracing::warn!(path = %self.path.display(), "search on a search-idle copy waited {IDLE_SEARCH_REFRESH_LIMIT:?} for its refresh; reading the last published view");
+                return;
+            };
             if !self.sched.skipped.load(Ordering::SeqCst) {
                 return;
             }
@@ -6890,18 +7057,20 @@ impl Shard {
             }
             let t0 = std::time::Instant::now();
             // A large backlog is sealed first (by this refresh, waiting at
-            // most `IN_FLIGHT_SEAL_WAIT` for background seals in flight), then
-            // published (ES: a search-idle shard's refresh writes its own
-            // segments, and the search waits for it). A served copy's refresh
-            // waits for the core and for completed writes' hand-off at most
-            // [`IDLE_SEARCH_REFRESH_WAIT`]: a flush capture, a merge install
-            // or a write batch holding them hands the refresh to the
-            // background workers (`refresh_deferred`), and the search reads
-            // the last published view; the copy is search-active and dirty,
-            // so the scheduler keeps refreshing it.
+            // most `IN_FLIGHT_SEAL_WAIT` for background seals in flight;
+            // the backlog cap keeps it to seconds of work), then published
+            // (ES: a search-idle shard's refresh writes its own segments,
+            // and the search waits for it). The core and completed writes'
+            // hand-off are waited for up to the rest of the limit: under
+            // bulk indexing write batches hold them in turn.
             let unpublished = self.core.try_read().map(|core| (core.num_unpublished_bytes(), self.publish_needs_seal(&core)));
-            let published = if served { self.try_publish_for(IDLE_SEARCH_REFRESH_WAIT) } else { Some(self.publish()) };
+            let published = if served {
+                self.try_publish_for(deadline.saturating_duration_since(std::time::Instant::now()).max(std::time::Duration::from_millis(1)))
+            } else { Some(self.publish()) };
             if published.is_none() {
+                // Still pending: the next search waits for it again, and a
+                // background worker refreshes meanwhile.
+                self.sched.skipped.store(true, Ordering::SeqCst);
                 self.bg.want_refresh.store(true, Ordering::Release);
             }
             let took = t0.elapsed();
@@ -6909,7 +7078,7 @@ impl Shard {
             if took >= SLOW_INSTALL {
                 let (bytes, sealed) = unpublished.map_or((None, None), |(b, s)| (Some(b), Some(s)));
                 tracing::warn!(path = %self.path.display(), took_ms = took.as_millis() as u64, served, unpublished_bytes = ?bytes, sealed_backlog = ?sealed,
-                    outcome = match &published { Some(Ok(true)) => "published", Some(Ok(false)) => "unchanged", Some(Err(_)) => "failed", None => "handed off" },
+                    outcome = match &published { Some(Ok(true)) => "published", Some(Ok(false)) => "unchanged", Some(Err(_)) => "failed", None => "timed out" },
                     "slow search-idle refresh (searches on this copy waited for it)");
             }
             match published {
@@ -6919,7 +7088,7 @@ impl Shard {
                 }
                 Some(Ok(false)) => {}
                 Some(Err(e)) => tracing::warn!("search-idle refresh of [{}] failed: {e}", self.path.display()),
-                None => tracing::debug!("search-idle refresh of [{}] deferred: core busy", self.path.display()),
+                None => tracing::warn!("search-idle refresh of [{}] timed out after {IDLE_SEARCH_REFRESH_LIMIT:?}; the search reads the last published view", self.path.display()),
             }
         }
     }
@@ -6970,8 +7139,16 @@ impl Shard {
     /// the commit seq_no. The graphs are copied in step 3 (chunked, graph
     /// writers interleaved) and streamed with the commit, while writes made
     /// after the capture land above it and replay from the translog.
+    ///
+    /// A flush is never refused for memory (ES never fails one for it): it
+    /// is what frees memory (memtables become segments; vector rows become
+    /// durable and shed their in-memory f32). Its allocations, the graph
+    /// checkpoint captures included, are charged even past the budget.
+    /// (Refused under pressure, a flush failed after installing its vector
+    /// chunks, and every retry then failed on their published reservations:
+    /// flushes stopped, and memory grew until ingest was refused.)
     pub fn flush_then(&self, captured: impl FnOnce()) -> Result<()> {
-        self.flush_inner(captured)
+        rustic_core::admission::forced(|| self.flush_inner(captured))
     }
 
     /// Install (or clear) the replication retention of a cluster primary:
@@ -7263,8 +7440,9 @@ impl Shard {
         let persisted = t0.elapsed();
         ws.committed_seq_no = commit_seq;
         *self.last_flush_started.lock() = t0;
-        // Keep delete tombstones (ES `index.gc_deletes`) so a re-index continues the version.
-        ws.prune_versions(&self.unresolved.lock());
+        // Keep delete tombstones until `index.gc_deletes` expires them, so a
+        // re-index within it continues the version (ES `pruneDeletedTombstones`).
+        ws.prune_versions(&self.unresolved.lock(), &self.tombstone_gc());
         drop(ws);
         self.counters.flush_total.fetch_add(1, Ordering::Relaxed);
         Counters::add_time(&self.counters.flush_time_nanos, t0.elapsed());
@@ -7297,11 +7475,17 @@ impl Shard {
     /// when it takes the lock, so the published copy stays exact until its
     /// own commit. Otherwise the lock is taken as usual, waiting briefly.
     /// Decisions (flush thresholds, snapshots) use the exact getters.
+    /// A cluster replica's write-ahead log ([`REPLICA_WAL_DIR`]: the
+    /// replica's translog, its engine translog unused) counts in
+    /// `translog_bytes`, as ES reports a replica copy's translog.
     pub fn write_stats(&self) -> WriteStats {
-        match self.write.try_lock_for(std::time::Duration::from_millis(50)) {
+        let replica_wal = dir_size(&self.path.join(REPLICA_WAL_DIR));
+        let mut st = match self.write.try_lock_for(std::time::Duration::from_millis(50)) {
             Some(ws) => self.publish_write_stats(&ws),
             None => *self.write_stats.lock(),
-        }
+        };
+        st.translog_bytes += replica_wal;
+        st
     }
 
     fn publish_write_stats(&self, ws: &WriteState) -> WriteStats {
@@ -7379,10 +7563,14 @@ impl Shard {
         // Explicit merges are visible to monitoring through commit; the gauges
         // are released on every return/error path. The completed totals below
         // still count only successful, non-no-op merges.
-        let current_docs = self.core.read().all_leaves().iter().map(|leaf| leaf.num_live_docs_latest() as u64).sum();
+        let (current_docs, current_bytes) = {
+            let core = self.core.read();
+            (core.all_leaves().iter().map(|leaf| leaf.num_live_docs_latest() as u64).sum(), core.segments().iter().map(|s| s.segment_bytes()).sum())
+        };
         let _current = CurrentGuard::new(vec![
             (&self.counters.merge_current, 1),
             (&self.counters.merge_current_docs, current_docs),
+            (&self.counters.merge_current_bytes, current_bytes),
         ]);
         // 1. Seal the unsealed tail so every doc indexed before the request is
         //    in a segment (encoded off the core lock, NRT seal protocol).
@@ -7459,6 +7647,10 @@ impl Shard {
             Some(job) => {
                 // Encoded on the force-merge pool, so seals and background
                 // merges keep their own workers.
+                let hook = MERGE_RUN_HOOK.lock().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
                 let merged = match job.run() {
                     Ok(m) => m,
                     Err(e) => {
@@ -7605,7 +7797,7 @@ fn store_dir_size(p: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
         for e in rd.flatten() {
-            if e.file_name() == TRANSLOG_DIR {
+            if e.file_name() == TRANSLOG_DIR || e.file_name() == REPLICA_WAL_DIR {
                 continue;
             }
             let Ok(md) = e.metadata() else { continue };
@@ -7924,7 +8116,7 @@ mod tests {
                         id, source: "{}", routing: None, seq_no: (round*64+i) as i64, version: 1,
                     }).collect();
                     let mut prepared = ids.iter().map(|_| crate::document::ParsedDoc {
-                        doc: doc("replica"), ignored: vec![], source: None,
+                        doc: doc("replica"), ignored: vec![], source: None, script_values: Vec::new(),
                     }).collect();
                     assert!(s.try_replay_new_batch(&ops, &mut prepared).unwrap());
                 } else {
@@ -8010,6 +8202,82 @@ mod tests {
         // re-create after delete continues the version
         let r = s.apply("i", "u", vec![idx("1", "d", WriteCond::default())], true).remove(0).unwrap();
         assert_eq!((r.version, r.result), (6, "created"));
+    }
+
+    /// Production review #124: delete tombstones expire after
+    /// `index.gc_deletes` (ES `LiveVersionMap.pruneTombstones`) on flush,
+    /// refresh and maintenance, giving their key and table memory back, so
+    /// deleting fresh ids forever under a small budget keeps writing. Within
+    /// the window a tombstone still answers external-version conflicts, and
+    /// an id an in-flight operation holds keeps its tombstone.
+    #[test]
+    fn expired_delete_tombstones_are_pruned_and_release_their_memory() {
+        let _private = rustic_core::admission::private_shared(1 << 30);
+        let budget = rustic_core::admission::shared();
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Shard::create(tmp.path(), "i", schema()).unwrap();
+        let gc = std::time::Duration::from_millis(200);
+        let past_gc = || std::thread::sleep(gc + std::time::Duration::from_millis(150));
+        s.set_gc_deletes(gc.as_millis() as i64);
+        let external = |v: u64| WriteCond { version: Some(v), version_type: Some(VersionType::External), ..Default::default() };
+        // Within the window: the tombstone answers external-version checks.
+        s.apply("i", "u", vec![idx("ext", "a", external(5))], false).remove(0).unwrap();
+        let r = s.apply("i", "u", vec![WriteOp::Delete { id: "ext".into(), cond: external(7) }], false).remove(0).unwrap();
+        assert_eq!((r.result, r.version), ("deleted", 7));
+        s.flush().unwrap();
+        let e = s.apply("i", "u", vec![idx("ext", "stale", external(6))], false).remove(0).unwrap_err();
+        assert!(e.reason.contains("version conflict"), "{}", e.reason);
+        assert!(s.get("ext").unwrap().is_none());
+        // An id held by an in-flight operation keeps its expired tombstone.
+        past_gc();
+        {
+            let _held = s.id_locks.lock_all(std::iter::once("ext"));
+            s.flush().unwrap();
+            assert_eq!(s.version_map_size().0, 1, "the held id keeps its tombstone");
+        }
+        s.flush().unwrap();
+        assert_eq!(s.version_map_size().0, 0, "expired and released");
+        // ES after gc_deletes: the version history of the id is gone.
+        assert_eq!(s.apply("i", "u", vec![idx("ext", "b", external(6))], false).remove(0).unwrap().version, 6);
+        s.apply("i", "u", vec![WriteOp::Delete { id: "ext".into(), cond: WriteCond::default() }], false).remove(0).unwrap();
+        // Fresh-id delete churn under a budget sized for about two rounds.
+        let per_round = 2000;
+        // Small bulks: their transient key admission stays well below what
+        // a round's tombstones retain.
+        let round = |r: usize| -> Vec<Result<WriteResult>> {
+            (0..per_round).step_by(50).flat_map(|from| s.apply("i", "u", (from..from + 50).map(|i| WriteOp::Delete { id: format!("r{r}-{i}"), cond: WriteCond::default() }).collect(), false)).collect()
+        };
+        past_gc();
+        s.flush().unwrap();
+        let before = budget.used();
+        assert!(round(0).iter().all(|r| r.as_ref().is_ok_and(|w| w.result == "not_found")));
+        // A refresh installs the batch (its staged claim keeps every entry
+        // until then) and keeps the tombstones inside the window.
+        s.refresh().unwrap();
+        assert!(s.version_map_size().0 >= per_round, "within the window the tombstones are kept");
+        let delta = budget.used().saturating_sub(before);
+        assert!(delta > 0, "tombstones are accounted");
+        budget.set_limit(budget.used() + delta);
+        for r in 1..8 {
+            past_gc();
+            let held = s.version_map_size().0;
+            assert!(held >= per_round, "round {r}: the previous round's tombstones are held: {held}");
+            if r % 2 == 0 {
+                s.flush().unwrap();
+            } else {
+                let pruned = s.maybe_prune_tombstones();
+                assert!(pruned >= per_round, "maintenance prunes without a refresh or flush: {pruned} of {held}, checkpoint {}", s.write.lock().hist.checkpoint);
+            }
+            let (entries, _) = s.version_map_size();
+            assert!(entries < 16, "round {r}: expired tombstones retained: {entries}");
+            assert!(budget.used() <= before + delta / 2, "round {r}: retained {} over {before}", budget.used());
+            let results = round(r);
+            assert!(results.iter().all(|w| w.is_ok()), "round {r}: deletes refused: {:?}", results.iter().find(|w| w.is_err()));
+            s.apply("i", "u", vec![idx(&format!("live{r}"), "x", WriteCond::default())], false).remove(0).unwrap();
+            s.refresh().unwrap();
+            assert!(s.version_map_size().0 >= per_round, "within the window the tombstones are kept");
+        }
+        budget.set_limit(1 << 30);
     }
 
     #[test]
@@ -8118,7 +8386,7 @@ mod tests {
         let make_docs = |invalid: bool| (0..63).map(|i| {
             let mut doc = doc("recovery");
             doc.add_vector(9, vec![if invalid && i == 31 { f32::NAN } else { i as f32 }, 1.]);
-            crate::document::ParsedDoc { doc, ignored: vec![], source: None }
+            crate::document::ParsedDoc { doc, ignored: vec![], source: None, script_values: Vec::new() }
         }).collect::<Vec<_>>();
         let mut invalid = make_docs(true);
         assert!(!s.try_replay_new_batch(&ops, &mut invalid).unwrap());
@@ -10151,14 +10419,13 @@ mod tests {
         assert!(HELD_THROTTLE.with(|slot| slot.borrow().is_none()), "a throttle hold leaked past its write");
     }
 
-    /// Wiki mixed load (c28j): right after a 5M-document preload every
-    /// search of the idle phase took about 41 s, queued behind the
-    /// search-idle refresh, which waited without bound. On a copy the
-    /// scheduler serves, a search whose refresh finds the core held (a
-    /// flush capture, a merge install) reads the last published view after
-    /// a bounded wait, and hands the refresh to the background workers.
+    /// ES `awaitShardSearchActive`: on a search-idle copy the scheduler
+    /// serves, the first search waits for the refresh its pending writes
+    /// need even while the core is held far past the old 100 ms bound (bulk
+    /// write batches in turn: c32y github_archive read an hours-old reader).
+    /// A second search arriving meanwhile shares that one refresh.
     #[test]
-    fn a_search_on_a_served_search_idle_copy_never_waits_on_a_held_core() {
+    fn the_first_search_on_a_served_search_idle_copy_waits_for_a_held_core() {
         let tmp = tempfile::tempdir().unwrap();
         let s = Arc::new(Shard::create(tmp.path(), "i", schema()).unwrap());
         s.bg.served.store(true, Ordering::Release);
@@ -10170,31 +10437,27 @@ mod tests {
             s.apply("i", "u", vec![idx(&format!("b{row}"), "unpublished", WriteCond::default())], false).remove(0).unwrap();
         }
         s.sched.idle.store(true, Ordering::SeqCst);
-        s.sched.skipped.store(true, Ordering::SeqCst);
-        // Something holds the core for far longer than a search may wait.
+        let refreshes = s.counters.refresh_total.load(Ordering::Relaxed);
         let held = s.core.write();
-        let searcher = { let s = s.clone(); std::thread::spawn(move || { let t0 = std::time::Instant::now(); s.before_search(); t0.elapsed() }) };
-        // A second search arriving meanwhile waits for the first's refresh
-        // a bounded time too.
+        let search = |s: &Arc<Shard>| { let s = s.clone(); std::thread::spawn(move || { s.before_search(); s.reader_view().num_live_docs() }) };
+        let first = search(&s);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let second = { let s = s.clone(); std::thread::spawn(move || { let t0 = std::time::Instant::now(); s.before_search(); t0.elapsed() }) };
-        let (first, second) = (searcher.join().unwrap(), second.join().unwrap());
+        let second = search(&s);
+        std::thread::sleep(std::time::Duration::from_millis(450));
         drop(held);
-        assert!(first < IDLE_SEARCH_REFRESH_WAIT * 4 + std::time::Duration::from_secs(5), "the search waited {first:?} on the held core");
-        assert!(second < IDLE_SEARCH_OTHER_REFRESH_WAIT + std::time::Duration::from_secs(5), "the second search waited {second:?}");
-        assert!(s.bg.want_refresh.load(Ordering::Acquire), "the refresh was handed to the background workers");
-        assert_eq!(s.reader_view().num_live_docs(), 20, "the searches read the last published view");
-        // The background refresh publishes the rest.
-        s.refresh_deferred();
-        assert_eq!(s.reader_view().num_live_docs(), 40);
+        assert_eq!((first.join().unwrap(), second.join().unwrap()), (40, 40), "a search read the stale view");
+        assert_eq!(s.counters.refresh_total.load(Ordering::Relaxed) - refreshes, 1, "one shared refresh");
+        // Search-active now, nothing pending: no refresh.
+        s.before_search();
+        assert_eq!(s.counters.refresh_total.load(Ordering::Relaxed) - refreshes, 1);
     }
 
-    /// A search never waits on a refresh it did not start (the refresh API,
-    /// a scheduled refresh): it reads the last published reader, even on a
-    /// search-idle copy with writes it cannot see yet, and the skipped
-    /// refresh stays due for the next search.
+    /// A search on a search-active copy never waits on a refresh it did not
+    /// start (the refresh API, a scheduled refresh): it reads the last
+    /// published reader. On a search-idle copy with writes it cannot see,
+    /// the search waits for a refresh covering them whoever else refreshes.
     #[test]
-    fn a_search_reads_the_last_reader_while_another_refresh_is_under_way() {
+    fn only_a_search_idle_copy_with_pending_writes_waits_beside_another_refresh() {
         let tmp = tempfile::tempdir().unwrap();
         let s = Shard::create(tmp.path(), "i", schema()).unwrap();
         for row in 0..50 {
@@ -10204,17 +10467,15 @@ mod tests {
         for row in 0..50 {
             s.apply("i", "u", vec![idx(&format!("b{row}"), "unpublished", WriteCond::default())], false).remove(0).unwrap();
         }
-        // Search-idle with unpublished writes: a search would refresh first.
-        s.sched.idle.store(true, Ordering::SeqCst);
         let api_refresh = s.refreshing();
-        let t0 = std::time::Instant::now();
+        // Search-active: the last reader, at once.
         s.before_search();
-        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "the search waited {:?}", t0.elapsed());
-        assert_eq!(s.reader_view().num_live_docs(), 50, "the search ran a refresh beside the one under way");
-        drop(api_refresh);
+        assert_eq!(s.reader_view().num_live_docs(), 50);
+        // Search-idle with unpublished writes: refreshed first.
         s.sched.idle.store(true, Ordering::SeqCst);
         s.before_search();
-        assert_eq!(s.reader_view().num_live_docs(), 100, "the skipped refresh was not kept due");
+        assert_eq!(s.reader_view().num_live_docs(), 100, "the search read the stale view beside another refresh");
+        drop(api_refresh);
     }
 
     /// The backlog cap: the memory bound until a seal rate is measured, then
@@ -10455,11 +10716,22 @@ mod tests {
     /// merge IO rate is at its maximum.
     #[test]
     fn the_indexing_throttle_waits_for_unthrottled_merge_io() {
-        assert!(!merge_throttle_due(9, 9, false, false));
-        assert!(merge_throttle_due(10, 9, false, false));
-        assert!(!merge_throttle_due(10, 9, true, false), "merges still IO-throttled: indexing is not");
-        assert!(merge_throttle_due(10, 9, true, true));
-        assert!(!merge_throttle_due(9, 9, true, true));
+        assert!(!merge_throttle_next(false, 9, 9, false, false));
+        assert!(merge_throttle_next(false, 10, 9, false, false));
+        assert!(!merge_throttle_next(false, 10, 9, true, false), "merges still IO-throttled: indexing is not");
+        assert!(merge_throttle_next(false, 10, 9, true, true));
+        assert!(!merge_throttle_next(false, 9, 9, true, true));
+    }
+
+    /// ES releases the indexing throttle only once the merges in flight are
+    /// back at `max_merge_count`: the IO rate leaving its maximum meanwhile
+    /// does not release it (and does not flap it per write).
+    #[test]
+    fn the_indexing_throttle_holds_until_the_merge_backlog_drains() {
+        assert!(merge_throttle_next(true, 10, 9, true, false), "a falling IO rate keeps the throttle on");
+        assert!(merge_throttle_next(true, 30, 9, true, true));
+        assert!(!merge_throttle_next(true, 9, 9, true, true), "released at max_merge_count");
+        assert!(!merge_throttle_next(true, 0, 9, false, false));
     }
 
     /// A retired copy (its files closed for the copy opened next) never
@@ -11750,6 +12022,25 @@ mod tests {
                 assert_eq!(s.core.read().num_segments(), 1);
             }
         }
+    }
+
+    /// A cluster replica's WAL in the shard path is its translog: counted in
+    /// `translog`, never in `store` (ES).
+    #[test]
+    fn a_replica_wal_counts_as_translog_never_as_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Shard::create(tmp.path(), "i", schema()).unwrap();
+        s.apply("i", "u", vec![idx("d0", "t", WriteCond::default())], false).remove(0).unwrap();
+        s.flush().unwrap();
+        s.files_changed();
+        let (store, translog) = (s.store_size(), s.write_stats().translog_bytes);
+        let wal = tmp.path().join(REPLICA_WAL_DIR);
+        std::fs::create_dir_all(&wal).unwrap();
+        std::fs::write(wal.join("wal-00000001.log"), vec![7u8; 300_000]).unwrap();
+        std::fs::write(wal.join("wal.ckp"), vec![1u8; 48]).unwrap();
+        s.files_changed();
+        assert_eq!(s.store_size(), store, "the replica WAL was counted as store");
+        assert_eq!(s.write_stats().translog_bytes, translog + 300_048, "the replica WAL is the copy's translog");
     }
 
     /// `max_num_segments` unset / -1 (`max_segments` 0) runs the merges the

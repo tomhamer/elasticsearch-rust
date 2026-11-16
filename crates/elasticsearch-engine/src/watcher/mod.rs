@@ -20,18 +20,19 @@ pub mod schedule;
 use crate::error::{EsError, Result};
 use crate::index::{IndexService, WriteReq};
 use crate::node::{Node, ResolveOpts};
+use crate::security::owner::StoredAuthn;
 use crate::shard::WriteCond;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub const WATCHES_INDEX: &str = ".watches";
 pub const TRIGGERED_INDEX: &str = ".triggered_watches";
 /// `.watcher-history-<HISTORY_VERSION>-<yyyy.MM.dd>`.
-pub const HISTORY_VERSION: &str = "17";
+pub const HISTORY_VERSION: &str = "18";
 pub const HISTORY_RETENTION_MS: i64 = 7 * 86_400_000;
 
 /// ISO-8601 with millis, UTC (`2026-10-04T18:00:00.000Z`).
@@ -91,8 +92,9 @@ pub struct WatcherService {
     /// Executed actions by type: (count, total millis).
     pub action_stats: Mutex<HashMap<String, (u64, u64)>>,
     pub running_threads: AtomicUsize,
-    last_cleanup: AtomicI64,
     started: AtomicBool,
+    /// Pending triggered executions were recovered (once per start).
+    pub recovered: AtomicBool,
     pub load_lock: Mutex<()>,
 }
 
@@ -119,8 +121,8 @@ pub fn service(node: &Node) -> Arc<WatcherService> {
                 counters: Counters::default(),
                 action_stats: Mutex::new(HashMap::new()),
                 running_threads: AtomicUsize::new(0),
-                last_cleanup: AtomicI64::new(0),
                 started: AtomicBool::new(false),
+                recovered: AtomicBool::new(false),
                 load_lock: Mutex::new(()),
             })
         })
@@ -164,6 +166,30 @@ impl WatcherService {
         }
     }
 
+    /// Make `watches` the cached set (a cluster node reloading `.watches`).
+    /// A watch whose trigger, start time and activity did not change keeps
+    /// its next fire time, so a reload never fires a trigger again.
+    pub fn replace_all(&self, watches: Vec<CachedWatch>) {
+        let _g = self.load_lock.lock();
+        let mut cache = self.cache.write();
+        let mut next = BTreeMap::new();
+        for mut w in watches {
+            if let Some(old) = cache.get(&w.id) {
+                if old.src["trigger"] == w.src["trigger"] && old.start_time() == w.start_time() && old.active() == w.active() {
+                    w.next_fire = old.next_fire;
+                }
+            }
+            next.insert(w.id.clone(), w);
+        }
+        *cache = next;
+        self.loaded.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the stored watches were loaded.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::SeqCst)
+    }
+
     /// Load every stored watch into the cache (once).
     pub fn ensure_loaded(&self, node: &Node) {
         if self.loaded.load(Ordering::SeqCst) {
@@ -175,7 +201,16 @@ impl WatcherService {
         }
         if let Some(svc) = node.get_index(WATCHES_INDEX) {
             let _ = svc.refresh();
-            for (id, src, version, seq_no, pt) in scan_watches(node).unwrap_or_default() {
+            // A scan that fails (or is incomplete) is retried on the next
+            // tick: it never counts as loading an empty schedule.
+            let scanned = match scan_watches(node) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("watcher: cannot load .watches yet: {e}");
+                    return;
+                }
+            };
+            for (id, src, version, seq_no, pt) in scanned {
                 match model::build_cached(&id, src, version, seq_no, pt) {
                     Ok(cw) => {
                         self.cache.write().insert(id, cw);
@@ -199,25 +234,58 @@ impl WatcherService {
     }
 }
 
+/// Watches read per page of a `.watches` scan.
+pub const WATCH_PAGE: usize = 1000;
+
+/// Every hit of `.watches`, page by page (`search` runs one page's body):
+/// no cap on the number of watches (finding 201), and a page that timed out
+/// or had failed shards fails the whole scan, so an incomplete list never
+/// replaces the schedule (finding 203).
+pub fn all_watch_hits(search: &dyn Fn(&Value) -> Result<Value>) -> Result<Vec<Value>> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut after: Option<Value> = None;
+    loop {
+        let mut body = json!({"size": WATCH_PAGE, "query": {"match_all": {}}, "seq_no_primary_term": true, "version": true, "sort": [{"_seq_no": "asc"}], "track_total_hits": false});
+        if let Some(a) = &after {
+            body["search_after"] = a.clone();
+        }
+        let v = search(&body)?;
+        let failed = v["_shards"]["failed"].as_u64().unwrap_or(0);
+        if v["timed_out"] == true || failed > 0 {
+            return Err(EsError::new(503, "status_exception", format!("the .watches scan returned incomplete results (timed_out: {}, failed shards: {failed})", v["timed_out"] == true)));
+        }
+        let hits = v["hits"]["hits"].as_array().cloned().unwrap_or_default();
+        let full = hits.len() >= WATCH_PAGE;
+        after = hits.last().map(|h| h["sort"].clone()).filter(Value::is_array);
+        out.extend(hits);
+        if !full {
+            return Ok(out);
+        }
+        if after.is_none() {
+            return Err(EsError::internal("the .watches scan cannot page past a full page (no sort values)"));
+        }
+    }
+}
+
 /// `(id, source, version, seq_no, primary_term)` of every document in `.watches`.
 pub fn scan_watches(node: &Node) -> Result<Vec<(String, Value, u64, i64, u64)>> {
     let mut out = Vec::new();
     let Some(svc) = node.get_index(WATCHES_INDEX) else { return Ok(out) };
     let _ = svc.refresh();
     let targets = node.resolve(WATCHES_INDEX, ResolveOpts { expand_hidden: true, ..Default::default() })?;
-    let body = json!({"size": 10000, "query": {"match_all": {}}, "seq_no_primary_term": true, "version": true});
-    let v: Value = match remote() {
-        Some(rest) => {
-            let _ = rest("POST", &format!("/{WATCHES_INDEX}/_refresh"), None);
-            rest("POST", &format!("/{WATCHES_INDEX}/_search?expand_wildcards=all"), Some(body))?
-        }
+    let rest = remote();
+    if let Some(rest) = &rest {
+        let _ = rest("POST", &format!("/{WATCHES_INDEX}/_refresh"), None);
+    }
+    let hits = all_watch_hits(&|body: &Value| match &rest {
+        Some(rest) => rest("POST", &format!("/{WATCHES_INDEX}/_search?expand_wildcards=all"), Some(body.clone())),
         None => {
-            let req = crate::search::parse_request(&body, &HashMap::new())?;
+            let req = crate::search::parse_request(body, &HashMap::new())?;
             let o = crate::search::execute(&targets, &req, &search_opts(node))?;
-            serde_json::from_str(&o.json).map_err(|e| EsError::internal(e.to_string()))?
+            serde_json::from_str(&o.json).map_err(|e| EsError::internal(e.to_string()))
         }
-    };
-    for h in v["hits"]["hits"].as_array().cloned().unwrap_or_default() {
+    })?;
+    for h in hits {
         out.push((
             h["_id"].as_str().unwrap_or("").to_string(),
             h["_source"].clone(),
@@ -233,22 +301,52 @@ pub fn scan_watches(node: &Node) -> Result<Vec<(String, Value, u64, i64, u64)>> 
 /// response body (a `Value::String` body is sent as NDJSON).
 pub type RestCall = Arc<dyn Fn(&str, &str, Option<Value>) -> Result<Value> + Send + Sync>;
 
-fn remote_slot() -> &'static Mutex<Option<RestCall>> {
-    static R: OnceLock<Mutex<Option<RestCall>>> = OnceLock::new();
+/// Builds [`RestCall`]s through the cluster coordinator running as a stored
+/// subject (`None`: the watcher's internal origin, `_system`). It carries no
+/// caller credentials: every execution names the identity it runs as.
+pub type RestFactory = Arc<dyn Fn(Option<&StoredAuthn>) -> Result<RestCall> + Send + Sync>;
+
+fn factory_slot() -> &'static Mutex<Option<RestFactory>> {
+    static R: OnceLock<Mutex<Option<RestFactory>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(None))
 }
 
 /// On a cluster, watch inputs, transforms and index actions read and write
 /// the cluster's indices through its coordinator (set from the watcher
-/// requests this node serves; scheduled executions use the latest).
-pub fn set_remote(remote: Option<RestCall>) {
-    if remote.is_some() {
-        *remote_slot().lock() = remote;
+/// requests this node serves). Each call runs as an explicit identity:
+/// the watcher's own indices as `_system` ([`remote`]), a watch's searches
+/// and writes as the subject that stored the watch ([`remote_as`]).
+pub fn set_rest_factory(factory: Option<RestFactory>) {
+    if factory.is_some() {
+        *factory_slot().lock() = factory;
     }
 }
 
+fn factory() -> Option<RestFactory> {
+    factory_slot().lock().clone()
+}
+
+/// Coordinator calls as the watcher's internal origin (`.watches`,
+/// `.triggered_watches`, the history), as ES writes them with
+/// `WATCHER_ORIGIN`. `None` off a cluster.
 pub(crate) fn remote() -> Option<RestCall> {
-    remote_slot().lock().clone()
+    let f = factory()?;
+    match f(None) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!("watcher coordinator call unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// Coordinator calls as `identity` (`None`: the internal origin, for watches
+/// stored with security off). `Ok(None)` off a cluster.
+pub(crate) fn remote_as(identity: Option<&StoredAuthn>) -> Result<Option<RestCall>> {
+    match factory() {
+        Some(f) => f(identity).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// An index expression in a REST path (`,` and `*` kept).
@@ -361,6 +459,29 @@ pub fn put_doc_local(svc: &IndexService, id: &str, src: &Value, cond: WriteCond)
     Ok((w.version, w.seq_no, w.primary_term, w.result == "created"))
 }
 
+/// Realtime read of one document: `(source, version, seq_no, primary_term)`,
+/// `None` when it does not exist. On a cluster the read goes through the
+/// coordinator (the primary's copy is the one conditional writes check).
+pub fn get_doc(svc: &IndexService, id: &str) -> Result<Option<(Value, u64, i64, u64)>> {
+    if let Some(rest) = remote() {
+        let v = match rest("GET", &format!("/{}/_doc/{}", path_expr(&svc.name), path_expr(id)), None) {
+            Ok(v) => v,
+            Err(e) if e.kind == "index_not_found_exception" || e.status == 404 => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if v["found"] != true {
+            return Ok(None);
+        }
+        return Ok(Some((v["_source"].clone(), v["_version"].as_u64().unwrap_or(1), v["_seq_no"].as_i64().unwrap_or(0), v["_primary_term"].as_u64().unwrap_or(1))));
+    }
+    let Some(g) = svc.get(id)? else { return Ok(None) };
+    let src: Value = match g.source.as_deref() {
+        Some(s) => serde_json::from_str(s).map_err(|e| EsError::internal(e.to_string()))?,
+        None => return Ok(None),
+    };
+    Ok(Some((src, g.version, g.seq_no, g.primary_term)))
+}
+
 pub fn delete_doc(svc: &IndexService, id: &str) -> Result<Option<u64>> {
     if let Some(rest) = remote() {
         let r = rest("DELETE", &format!("/{}/_doc/{}", path_expr(&svc.name), path_expr(id)), None)?;
@@ -371,9 +492,49 @@ pub fn delete_doc(svc: &IndexService, id: &str) -> Result<Option<u64>> {
     Ok(if w.result == "deleted" { Some(w.version) } else { None })
 }
 
-/// The history data stream `.watcher-history-17`.
+/// The history data stream `.watcher-history-18`.
 pub fn history_stream() -> String {
     format!(".watcher-history-{HISTORY_VERSION}")
+}
+
+/// The composable template of the history stream (ES
+/// `WatcherIndexTemplateRegistry.HISTORY_TEMPLATE_NAME`): `.watch-history-18`.
+pub fn history_template_name() -> String {
+    format!(".watch-history-{HISTORY_VERSION}")
+}
+
+/// Install the watcher registry's lifecycle policy and history template
+/// when missing or older, as ES's `WatcherIndexTemplateRegistry` does on
+/// startup (they used to appear only with the first history record, so
+/// `GET _ilm/policy/watch-history-ilm-policy-16` answered 404). Called by
+/// [`crate::registry::ensure`]. Returns whether anything changed.
+pub fn ensure_registry(node: &Node) -> bool {
+    if !watcher_enabled(node) {
+        return false;
+    }
+    let ilm = use_ilm(node);
+    let mut changed = false;
+    // `WatcherIndexTemplateRegistry.getLifecyclePolicies`: the history
+    // policy, installed (if missing) only by the watcher's registry, so a
+    // node with watcher disabled has none.
+    if ilm && node.ilm.policy(HISTORY_POLICY).is_none() {
+        match node.ilm.put_policy(node, HISTORY_POLICY, history_policy()) {
+            Ok(_) => changed = true,
+            Err(e) => tracing::warn!("failed to install the watch history lifecycle policy: {e}"),
+        }
+    }
+    let name = history_template_name();
+    let want = history_template(&history_stream(), ilm);
+    let older = node.templates.read().index.get(&name).is_none_or(|t| t["version"].as_i64().unwrap_or(0) < want["version"].as_i64().unwrap_or(0));
+    if older {
+        let mut t = want;
+        let now = crate::date::now_millis();
+        t["created_date_millis"] = now.into();
+        t["modified_date_millis"] = now.into();
+        node.templates.write().index.insert(name, t);
+        changed = true;
+    }
+    changed
 }
 
 fn history_mapping() -> Value {
@@ -406,11 +567,17 @@ fn history_mapping() -> Value {
 /// Write one history document (data stream and template created on demand).
 pub fn write_history(node: &Node, id: &str, record: &Value, _now: i64) {
     let name = history_stream();
+    let ilm = use_ilm(node);
     if let Some(rest) = remote() {
-        // On a cluster: the template is cluster metadata and the record goes
-        // to the data stream's primary (the stream is created on demand).
-        if !node.templates.read().index.contains_key(&name) {
-            if let Err(e) = rest("PUT", &format!("/_index_template/{}", path_expr(&name)), Some(history_template(&name))) {
+        // On a cluster: the policy and template are cluster metadata and the
+        // record goes to the data stream's primary (created on demand).
+        if ilm && node.ilm.policy(HISTORY_POLICY).is_none() {
+            if let Err(e) = rest("PUT", &format!("/_ilm/policy/{HISTORY_POLICY}"), Some(json!({"policy": history_policy()}))) {
+                tracing::warn!("failed to install the watch history lifecycle policy: {e}");
+            }
+        }
+        if !node.templates.read().index.contains_key(&history_template_name()) {
+            if let Err(e) = rest("PUT", &format!("/_index_template/{}", path_expr(&history_template_name())), Some(history_template(&name, ilm))) {
                 tracing::warn!("failed to install the watch history template: {e}");
             }
         }
@@ -419,9 +586,14 @@ pub fn write_history(node: &Node, id: &str, record: &Value, _now: i64) {
         }
         return;
     }
-    if !node.templates.read().index.contains_key(&name) {
-        let tpl = history_template(&name);
-        node.templates.write().index.insert(name.clone(), tpl);
+    if ilm && node.ilm.policy(HISTORY_POLICY).is_none() {
+        if let Err(e) = node.ilm.put_policy(node, HISTORY_POLICY, history_policy()) {
+            tracing::warn!("failed to install the watch history lifecycle policy: {e}");
+        }
+    }
+    if !node.templates.read().index.contains_key(&history_template_name()) {
+        let tpl = history_template(&name, ilm);
+        node.templates.write().index.insert(history_template_name(), tpl);
         let _ = node.persist_state();
     }
     let svc = match node.write_index(&name, true) {
@@ -436,17 +608,44 @@ pub fn write_history(node: &Node, id: &str, record: &Value, _now: i64) {
     }
 }
 
+/// The lifecycle policy of the watch history (ES
+/// `WatcherIndexTemplateRegistry`, `watch-history-ilm-policy.json`): roll
+/// over at 50gb or 3 days, delete 4 days after rollover.
+pub const HISTORY_POLICY: &str = "watch-history-ilm-policy-16";
+
+pub fn history_policy() -> Value {
+    // ES's `watch-history-ilm-policy.json`, as `GET _ilm/policy` shows it.
+    json!({
+        "phases": {
+            "hot": {"min_age": "0ms", "actions": {"rollover": {"max_age": "3d", "max_primary_shard_size": "50gb"}}},
+            "delete": {"min_age": "4d", "actions": {"delete": {"delete_searchable_snapshot": true}}}
+        },
+        "_meta": {"managed": true, "description": "default policy for the watcher history indices"}
+    })
+}
+
+/// `xpack.watcher.use_ilm_index_management` (default true): the history
+/// template names [`HISTORY_POLICY`], which ILM applies on every node set.
+fn use_ilm(node: &Node) -> bool {
+    setting(node, "xpack.watcher.use_ilm_index_management").map(|s| s != "false").unwrap_or(true)
+}
+
 /// The index template of the watch history data stream.
-fn history_template(name: &str) -> Value {
+fn history_template(name: &str, ilm: bool) -> Value {
+    let mut settings = json!({"index.number_of_shards": 1, "index.auto_expand_replicas": "0-1", "index.hidden": true, "index.format": 6});
+    if ilm {
+        settings["index.lifecycle.name"] = json!(HISTORY_POLICY);
+    }
     json!({
         "index_patterns": [format!("{name}*")],
         "priority": 2147483647i64,
         "data_stream": {"hidden": true},
         "template": {
-            "settings": {"index.number_of_shards": 1, "index.auto_expand_replicas": "0-1", "index.hidden": true, "index.format": 6},
+            "settings": settings,
             "mappings": history_mapping()
         },
-        "version": 17,
+        "allow_auto_create": true,
+        "version": HISTORY_VERSION.parse::<i64>().unwrap_or(18),
         "_meta": {"description": "index template for watcher history indices", "managed": true}
     })
 }
@@ -471,34 +670,29 @@ pub fn default_throttle_ms(node: &Node) -> i64 {
     setting(node, "xpack.watcher.execution.default_throttle_period").and_then(|s| crate::ilm::parse_time_millis(&s)).unwrap_or(5000)
 }
 
-/// Delete history backing indices older than the retention (daily cleaner).
-fn cleanup_history(node: &Node, now: i64) {
-    if setting(node, "xpack.watcher.history.cleaner_service.enabled").map(|s| s == "false").unwrap_or(false) {
-        return;
-    }
-    let retention = setting(node, "xpack.watcher.history.cleaner_service.retention").and_then(|s| crate::ilm::parse_time_millis(&s)).unwrap_or(HISTORY_RETENTION_MS);
-    let Some(ds) = node.data_stream(&history_stream()) else { return };
-    for idx in ds.indices.iter().filter(|i| i.as_str() != ds.write_index()) {
-        if let Some(svc) = node.get_index(idx) {
-            if now - svc.creation_date > retention {
-                let _ = node.delete_index(idx);
-            }
-        }
-    }
-}
 
 /// One scheduler pass at `now`: fire due watches. Returns the watches fired
 /// as `(id, scheduled_time)`; exposed for tests with a fake clock.
 pub fn due_watches(svc: &WatcherService, now: i64) -> Vec<(String, i64)> {
+    due_watches_where(svc, now, 0, &|_| true)
+}
+
+/// [`due_watches`] for the watches `owned` says this node triggers (on a
+/// cluster: the watches whose `.watches` copy it was assigned, see
+/// `elasticsearch_node::watcher_sched`). A watch this node does not own has
+/// no next fire time; one it starts owning is scheduled from `now + grace`
+/// (milliseconds), so a trigger the previous owner may still fire before it
+/// sees the new assignment is not fired twice.
+pub fn due_watches_where(svc: &WatcherService, now: i64, grace: i64, owned: &dyn Fn(&str) -> bool) -> Vec<(String, i64)> {
     let mut fired = Vec::new();
     let mut cache = svc.cache.write();
     for (id, w) in cache.iter_mut() {
-        if !w.active() {
+        if !w.active() || !owned(id) {
             w.next_fire = None;
             continue;
         }
         if w.next_fire.is_none() {
-            w.next_fire = w.schedule.next_after(w.start_time(), now);
+            w.next_fire = w.schedule.next_after(w.start_time(), now + grace.max(0));
         }
         if let Some(nf) = w.next_fire {
             if nf <= now {
@@ -508,6 +702,143 @@ pub fn due_watches(svc: &WatcherService, now: i64) -> Vec<(String, i64)> {
         }
     }
     fired
+}
+
+/// Watch executions running at once.
+pub const MAX_RUNNING: usize = 64;
+
+/// Make watch `id` due again at `scheduled` (a trigger that could not be
+/// admitted): the next scheduler pass fires it with that scheduled time.
+fn keep_due(svc: &WatcherService, id: &str, scheduled: i64) {
+    if let Some(w) = svc.cache.write().get_mut(id) {
+        w.next_fire = Some(w.next_fire.map_or(scheduled, |nf| nf.min(scheduled)));
+    }
+}
+
+/// Execute the `due` watches (`(id, scheduled time)`), each on its own
+/// thread (at most [`MAX_RUNNING`] at once, as the local scheduler).
+pub fn fire(node: &Arc<Node>, svc: &Arc<WatcherService>, due: Vec<(String, i64)>, now: i64) {
+    for (id, scheduled) in due {
+        if svc.running_threads.load(Ordering::SeqCst) >= MAX_RUNNING {
+            // The trigger stays due (retried on the next tick with its own
+            // scheduled time) instead of being dropped (finding 202).
+            tracing::debug!("watcher execution pool is saturated; watch [{id}] stays due");
+            keep_due(svc, &id, scheduled);
+            continue;
+        }
+        svc.running_threads.fetch_add(1, Ordering::SeqCst);
+        let node2 = node.clone();
+        let svc2 = svc.clone();
+        let id2 = id.clone();
+        let ok = std::thread::Builder::new().name(format!("watcher-exec-{id}")).spawn(move || {
+            if let Err(e) = exec::run_scheduled(&node2, &svc2, &id2, scheduled, now) {
+                tracing::warn!("watch [{id2}] execution failed: {e}");
+            }
+            svc2.running_threads.fetch_sub(1, Ordering::SeqCst);
+        });
+        if ok.is_err() {
+            svc.running_threads.fetch_sub(1, Ordering::SeqCst);
+            keep_due(svc, &id, scheduled);
+        }
+    }
+}
+
+/// The watch id of a `.triggered_watches` record id
+/// (`<watch id>_<uuid>-<time>`; a watch id may itself hold `_`).
+pub fn record_watch_id(record_id: &str) -> Option<&str> {
+    let b = record_id.as_bytes();
+    record_id.match_indices('_').rev().map(|(i, _)| i).find(|&i| {
+        let uuid = record_id.get(i + 1..i + 37);
+        uuid.is_some_and(|u| uuid::Uuid::parse_str(u).is_ok()) && b.get(i + 37) == Some(&b'-')
+    }).map(|i| &record_id[..i])
+}
+
+/// The pending triggered executions in `.triggered_watches`: `(watch id,
+/// record id, scheduled time, triggered time)`.
+pub fn triggered_records(node: &Node) -> Result<Vec<(String, String, i64, i64)>> {
+    let rest = remote();
+    let local = node.get_index(TRIGGERED_INDEX);
+    if rest.is_none() && local.is_none() {
+        return Ok(Vec::new());
+    }
+    if let Some(svc) = &local {
+        let _ = svc.refresh();
+    }
+    let hits = all_watch_hits(&|body: &Value| match &rest {
+        Some(rest) => rest("POST", &format!("/{TRIGGERED_INDEX}/_search?expand_wildcards=all&ignore_unavailable=true"), Some(body.clone())),
+        None => {
+            let targets = node.resolve(TRIGGERED_INDEX, ResolveOpts { expand_hidden: true, ..Default::default() })?;
+            let req = crate::search::parse_request(body, &HashMap::new())?;
+            let o = crate::search::execute(&targets, &req, &search_opts(node))?;
+            serde_json::from_str(&o.json).map_err(|e| EsError::internal(e.to_string()))
+        }
+    })?;
+    let mut out = Vec::new();
+    for h in hits {
+        let rid = h["_id"].as_str().unwrap_or("").to_string();
+        let Some(watch) = record_watch_id(&rid).map(str::to_string) else { continue };
+        let ev = &h["_source"]["trigger_event"];
+        let triggered = ev["triggered_time"].as_str().and_then(parse_iso).unwrap_or_else(crate::date::now_millis);
+        let scheduled = ev["schedule"]["scheduled_time"].as_str().and_then(parse_iso).unwrap_or(triggered);
+        out.push((watch, rid, scheduled, triggered));
+    }
+    Ok(out)
+}
+
+/// Execute the triggered watches a previous run left pending (ES
+/// `WatcherService.reloadInner`: `findTriggeredWatches`, then
+/// `executeTriggeredWatches`), for the watches `owned` says this node runs,
+/// once per start (finding 211). Records of executions running here are
+/// left alone; a record whose watch no longer exists is retired.
+pub fn recover_triggered(node: &Arc<Node>, svc: &Arc<WatcherService>, owned: &dyn Fn(&str) -> bool) {
+    let records = match triggered_records(node) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("watcher: cannot read pending triggered watches yet: {e}");
+            return;
+        }
+    };
+    svc.recovered.store(true, Ordering::SeqCst);
+    for (watch, rid, scheduled, triggered) in records {
+        if svc.current.lock().contains_key(&rid) || !owned(&watch) {
+            continue;
+        }
+        if !svc.cache.read().contains_key(&watch) {
+            if let Ok(t) = triggered_index(node) {
+                let _ = delete_doc(&t, &rid);
+            }
+            continue;
+        }
+        let (node2, svc2) = (node.clone(), svc.clone());
+        svc.running_threads.fetch_add(1, Ordering::SeqCst);
+        let spawned = std::thread::Builder::new().name(format!("watcher-recover-{watch}")).spawn(move || {
+            if let Err(e) = exec::run_recovered(&node2, &svc2, &watch, &rid, scheduled, triggered) {
+                tracing::warn!("recovered execution of watch [{watch}] failed: {e}");
+            }
+            svc2.running_threads.fetch_sub(1, Ordering::SeqCst);
+        });
+        if spawned.is_err() {
+            svc.running_threads.fetch_sub(1, Ordering::SeqCst);
+            svc.recovered.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Every watch in `.watches`, read through the cluster coordinator as the
+/// watcher's internal origin (refreshed first).
+pub fn load_from_cluster() -> Result<Vec<CachedWatch>> {
+    let rest = remote().ok_or_else(|| EsError::internal("no cluster coordinator for watcher"))?;
+    let _ = rest("POST", &format!("/{WATCHES_INDEX}/_refresh?ignore_unavailable=true"), None);
+    let hits = all_watch_hits(&|body: &Value| rest("POST", &format!("/{WATCHES_INDEX}/_search?expand_wildcards=all&ignore_unavailable=true"), Some(body.clone())))?;
+    let mut out = Vec::new();
+    for h in hits {
+        let id = h["_id"].as_str().unwrap_or("").to_string();
+        match model::build_cached(&id, h["_source"].clone(), h["_version"].as_u64().unwrap_or(1), h["_seq_no"].as_i64().unwrap_or(0), h["_primary_term"].as_u64().unwrap_or(1)) {
+            Ok(cw) => out.push(cw),
+            Err(e) => tracing::warn!("failed to load watch [{id}]: {e}"),
+        }
+    }
+    Ok(out)
 }
 
 /// Start the scheduler thread for `node` (idempotent).
@@ -525,32 +856,16 @@ pub fn start(node: &Arc<Node>) {
             continue;
         }
         svc.ensure_loaded(&node);
+        // History retention is the history template's lifecycle policy
+        // (ILM), as in ES: nothing to clean up here.
         let now = crate::date::now_millis();
-        if now - svc.last_cleanup.load(Ordering::Relaxed) > 3_600_000 {
-            svc.last_cleanup.store(now, Ordering::Relaxed);
-            cleanup_history(&node, now);
-        }
         if svc.manually_stopped() {
             continue;
         }
-        for (id, scheduled) in due_watches(&svc, now) {
-            if svc.running_threads.load(Ordering::SeqCst) >= 64 {
-                tracing::warn!("watcher execution pool is saturated; skipping watch [{id}]");
-                continue;
-            }
-            svc.running_threads.fetch_add(1, Ordering::SeqCst);
-            let node2 = node.clone();
-            let svc2 = svc.clone();
-            let ok = std::thread::Builder::new().name(format!("watcher-exec-{id}")).spawn(move || {
-                if let Err(e) = exec::run_scheduled(&node2, &svc2, &id, scheduled, now) {
-                    tracing::warn!("watch [{id}] execution failed: {e}");
-                }
-                svc2.running_threads.fetch_sub(1, Ordering::SeqCst);
-            });
-            if ok.is_err() {
-                svc.running_threads.fetch_sub(1, Ordering::SeqCst);
-            }
+        if svc.is_loaded() && !svc.recovered.load(Ordering::SeqCst) {
+            recover_triggered(&node, &svc, &|_| true);
         }
+        fire(&node, &svc, due_watches(&svc, now), now);
     });
     if spawned.is_err() {
         svc.started.store(false, Ordering::SeqCst);
@@ -563,10 +878,14 @@ mod doc_uri_tests {
 
     #[test]
     fn history_goes_to_the_data_stream_create_only() {
-        assert_eq!(history_doc_uri(".watcher-history-17", "w_1-2026"), "/.watcher-history-17/_create/w_1-2026");
-        let t = history_template(".watcher-history-17");
-        assert_eq!(t["index_patterns"], json!([".watcher-history-17*"]));
+        assert_eq!(history_doc_uri(".watcher-history-18", "w_1-2026"), "/.watcher-history-18/_create/w_1-2026");
+        let t = history_template(".watcher-history-18", true);
+        assert_eq!(t["index_patterns"], json!([".watcher-history-18*"]));
         assert_eq!(t["data_stream"], json!({"hidden": true}));
+        // Retention is the lifecycle policy's (ES WatcherIndexTemplateRegistry).
+        assert_eq!(t["template"]["settings"]["index.lifecycle.name"], HISTORY_POLICY);
+        assert!(history_template(".watcher-history-18", false)["template"]["settings"].get("index.lifecycle.name").is_none());
+        assert_eq!(history_policy()["phases"]["delete"]["min_age"], "4d");
     }
 
     #[test]
@@ -589,6 +908,93 @@ mod tests {
         let mut src = model::parse_watch("x", &json!({"trigger": {"schedule": trigger}}), ms(created), true).unwrap();
         src["status"]["state"]["timestamp"] = json!(created);
         src
+    }
+
+    /// Finding 211: a triggered execution persisted in `.triggered_watches`
+    /// but never finished (a restart) runs on recovery, under its own record,
+    /// which is then retired; a record whose watch is gone is retired too.
+    #[test]
+    fn pending_triggered_watches_are_recovered() {
+        assert_eq!(record_watch_id("my_watch_0f8fad5b-d9cb-469f-a165-70867728950e-2026-11-09T00:00:00.000000000Z"), Some("my_watch"));
+        assert_eq!(record_watch_id("nouuid_here-2026"), None);
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = service(&node);
+        let src = model::parse_watch("w1", &json!({
+            "trigger": {"schedule": {"interval": "1h"}},
+            "input": {"simple": {"x": 1}},
+            "actions": {"to_out": {"index": {"index": "recovered-out"}}}
+        }), crate::date::now_millis(), true).unwrap();
+        svc.cache.write().insert("w1".into(), model::build_cached("w1", src, 1, 0, 1).unwrap());
+        let t = triggered_index(&node).unwrap();
+        let rid = "w1_0f8fad5b-d9cb-469f-a165-70867728950e-2026-11-09T00:00:00.000000000Z";
+        let orphan = "gone_6ba7b810-9dad-11d1-80b4-00c04fd430c8-2026-11-09T00:00:00.000000000Z";
+        for id in [rid, orphan] {
+            put_doc(&t, id, &json!({"trigger_event": {"type": "schedule", "triggered_time": "2026-11-09T00:00:00.000Z", "schedule": {"scheduled_time": "2026-11-09T00:00:00.000Z"}}, "state": "waiting"}), Default::default()).unwrap();
+        }
+        assert_eq!(triggered_records(&node).unwrap().len(), 2);
+        recover_triggered(&node, &svc, &|_| true);
+        assert!(svc.recovered.load(Ordering::SeqCst));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let ran = node.get_index("recovered-out").is_some_and(|s| {
+                let _ = s.refresh();
+                s.doc_count().0 > 0
+            });
+            if ran && triggered_records(&node).unwrap().is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "recovered execution did not run: {:?}", triggered_records(&node));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Finding 202: triggers the saturated pool cannot admit stay due with
+    /// their scheduled time instead of being dropped.
+    #[test]
+    fn saturated_triggers_stay_due() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = service(&node);
+        let created = "2020-01-01T00:00:00.000Z";
+        for i in 0..65 {
+            let id = format!("w{i}");
+            let cw = model::build_cached(&id, stored(json!({"daily": {"at": "02:30"}}), created), 1, 0, 1).unwrap();
+            svc.cache.write().insert(id, cw);
+        }
+        let t = ms("2020-01-01T02:30:00Z");
+        // A first pass schedules each watch's next fire time (02:30).
+        assert!(due_watches(&svc, t - 60_000).is_empty());
+        let due = due_watches(&svc, t);
+        assert_eq!(due.len(), 65);
+        // The pool is full: nothing is admitted, nothing is lost.
+        svc.running_threads.store(MAX_RUNNING, Ordering::SeqCst);
+        fire(&node, &svc, due.clone(), t);
+        let again = due_watches(&svc, t + 1000);
+        assert_eq!(again.len(), 65);
+        assert!(again.iter().all(|(_, s)| *s == ms("2020-01-01T02:30:00Z")), "{again:?}");
+        svc.running_threads.store(0, Ordering::SeqCst);
+    }
+
+    /// Finding 201 / 203: the scan pages past any page size and refuses an
+    /// incomplete page.
+    #[test]
+    fn watch_scans_page_and_refuse_incomplete_results() {
+        let total = WATCH_PAGE * 2 + 5;
+        let pages = std::cell::Cell::new(0);
+        let hits = all_watch_hits(&|body: &Value| {
+            pages.set(pages.get() + 1);
+            let from = body["search_after"][0].as_u64().map_or(0, |s| s as usize + 1);
+            let hits: Vec<Value> = (from..(from + WATCH_PAGE).min(total)).map(|i| json!({"_id": format!("w{i}"), "sort": [i]})).collect();
+            Ok(json!({"timed_out": false, "_shards": {"failed": 0}, "hits": {"hits": hits}}))
+        })
+        .unwrap();
+        assert_eq!(hits.len(), total);
+        assert_eq!(pages.get(), 3);
+        let partial = all_watch_hits(&|_: &Value| Ok(json!({"timed_out": true, "_shards": {"failed": 0}, "hits": {"hits": []}})));
+        assert!(partial.is_err());
+        let failed = all_watch_hits(&|_: &Value| Ok(json!({"timed_out": false, "_shards": {"failed": 1}, "hits": {"hits": []}})));
+        assert!(failed.is_err());
     }
 
     /// Fake-clock scheduler test: every schedule type fires at the expected instants.

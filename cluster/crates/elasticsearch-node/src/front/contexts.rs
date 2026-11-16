@@ -56,6 +56,8 @@ enum HitField {
     Score,
     #[serde(rename = "sort")]
     Sort,
+    #[serde(rename = "_sort_raw")]
+    SortRaw,
     #[serde(other)]
     Other,
 }
@@ -65,6 +67,8 @@ struct HitKeys {
     index: Option<String>,
     score: Option<f64>,
     sort: Option<Vec<Value>>,
+    /// Typed sort values (`fanout::RAW_SORT`), ordered on when present.
+    sort_raw: Option<Vec<Value>>,
 }
 
 /// Reads a hit's merge keys into `keys`. Without sort keys only `_index`
@@ -87,6 +91,7 @@ impl<'de> serde::de::Visitor<'de> for KeyReader<'_> {
                 HitField::Index => { self.keys.index = m.next_value()?; index = true; }
                 HitField::Score => { self.keys.score = m.next_value::<Value>()?.as_f64(); score = true; }
                 HitField::Sort if self.need_sort => self.keys.sort = m.next_value()?,
+                HitField::SortRaw if self.need_sort => self.keys.sort_raw = m.next_value()?,
                 _ => { m.next_value::<serde::de::IgnoredAny>()?; }
             }
             if index && score && !self.need_sort {
@@ -102,7 +107,22 @@ fn buf_hit(raw: Box<serde_json::value::RawValue>, need_sort: bool) -> BufHit {
     use serde::Deserializer as _;
     let mut keys = HitKeys::default();
     let _ = serde_json::Deserializer::from_str(raw.get()).deserialize_map(KeyReader { keys: &mut keys, need_sort });
-    BufHit { index: keys.index, score: keys.score, sort: keys.sort, raw: raw.get().into() }
+    let text: Box<str> = match keys.sort_raw.is_some().then(|| without_raw_sort(raw.get())).flatten() { Some(t) => t.into(), None => raw.get().into() };
+    BufHit { index: keys.index, score: keys.score, sort: keys.sort_raw.or(keys.sort), raw: text }
+}
+
+/// A hit's text without its typed sort values (`fanout::RAW_SORT`, written
+/// by the engine right after `sort`): they order the merge and are never
+/// returned. An unescaped `,"_sort_raw":` is a member of the hit itself
+/// (user `_source` members come earlier, so the last one is the engine's).
+fn without_raw_sort(raw: &str) -> Option<String> {
+    let marker = format!(",\"{}\":", fanout::RAW_SORT);
+    let at = raw.rfind(&marker)?;
+    let value = &raw[at + marker.len()..];
+    let mut stream = serde_json::Deserializer::from_str(value).into_iter::<Vec<Value>>();
+    stream.next()?.ok()?;
+    let rest = &value[stream.byte_offset()..];
+    matches!(rest.trim_start().chars().next(), Some(',' | '}')).then(|| format!("{}{}", &raw[..at], rest))
 }
 
 /// A sub response read in one pass: everything but `hits.hits` as JSON
@@ -265,7 +285,8 @@ fn buf_hit_str(raw: &str, need_sort: bool) -> BufHit {
             }
         }
     }
-    BufHit { index: keys.index, score: keys.score, sort: keys.sort, raw: raw.into() }
+    let text: Box<str> = match keys.sort_raw.is_some().then(|| without_raw_sort(raw)).flatten() { Some(t) => t.into(), None => raw.into() };
+    BufHit { index: keys.index, score: keys.score, sort: keys.sort_raw.or(keys.sort), raw: text }
 }
 
 /// The value of the hit's top-level `sort` when it is the hit's last
@@ -371,6 +392,63 @@ struct Sub {
     /// Its node answered a touch with a page (a build before the touch):
     /// it is not touched again, and its age-based refill keeps it alive.
     legacy: bool,
+    /// Its last page was incomplete (timed out, or a transient shard
+    /// failure): the sub stays live and is asked again, and every page of
+    /// the composite reports this state until a complete page clears it.
+    unresolved: Option<Unresolved>,
+}
+
+/// What made a sub's last page incomplete.
+#[derive(Clone, Debug, Default)]
+struct Unresolved {
+    timed_out: bool,
+    failures: Vec<copies::ShardFailure>,
+}
+
+/// The `_shards.failures` of a sub page split into the transient ones (the
+/// page is incomplete: the same context is asked again) and those of a
+/// shard the sub-context lost for good (context, copy or shard gone),
+/// which the scroll reports on every page but never retries.
+fn page_failures_of(meta: &Map<String, Value>, owner: &str) -> (Vec<copies::ShardFailure>, Vec<copies::ShardFailure>) {
+    let (mut transient, mut gone) = (Vec::new(), Vec::new());
+    for f in meta.get("_shards").and_then(|s| s.get("failures")).and_then(Value::as_array).into_iter().flatten() {
+        let (Some(index), Some(shard)) = (f["index"].as_str(), f["shard"].as_u64()) else { continue };
+        let ty = f["reason"]["type"].as_str().unwrap_or("");
+        let lost = matches!(ty, "search_context_missing_exception" | "shard_not_found_exception" | "index_shard_closed_exception" | "no_shard_available_action_exception");
+        let status = if lost { 404 } else { f.get("status").and_then(Value::as_u64).map_or(500, |s| s as u16) };
+        let failure = copies::ShardFailure { index: index.to_string(), shard: shard as u32, node: Some(owner.to_string()), status, reason: f["reason"].clone(), engine_error: None };
+        if lost { gone.push(failure) } else { transient.push(failure) }
+    }
+    (transient, gone)
+}
+
+impl Sub {
+    /// Buffer a successful sub page. The sub is exhausted only by a
+    /// complete page (not timed out, no transient shard failure) that is
+    /// short or empty: an incomplete page says nothing about what is left
+    /// (the engine's cursor advanced only past the hits it returned), so
+    /// the sub stays refillable and keeps the page's unresolved state.
+    fn absorb(&mut self, hits: VecDeque<BufHit>, timed_out: bool, failures: Vec<copies::ShardFailure>, sub_page: usize) {
+        let complete = !timed_out && failures.is_empty();
+        self.done = complete && (hits.is_empty() || hits.len() < sub_page);
+        self.unresolved = (!complete).then_some(Unresolved { timed_out, failures });
+        self.buf.extend(hits);
+    }
+}
+
+/// The unresolved state of the subs not asked on this page (`asked[i]`):
+/// carried onto the page so a sub's timeout or transient failure is not
+/// reset by a page that did not ask it again.
+fn carried_unresolved(subs: &[Sub], asked: &[bool]) -> (bool, Vec<copies::ShardFailure>) {
+    let mut timed_out = false;
+    let mut failures = Vec::new();
+    for (s, _) in subs.iter().zip(asked).filter(|(s, a)| !**a && !s.done) {
+        if let Some(u) = &s.unresolved {
+            timed_out |= u.timed_out;
+            failures.extend(u.failures.iter().cloned());
+        }
+    }
+    (timed_out, failures)
 }
 
 struct Composite {
@@ -413,14 +491,22 @@ fn composites() -> &'static Mutex<HashMap<String, Composite>> {
     M.get_or_init(Default::default)
 }
 
-fn purge_expired() {
+/// Drop the composite scrolls past their keep-alive: their buffered hits
+/// and accounting charge go with them, freed after the registry lock.
+pub(super) fn purge_expired() {
     let now = Instant::now();
-    composites().lock().retain(|_, c| c.expires > now);
+    let expired: Vec<Composite> = {
+        let mut m = composites().lock();
+        let keys: Vec<String> = m.iter().filter(|(_, c)| c.expires <= now).map(|(k, _)| k.clone()).collect();
+        keys.iter().filter_map(|k| m.remove(k)).collect()
+    };
+    drop(expired);
 }
 
 /// `DELETE /_search/scroll/_all` on this node.
 pub(super) fn forget_all() {
-    composites().lock().clear();
+    let all = std::mem::take(&mut *composites().lock());
+    drop(all);
 }
 
 // Only contexts observed before dispatch belong to this clear operation.
@@ -571,7 +657,29 @@ pub(super) fn plan_groups(plan: &copies::Plan) -> Vec<Group> {
         let (Some((i, k)), Some(first)) = (copies::split_key(key), plan.candidates(key).first().cloned()) else { continue };
         out.entry((first, k)).or_default().push(i);
     }
-    out.into_iter().map(|((n, k), idx)| (n, k, idx)).collect()
+    split_groups(out.into_iter().map(|((n, k), idx)| (n, k, idx)).collect())
+}
+
+/// Most targets one group's engine search may cover: its target ordinal
+/// sits above bit 44 of a `_shard_doc` (the engine's `SHARD_DOC_SHIFT`),
+/// and the composite keeps the sub's local value below [`SUB_SHIFT`].
+const MAX_GROUP_TARGETS: usize = 1 << (SUB_SHIFT - 44);
+
+/// Groups of at most [`MAX_GROUP_TARGETS`] indices each, so every target's
+/// ordinal survives the composite `_shard_doc` packing (#602: a group of
+/// 257 indices lost bit 52, and its target 256 collided with target 0).
+fn split_groups(groups: Vec<Group>) -> Vec<Group> {
+    let mut out = Vec::with_capacity(groups.len());
+    for (n, k, idx) in groups {
+        if idx.len() <= MAX_GROUP_TARGETS {
+            out.push((n, k, idx));
+            continue;
+        }
+        for chunk in idx.chunks(MAX_GROUP_TARGETS) {
+            out.push((n.clone(), k, chunk.to_vec()));
+        }
+    }
+    out
 }
 
 /// A group's nodes in order: its own, then the other nodes the plan lists
@@ -754,7 +862,11 @@ fn hit_cmp(a: &BufHit, ai: usize, b: &BufHit, bi: usize, keys: Option<&[fanout::
 /// refilled sub's next hit). Pages are therefore exactly those of the
 /// former rule (refill every live sub holding fewer than `n` hits), which
 /// fetched a page from every sub it could and left up to two pages per
-/// sub fetched and unreturned when the client stopped scrolling. ES fetches
+/// sub fetched and unreturned when the client stopped scrolling. (An
+/// incomplete refill, timed out or with a transient shard failure, can
+/// leave a live sub short or empty: it is asked again on the next page,
+/// and that page reports the unresolved state; production review #116.)
+/// ES fetches
 /// only the hits a page returns (`SearchScrollQueryThenFetchAsyncAction`:
 /// query every shard, merge, then fetch the page's docs; from knowledge of
 /// the 9.5.5 source, not re-read here).
@@ -934,7 +1046,13 @@ pub(super) async fn start_scroll(node: &Arc<ClusterNode>, req: &RestReq, mut gro
         }
         match v["_scroll_id"].as_str() {
             Some(id) if r.is_success() => {
-                subs.push(Sub { id: id.to_string(), shard, indices: idx.clone(), done: hits.is_empty() || hits.len() < sub_page, buf: hits, touched: now, legacy: false });
+                // The page itself reports its timeout and failures through
+                // the merge below; the sub keeps them while unresolved.
+                let timed_out = v.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
+                let transient = v.as_object().map_or_else(Vec::new, |m| page_failures_of(m, &owner).0);
+                let mut sub = Sub { id: id.to_string(), shard, indices: idx.clone(), done: false, buf: VecDeque::new(), touched: now, legacy: false, unresolved: None };
+                sub.absorb(hits, timed_out, transient, sub_page);
+                subs.push(sub);
                 parts.push(v);
             }
             _ => {
@@ -1023,6 +1141,44 @@ async fn missing(_node: &Arc<ClusterNode>, _req: &RestReq, inner: &str) -> RestR
 /// requests.
 pub(super) const SCROLL_TOUCH_HEADER: &str = "x-rustic-internal-scroll-touch";
 
+/// Marks a point-in-time sub search whose hits name their shard
+/// (`elasticsearch_http::InternalPitShardTags`): a search ordered by score
+/// over subs that each cover several shards breaks ties by shard. A node of
+/// an earlier build ignores it (ties then follow the subs' order).
+pub(super) const PIT_SHARD_TAGS_HEADER: &str = "x-rustic-internal-pit-shard-tags";
+
+/// A score-ordered point-in-time merge: the hits of every part in shard
+/// order (`_index`, then the shard each names, then each part's own order),
+/// held by the first part, so the merge's stable sort breaks score ties by
+/// shard as ES does (by shard request index) rather than by the node that
+/// answered. Parts whose hits do not all name a shard are left alone.
+fn hits_in_shard_order(parts: &mut [Value]) {
+    let key = elasticsearch_engine::search::SHARD_TAG_KEY;
+    let tagged = parts.iter().all(|p| p["hits"]["hits"].as_array().is_none_or(|h| h.iter().all(|x| x.get(key).is_some())));
+    if !tagged || parts.len() < 2 {
+        return;
+    }
+    let mut all: Vec<Value> = Vec::new();
+    for p in parts.iter_mut() {
+        if let Some(h) = p.pointer_mut("/hits/hits").and_then(Value::as_array_mut) {
+            all.append(h);
+        }
+    }
+    all.sort_by(|a, b| a["_index"].as_str().cmp(&b["_index"].as_str()).then_with(|| a[key].as_u64().cmp(&b[key].as_u64())));
+    if let Some(h) = parts[0].pointer_mut("/hits/hits") {
+        *h = Value::Array(all);
+    }
+}
+
+/// Drop the merge-only shard names from a merged answer's hits.
+fn drop_shard_tags(merged: &mut Value) {
+    for h in merged.pointer_mut("/hits/hits").and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(o) = h.as_object_mut() {
+            o.shift_remove(elasticsearch_engine::search::SHARD_TAG_KEY);
+        }
+    }
+}
+
 fn owner_supports_touch(state: &elasticsearch_cluster::state::ClusterState, id: &str) -> bool {
     unwrap_id(id).and_then(|(owner, _)| state.nodes.get(owner)).is_some_and(|peer|
         crate::internal_capabilities::supports(peer, crate::internal_capabilities::Capability::ScrollTouch))
@@ -1066,15 +1222,19 @@ pub(super) async fn continue_scroll(node: &Arc<ClusterNode>, req: &RestReq, owne
     let aged = |s: &Sub| now.duration_since(s.touched) > c.keep_alive / 2;
     let keys = fanout::sort_keys(&c.body, &c.params);
     let short = refills_needed(&c.subs, c.size, keys.as_deref());
+    let sub_count = c.subs.len().to_string();
     let refill: Vec<usize> = (0..c.subs.len()).filter(|&i| !c.subs[i].done && (short[i] || (c.subs[i].legacy && aged(&c.subs[i])))).collect();
     let futs = refill.iter().map(|&i| {
         let (id, k) = (c.subs[i].id.clone(), c.subs[i].shard);
         let (node, ka) = (node.clone(), ka.clone());
         let req = req.clone();
+        let sub_count = &sub_count;
         async move {
             let Some((o, sub_inner)) = unwrap_id(&id) else { return RestResp::error(500, "illegal_state_exception", "bad sub scroll id") };
+            // A shard read for this coordinator's merge, as the first page
+            // was: its hits carry their typed sort values like the first.
             let r = json_req(&req, "POST", "/_search/scroll", &json!({"scroll_id": sub_inner, "scroll": ka}))
-                .and_then(|mut r| { r.push_header(elasticsearch_http::HIT_SPANS_HEADER, "1")?; Ok(r) });
+                .and_then(|mut r| { r.push_header(elasticsearch_http::HIT_SPANS_HEADER, "1")?; r.replace_header(crate::shard_engines::PREFILTER_SHARDS_HEADER, sub_count)?; Ok(r) });
             exec_shard(&node, o, k, r).await
         }
     });
@@ -1115,6 +1275,10 @@ pub(super) async fn continue_scroll(node: &Arc<ClusterNode>, req: &RestReq, owne
     let mut timed_out = false;
     let (mut request_error, mut page_failures, mut cleared) = (None, Vec::new(), Vec::new());
     let (asked, mut answered) = (pages.len(), 0usize);
+    let mut asked_now = vec![false; c.subs.len()];
+    for &(i, _) in &pages {
+        asked_now[i] = true;
+    }
     for (i, r) in pages {
         if copies::is_request_error(&r) {
             // This request's error (every sub would give it): the answer,
@@ -1129,7 +1293,9 @@ pub(super) async fn continue_scroll(node: &Arc<ClusterNode>, req: &RestReq, owne
             if r.status != 404 && !(copies::node_failure(&r) && !ty.contains("timeout")) {
                 // A rejection, a timeout, a shard error: this page reports
                 // it, and the next page asks the same context again (ES
-                // `SearchScrollAsyncAction`).
+                // `SearchScrollAsyncAction`). Until it answers a
+                // complete page, later pages report it too.
+                c.subs[i].unresolved = Some(Unresolved { timed_out: false, failures: failure.iter().cloned().collect() });
                 page_failures.extend(failure);
                 continue;
             }
@@ -1141,6 +1307,7 @@ pub(super) async fn continue_scroll(node: &Arc<ClusterNode>, req: &RestReq, owne
             c.lost.extend(failure);
             cleared.push(tag(c.subs[i].shard, &c.subs[i].id));
             c.subs[i].done = true;
+            c.subs[i].unresolved = None;
             c.subs[i].buf.clear();
             continue;
         }
@@ -1152,27 +1319,23 @@ pub(super) async fn continue_scroll(node: &Arc<ClusterNode>, req: &RestReq, owne
         // lost with its copy (context gone, copy gone or closed) is failed
         // for the rest of the scroll; any other failure is this page's
         // only (the sub still returns that shard's next hits).
-        for f in meta.get("_shards").and_then(|s| s.get("failures")).and_then(Value::as_array).into_iter().flatten() {
-            let (Some(index), Some(shard)) = (f["index"].as_str(), f["shard"].as_u64()) else { continue };
-            let owner = unwrap_id(&c.subs[i].id).map(|(o, _)| o.to_string()).unwrap_or_default();
-            let ty = f["reason"]["type"].as_str().unwrap_or("");
-            let gone = matches!(ty, "search_context_missing_exception" | "shard_not_found_exception" | "index_shard_closed_exception" | "no_shard_available_action_exception");
-            let status = if gone { 404 } else { f.get("status").and_then(Value::as_u64).map_or(500, |s| s as u16) };
-            let failure = copies::ShardFailure { index: index.to_string(), shard: shard as u32, node: Some(owner), status, reason: f["reason"].clone(), engine_error: None };
-            if !gone {
-                page_failures.push(failure);
-            } else if !c.lost.iter().any(|l| l.index == index && l.shard as u64 == shard) {
+        let owner = unwrap_id(&c.subs[i].id).map(|(o, _)| o.to_string()).unwrap_or_default();
+        let (transient, gone) = page_failures_of(&meta, &owner);
+        for failure in gone {
+            if !c.lost.iter().any(|l| l.index == failure.index && l.shard == failure.shard) {
                 c.lost.push(failure);
             }
         }
+        page_failures.extend(transient.iter().cloned());
         took = took.max(meta.get("took").and_then(Value::as_u64).unwrap_or(0));
-        timed_out |= meta.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
+        let sub_timed_out = meta.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
+        timed_out |= sub_timed_out;
+        let sub_page = c.sub_page;
         let s = &mut c.subs[i];
         if let Some(id) = meta.get("_scroll_id").and_then(Value::as_str) {
             s.id = id.to_string();
         }
-        s.done = hits.is_empty() || hits.len() < c.sub_page;
-        s.buf.extend(hits);
+        s.absorb(hits, sub_timed_out, transient, sub_page);
         s.touched = now;
     }
     if !cleared.is_empty() {
@@ -1203,6 +1366,11 @@ pub(super) async fn continue_scroll(node: &Arc<ClusterNode>, req: &RestReq, owne
         let failures: Vec<copies::ShardFailure> = c.failed_at_start.iter().chain(&c.lost).cloned().collect();
         return copies::phase_failure("query", "all shards failed", &failures);
     }
+    // A sub left incomplete by an earlier page and not asked on this one
+    // is still unresolved: this page says so too.
+    let (carried_timeout, carried) = carried_unresolved(&c.subs, &asked_now);
+    timed_out |= carried_timeout;
+    page_failures.extend(carried);
     let page = take(&mut c.subs, c.size, keys.as_deref());
     let params = req.params();
     let mut hits = Map::new();
@@ -1255,7 +1423,31 @@ pub(super) fn pit_validation_id(id: &str) -> Option<String> {
 }
 
 fn pit_subs(inner: &str) -> Option<Vec<String>> {
+    pit_state(inner).map(|p| p.ids)
+}
+
+/// What a composite PIT id holds: its shard contexts, and the shards it was
+/// opened without (ES encodes every shard of a PIT in its id, the missing
+/// ones without a context, and reports them failed on every search).
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PitState {
+    ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing: Vec<(String, u32)>,
+}
+
+/// The id of a PIT state: a plain list of sub ids when it misses no shard
+/// (the format of PITs that never miss one), else the whole state.
+fn encode_pit(state: &PitState) -> String {
+    let raw = if state.missing.is_empty() { serde_json::to_vec(&state.ids) } else { serde_json::to_vec(state) };
+    format!("{PIT_PREFIX}{}", hex(&raw.unwrap_or_default()))
+}
+
+fn pit_state(inner: &str) -> Option<PitState> {
     let raw = unhex(inner.strip_prefix(PIT_PREFIX)?)?;
+    if let Ok(ids) = serde_json::from_slice::<Vec<String>>(&raw) {
+        return Some(PitState { ids, missing: Vec::new() });
+    }
     serde_json::from_slice(&raw).ok()
 }
 
@@ -1308,7 +1500,8 @@ pub(super) async fn open_pit(node: &Arc<ClusterNode>, req: &RestReq, groups: Vec
         let _ = close_ids(node, req, &ids).await;
         return f;
     }
-    let inner = format!("{PIT_PREFIX}{}", hex(&serde_json::to_vec(&ids).unwrap_or_default()));
+    // The shards the PIT misses stay in it: every later search reports them.
+    let inner = encode_pit(&PitState { ids, missing: missing.clone() });
     let mut out = json!({"id": wrap_id(node, &inner), "_shards": {"total": shards[0], "successful": shards[1], "skipped": shards[2], "failed": shards[3]}});
     let unavailable: Vec<copies::ShardFailure> = missing.iter().map(|(i, k)| copies::ShardFailure::unavailable(i, *k)).collect();
     copies::add_failures(&mut out, &unavailable);
@@ -1372,10 +1565,51 @@ fn tiebreak_slot(body: &Value, params: &HashMap<String, String>) -> Option<(usiz
 }
 
 /// Search a composite PIT (`wrapped` is the client's id).
+fn search_pit_boxed<'a>(node: &'a Arc<ClusterNode>, req: RestReq, wrapped: &'a str, inner: &'a str) -> futures::future::BoxFuture<'a, Option<RestResp>> {
+    Box::pin(async move { search_pit(node, &req, wrapped, inner).await })
+}
+
+/// ES's DFS kNN phase over a point in time: each `knn` clause's global top
+/// k as a lone kNN search of the point in time, then the request with them
+/// folded into its query (`fanout::knn_rewrite`), its text scored with the
+/// point in time's statistics (DFS).
+async fn pit_knn_dfs(node: &Arc<ClusterNode>, req: &RestReq, wrapped: &str, inner: &str, body: &Value, params: &HashMap<String, String>) -> RestResp {
+    let unanswered = || RestResp::error(500, "illegal_state_exception", "the point in time could not be searched");
+    let (_, size) = fanout::from_size(body, params);
+    let mut top = Vec::new();
+    for clause in fanout::knn_clauses(body) {
+        let mut b = fanout::knn_dfs_body(&clause, size, body);
+        b["pit"] = body["pit"].clone();
+        let r = match req.try_rebuilt(&b, |p| !["from", "size", "sort"].contains(&p) && !fanout::Q_PARAMS.contains(&p)) {
+            Ok(r) => r,
+            Err(e) => return super::err(e),
+        };
+        let resp = search_pit_boxed(node, r, wrapped, inner).await.unwrap_or_else(unanswered);
+        if !resp.is_success() {
+            return resp;
+        }
+        top.push(fanout::scored_hits(&resp.body_json().unwrap_or(Value::Null)));
+    }
+    let rewritten = match req.try_rebuilt(&fanout::knn_rewrite(body, params, &top), |p| !fanout::Q_PARAMS.contains(&p)).and_then(super::force_dfs) {
+        Ok(r) => r,
+        Err(e) => return super::err(e),
+    };
+    search_pit_boxed(node, rewritten, wrapped, inner).await.unwrap_or_else(unanswered)
+}
+
 pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: &str, inner: &str) -> Option<RestResp> {
-    let ids = pit_subs(inner)?;
+    let PitState { ids, missing } = pit_state(inner)?;
     let body = req.json().unwrap_or(json!({}));
     let params = req.params();
+    // A coordinating cluster's cross-cluster reduce: the body is the shard
+    // body already, and the shard results are answered unmerged.
+    let parts_mode = super::ccs_parts(req);
+    // ES: a PIT opened without some shards searches without them, each a
+    // shard failure; a search that does not allow partial results is
+    // rejected for them.
+    if !missing.is_empty() && !copies::allow_partial(node, &params) {
+        return Some(super::stateless_read::missing_shards_rejected(&missing));
+    }
     if body.get("collapse").and_then(|c| c.get("inner_hits")).is_some() {
         // The expand phase would have to search the same point in time.
         return Some(RestResp::error(500, "illegal_state_exception", "collapse with inner_hits in a point in time cannot be combined across shards yet"));
@@ -1392,8 +1626,12 @@ pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: 
         if let Some(f) = fanout::unsupported_feature(&checked, &params) {
             return Some(RestResp::error(500, "illegal_state_exception", &format!("{f} in a point in time cannot be combined across shards yet")));
         }
-        if fanout::knn_needs_dfs(&checked, &params) || !fanout::knn_clauses(&checked).is_empty() {
-            return Some(RestResp::error(500, "illegal_state_exception", "knn in a point in time cannot be combined across shards yet"));
+        // kNN combined with anything (or several kNN clauses): ES's DFS
+        // kNN phase over the point in time, each clause's global top k
+        // folded into the query. A lone kNN merges exactly (each shard's
+        // top k, cut to the global k).
+        if fanout::knn_needs_dfs(&checked, &params) {
+            return Some(pit_knn_dfs(node, req, wrapped, inner, &body, &params).await);
         }
     }
     let (from, size) = fanout::from_size(&body, &params);
@@ -1407,7 +1645,7 @@ pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: 
     for (i, id) in ids.iter().enumerate() {
         let (k, id) = untag(id);
         let Some((owner, sub_inner)) = unwrap_id(id) else { continue };
-        let mut b = fanout::node_body(&body, from, size);
+        let mut b = if parts_mode { body.clone() } else { fanout::node_body(&body, from, size) };
         b["pit"]["id"] = json!(sub_inner);
         // Split a global cursor back into this sub's own cursor: subs that
         // sort before the cursor's one have given all their ties (cursor past
@@ -1430,8 +1668,13 @@ pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: 
         let r = match json_req_formatted(req,"POST",format_args!("/_search{query}"),&b) {Ok(r)=>r,Err(e)=>return Some(RestResp::json(e.status,&e.to_json()))};
         reqs.push((owner.to_string(), k, r));
     }
-    let searched_shards: usize = covers.iter().map(|count| count.unwrap_or(1)).sum();
+    let searched_shards: usize = covers.iter().map(|count| count.unwrap_or(1)).sum::<usize>() + missing.len();
     for (_, _, request) in &mut reqs {if let Err(e)=request.replace_header(crate::shard_engines::PREFILTER_SHARDS_HEADER,&searched_shards.to_string()) {return Some(RestResp::json(e.status,&e.to_json()))}}
+    // Ordered by score over several shards: each hit names its shard.
+    let shard_tags = slot.is_none() && searched_shards > 1;
+    if shard_tags {
+        for (_, _, request) in &mut reqs {if let Err(e)=request.replace_header(PIT_SHARD_TAGS_HEADER,"true") {return Some(RestResp::json(e.status,&e.to_json()))}}
+    }
     // DFS over the PIT's shard contexts (the engine's PIT search answers a
     // stats round from the same point in time).
     if super::dfs_wanted(req, &body, &params, reqs.len()) {
@@ -1455,7 +1698,7 @@ pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: 
     let mut parts = Vec::new();
     // ES: a shard whose PIT context is gone (or that failed) is a shard
     // failure of this search, not the search's answer.
-    let mut failures: Vec<copies::ShardFailure> = Vec::new();
+    let mut failures: Vec<copies::ShardFailure> = missing.iter().map(|(i, k)| copies::ShardFailure::unavailable(i, *k)).collect();
     let mut sources = elasticsearch_engine::source_json::ResponseSources::default();
     for (i, r) in futures::future::join_all(futs).await.into_iter().enumerate() {
         if !r.is_success() {
@@ -1478,8 +1721,10 @@ pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: 
         }
         if let (Some(slot), Some(hits)) = (slot, v["hits"]["hits"].as_array_mut()) {
             for h in hits {
-                if let Some(x) = h["sort"].get(slot).and_then(Value::as_i64) {
-                    h["sort"][slot] = json!(((i as i64) << SUB_SHIFT) | (x & LOCAL_MASK));
+                for key in ["sort", fanout::RAW_SORT] {
+                    if let Some(x) = h.get(key).and_then(|s| s.get(slot)).and_then(Value::as_i64) {
+                        h[key][slot] = json!(((i as i64) << SUB_SHIFT) | (x & LOCAL_MASK));
+                    }
                 }
             }
         }
@@ -1510,7 +1755,25 @@ pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: 
             return Some(copies::phase_failure("query", "Partial shards failure", &failures));
         }
     }
+    if parts_mode {
+        // The coordinating cluster merges the parts: no shard tags leave here.
+        if shard_tags {
+            parts.iter_mut().for_each(drop_shard_tags);
+        }
+        let mut failed = json!({"_shards": {"total": 0, "successful": 0, "skipped": 0, "failed": 0}});
+        copies::add_failures(&mut failed, &failures);
+        let out = json!({"_ccs_parts": parts, "_ccs_failures": failed["_shards"], "took": 0});
+        let mut raw = RestResp::json(200, &Value::Null);
+        raw.replace_body_vec(sources.render(&out));
+        return Some(raw);
+    }
+    if shard_tags {
+        hits_in_shard_order(&mut parts);
+    }
     let mut merged = fanout::merge_search_with_source(&parts, &merge_body, &params, node.engine.max_buckets(), &req.body);
+    if shard_tags {
+        drop_shard_tags(&mut merged);
+    }
     if let Some(e) = fanout::take_agg_breaking() { return Some(RestResp::json(e.status, &e.to_json())); }
     if let Some(e) = fanout::take_agg_error() { return Some(RestResp::json(e.status, &e.to_json())); }
     copies::add_failures(&mut merged, &failures);
@@ -1526,6 +1789,70 @@ pub(super) async fn search_pit(node: &Arc<ClusterNode>, req: &RestReq, wrapped: 
 #[cfg(test)]
 mod scroll_shard_tests {
     use super::*;
+    #[test]
+    fn buffered_hits_order_on_typed_sort_values_and_drop_them() {
+        let raw = r#"{"_index":"i","_id":"1","_score":null,"_source":{"_sort_raw":[1]},"sort":["28/01/2021"],"_sort_raw":[1611792000000]}"#;
+        let hit = buf_hit_str(raw, true);
+        assert_eq!(hit.sort, Some(vec![json!(1611792000000i64)]));
+        assert_eq!(&*hit.raw, r#"{"_index":"i","_id":"1","_score":null,"_source":{"_sort_raw":[1]},"sort":["28/01/2021"]}"#);
+        // Followed by another member.
+        let raw = r#"{"_id":"1","sort":["x"],"_sort_raw":["\u0001"],"matched_queries":["q"]}"#;
+        assert_eq!(without_raw_sort(raw).unwrap(), r#"{"_id":"1","sort":["x"],"matched_queries":["q"]}"#);
+        // A hit without them is untouched.
+        let raw = r#"{"_id":"1","sort":[3]}"#;
+        let hit = buf_hit_str(raw, true);
+        assert_eq!((hit.sort, &*hit.raw), (Some(vec![json!(3)]), raw));
+    }
+    #[test]
+    fn score_ties_across_pit_subs_follow_shard_order() {
+        // Node A answers shards 0, 2 and 4, node B shards 1 and 3; every
+        // hit ties on score. ES orders them by shard, not by node.
+        let hit = |id: &str, shard: u64| json!({"_index": "i", "_id": id, "_score": 0.5, "_rustic_shard": shard});
+        let part = |hits: Vec<Value>| json!({"hits": {"total": {"value": hits.len(), "relation": "eq"}, "max_score": 0.5, "hits": hits}, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0}});
+        let mut parts = vec![part(vec![hit("a0", 0), hit("a2", 2), hit("a4", 4)]), part(vec![hit("b1", 1), hit("b3", 3)])];
+        hits_in_shard_order(&mut parts);
+        let mut merged = fanout::merge_search(&parts, &json!({"size": 4}), &HashMap::new());
+        drop_shard_tags(&mut merged);
+        let ids: Vec<&str> = merged["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a0", "b1", "a2", "b3"]);
+        assert!(!merged.to_string().contains("_rustic_shard"), "{merged}");
+        // Untagged parts (a node of an earlier build) are left alone.
+        let mut parts = vec![part(vec![json!({"_index": "i", "_id": "x", "_score": 0.5})]), part(vec![hit("y", 0)])];
+        hits_in_shard_order(&mut parts);
+        assert_eq!(parts[0]["hits"]["hits"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn groups_fit_the_composite_shard_doc_packing() {
+        assert_eq!(MAX_GROUP_TARGETS, 256);
+        let idx: Vec<String> = (0..600).map(|i| format!("d{i:03}")).collect();
+        let groups = split_groups(vec![("n1".into(), 0, idx.clone()), ("n2".into(), 0, vec!["x".into()])]);
+        assert_eq!(groups.iter().map(|g| g.2.len()).collect::<Vec<_>>(), [256, 256, 88, 1]);
+        let flat: Vec<String> = groups.iter().take(3).flat_map(|g| g.2.clone()).collect();
+        assert_eq!(flat, idx, "every index once, in order");
+        // The largest local value a group can produce keeps its sub index.
+        let local = (((MAX_GROUP_TARGETS - 1) as i64) << 44) | ((1i64 << 44) - 1);
+        assert_eq!(local & LOCAL_MASK, local);
+    }
+
+    #[test]
+    fn partial_pit_id_keeps_its_missing_shards() {
+        let full = PitState { ids: vec!["~k1:n1.abc".into(), "n2.def".into()], missing: Vec::new() };
+        let inner = encode_pit(&full);
+        // A complete PIT keeps the plain sub-id list (ids already issued
+        // stay readable, and read the same).
+        let legacy = format!("{PIT_PREFIX}{}", hex(&serde_json::to_vec(&full.ids).unwrap()));
+        assert_eq!(inner, legacy);
+        assert_eq!(pit_state(&legacy).unwrap(), full);
+        let partial = PitState { ids: vec!["n1.abc".into()], missing: vec![("logs".into(), 1), ("logs".into(), 3)] };
+        let inner = encode_pit(&partial);
+        assert_eq!(pit_state(&inner).unwrap(), partial);
+        assert_eq!(pit_subs(&inner).unwrap(), partial.ids);
+        // Every shard missing: no context, still every failure.
+        let none = PitState { ids: Vec::new(), missing: vec![("logs".into(), 0)] };
+        assert_eq!(pit_state(&encode_pit(&none)).unwrap(), none);
+        assert!(pit_state("~pzz").is_none());
+    }
     #[test]
     fn admitted_query_formatters_preserve_order_empty_values_and_encoding() {
         assert_eq!(&*query_without("&&a=1&size=9&flag&from=2&a=3&", &["size","from"]).unwrap(),"?a=1&flag&a=3");
@@ -1564,7 +1891,7 @@ mod scroll_shard_tests {
         assert_eq!((pa["_scroll_id"].as_str(), pa["took"].as_u64(), pb["took"].as_u64()), (Some("a1"), Some(3), Some(7)));
         assert_eq!(pa["hits"], json!({"hits": []}));
         let now = Instant::now();
-        let mut subs = vec![Sub { id: "a".into(), shard: 0, indices: vec![], buf: ha, done: true, touched: now, legacy: false }, Sub { id: "b".into(), shard: 0, indices: vec![], buf: hb, done: true, touched: now, legacy: false }];
+        let mut subs = vec![Sub { id: "a".into(), shard: 0, indices: vec![], buf: ha, done: true, touched: now, legacy: false, unresolved: None }, Sub { id: "b".into(), shard: 0, indices: vec![], buf: hb, done: true, touched: now, legacy: false, unresolved: None }];
         let page = take(&mut subs, 3, None);
         let out = with_raw_hits(200, &json!({"hits": {"max_score": max_score(&page), "hits": RAW_HITS}}), &page);
         let text = std::str::from_utf8(&out.body).map(str::to_owned).unwrap();
@@ -1585,7 +1912,7 @@ mod scroll_shard_tests {
         assert_eq!(meta["hits"], json!({"total": 2, "max_score": null, "hits": []}));
         let hb = sub_hits(b, true).unwrap().hits;
         let now = Instant::now();
-        let mut subs = vec![Sub { id: "a".into(), shard: 0, indices: vec![], buf: ha, done: true, touched: now, legacy: false }, Sub { id: "b".into(), shard: 0, indices: vec![], buf: hb, done: true, touched: now, legacy: false }];
+        let mut subs = vec![Sub { id: "a".into(), shard: 0, indices: vec![], buf: ha, done: true, touched: now, legacy: false, unresolved: None }, Sub { id: "b".into(), shard: 0, indices: vec![], buf: hb, done: true, touched: now, legacy: false, unresolved: None }];
         let page = take(&mut subs, 3, Some(&keys));
         let ids: Vec<Value> = page.iter().map(|h| serde_json::from_str::<Value>(&h.raw).unwrap()["_id"].clone()).collect();
         assert_eq!(ids, [json!("1"), json!("2"), json!("3")]);
@@ -1775,7 +2102,7 @@ mod scroll_shard_tests {
                 let take_n = size.min(s.len());
                 let page: std::collections::VecDeque<BufHit> = s.drain(..take_n).collect();
                 fetched += page.len();
-                Sub { id: String::new(), shard: 0, indices: vec![], done: page.len() < size, buf: page, touched: now, legacy: false }
+                Sub { id: String::new(), shard: 0, indices: vec![], done: page.len() < size, buf: page, touched: now, legacy: false, unresolved: None }
             }).collect();
             let mut out = vec![take(&mut subs, size, keys).iter().map(|h| h.raw.to_string()).collect::<Vec<_>>()];
             for _ in 1..pages {
@@ -1839,4 +2166,156 @@ mod scroll_shard_tests {
         eprintln!("pmc page ({} bytes): serde read {serde_read:?}, borrowed read {scan_read:?}, write {write:?}", body.len());
     }
 
+
+    /// #383: an abandoned composite scroll past its keep-alive is dropped
+    /// by the periodic maintenance, with its buffered hits' charge.
+    #[test]
+    fn maintenance_drops_expired_composites_and_their_charge() {
+        let b = elasticsearch_engine::memory::Breakers::leak_for_tests(1 << 30);
+        let accounting = b.reserve_without_breaking(elasticsearch_engine::memory::Kind::Accounting, 0);
+        let sub = Sub { id: "n.1".into(), shard: 0, indices: vec!["i".into()], buf: (0..50).map(|_| BufHit { index: None, score: None, sort: None, raw: "x".repeat(10_000).into_boxed_str() }).collect(),
+            done: false, touched: Instant::now(), legacy: false, unresolved: None };
+        let mut c = Composite { subs: vec![sub], body: json!({}), params: HashMap::new(), shards: json!({}), failed_at_start: Vec::new(), lost: Vec::new(), total: None,
+            size: 10, sub_page: 10, keep_alive: Duration::from_millis(1), expires: Instant::now() - Duration::from_secs(1), accounting };
+        c.account();
+        assert!(b.accounting.reserved() >= 500_000, "{}", b.accounting.reserved());
+        let key = format!("{SCROLL_PREFIX}review383");
+        composites().lock().insert(key.clone(), c);
+        super::super::reap_expired_contexts();
+        assert!(!composites().lock().contains_key(&key));
+        assert_eq!(b.accounting.reserved(), 0);
+    }
+}
+
+#[cfg(test)]
+mod scroll_timeout_tests {
+    use super::*;
+
+    /// One sub-search of a deterministic stub: its stream of hits and the
+    /// calls (0 = the first page) that time out, returning only the first
+    /// `n` hits they would have (0: an empty timed-out page).
+    struct StubSub {
+        hits: VecDeque<BufHit>,
+        calls: usize,
+        timeouts: Vec<(usize, usize)>,
+    }
+
+    impl StubSub {
+        fn new(sub: usize, len: usize, timeouts: Vec<(usize, usize)>) -> Self {
+            let hits = (0..len).map(|d| buf_hit_str(&format!(r#"{{"_index":"i","_id":"{sub}-{d}","_score":null,"_source":{{}},"sort":[{d}]}}"#), true)).collect();
+            StubSub { hits, calls: 0, timeouts }
+        }
+        /// A page of up to `page` hits; the engine cursor advances past the
+        /// hits returned only.
+        fn page(&mut self, page: usize) -> (VecDeque<BufHit>, bool) {
+            let call = self.calls;
+            self.calls += 1;
+            let (n, timed_out) = match self.timeouts.iter().find(|(c, _)| *c == call) {
+                Some(&(_, n)) => (n.min(page), true),
+                None => (page, false),
+            };
+            let n = n.min(self.hits.len());
+            (self.hits.drain(..n).collect(), timed_out)
+        }
+    }
+
+    /// Run a composite scroll over the stubs to its end (an empty page
+    /// with every sub exhausted): the ids of every page, and each page's
+    /// reported `timed_out`.
+    fn scroll(stubs: &mut [StubSub], size: usize) -> (Vec<String>, Vec<bool>) {
+        let keys = fanout::sort_keys(&json!({}), &HashMap::from([("sort".to_string(), "_doc".to_string())]));
+        let keys = keys.as_deref();
+        let now = Instant::now();
+        let (mut ids, mut reported) = (Vec::new(), Vec::new());
+        let id = |h: &BufHit| { let v: Value = serde_json::from_str(&h.raw).unwrap(); v["_id"].as_str().unwrap().to_string() };
+        // The first page (start_scroll).
+        let mut timed_out = false;
+        let mut subs: Vec<Sub> = stubs.iter_mut().map(|stub| {
+            let (hits, t) = stub.page(size);
+            timed_out |= t;
+            let mut s = Sub { id: String::new(), shard: 0, indices: vec![], done: false, buf: VecDeque::new(), touched: now, legacy: false, unresolved: None };
+            s.absorb(hits, t, Vec::new(), size);
+            s
+        }).collect();
+        ids.extend(take(&mut subs, size, keys).iter().map(id));
+        reported.push(timed_out);
+        // Continuation pages (continue_scroll).
+        for _ in 0..10_000 {
+            let short = refills_needed(&subs, size, keys);
+            let mut asked = vec![false; subs.len()];
+            let mut timed_out = false;
+            for i in 0..subs.len() {
+                if !subs[i].done && short[i] {
+                    asked[i] = true;
+                    let (hits, t) = stubs[i].page(size);
+                    timed_out |= t;
+                    subs[i].absorb(hits, t, Vec::new(), size);
+                }
+            }
+            let (carried, _) = carried_unresolved(&subs, &asked);
+            let page = take(&mut subs, size, keys);
+            reported.push(timed_out || carried);
+            if page.is_empty() && subs.iter().all(|s| s.done) {
+                return (ids, reported);
+            }
+            ids.extend(page.iter().map(id));
+        }
+        panic!("scroll never ended");
+    }
+
+    fn assert_exactly_once(ids: &[String], lens: &[usize]) {
+        let mut want: Vec<String> = lens.iter().enumerate().flat_map(|(s, &n)| (0..n).map(move |d| format!("{s}-{d}"))).collect();
+        let mut got = ids.to_vec();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "every document exactly once");
+    }
+
+    /// Finding 116: an empty timed-out sub page between healthy pages, on
+    /// the first page and on a continuation page, leaves the sub live: the
+    /// scroll goes on to return every remaining document exactly once.
+    #[test]
+    fn timed_out_empty_sub_page_does_not_abandon_the_source() {
+        let lens = [57, 43, 61];
+        for (case, timeouts) in [
+            ("initial page", vec![(0usize, 0usize)]),
+            ("continuation page", vec![(2, 0)]),
+            ("initial and two continuation pages", vec![(0, 0), (1, 0), (4, 0)]),
+            ("short timed-out continuation page", vec![(2, 3)]),
+        ] {
+            let mut stubs: Vec<StubSub> = lens.iter().enumerate().map(|(s, &n)| StubSub::new(s, n, if s == 1 { timeouts.clone() } else { vec![] })).collect();
+            let (ids, reported) = scroll(&mut stubs, 10);
+            assert_exactly_once(&ids, &lens);
+            assert!(reported.iter().any(|&t| t), "{case}: the timeout is reported");
+            assert!(stubs[1].hits.is_empty(), "{case}: the timed-out source was drained");
+        }
+    }
+
+    /// An incomplete page leaves its state on the sub until a complete page
+    /// clears it; a later page that does not ask that sub still reports it.
+    #[test]
+    fn unresolved_sub_state_is_carried_until_resolved() {
+        let now = Instant::now();
+        let hit = |d: usize| buf_hit_str(&format!(r#"{{"_index":"i","_id":"{d}","_score":null,"_source":{{}},"sort":[{d}]}}"#), true);
+        let failure = copies::ShardFailure { index: "i".into(), shard: 0, node: None, status: 429, reason: json!({"type": "es_rejected_execution_exception"}), engine_error: None };
+        let mut s = Sub { id: String::new(), shard: 0, indices: vec![], done: false, buf: VecDeque::new(), touched: now, legacy: false, unresolved: None };
+        // Short, but with a transient failure: not exhausted.
+        s.absorb((0..3).map(hit).collect(), false, vec![failure.clone()], 10);
+        assert!(!s.done);
+        let subs = vec![s];
+        let (t, f) = carried_unresolved(&subs, &[false]);
+        assert!(!t);
+        assert_eq!(f.len(), 1);
+        // Asked on this page: its own answer reports, nothing is carried.
+        assert!(carried_unresolved(&subs, &[true]).1.is_empty());
+        let mut s = subs.into_iter().next().unwrap();
+        s.absorb((0..2).map(hit).collect(), true, vec![], 10);
+        assert!(!s.done);
+        assert!(carried_unresolved(std::slice::from_ref(&s), &[false]).0);
+        // A complete short page exhausts it and clears the state.
+        s.absorb(VecDeque::new(), false, vec![], 10);
+        assert!(s.done && s.unresolved.is_none());
+        let (t, f) = carried_unresolved(std::slice::from_ref(&s), &[false]);
+        assert!(!t && f.is_empty());
+    }
 }

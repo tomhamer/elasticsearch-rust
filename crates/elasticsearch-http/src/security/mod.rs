@@ -8,9 +8,12 @@ pub mod access;
 pub mod actions;
 mod api;
 pub(crate) mod authz;
+pub mod edge;
+pub mod owner;
 mod query;
 
 use crate::{Req, Resp, R};
+use elasticsearch_engine::boxed_future::boxed;
 use elasticsearch_engine::error::EsError;
 use elasticsearch_engine::node::Node;
 use elasticsearch_engine::security::{AuthFail, Authn, Credentials, Permission, Principal};
@@ -32,17 +35,31 @@ pub fn disabled(req: &Req) -> R {
 pub async fn handle(node: Arc<Node>, req: Req) -> R {
     let authn = if req.extensions.get::<crate::SystemIdentity>().is_some() {
         elasticsearch_engine::security::Security::system()
+    } else if let Some(stored) = req.extensions.get::<crate::InternalIdentity>() {
+        // Background work running as the subject that defined it (a watch).
+        stored.0.to_authn()
     } else {
-        match node.security.authenticate(credentials(&req)) {
-            Ok(a) => a,
-            Err(f) => return Ok(auth_failure(&node, f, &req)),
+        // Requests reaching the security layer without the client edge
+        // (forwarded from another node, in-process dispatch) verify
+        // expensive hashes on the crypto pool too, never on this runtime.
+        match boxed(|| edge::verify(&node, credentials(&req), None)).await {
+            edge::Verified::Authenticated(a) => a,
+            edge::Verified::Failed(f) => return Ok(auth_failure(&node, f, &req)),
+            edge::Verified::Rejected(error) => return Err(error),
         }
     };
-    let authn = match req.headers.get("es-security-runas-user").and_then(|v| v.to_str().ok()) {
+    let runas_header = if req.extensions.get::<crate::InternalIdentity>().is_some() { None } else { req.headers.get("es-security-runas-user") };
+    let authn = match runas_header.and_then(|v| v.to_str().ok()) {
         Some(target) if !target.is_empty() => {
             let target = target.to_string();
             match node.security.run_as(authn.clone(), &target) {
                 Ok(a) => a,
+                // ES fails the authentication (401) when the run-as target
+                // is a disabled user the subject may otherwise run as.
+                Err(()) if node.security.run_as_target_disabled(&authn, &target) => {
+                    // (`authenticationFailed` names the authenticating token's principal.)
+                    return Ok(auth_failure(&node, AuthFail::User(authn.username.clone()), &req));
+                }
                 Err(()) => {
                     let perm = node.security.permission(&authn);
                     let action = actions::classify(&req).action;
@@ -76,9 +93,9 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
         if req.extensions.get::<crate::AuthorizedDispatch>().is_some() {
             return crate::dispatch(node, req).await;
         }
-        return api::handle(node, req, authn).await;
+        return boxed(move || api::handle(node, req, authn)).await;
     }
-    authz::authorize_and_dispatch(node, req, authn).await
+    boxed(move || authz::authorize_and_dispatch(node, req, authn)).await
 }
 
 /// The workflow the request's REST handler belongs to (ES 8.19 defines one:
@@ -96,8 +113,13 @@ fn credentials(req: &Req) -> Credentials {
 /// Whether a request with this `Authorization` header authenticates (always,
 /// with security off). ES authenticates before `RestController` charges the
 /// in-flight breaker, so an unauthenticated request gets its 401, not a 429.
+///
+/// Never runs expensive (bcrypt / PBKDF2) verification on the calling
+/// thread: credentials that would need it count as authenticated here (the
+/// HTTP edge, [`edge::authenticate`], already verified them on the crypto
+/// pool, and the security layer decides the request).
 pub fn authenticated(node: &Node, authorization: Option<&str>) -> bool {
-    !node.security.enabled() || node.security.authenticate(credentials_from(authorization)).is_ok()
+    !node.security.enabled() || node.security.authenticate_nonblocking(&credentials_from(authorization)).is_none_or(|r| r.is_ok())
 }
 
 fn credentials_from(header: Option<&str>) -> Credentials {

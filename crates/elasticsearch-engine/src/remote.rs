@@ -69,10 +69,22 @@ fn scalar(v: &Value) -> Option<String> {
 /// config directory, then reloaded when its files change). Errors are the
 /// SSL configuration errors' messages.
 pub fn reindex_context(settings: &Map<String, Value>) -> std::result::Result<Arc<elasticsearch_ssl::Reloadable<rustls::ClientConfig>>, String> {
+    client_context(settings, elasticsearch_ssl::REINDEX_SSL, false)
+}
+
+/// A client TLS context from the node's `<prefix>*` settings (`prefix`
+/// ends with a dot: `xpack.http.ssl.`, `xpack.notification.email.ssl.`),
+/// with ES's client defaults (full verification against the default trust
+/// unless configured). `no_verify` forces `verification_mode: none` (a
+/// host the operator explicitly trusts, `smtp.ssl.trust`). Built once per
+/// distinct settings and config directory, then reloaded when its files
+/// change. Errors are the SSL configuration errors' messages.
+pub fn client_context(settings: &Map<String, Value>, prefix: &str, no_verify: bool) -> std::result::Result<Arc<elasticsearch_ssl::Reloadable<rustls::ClientConfig>>, String> {
     use std::collections::HashMap;
     use std::sync::LazyLock;
     static CONTEXTS: LazyLock<parking_lot::Mutex<HashMap<String, Arc<elasticsearch_ssl::Reloadable<rustls::ClientConfig>>>>> = LazyLock::new(Default::default);
-    let get = |k: &str| settings.get(k).and_then(scalar);
+    let verification_key = format!("{prefix}verification_mode");
+    let get = |k: &str| if no_verify && k == verification_key { Some("none".to_string()) } else { settings.get(k).and_then(scalar) };
     let get_list = |k: &str| -> Vec<String> {
         match settings.get(k) {
             Some(Value::Array(a)) => a.iter().filter_map(scalar).collect(),
@@ -89,8 +101,8 @@ pub fn reindex_context(settings: &Map<String, Value>) -> std::result::Result<Arc
         .and_then(Value::as_str)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("ES_PATH_CONF").unwrap_or_else(|_| "config".into())));
-    let mut key = conf.display().to_string();
-    let mut relevant: Vec<(&String, &Value)> = settings.iter().filter(|(k, _)| k.starts_with(elasticsearch_ssl::REINDEX_SSL)).collect();
+    let mut key = format!("{prefix}|{no_verify}|{}", conf.display());
+    let mut relevant: Vec<(&String, &Value)> = settings.iter().filter(|(k, _)| k.starts_with(prefix)).collect();
     relevant.sort_by(|a, b| a.0.cmp(b.0));
     for (k, v) in relevant {
         key.push('\n');
@@ -102,9 +114,26 @@ pub fn reindex_context(settings: &Map<String, Value>) -> std::result::Result<Arc
     if let Some(c) = contexts.get(&key) {
         return Ok(c.clone());
     }
-    let context = Arc::new(elasticsearch_ssl::reindex_client_reloadable(&get, &get_list, &conf)?);
+    let config = elasticsearch_ssl::SslConfig::parse(
+        prefix,
+        &get,
+        &get_list,
+        &conf,
+        elasticsearch_ssl::Defaults { verification_mode: elasticsearch_ssl::VerificationMode::Full, client_authentication: elasticsearch_ssl::ClientAuth::None },
+    )?;
+    let context = Arc::new(config.reloadable_client()?);
     contexts.insert(key, context.clone());
     Ok(context)
+}
+
+/// [`client_context`]'s current client config (reloaded first when its
+/// files changed, unless `resource.reload.enabled` is false).
+pub fn client_tls(settings: &Map<String, Value>, prefix: &str, no_verify: bool) -> std::result::Result<Arc<rustls::ClientConfig>, String> {
+    let context = client_context(settings, prefix, no_verify)?;
+    if settings.get("resource.reload.enabled").and_then(scalar).as_deref() != Some("false") {
+        elasticsearch_ssl::Reload::check(&*context);
+    }
+    Ok(context.load())
 }
 
 /// A blocking connection: plain TCP or TLS over it.

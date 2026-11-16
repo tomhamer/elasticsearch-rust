@@ -49,6 +49,168 @@ pub fn search(node: &Node, indices: &str, body: &Value) -> Result<Value> {
     serde_json::from_str(&out.json).map_err(|e| EsError::internal(e.to_string()))
 }
 
+/// Scroll keep-alive for ML extractors (ES `ScrollDataExtractor`: 5m).
+const SCROLL_KEEP_ALIVE: &str = "5m";
+
+/// A scroll over one search (ES `ScrollDataExtractor` / the analytics
+/// reindex): every matching hit exactly once, in the request's sort order
+/// (ties in hit order), over a view pinned when the scroll opened. A page
+/// that fails leaves the scroll where it was, so retrying [`Scroll::next_page`]
+/// neither skips nor repeats hits.
+pub struct Scroll {
+    indices: String,
+    body: Value,
+    state: ScrollState,
+}
+
+enum ScrollState {
+    /// Not opened yet (opening is the first page).
+    Fresh,
+    /// Single node: the pinned shard views and per-shard cursors.
+    Local { targets: Vec<crate::search::Target>, req: Box<crate::search::SearchRequest>, cursors: Vec<crate::search::Cursor> },
+    /// Cluster: a REST scroll through the coordinator.
+    Remote { coord: crate::coord::Coordinator, id: String },
+    /// The position is gone (see [`Scroll::lost`]).
+    Lost,
+    Done,
+}
+
+impl Scroll {
+    /// A scroll of `body` (with its own `size` and `sort`) over `indices`.
+    pub fn new(indices: &str, body: Value) -> Scroll {
+        Scroll { indices: indices.to_string(), body, state: ScrollState::Fresh }
+    }
+
+    /// The next page of hits; empty once the scroll is exhausted. On an
+    /// error the scroll stays where it was (retry the page), unless
+    /// [`Scroll::lost`]: the remote context moved past a partial page or
+    /// expired, and the caller must reopen.
+    pub fn next_page(&mut self, node: &Node) -> Result<Vec<Value>> {
+        let resp = match &mut self.state {
+            ScrollState::Done => return Ok(Vec::new()),
+            ScrollState::Lost => return Err(EsError::search_context_missing("ml-extractor")),
+            ScrollState::Fresh => match crate::coord::current() {
+                Some(c) => {
+                    let path = format!("/{}/_search?scroll={SCROLL_KEEP_ALIVE}&allow_no_indices=true", crate::coord::path_segment(&self.indices));
+                    let resp = c("POST", &path, Some(self.body.clone()))?;
+                    let id = resp["_scroll_id"].as_str().map(str::to_string);
+                    if let Err(e) = page_failure(&resp) {
+                        if let Some(id) = id {
+                            let _ = c("DELETE", "/_search/scroll", Some(serde_json::json!({"scroll_id": id})));
+                        }
+                        return Err(e);
+                    }
+                    self.state = match id {
+                        Some(id) => ScrollState::Remote { coord: c, id },
+                        None => ScrollState::Done,
+                    };
+                    resp
+                }
+                None => {
+                    let targets = node.resolve(&self.indices, ResolveOpts { allow_no_indices: true, ..Default::default() })?;
+                    let req = crate::search::parse_request(&self.body, &Default::default())?;
+                    let targets = node.snapshot(&targets)?;
+                    let out = crate::search::execute(&targets, &req, &Self::opts(node, None))?;
+                    let resp: Value = serde_json::from_str(&out.json).map_err(|e| EsError::internal(e.to_string()))?;
+                    page_failure(&resp)?;
+                    self.state = ScrollState::Local { targets, req: Box::new(req), cursors: out.cursors };
+                    resp
+                }
+            },
+            ScrollState::Local { targets, req, cursors } => {
+                let out = crate::search::execute(targets, req, &Self::opts(node, Some(cursors.as_slice())))?;
+                let resp: Value = serde_json::from_str(&out.json).map_err(|e| EsError::internal(e.to_string()))?;
+                page_failure(&resp)?;
+                // Cursors move only once the page succeeded.
+                *cursors = out.cursors;
+                resp
+            }
+            ScrollState::Remote { coord, id } => {
+                let resp = match coord("POST", "/_search/scroll", Some(serde_json::json!({"scroll": SCROLL_KEEP_ALIVE, "scroll_id": id.clone()}))) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if e.status == 404 || e.kind.contains("search_context_missing") {
+                            self.close_lost();
+                        }
+                        return Err(e);
+                    }
+                };
+                if let Some(n) = resp["_scroll_id"].as_str() {
+                    *id = n.to_string();
+                }
+                if let Err(e) = page_failure(&resp) {
+                    // The server-side cursors already moved past this page.
+                    self.close_lost();
+                    return Err(e);
+                }
+                resp
+            }
+        };
+        let hits = resp["hits"]["hits"].as_array().cloned().unwrap_or_default();
+        if hits.is_empty() {
+            self.close();
+        }
+        Ok(hits)
+    }
+
+    /// Whether the scroll lost its position (reopen to continue).
+    pub fn lost(&self) -> bool {
+        matches!(self.state, ScrollState::Lost)
+    }
+
+    /// Tests: the scroll's position is lost (as an expired remote context).
+    #[cfg(test)]
+    pub(crate) fn lose(&mut self) {
+        self.close_lost();
+    }
+
+    fn close_lost(&mut self) {
+        self.close();
+        self.state = ScrollState::Lost;
+    }
+
+    fn opts<'a>(node: &Node, cursors: Option<&'a [crate::search::Cursor]>) -> crate::search::ExecOpts<'a> {
+        crate::search::ExecOpts { terms_lookup: None, cursors, max_buckets: node.max_buckets().max(65_536), scroll_id: None, pit_id: None }
+    }
+
+    /// Release the pinned view / the remote scroll context.
+    pub fn close(&mut self) {
+        if let ScrollState::Remote { coord, id } = std::mem::replace(&mut self.state, ScrollState::Done) {
+            let _ = coord("DELETE", "/_search/scroll", Some(serde_json::json!({"scroll_id": id})));
+        }
+    }
+}
+
+/// A page with shard failures would silently drop the failed shards' hits.
+/// A search response every shard answered in full: shard failures, or a
+/// timed out search, are an error (the extractor retries the page).
+pub(crate) fn require_complete(resp: &Value) -> Result<()> {
+    page_failure(resp)?;
+    if resp["_shards"]["failed"].as_u64().unwrap_or(0) > 0 {
+        return Err(EsError::new(503, "search_phase_execution_exception", "Partial shard failure"));
+    }
+    if resp["timed_out"].as_bool() == Some(true) {
+        return Err(EsError::new(503, "search_phase_execution_exception", "The search timed out before every shard answered"));
+    }
+    Ok(())
+}
+
+fn page_failure(resp: &Value) -> Result<()> {
+    match resp["_shards"]["failures"].as_array().and_then(|a| a.first()) {
+        Some(f) => {
+            let reason = f["reason"]["reason"].as_str().unwrap_or("shard failure");
+            Err(EsError::new(503, "search_phase_execution_exception", format!("Partial shard failure: {reason}")))
+        }
+        None => Ok(()),
+    }
+}
+
+impl Drop for Scroll {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Is ML upgrade mode on (`POST _ml/set_upgrade_mode?enabled=true`)?
 pub fn upgrade_mode(node: &Node) -> bool {
     store::service(node).upgrade_mode()

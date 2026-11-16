@@ -101,8 +101,16 @@ pub fn plan(sets: &[NodeSetScale], es: &EsObservation, bootstrapped: bool, max_s
 
     let downscaling: Vec<&NodeSetScale> = sets.iter().filter(|s| s.current > s.desired).collect();
 
-    // ---- never-formed cluster: nothing to protect
+    // ---- cluster never seen formed. Missing bookkeeping is not proof it
+    // never formed (the annotation is written after formation): existing
+    // pods are only resized directly when Elasticsearch answers and reports
+    // no formed cluster (production review #297).
     if !bootstrapped {
+        if !es.reachable() && downscaling.iter().any(|s| s.current > 0) {
+            p.waiting.push("downscale postponed: whether the cluster formed is unknown while Elasticsearch is unreachable".into());
+            finish_deletes(sets, &mut p);
+            return p;
+        }
         for s in &downscaling {
             p.actions.push(ScaleAction::SetReplicas { sts: s.sts.clone(), replicas: s.desired });
         }
@@ -131,6 +139,14 @@ pub fn plan(sets: &[NodeSetScale], es: &EsObservation, bootstrapped: bool, max_s
 
     let has_shards = |pod: &str| es.shards.iter().any(|r| r.node.as_deref() == Some(pod));
     let in_cluster = |pod: &str| es.nodes.iter().any(|n| n.name == pod);
+    // A data pod is drained only with positive evidence: it is in the
+    // cluster holding no copy, or it left and every shard has an assigned
+    // copy (green). A red cluster may have its only copy on a departed
+    // pod's volume (production review #287: an unavailable pod has no
+    // `_cat/shards` rows, which proved nothing).
+    let red = es.health.as_ref().is_some_and(|h| h.status == crate::es_client::Health::Red);
+    let green = es.health.as_ref().is_some_and(|h| h.status == crate::es_client::Health::Green);
+    let drained = |pod: &str| !red && !has_shards(pod) && (in_cluster(pod) || green);
 
     // ---- 2. voting exclusions bookkeeping
     let excluded: BTreeSet<&String> = es.voting_exclusions.iter().collect();
@@ -147,7 +163,7 @@ pub fn plan(sets: &[NodeSetScale], es: &EsObservation, bootstrapped: bool, max_s
         let mut r = s.current;
         while r > s.desired {
             let pod = s.pod(r - 1);
-            if s.data && (!observed.contains(&pod) || has_shards(&pod)) {
+            if s.data && (!observed.contains(&pod) || !drained(&pod)) {
                 p.migrating_data = true;
                 p.waiting.push(format!("{pod}: waiting for shards to migrate away"));
                 break;
@@ -156,9 +172,15 @@ pub fn plan(sets: &[NodeSetScale], es: &EsObservation, bootstrapped: bool, max_s
                 if master_shrunk {
                     p.waiting.push(format!("{pod}: another master-eligible node is being removed"));
                 } else if excluded.contains(&pod) {
-                    // the exclusion is committed: removing this voter is safe
-                    r -= 1;
-                    master_shrunk = true;
+                    // The exclusion record alone is not the proof: the node
+                    // must be out of the committed and accepted voting
+                    // configurations (production review #289).
+                    if es.voters.as_ref().is_some_and(|v| !v.contains(&pod)) {
+                        r -= 1;
+                        master_shrunk = true;
+                    } else {
+                        p.waiting.push(format!("{pod}: waiting for the voting configuration to drop it"));
+                    }
                 } else {
                     if excluded_present.is_empty() && add_voting.is_none() {
                         add_voting = Some(pod.clone());
@@ -178,6 +200,21 @@ pub fn plan(sets: &[NodeSetScale], es: &EsObservation, bootstrapped: bool, max_s
     }
     finish_deletes(sets, &mut p);
     p
+}
+
+/// The roles a nodeSet's existing pods may still hold while its spec moves
+/// to new roles: the desired roles, plus those its StatefulSet's pod
+/// template labels and its pods' Elasticsearch roles show (production
+/// review #286: a downscale combined with a role change was planned from
+/// the desired roles alone, deleting data and voters without migration).
+pub fn conservative_roles(desired_master: bool, desired_data: bool, labels: Option<&std::collections::BTreeMap<String, String>>, observed_roles: &[&str]) -> (bool, bool) {
+    let flag = |k: &str| labels.is_some_and(|l| l.get(k).is_none_or(|v| v == "true"));
+    let es_master = observed_roles.iter().any(|r| r.contains('m'));
+    let es_data = observed_roles.iter().any(|r| r.chars().any(|c| matches!(c, 'd' | 'h' | 'w' | 'c' | 'f' | 's')));
+    (
+        desired_master || flag(crate::names::LABEL_NODE_MASTER) || es_master,
+        desired_data || flag(crate::names::LABEL_NODE_DATA) || es_data,
+    )
 }
 
 fn finish_deletes(sets: &[NodeSetScale], p: &mut ScalePlan) {
@@ -202,6 +239,7 @@ mod tests {
         EsObservation {
             health: Some(ClusterHealth { status: Health::Green, number_of_nodes: nodes.len() as i64, relocating_shards: 0, initializing_shards: 0, unassigned_shards: 0 }),
             nodes: nodes.iter().map(|n| EsNode { id: format!("id-{n}"), name: n.to_string(), roles: "dm".into(), is_master: false }).collect(),
+            voters: Some(BTreeSet::new()),
             ..Default::default()
         }
     }
@@ -229,8 +267,71 @@ mod tests {
     #[test]
     fn unbootstrapped_cluster_resizes_directly() {
         let sets = [set("c-es-d", 5, 2, true, true)];
-        let p = plan(&sets, &EsObservation::default(), false, None);
+        // Elasticsearch answers and no cluster formed: nothing to protect.
+        let p = plan(&sets, &es(&[]), false, None);
         assert_eq!(p.actions, vec![ScaleAction::SetReplicas { sts: "c-es-d".into(), replicas: 2 }]);
+        // Never seen formed but unreachable: existing pods may hold a formed
+        // cluster's data (the annotation is written after formation).
+        let p = plan(&sets, &EsObservation::default(), false, None);
+        assert!(p.actions.is_empty(), "{:?}", p.actions);
+        assert!(p.waiting.iter().any(|w| w.contains("unknown")), "{:?}", p.waiting);
+        // A new set without pods still resizes.
+        let p = plan(&[set("c-es-new", 0, 0, true, true)], &EsObservation::default(), false, None);
+        assert!(p.waiting.is_empty());
+    }
+
+    /// Production review #287: a red cluster, or a departed data pod
+    /// whose shards may have no other copy, keeps its volume.
+    #[test]
+    fn unavailable_data_pod_with_unassigned_copies_is_kept() {
+        let sets = [set("c-es-d", 3, 2, false, true)];
+        let mut o = es(&["c-es-d-0", "c-es-d-1"]);
+        o.allocation_excludes = vec!["c-es-d-2".into()];
+        o.shards = vec![ShardRow { index: "i".into(), shard: "0".into(), primary: true, state: "UNASSIGNED".into(), node: None }];
+        o.health.as_mut().unwrap().status = Health::Red;
+        let p = plan(&sets, &o, true, None);
+        assert!(!p.actions.iter().any(|a| matches!(a, ScaleAction::SetReplicas { .. })), "{:?}", p.actions);
+        // Yellow and the pod gone: not proof either.
+        o.health.as_mut().unwrap().status = Health::Yellow;
+        let p = plan(&sets, &o, true, None);
+        assert!(!p.actions.iter().any(|a| matches!(a, ScaleAction::SetReplicas { .. })), "{:?}", p.actions);
+        // Green with the pod gone: every shard has an assigned copy.
+        o.health.as_mut().unwrap().status = Health::Green;
+        o.shards.clear();
+        let p = plan(&sets, &o, true, None);
+        assert_eq!(p.replicas_for("c-es-d"), Some(2));
+    }
+
+    /// Production review #289: an exclusion record without the node out of
+    /// the voting configuration never shrinks the set.
+    #[test]
+    fn master_removal_waits_for_the_voting_configuration() {
+        let sets = [set("c-es-m", 3, 2, true, false)];
+        let mut o = es(&["c-es-m-0", "c-es-m-1", "c-es-m-2"]);
+        o.voting_exclusions = vec!["c-es-m-2".into()];
+        o.voters = Some(["c-es-m-0", "c-es-m-1", "c-es-m-2"].iter().map(|s| s.to_string()).collect());
+        let p = plan(&sets, &o, true, None);
+        assert!(p.actions.is_empty(), "{:?}", p.actions);
+        o.voters = None;
+        assert!(plan(&sets, &o, true, None).actions.is_empty(), "unobserved configuration: no shrink");
+        o.voters = Some(["c-es-m-0", "c-es-m-1"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(plan(&sets, &o, true, None).replicas_for("c-es-m"), Some(2));
+    }
+
+    /// Production review #286: roles still held by the existing pods count.
+    #[test]
+    fn existing_roles_are_kept_during_a_role_change() {
+        let labels: std::collections::BTreeMap<String, String> = [(crate::names::LABEL_NODE_MASTER.to_string(), "true".to_string()), (crate::names::LABEL_NODE_DATA.to_string(), "true".to_string())].into();
+        assert_eq!(conservative_roles(false, false, Some(&labels), &[]), (true, true));
+        assert_eq!(conservative_roles(false, false, None, &["dim"]), (true, true));
+        assert_eq!(conservative_roles(false, false, None, &["-"]), (false, false));
+        // Planned with the kept roles, the old master/data pods drain first.
+        let (master, data) = conservative_roles(false, false, Some(&labels), &[]);
+        let sets = [NodeSetScale { master, data, ..set("c-es-old", 3, 1, false, false) }];
+        let mut o = es(&["c-es-old-0", "c-es-old-1", "c-es-old-2"]);
+        o.shards = vec![shard("c-es-old-2")];
+        let p = plan(&sets, &o, true, None);
+        assert!(!p.actions.iter().any(|a| matches!(a, ScaleAction::SetReplicas { .. })), "{:?}", p.actions);
     }
 
     #[test]
@@ -285,6 +386,7 @@ mod tests {
         assert_eq!(p.actions, vec![ScaleAction::AddVotingExclusion("c-es-m-4".into())]);
         // round 2: exclusion observed -> shrink by one
         o.voting_exclusions = vec!["c-es-m-4".into()];
+        o.voters = Some(["c-es-m-0", "c-es-m-1", "c-es-m-2"].iter().map(|s| s.to_string()).collect());
         let p = plan(&sets, &o, true, None);
         assert_eq!(p.actions, vec![ScaleAction::SetReplicas { sts: "c-es-m".into(), replicas: 4 }]);
         // round 3: m-4 still in the cluster (terminating): no new exclusion yet

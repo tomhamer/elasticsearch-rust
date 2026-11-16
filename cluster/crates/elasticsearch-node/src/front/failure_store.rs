@@ -88,7 +88,7 @@ async fn ensure(node: &Arc<ClusterNode>, stream: SharedText) -> Result<SharedTex
     }
     await_mirror(node).await;
     if let Some(stream) = node.engine.data_stream(&stream).filter(|stream| !stream.failure_needs_rollover()) {
-        if let Some(index) = stream.failure_write_index().filter(|index| node.state().metadata.indices.contains_key(*index)) {
+        if let Some(index) = stream.failure_write_index().filter(|index| node.state().metadata.indices.contains_key(*index) && !node.engine.index_listed_by_another_stream(&stream.name, index)) {
             // Recovery may temporarily remove the master's local engine shell.
             // An allocated failure index remains the write target; this is not
             // a request to advance the data stream's generation.
@@ -100,7 +100,8 @@ async fn ensure(node: &Arc<ClusterNode>, stream: SharedText) -> Result<SharedTex
         if engine.data_stream(&stream).is_none() { engine.create_data_stream_ext(&stream, true)?; }
         engine.failure_store_write_index(&stream).and_then(|service|SharedText::try_new(&service.name))
     }).await.map_err(|error| RemoteError::new(&error.kind, error.reason, error.status))?;
-    if !node.wait_applied_everywhere(version, Duration::from_secs(30)).await {
+    // The publication creating the failure index, applied on every node.
+    if !node.wait_state_applied_everywhere(version, Duration::from_secs(30)).await {
         return Err(RemoteError::new("timeout_exception", "failure store metadata was not applied everywhere", 503));
     }
     wait_for_primary(node, &index, Duration::from_secs(30)).await;

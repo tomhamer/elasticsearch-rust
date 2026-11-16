@@ -220,7 +220,7 @@ impl FieldAcc {
                     None => Col::Generic,
                 }
             }
-            (LeafReader::Segment(_), Kind::Keyword) if super::allocation::Allocation::new().enabled()=>Col::Generic,
+            (LeafReader::Segment(_), Kind::Keyword) if super::allocation::Allocation::scalar().enabled()=>Col::Generic,
             (LeafReader::Segment(s), Kind::Keyword) if id != ID_FIELD => {
                 match s.keyword_reader(id) {
                     Some(c) => Col::SegKeyword(c),
@@ -265,7 +265,7 @@ impl FieldAcc {
 
     fn reserve_decoding(&self,leaf:&LeafReader<'static>,doc:DocId)->SResult<super::allocation::Allocation> {
         super::allocation::Scope::collect_dead();
-        let allocation=super::allocation::Allocation::new();
+        let allocation=super::allocation::Allocation::scalar();
         if !allocation.enabled() {return Ok(allocation)}
         let mut metadata=0u64;
         if let Some(id)=self.id {metadata=metadata.saturating_add(leaf.field_reader_allocation_bound(id));}
@@ -407,7 +407,7 @@ impl FieldAcc {
             Kind::Date => leaf.i64_values(id, doc).into_iter().map(Val::Date).collect(),
             Kind::Unsigned => leaf.u64_values(id, doc).into_iter().map(|v| Val::Long(v as i64)).collect(),
             Kind::Double => leaf.f64_values(id, doc).into_iter().map(|v| Val::Double(crate::aggs::es_scaled(v, self.scale))).collect(),
-            Kind::Bool => leaf.bool_value(id, doc).map(Val::Bool).into_iter().collect(),
+            Kind::Bool => leaf.bool_values(id, doc).into_iter().map(Val::Bool).collect(),
             Kind::Keyword => leaf.keyword_values(id, doc).into_iter().map(Val::string).collect(),
             Kind::Ip => leaf.keyword_values(id, doc).iter().map(|t| Val::string(crate::values::ip_display(t))).collect(),
             _ => Vec::new(),
@@ -436,6 +436,20 @@ pub struct DocCtx {
     /// Doc values taken from a JSON document instead of a leaf
     /// (`_scripts/painless/_execute` with `context_setup.document`).
     pub source_json: Option<serde_json::Value>,
+    /// The deadline of the run reading this doc (set by `Executor::run`
+    /// when runtime fields are bound): dependent runtime-field executors
+    /// poll it too, as one execution context with the outer script.
+    pub cancel: Option<Arc<super::runtime::Cancel>>,
+}
+
+/// A dependent runtime field's failure as its reader sees it: errors no
+/// script may catch (loop limit, breaker, deadline or cancellation, stack
+/// overflow) keep their identity; others name the field.
+pub(crate) fn dependent_failure(name: &str, err: Box<super::error::ScriptErr>) -> Box<super::error::ScriptErr> {
+    if err.kind == "painless_error" || err.kind == "stack_overflow_error" || err.breaker.is_some() || err.kind == super::runtime::TIME_EXCEEDED {
+        return err;
+    }
+    illegal_arg(format!("failed to evaluate runtime field [{name}]: {}", err.msg))
 }
 
 pub const MISSING_VALUE: &str = "A document doesn't have a value for a field! Use doc[<field>].size()==0 to check if a document is missing a field!";
@@ -444,7 +458,7 @@ impl DocCtx {
     pub fn new(names: &[String], lookup: Option<Arc<FieldLookup>>, runtime: Option<Arc<super::RuntimeFields>>) -> DocCtx {
         let fields = names.iter().map(|n| FieldAcc::resolve(n, lookup.as_deref(), runtime.as_deref())).collect();
         let n = runtime.as_ref().map(|r| r.fields.len()).unwrap_or(0);
-        DocCtx { lookup, runtime, fields, leaf: None, doc: 0, rt_execs: (0..n).map(|_| None).collect(), depth: 0, source_json: None }
+        DocCtx { lookup, runtime, fields, leaf: None, doc: 0, rt_execs: (0..n).map(|_| None).collect(), depth: 0, source_json: None, cancel: None }
     }
 
     pub fn bind(&mut self, leaf: LeafReader<'static>) {
@@ -539,7 +553,9 @@ impl DocCtx {
         }
         let doc = self.doc;
         let e = self.rt_execs[idx].as_mut().unwrap();
-        rt.fields[idx].values(e, doc).map_err(|err| illegal_arg(format!("failed to evaluate runtime field [{}]: {}", rt.fields[idx].name, err.msg)))
+        // The outer run's deadline (its task token is captured at creation).
+        e.rt.cancel = self.cancel.clone();
+        rt.fields[idx].values(e, doc).map_err(|err| dependent_failure(&rt.fields[idx].name, err))
     }
 
     /// First value of `slot` when it can be read straight from a bound
@@ -677,7 +693,7 @@ impl DocCtx {
                 self.fields[slot].all(leaf, self.doc)?
             }
         };
-        let _outer=super::allocation::Allocation::values(vals.capacity())?;
+        let _outer=super::allocation::Allocation::scalar();
         _outer.reserve((vals.capacity() as u64).saturating_mul(std::mem::size_of::<Val>() as u64).saturating_add(self.fields[slot].name.len() as u64).saturating_add(256))?;
         let value=Val::DocValues(Rc::new(DocValues { field: self.fields[slot].name.clone(), values: vals }));
         super::allocation::Scope::adopt(&value)?;

@@ -164,10 +164,12 @@ pub fn knn_needs_dfs(body: &Value, params: &std::collections::HashMap<String, St
     }
 }
 
-/// The DFS-phase body for one `knn` clause: a lone kNN search for its
-/// global top `k` (`k` defaults to the request's `size`). Boost and name are
-/// applied when the results are combined ([`knn_rewrite`]).
-pub fn knn_dfs_body(clause: &Value, size: usize) -> Value {
+/// The DFS-phase body for one `knn` clause of request `body`: a lone kNN
+/// search for its global top `k` (`k` defaults to the request's `size`).
+/// Boost and name are applied when the results are combined
+/// ([`knn_rewrite`]). The request's `runtime_mappings` come along: a kNN
+/// filter on a request runtime field selects with it (#580).
+pub fn knn_dfs_body(clause: &Value, size: usize, body: &Value) -> Value {
     let mut c = clause.clone();
     let k = c.get("k").and_then(Value::as_u64).unwrap_or(size.max(1) as u64);
     if let Some(o) = c.as_object_mut() {
@@ -175,7 +177,11 @@ pub fn knn_dfs_body(clause: &Value, size: usize) -> Value {
         o.remove("_name");
         o.insert("k".into(), json!(k));
     }
-    json!({"knn": c, "from": 0, "size": k, "_source": false})
+    let mut out = json!({"knn": c, "from": 0, "size": k, "_source": false});
+    if let Some(rm) = body.get("runtime_mappings").filter(|v| !v.is_null()) {
+        out["runtime_mappings"] = rm.clone();
+    }
+    out
 }
 
 /// The `q` URL query as a `query_string` query (`RestActions#urlParamsToQueryBuilder`).
@@ -279,7 +285,9 @@ pub fn collapse_value<'a>(hit: &'a Value, field: &str) -> Option<&'a Value> {
 }
 
 /// Attach the expand results: `results[h * entries.len() + e]` is the
-/// response of entry `e` for hit `h`.
+/// response of entry `e` for hit `h`. An expansion that timed out or lost
+/// shards marks the response so (`timed_out`, `_shards.failures`): its
+/// inner hits are not presented as complete.
 pub fn attach_inner_hits(resp: &mut Value, entries: &[Value], results: &[Value]) {
     let Some(hits) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) else { return };
     for (h, hit) in hits.iter_mut().enumerate() {
@@ -292,6 +300,9 @@ pub fn attach_inner_hits(resp: &mut Value, entries: &[Value], results: &[Value])
         if let Some(o) = hit.as_object_mut() {
             o.insert("inner_hits".into(), Value::Object(inner));
         }
+    }
+    for r in results {
+        elasticsearch_engine::collapse::merge_completeness(resp, r);
     }
 }
 
@@ -456,8 +467,10 @@ pub(super) fn sort_keys(body: &Value, params: &std::collections::HashMap<String,
 pub(super) fn cmp_values(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
-            // Integers compare exactly; mixed falls back to f64.
-            match (x.as_i64(), y.as_i64()) {
+            // Integers (signed or an unsigned_long past i64::MAX) compare
+            // exactly; mixed falls back to f64.
+            let int = |n: &serde_json::Number| n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from));
+            match (int(x), int(y)) {
                 (Some(p), Some(q)) => p.cmp(&q),
                 _ => x.as_f64().unwrap_or(0.0).partial_cmp(&y.as_f64().unwrap_or(0.0)).unwrap_or(Ordering::Equal),
             }
@@ -484,9 +497,18 @@ fn inf_value(v: &Value) -> Option<f64> {
     }
 }
 
+/// A shard hit's typed sort values when it carries them (the engine adds
+/// them where the rendered `sort` does not order like the sorted values:
+/// formatted dates, ips, versions), else its `sort`.
+pub(super) fn merge_sort_values(h: &Value) -> Option<&[Value]> {
+    member(h, RAW_SORT).or_else(|| member(h, "sort")).and_then(Value::as_array).map(Vec::as_slice)
+}
+
+pub(super) const RAW_SORT: &str = elasticsearch_engine::search::RAW_SORT_KEY;
+
 pub(super) fn hit_order(a: &Value, b: &Value, keys: Option<&[SortKey]>) -> Ordering {
     match keys {
-        Some(keys) => sort_order(a["sort"].as_array().map(Vec::as_slice), b["sort"].as_array().map(Vec::as_slice), keys),
+        Some(keys) => sort_order(merge_sort_values(a), merge_sort_values(b), keys),
         None => score_order(a["_score"].as_f64(), b["_score"].as_f64()),
     }
 }
@@ -519,9 +541,11 @@ pub(super) fn score_order(a: Option<f64>, b: Option<f64>) -> Ordering {
     y.partial_cmp(&x).unwrap_or(Ordering::Equal)
 }
 
-/// `from` / `size` of the request (body wins over the URL, ES defaults 0/10).
+/// `from` / `size` of the request (the URL wins over the body, ES defaults 0/10).
 pub fn from_size(body: &Value, params: &std::collections::HashMap<String, String>) -> (usize, usize) {
-    let get = |k: &str, d: usize| body.get(k).and_then(Value::as_u64).map(|v| v as usize).or_else(|| params.get(k).and_then(|v| v.parse().ok())).unwrap_or(d);
+    // ES `RestSearchAction`: URL `from` / `size` apply after the body is
+    // parsed, so they override the body's (#570).
+    let get = |k: &str, d: usize| params.get(k).and_then(|v| v.parse().ok()).or_else(|| body.get(k).and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(d);
     (get("from", 0), get("size", 10))
 }
 
@@ -540,9 +564,9 @@ pub fn node_body(body: &Value, from: usize, size: usize) -> Value {
 
 /// Merge per-node search responses (already in ES shape).
 /// (index, `_id`) → fused rank of a final retriever search's rank plan.
-fn rank_plan_order(body: &Value) -> Option<std::collections::HashMap<(String, String), usize>> {
+fn rank_plan_order(body: &Value) -> Option<std::collections::HashMap<(String, String, Option<String>), usize>> {
     let order = body.get(elasticsearch_engine::retriever::RANK_PLAN_KEY)?.get("order")?.as_array()?;
-    Some(order.iter().enumerate().filter_map(|(i, e)| Some(((e[0].as_str()?.to_string(), e[1].as_str()?.to_string()), i))).collect())
+    Some(order.iter().enumerate().filter_map(|(i, e)| Some(((e[0].as_str()?.to_string(), e[1].as_str()?.to_string(), e.get(2).and_then(Value::as_str).map(str::to_string)), i))).collect())
 }
 
 pub fn merge_search(responses: &[Value], body: &Value, params: &std::collections::HashMap<String, String>) -> Value {
@@ -580,6 +604,7 @@ pub fn merge_search_with_limit(responses: &[Value], body: &Value, params: &std::
     let (mut took, mut timed_out, mut terminated_early) = (0u64, false, None::<bool>);
     let mut shards = [0u64; 4];
     let mut failures: Vec<Value> = Vec::new();
+    let (mut raw_any, mut raw_all) = (false, true);
     for r in responses {
         took = took.max(r["took"].as_u64().unwrap_or(0));
         timed_out |= r["timed_out"].as_bool().unwrap_or(false);
@@ -608,6 +633,13 @@ pub fn merge_search_with_limit(responses: &[Value], body: &Value, params: &std::
             max_score = Some(max_score.map_or(s, |m| m.max(s)));
         }
         if let Some(h) = r["hits"]["hits"].as_array() {
+            // One shard request renders every hit alike: its first hit says
+            // whether they carry typed sort values.
+            if let Some(first) = h.first() {
+                let has = member(first, RAW_SORT).is_some();
+                raw_any |= has;
+                raw_all &= has || member(first, "sort").is_none();
+            }
             hits.extend(h.iter());
         }
     }
@@ -615,7 +647,13 @@ pub fn merge_search_with_limit(responses: &[Value], body: &Value, params: &std::
     // The keys each comparison reads are looked up once per hit.
     match keys.as_deref() {
         Some(keys) => {
-            let mut keyed: Vec<(Option<&[Value]>, Option<&str>, &Value)> = hits.iter().map(|h| (member(h, "sort").and_then(Value::as_array).map(Vec::as_slice), member(h, "_index").and_then(Value::as_str), *h)).collect();
+            // Typed sort values when every hit carries them (a node that
+            // predates them sends only the rendered ones).
+            let raw = raw_any && raw_all;
+            let mut keyed: Vec<(Option<&[Value]>, Option<&str>, &Value)> = hits.iter().map(|h| {
+                let values = if raw { merge_sort_values(h) } else { member(h, "sort").and_then(Value::as_array).map(Vec::as_slice) };
+                (values, member(h, "_index").and_then(Value::as_str), *h)
+            }).collect();
             keyed.sort_by(|a, b| sort_order(a.0, b.0, keys).then_with(|| a.1.cmp(&b.1)));
             hits = keyed.into_iter().map(|k| k.2).collect();
         }
@@ -628,7 +666,9 @@ pub fn merge_search_with_limit(responses: &[Value], body: &Value, params: &std::
     if keys.is_none() {
         if let Some(order) = rank_plan_order(body) {
             // Compound retrievers: score ties keep the fused rank order.
-            let rank = |h: &Value| order.get(&(h["_index"].as_str().unwrap_or("").to_string(), h["_id"].as_str().unwrap_or("").to_string())).copied().unwrap_or(usize::MAX);
+            // A doc is its index, `_id` and routing: another doc may share
+            // the `_id` under another routing.
+            let rank = |h: &Value| order.get(&(h["_index"].as_str().unwrap_or("").to_string(), h["_id"].as_str().unwrap_or("").to_string(), h["_routing"].as_str().map(str::to_string))).copied().unwrap_or(usize::MAX);
             hits.sort_by(|a, b| hit_order(a, b, None).then_with(|| rank(a).cmp(&rank(b))));
         }
     }
@@ -661,7 +701,15 @@ pub fn merge_search_with_limit(responses: &[Value], body: &Value, params: &std::
             gte = true;
         }
     }
-    let page: Vec<Value> = hits.into_iter().skip(from).take(size).cloned().collect();
+    let mut page: Vec<Value> = hits.into_iter().skip(from).take(size).cloned().collect();
+    // Typed sort values are for the merge only.
+    if raw_any {
+        for h in &mut page {
+            if let Some(o) = h.as_object_mut() {
+                o.shift_remove(RAW_SORT);
+            }
+        }
+    }
     let mut out = Map::new();
     out.insert("took".into(), json!(took));
     out.insert("timed_out".into(), json!(timed_out));
@@ -736,7 +784,15 @@ fn merge_suggest(spec: &Value, responses: &[Value]) -> Value {
             let mut opts: Vec<Value> = Vec::new();
             let mut index: BTreeMap<String, usize> = BTreeMap::new();
             for o in lists.iter().filter_map(|l| l.get(i)).flat_map(|e| e["options"].as_array().into_iter().flatten()) {
-                let key = if kind == "completion" && !skip_dups { format!("{}\u{0}{}", o["_index"], o["_id"]) } else { o["text"].to_string() };
+                if kind == "completion" && !skip_dups {
+                    // Every shard's suggestion is its own (ES
+                    // `CompletionSuggestion.reduce` merges without
+                    // deduplicating): two documents sharing an `_id` under
+                    // different routings are both kept (#597).
+                    opts.push(o.clone());
+                    continue;
+                }
+                let key = o["text"].to_string();
                 let score = |v: &Value| v.get("score").or_else(|| v.get("_score")).and_then(Value::as_f64).unwrap_or(0.0);
                 match index.get(&key) {
                     None => {
@@ -821,6 +877,7 @@ pub(super) async fn multi_doc(node: &std::sync::Arc<crate::node::ClusterNode>, r
     use crate::shard_engines as se;
     let segs = req.segments();
     let op = segs.iter().rev().find(|s| *s == "_mget" || *s == "_mtermvectors")?.clone();
+    let op_is_mget = op == "_mget";
     let mut body = req.json()?;
     let path_index = if segs.len() >= 2 && segs[1] == op { Some(segs[0].clone()) } else { None };
     // A body ES rejects (`MultiGetRequest#add`: a top-level key other than
@@ -842,36 +899,40 @@ pub(super) async fn multi_doc(node: &std::sync::Arc<crate::node::ClusterNode>, r
     let docs = body.get("docs")?.as_array()?.clone();
     let params = req.params();
     let opts = elasticsearch_engine::node::ResolveOpts::from_params(&params);
+    let scalar = |v: &Value| v.as_str().map(str::to_string).or_else(|| (v.is_number() || v.is_boolean()).then(|| v.to_string()));
     let exprs: Vec<Option<String>> = docs.iter().map(|d| d.get("_index").and_then(Value::as_str).map(str::to_string).or_else(|| path_index.clone())).collect();
+    // The item's routing (its own, else the URL's) as ES resolves it
+    // against the item's index expression (`resolveIndexRouting`: an
+    // alias's `index_routing`); `Err`: a conflict the engine renders.
+    let item_routing: Vec<Option<String>> = docs.iter().map(|d| d.get("routing").or_else(|| d.get("_routing")).and_then(|v| scalar(v)).or_else(|| params.get("routing").cloned())).collect();
     let engine = node.engine.clone();
-    let names: Vec<Option<String>> = tokio::task::spawn_blocking(move || {
+    let (names, routings): (Vec<Option<String>>, Vec<Result<Option<String>, ()>>) = tokio::task::spawn_blocking(move || {
         exprs
             .iter()
-            .map(|e| {
-                let e = e.as_ref()?;
-                let ts = engine.resolve(e, opts).ok()?;
-                if ts.len() == 1 { Some(ts[0].svc.name.clone()) } else { None }
+            .zip(item_routing)
+            .map(|(e, r)| {
+                let Some(e) = e.as_ref() else { return (None, Ok(r)) };
+                let routing = if op_is_mget { engine.index_routing_for(e, r.as_deref()).map_err(|_| ()) } else { Ok(r) };
+                let name = engine.resolve(e, opts).ok().and_then(|ts| (ts.len() == 1).then(|| ts[0].svc.name.clone()));
+                (name, routing)
             })
-            .collect()
+            .unzip()
     })
     .await
     .ok()?;
     let st = node.state();
     let local = node.local.id.clone();
-    let scalar = |v: &Value| v.as_str().map(str::to_string).or_else(|| (v.is_number() || v.is_boolean()).then(|| v.to_string()));
     // (index, shard) of every doc; a routing error or an artificial doc
     // (no `_id`) goes to shard 0, whose engine renders / answers it.
     let keys: Vec<Option<(String, u32)>> = names
         .iter()
         .zip(&docs)
-        .map(|(n, d)| {
+        .zip(&routings)
+        .map(|((n, d), routing)| {
             let n = n.as_ref()?;
-            let k = match d.get("_id").and_then(|v| scalar(v)) {
-                Some(id) => {
-                    let routing = d.get("routing").or_else(|| d.get("_routing")).and_then(|v| scalar(v)).or_else(|| params.get("routing").cloned());
-                    se::doc_shard(&st.metadata, n, &id, routing.as_deref()).unwrap_or(0)
-                }
-                None => 0,
+            let k = match (d.get("_id").and_then(|v| scalar(v)), routing) {
+                (Some(id), Ok(routing)) => se::doc_shard(&st.metadata, n, &id, routing.as_deref()).unwrap_or(0),
+                _ => 0,
             };
             Some((n.clone(), k))
         })
@@ -1034,6 +1095,21 @@ pub(super) async fn multi_doc(node: &std::sync::Arc<crate::node::ClusterNode>, r
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merge_orders_on_typed_sort_values_and_drops_them() {
+        use serde_json::json;
+        // Day-first dates: the rendered strings order wrongly, the millis right.
+        let hit = |id: &str, shown: &str, millis: i64| json!({"_index": "i", "_id": id, "_score": null, "sort": [shown], "_sort_raw": [millis]});
+        let a = json!({"hits": {"total": {"value": 2, "relation": "eq"}, "hits": [hit("x", "02/01/2021", 1_609_545_600_000), hit("z", "01/03/2021", 1_614_556_800_000)]}, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0}});
+        let b = json!({"hits": {"total": {"value": 1, "relation": "eq"}, "hits": [hit("y", "28/01/2021", 1_611_792_000_000)]}, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0}});
+        let body = json!({"sort": [{"d": {"format": "dd/MM/yyyy"}}]});
+        let out = merge_search(&[a, b], &body, &Default::default());
+        let ids: Vec<&str> = out["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["x", "y", "z"]);
+        assert!(!out.to_string().contains("_sort_raw"), "{out}");
+        assert_eq!(out["hits"]["hits"][1]["sort"], json!(["28/01/2021"]));
+    }
+
     use super::*;
     use std::collections::HashMap;
 
@@ -1046,6 +1122,10 @@ mod tests {
         v.sort_by(cmp_values);
         assert_eq!(v, vec![json!("-Infinity"), json!("Apple"), json!("Infinity"), json!("apple"), json!("zebra")]);
         assert_eq!(cmp_values(&json!("Infinity"), &json!("apple")), Ordering::Less);
+        // unsigned_long past i64::MAX compares exactly (f64 ties them).
+        assert_eq!(cmp_values(&json!(u64::MAX), &json!(u64::MAX - 1)), Ordering::Greater);
+        assert_eq!(cmp_values(&json!(9_223_372_036_854_775_808u64), &json!(i64::MAX)), Ordering::Greater);
+        assert_eq!(cmp_values(&json!(-1), &json!(u64::MAX)), Ordering::Less);
         // A numeric key's missing sentinel against numbers.
         assert_eq!(cmp_values(&json!("Infinity"), &json!(1e300)), Ordering::Greater);
         assert_eq!(cmp_values(&json!(-5), &json!("-Infinity")), Ordering::Greater);
@@ -1208,6 +1288,37 @@ mod tests {
         assert_eq!(merge_search(&[r1, r2], &json!({}), &p)["hits"]["total"], 3);
     }
 
+    /// #597: completion options of two shards sharing an `_id` (other
+    /// routings) are both kept without `skip_duplicates`; with it, one per text.
+    #[test]
+    fn completion_keeps_same_id_documents_of_other_shards() {
+        let part = |text: &str, score: f64| json!({"suggest": {"s": [{"text": "a", "offset": 0, "length": 1, "options": [{"text": text, "_index": "p", "_id": "product-1", "_score": score}]}]}});
+        let spec = json!({"s": {"prefix": "a", "completion": {"field": "c", "size": 2}}});
+        let out = merge_suggest(&spec, &[part("apple", 2.0), part("apricot", 1.0)]);
+        let texts: Vec<&str> = out["s"][0]["options"].as_array().unwrap().iter().map(|o| o["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["apple", "apricot"]);
+        let dup = json!({"s": {"prefix": "a", "completion": {"field": "c", "size": 2, "skip_duplicates": true}}});
+        let out = merge_suggest(&dup, &[part("apple", 2.0), part("apple", 1.0)]);
+        assert_eq!(out["s"][0]["options"].as_array().unwrap().len(), 1);
+        let out = merge_suggest(&spec, &[part("apple", 2.0), part("apple", 1.0)]);
+        assert_eq!(out["s"][0]["options"].as_array().unwrap().len(), 2);
+    }
+
+    /// #570: URL `from` / `size` override the body's (ES applies them
+    /// after parsing the body), for the window and the merge.
+    #[test]
+    fn url_pagination_overrides_the_body() {
+        let p = |f: &str, s: &str| HashMap::from([("from".to_string(), f.to_string()), ("size".to_string(), s.to_string())]);
+        assert_eq!(from_size(&json!({"from": 0, "size": 10}), &p("10", "10")), (10, 10));
+        assert_eq!(from_size(&json!({"size": 0}), &HashMap::from([("size".to_string(), "10".to_string())])), (0, 10));
+        assert_eq!(from_size(&json!({"from": 3, "size": 4}), &HashMap::new()), (3, 4));
+        let r = json!({"_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+            "hits": {"total": {"value": 3, "relation": "eq"}, "max_score": 3.0, "hits": [{"_index": "a", "_id": "1", "_score": 3.0}, {"_index": "a", "_id": "2", "_score": 2.0}, {"_index": "a", "_id": "3", "_score": 1.0}]}});
+        let m = merge_search(&[r], &json!({"from": 0, "size": 1}), &p("1", "1"));
+        assert_eq!(m["hits"]["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(m["hits"]["hits"][0]["_id"], "2", "{m}");
+    }
+
     #[test]
     fn merges_by_sort_values() {
         let r1 = json!({"hits": {"hits": [{"_index": "a", "_id": "1", "sort": [5]}, {"_index": "a", "_id": "2", "sort": [1]}]}});
@@ -1327,6 +1438,28 @@ mod tests {
         assert!(resp["hits"]["hits"][1]["inner_hits"]["x"]["hits"]["total"].is_object());
     }
 
+    /// Finding 265: a shard that fails (or a timeout) during the expand
+    /// phase reaches the response; healthy expansions leave it as it was.
+    #[test]
+    fn collapse_expand_failures_reach_the_response() {
+        let first = || json!({"timed_out": false, "_shards": {"total": 2, "successful": 2, "skipped": 0, "failed": 0}, "hits": {"hits": [{"_id": "1", "fields": {"g": ["a"]}}]}});
+        let entries = vec![json!({"name": "x"})];
+        let ok = json!({"timed_out": false, "_shards": {"total": 2, "successful": 2, "skipped": 0, "failed": 0}, "hits": {"hits": [{"_id": "1x"}]}});
+        let mut resp = first();
+        attach_inner_hits(&mut resp, &entries, &[ok]);
+        assert_eq!(resp["_shards"], first()["_shards"]);
+        assert_eq!(resp["timed_out"], false);
+        let failure = json!({"shard": 1, "index": "i", "node": "n2", "reason": {"type": "node_disconnected_exception", "reason": "gone"}});
+        let partial = json!({"timed_out": true, "_shards": {"total": 2, "successful": 1, "skipped": 0, "failed": 1, "failures": [failure]}, "hits": {"hits": [{"_id": "1x"}]}});
+        let mut resp = first();
+        attach_inner_hits(&mut resp, &entries, &[partial]);
+        assert_eq!(resp["hits"]["hits"][0]["inner_hits"]["x"]["hits"]["hits"][0]["_id"], "1x");
+        assert_eq!(resp["timed_out"], true);
+        assert_eq!(resp["_shards"]["failed"], 1);
+        assert_eq!(resp["_shards"]["successful"], 1);
+        assert_eq!(resp["_shards"]["failures"][0]["shard"], 1);
+    }
+
     #[test]
     fn collapse_keeps_best_hit_per_key() {
         let hit = |i: &str, id: &str, s: f64, k: Value| json!({"_index": i, "_id": id, "_score": s, "fields": {"k": [k]}});
@@ -1363,9 +1496,21 @@ mod tests {
 
     #[test]
     fn knn_dfs_body_asks_for_k() {
-        let b = knn_dfs_body(&json!({"field": "v", "query_vector": [1.0], "boost": 2.0, "_name": "n"}), 7);
+        let b = knn_dfs_body(&json!({"field": "v", "query_vector": [1.0], "boost": 2.0, "_name": "n"}), 7, &json!({}));
         assert_eq!(b, json!({"knn": {"field": "v", "query_vector": [1.0], "k": 7}, "from": 0, "size": 7, "_source": false}));
-        assert_eq!(knn_dfs_body(&json!({"field": "v", "k": 3}), 10)["size"], 3);
+        assert_eq!(knn_dfs_body(&json!({"field": "v", "k": 3}), 10, &json!({}))["size"], 3);
+    }
+
+    /// #580: the candidate selection keeps the request's runtime fields, so
+    /// a kNN filter on one selects the same documents with and without the
+    /// aggregation that turned DFS on.
+    #[test]
+    fn knn_dfs_body_keeps_runtime_mappings() {
+        let rm = json!({"allow": {"type": "keyword"}});
+        let body = json!({"runtime_mappings": rm, "knn": {"field": "v", "k": 2, "filter": {"term": {"allow": "yes"}}}, "aggs": {"p": {"sum": {"field": "price"}}}});
+        let b = knn_dfs_body(&body["knn"], 10, &body);
+        assert_eq!(b["runtime_mappings"], rm);
+        assert_eq!(b["knn"]["filter"], json!({"term": {"allow": "yes"}}));
     }
 
     #[test]

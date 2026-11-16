@@ -17,7 +17,12 @@ exec 9>"$target_dir/.pr3-build.lock"
 flock -n 9 || { echo 'Shared target busy' >&2; exit 2; }
 cd "$source_dir"
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR="$target_dir"
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
+# rustc 1.99 crashes (SIGTRAP) compiling candle-core for Graviton3 with SVE
+# enabled; aarch64 keeps native tuning without SVE, plus the FP16 extension
+# that RUSTFLAGS would otherwise drop from .cargo/config.toml.
+native_flags='-C target-cpu=native'
+[ "$(uname -m)" = aarch64 ] && native_flags="$native_flags -C target-feature=+fp16,-sve,-sve2"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" RUSTFLAGS="${RUSTFLAGS:-$native_flags}"
 cargo +stable metadata --locked --no-deps --format-version 1 > "$result_dir/metadata.json"
 python3 - "$result_dir" <<'PY'
 import json,pathlib,sys

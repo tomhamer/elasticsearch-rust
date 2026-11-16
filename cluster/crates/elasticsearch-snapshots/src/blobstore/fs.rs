@@ -57,10 +57,42 @@ pub fn resolve_repo_location(repo: &str, location: &str, path_repo: &[PathBuf]) 
     }
 }
 
-#[derive(Debug, Clone)]
+/// Called before every fsync the store issues (files and directories), with
+/// the path about to be synced; an error fails the sync. Fault injection for
+/// tests.
+pub type SyncHook = std::sync::Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct FsBlobStore {
     root: PathBuf,
     buffer_size: usize,
+    sync_hook: Option<SyncHook>,
+}
+
+impl std::fmt::Debug for FsBlobStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsBlobStore").field("root", &self.root).field("sync_hook", &self.sync_hook.is_some()).finish()
+    }
+}
+
+/// Removes a temporary file unless disarmed: covers both error returns and
+/// a write future dropped mid-way (a cancelled snapshot).
+struct TempFile {
+    path: Option<PathBuf>,
+}
+
+impl TempFile {
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 impl FsBlobStore {
@@ -69,7 +101,40 @@ impl FsBlobStore {
         if !readonly {
             tokio::fs::create_dir_all(&root).await.map_err(|e| SnapshotError::io(format!("creating [{}]", root.display()), e))?;
         }
-        Ok(Self { root, buffer_size: 128 * 1024 })
+        Ok(Self { root, buffer_size: 128 * 1024, sync_hook: None })
+    }
+
+    /// Install a [`SyncHook`] (fault injection).
+    pub fn with_sync_hook(mut self, hook: SyncHook) -> Self {
+        self.sync_hook = Some(hook);
+        self
+    }
+
+    fn hook(&self, p: &Path) -> std::io::Result<()> {
+        match &self.sync_hook {
+            Some(h) => h(p),
+            None => Ok(()),
+        }
+    }
+
+    /// fsync a written file.
+    async fn sync_file(&self, f: &tokio::fs::File, p: &Path) -> Result<()> {
+        self.hook(p).map_err(|e| SnapshotError::io(format!("fsync [{}]", p.display()), e))?;
+        f.sync_all().await.map_err(|e| SnapshotError::io(format!("fsync [{}]", p.display()), e))
+    }
+
+    /// fsync a directory so the entries created in it (a published blob, a
+    /// new child directory) survive a crash. Errors propagate: a blob whose
+    /// directory entry may not be durable must not be reported written
+    /// (Lucene `IOUtils.fsync(dir, true)`, as ES `FsBlobContainer` does).
+    async fn sync_dir(&self, dir: &Path) -> Result<()> {
+        self.hook(dir).map_err(|e| SnapshotError::io(format!("fsync directory [{}]", dir.display()), e))?;
+        #[cfg(unix)]
+        {
+            let d = tokio::fs::File::open(dir).await.map_err(|e| SnapshotError::io(format!("fsync directory [{}]", dir.display()), e))?;
+            d.sync_all().await.map_err(|e| SnapshotError::io(format!("fsync directory [{}]", dir.display()), e))?;
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -94,11 +159,28 @@ impl FsBlobStore {
         }
     }
 
-    async fn ensure_parent(p: &Path) -> Result<()> {
-        if let Some(parent) = p.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| SnapshotError::io(format!("creating [{}]", parent.display()), e))?;
+    /// Create the missing directories above `p`, fsyncing the parent of
+    /// each one created so the path to a published blob is durable.
+    async fn ensure_parent(&self, p: &Path) -> Result<()> {
+        let Some(parent) = p.parent() else { return Ok(()) };
+        let mut missing = Vec::new();
+        let mut cur = Some(parent);
+        while let Some(d) = cur {
+            if tokio::fs::try_exists(d).await.unwrap_or(false) {
+                break;
+            }
+            missing.push(d.to_path_buf());
+            cur = d.parent();
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tokio::fs::create_dir_all(parent).await.map_err(|e| SnapshotError::io(format!("creating [{}]", parent.display()), e))?;
+        // Deepest first is fine: each fsync makes one new entry durable.
+        for d in &missing {
+            if let Some(up) = d.parent() {
+                self.sync_dir(up).await?;
+            }
         }
         Ok(())
     }
@@ -108,31 +190,43 @@ impl FsBlobStore {
         p.with_file_name(format!("pending-{name}-{}", random_base64_uuid()))
     }
 
-    /// Move a fully written temp file into place, honouring `fail_if_exists`.
-    async fn publish(tmp: &Path, dest: &Path, key: &str, fail_if_exists: bool) -> Result<()> {
-        let r = if fail_if_exists {
+    /// Move a fully written (and fsynced) temp file into place, honouring
+    /// `fail_if_exists`, then fsync the directory: success is reported only
+    /// once the blob's directory entry is durable.
+    async fn publish(&self, tmp: &mut TempFile, dest: &Path, key: &str, fail_if_exists: bool) -> Result<()> {
+        let src = tmp.path.clone().expect("armed temp file");
+        if fail_if_exists {
             // hard_link fails atomically if `dest` exists.
-            match tokio::fs::hard_link(tmp, dest).await {
-                Ok(()) => {
-                    let _ = tokio::fs::remove_file(tmp).await;
-                    Ok(())
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(SnapshotError::blob_exists(key)),
-                Err(e) => Err(SnapshotError::io(format!("blob [{key}]"), e)),
+            match tokio::fs::hard_link(&src, dest).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(SnapshotError::blob_exists(key)),
+                Err(e) => return Err(SnapshotError::io(format!("blob [{key}]"), e)),
             }
+            // The temp name is unlinked by the guard (best effort).
         } else {
-            tokio::fs::rename(tmp, dest).await.map_err(|e| SnapshotError::io(format!("blob [{key}]"), e))
-        };
-        if r.is_err() {
-            let _ = tokio::fs::remove_file(tmp).await;
+            tokio::fs::rename(&src, dest).await.map_err(|e| SnapshotError::io(format!("blob [{key}]"), e))?;
+            tmp.disarm();
         }
-        r?;
+        drop(std::mem::replace(tmp, TempFile { path: None }));
         if let Some(parent) = dest.parent() {
-            if let Ok(d) = tokio::fs::File::open(parent).await {
-                let _ = d.sync_all().await;
-            }
+            self.sync_dir(parent).await?;
         }
         Ok(())
+    }
+
+    async fn write_file(&self, path: &Path, stream: &mut ByteStream, create_new: bool) -> Result<()> {
+        let f = if create_new {
+            tokio::fs::OpenOptions::new().write(true).create_new(true).open(path).await
+        } else {
+            tokio::fs::File::create(path).await
+        }
+        .map_err(|e| SnapshotError::io(format!("creating [{}]", path.display()), e))?;
+        let mut w = tokio::io::BufWriter::with_capacity(self.buffer_size, f);
+        while let Some(chunk) = stream.next().await {
+            w.write_all(&chunk?).await?;
+        }
+        w.flush().await?;
+        self.sync_file(w.get_ref(), path).await
     }
 }
 
@@ -179,37 +273,21 @@ impl BlobStore for FsBlobStore {
 
     async fn write_stream(&self, key: &str, _len: u64, mut stream: ByteStream, opts: WriteOptions) -> Result<()> {
         let dest = self.path(key)?;
-        Self::ensure_parent(&dest).await?;
+        self.ensure_parent(&dest).await?;
         if opts.atomic || opts.fail_if_exists {
             if opts.fail_if_exists && tokio::fs::try_exists(&dest).await.unwrap_or(false) {
                 return Err(SnapshotError::blob_exists(key));
             }
-            let tmp = Self::temp_path(&dest);
-            let res: Result<()> = async {
-                let f = tokio::fs::File::create(&tmp).await?;
-                let mut w = tokio::io::BufWriter::with_capacity(self.buffer_size, f);
-                while let Some(chunk) = stream.next().await {
-                    w.write_all(&chunk?).await?;
-                }
-                w.flush().await?;
-                w.get_mut().sync_all().await?;
-                Ok(())
-            }
-            .await;
-            if let Err(e) = res {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(e);
-            }
-            Self::publish(&tmp, &dest, key, opts.fail_if_exists).await
+            let mut tmp = TempFile { path: Some(Self::temp_path(&dest)) };
+            self.write_file(tmp.path.as_deref().expect("armed"), &mut stream, true).await?;
+            self.publish(&mut tmp, &dest, key, opts.fail_if_exists).await
         } else {
-            let f = tokio::fs::File::create(&dest).await?;
-            let mut w = tokio::io::BufWriter::with_capacity(self.buffer_size, f);
-            while let Some(chunk) = stream.next().await {
-                w.write_all(&chunk?).await?;
+            // ES `FsBlobContainer.writeBlob`: fsync the file, then its directory.
+            self.write_file(&dest, &mut stream, false).await?;
+            match dest.parent() {
+                Some(parent) => self.sync_dir(parent).await,
+                None => Ok(()),
             }
-            w.flush().await?;
-            w.get_mut().sync_all().await?;
-            Ok(())
         }
     }
 

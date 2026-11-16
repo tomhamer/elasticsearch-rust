@@ -46,6 +46,7 @@ mod parallel_beam;
 pub(crate) use parallel_beam::beam_workers;
 pub(crate) use source::SharedQuantized;
 mod huge;
+pub use huge::{set_spill_dir, spilled_bytes};
 mod filter_first;
 mod generation;
 mod level_generator;
@@ -59,7 +60,7 @@ pub use filter_first::{PreparedNodeFilter, MutableSearchMode, VespaFilterEstimat
 use generation::GenerationGuard;
 use node_table::{NodeIdentity, NodeMetadata, NodeRecord, NodeState};
 use storage::{CaptureLog, GraphStorage as Control, Writer};
-pub use storage::{InsertReservation, MutableArrayMemory, MutableStorageMemory, ReclaimedNode};
+pub use storage::{InsertReservation, MutableArrayMemory, MutableStorageMemory, ReclaimedNode, SaveChanges, SlotBits, EditChunk, LINK_EDIT, REMOVE_EDIT};
 use visited::{FilterEstimate, VisitedTracker, estimate_visited_nodes};
 
 const NO_ENTRY: u64 = 0;
@@ -155,6 +156,12 @@ pub trait MutableVectorSource {
     fn get_node(&self, _handle: NodeHandle, key: u64) -> Option<&[f32]> {
         self.get(key)
     }
+    /// Whether node `handle` has its `dim`-cell row, checked without
+    /// reading it where possible (a quantized source checks its code row:
+    /// a shed row's f32 is a lookup in the vector store).
+    fn has_row(&self, handle: NodeHandle, key: u64, dim: usize) -> bool {
+        self.get_node(handle, key).is_some_and(|row| row.len() == dim)
+    }
     /// The row graph maintenance compares (diversity selection, neighbour
     /// pruning): the exact row, or for a quantized source the vector its
     /// codes approximate (no f32 read: a shed row's f32 is on disk, and
@@ -170,6 +177,11 @@ pub trait MutableVectorSource {
     /// on the stored codes, as Vespa's pruning computes distances on a
     /// tensor's stored cell type; `None` when the codes do not support it.
     fn code_scorer(&self, _epoch: u64) -> Option<Box<dyn Fn(&[f32], &[f32]) -> f64 + '_>> { None }
+    /// Whether a new node's neighbours are also selected on stored code
+    /// rows ([`code_row`](Self::code_row)), not only pruning: a 1-bit
+    /// field's maintenance rows, which compare on their codes as cheaply
+    /// as decoded rows are compared, without the decode.
+    fn diverse_on_codes(&self) -> bool { false }
 }
 
 /// See [`MutableVectorSource::dense_layout`].
@@ -922,6 +934,7 @@ impl MutableHnsw {
                         anchor,
                         self.params.m,
                         &mut scratch.selected,
+                        Some(node),
                     );
                     connections[l].extend(
                         scratch
@@ -983,7 +996,7 @@ impl MutableHnsw {
             }
             candidates.sort_unstable();
             let mut diverse = Vec::new();
-            select_diverse(&view, source, self.similarity, &candidates, None, self.params.m, &mut diverse);
+            select_diverse(&view, source, self.similarity, &candidates, None, self.params.m, &mut diverse, None);
             selected.extend(diverse.into_iter().map(|candidate| SavedNeighbor {
                 handle: view.candidate_node(candidate).handle(), levels: candidate.levels,
             }));
@@ -1156,9 +1169,7 @@ impl MutableHnsw {
                     if node.levels != saved.levels || !view.visible(node) || node.level() < level {
                         return false;
                     }
-                    let valid = source
-                        .get_node(saved.handle, node.key())
-                        .is_some_and(|r| r.len() == self.dim as usize);
+                    let valid = source.has_row(saved.handle, node.key(), self.dim as usize);
                     incomplete |= !valid;
                     valid
                 })
@@ -1180,6 +1191,16 @@ impl MutableHnsw {
         if !self.snapshot().live(id) {
             return false;
         }
+        // Reserved as entries arrive (see `Writer::reserve_slots`): a
+        // refused reservation retires nothing.
+        let needed = writer.visibility_retained.len() + 1;
+        let writer = &mut *writer;
+        if storage::reserve_map(&mut writer.visibility_retained, &mut writer.visibility_memory, needed, "graph visibility retirement registry").is_err() {
+            return false;
+        }
+        // Its record's retirement goes in the next graph save.
+        writer.mark_saved_change(id.slot(), false);
+        writer.save_retired.mark(id.slot());
         writer
             .visibility_retained
             .entry(id)
@@ -1387,7 +1408,23 @@ impl MutableHnsw {
     #[allow(clippy::too_many_arguments)]
     fn encode_retained_chunked(&self,bytes:&mut Vec<u8>,view:&MutableHnswSnapshot,allocated:u32,watermark:Option<u64>,retirements:&std::collections::HashMap<NodeHandle,u64>,incarnations:Option<&[u32]>,
         chunk:usize,flush:&mut dyn FnMut(&mut Vec<u8>)->Result<()>)->Result<()> {
-        bytes.extend_from_slice(b"RMHG\x04\0\0\0");
+        self.encode_header(bytes, b"RMHG\x04\0\0\0", view, allocated, watermark);
+        let table = self
+            .control
+            .nodes
+            .read(&view.guard)
+            .expect("matching domain");
+        for slot in 0..allocated {
+            if bytes.len() >= chunk { flush(bytes)?; }
+            Self::encode_slot(bytes, &table, view, slot, retirements, incarnations);
+        }
+        Ok(())
+    }
+
+    /// A graph checkpoint's header (`magic`, then the graph's parameters,
+    /// entry, slot universe, publication and watermark).
+    fn encode_header(&self, bytes: &mut Vec<u8>, magic: &[u8; 8], view: &MutableHnswSnapshot, allocated: u32, watermark: Option<u64>) {
+        bytes.extend_from_slice(magic);
         put32(bytes, self.dim);
         put32(
             bytes,
@@ -1411,44 +1448,138 @@ impl MutableHnsw {
         put64(bytes, view.publication);
         put32(bytes, u32::from(watermark.is_some()));
         put64(bytes, watermark.unwrap_or(0));
-        let table = self
-            .control
-            .nodes
-            .read(&view.guard)
-            .expect("matching domain");
-        for slot in 0..allocated {
-            if bytes.len() >= chunk { flush(bytes)?; }
-            let incarnation = incarnations.map_or_else(
-                || table.get(slot + 1).expect("allocated node row").metadata().incarnation,
-                |saved| saved[slot as usize]);
-            put32(bytes, incarnation);
-            let node = view.current_node(slot + 1);
-            put32(bytes, u32::from(node.is_some()));
-            let Some(node) = node else {
-                continue;
-            };
-            put64(bytes, node.key());
-            put64(bytes, node.record.publication_after_acquire());
-            put32(bytes, node.inverse_norm().to_bits());
-            put32(bytes, node.level() as u32);
-            let retirement = retirements.get(&node.handle());
-            put32(bytes, u32::from(retirement.is_some()));
-            put64(bytes, retirement.copied().unwrap_or(0));
-            for level in 0..=node.level() {
-                let links = node.links(level).unwrap();
-                put32(bytes, links.len() as u32);
-                for &id in links {
-                    put32(bytes, id);
-                }
+    }
+
+    /// Slot `slot`'s checkpoint record (0-based): its incarnation, whether
+    /// it holds a node, and that node's key, publication, norm, levels,
+    /// retirement and links.
+    fn encode_slot(bytes: &mut Vec<u8>, table: &node_table::NodeTableRead<'_>, view: &MutableHnswSnapshot, slot: u32,
+        retirements: &std::collections::HashMap<NodeHandle,u64>, incarnations: Option<&[u32]>) {
+        let incarnation = incarnations.map_or_else(
+            || table.get(slot + 1).expect("allocated node row").metadata().incarnation,
+            |saved| saved[slot as usize]);
+        put32(bytes, incarnation);
+        let node = view.current_node(slot + 1);
+        put32(bytes, u32::from(node.is_some()));
+        let Some(node) = node else {
+            return;
+        };
+        put64(bytes, node.key());
+        put64(bytes, node.record.publication_after_acquire());
+        put32(bytes, node.inverse_norm().to_bits());
+        put32(bytes, node.level() as u32);
+        let retirement = retirements.get(&node.handle());
+        put32(bytes, u32::from(retirement.is_some()));
+        put64(bytes, retirement.copied().unwrap_or(0));
+        for level in 0..=node.level() {
+            let links = node.links(level).unwrap();
+            put32(bytes, links.len() as u32);
+            for &id in links {
+                put32(bytes, id);
             }
         }
-        Ok(())
     }
+
+    /// An incremental graph checkpoint (`RMHD1`): the header of a full one,
+    /// then only the records of `slots` (below `allocated`), each after its
+    /// slot number. Applied over the previous checkpoint of its chain, it
+    /// gives exactly the full checkpoint of the same capture
+    /// ([`Self::open_chain`]). Streamed to `out` in pieces of about
+    /// `chunk` bytes; returns the bytes written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stream_delta(&self, view: &MutableHnswSnapshot, allocated: u32, watermark: Option<u64>,
+        retirements: &std::collections::HashMap<NodeHandle,u64>, incarnations: Option<&[u32]>, slots: &SlotBits,
+        chunk: usize, out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<usize> {
+        let chunk = chunk.max(64);
+        let _memory = crate::admission::shared().reserve(chunk as u64 * 2, "streamed graph delta buffer")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(chunk * 2).map_err(|_| failure("graph delta buffer"))?;
+        self.encode_header(&mut bytes, b"RMHD\x01\0\0\0", view, allocated, watermark);
+        let count = slots.iter().take_while(|&slot| slot < allocated).count();
+        put32(&mut bytes, u32::try_from(count).map_err(|_| failure("graph delta record count"))?);
+        let table = self.control.nodes.read(&view.guard).map_err(crate::vector::hnsw::mutable::failure_error)?;
+        let mut written = 0;
+        for slot in slots.iter().take_while(|&slot| slot < allocated) {
+            if bytes.len() >= chunk { out(&bytes)?; written += bytes.len(); bytes.clear(); }
+            put32(&mut bytes, slot);
+            Self::encode_slot(&mut bytes, &table, view, slot, retirements, incarnations);
+        }
+        if !bytes.is_empty() { out(&bytes)?; written += bytes.len(); }
+        Ok(written)
+    }
+
+    /// An incremental graph checkpoint as a link log (`RMHL1`, segment format
+    /// v40): the header of a full one; whole records only for the slots
+    /// whose state is new since the durable checkpoint (nodes inserted, and
+    /// slots now vacant: their incarnation); the retirement of other nodes
+    /// whose retirement changed; then the link edits published since
+    /// ([`SaveChanges::edits`]), in order, framed in checksummed pieces.
+    /// Replayed over the chain at open ([`Self::open_chain`]). Returns the
+    /// bytes written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stream_link_delta(&self, view: &MutableHnswSnapshot, allocated: u32, watermark: Option<u64>,
+        retirements: &std::collections::HashMap<NodeHandle,u64>, incarnations: Option<&[u32]>, changes: &SaveChanges,
+        chunk: usize, out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<usize> {
+        let chunk = chunk.max(64);
+        let _memory = crate::admission::shared().reserve(chunk as u64 * 2, "streamed graph link log buffer")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(chunk * 2).map_err(|_| failure("graph link log buffer"))?;
+        let mut written = 0;
+        self.encode_header(&mut bytes, b"RMHL\x01\0\0\0", view, allocated, watermark);
+        let table = self.control.nodes.read(&view.guard).map_err(crate::vector::hnsw::mutable::failure_error)?;
+        // Slots whose whole record is written: inserted, or vacant now.
+        let whole = |slot: u32| slot < allocated && (changes.inserted.contains(slot)
+            || (changes.slots.contains(slot) && view.current_node(slot + 1).is_none()));
+        let mut candidates = changes.inserted.clone();
+        candidates.union_with(&changes.slots);
+        let count = candidates.iter().filter(|&slot| whole(slot)).count();
+        put32(&mut bytes, u32::try_from(count).map_err(|_| failure("graph link log record count"))?);
+        for slot in candidates.iter().filter(|&slot| whole(slot)) {
+            if bytes.len() >= chunk { out(&bytes)?; written += bytes.len(); bytes.clear(); }
+            put32(&mut bytes, slot);
+            Self::encode_slot(&mut bytes, &table, view, slot, retirements, incarnations);
+        }
+        let retired: Vec<(u32, NodeHandle)> = changes.retired.iter().filter(|&slot| slot < allocated && !whole(slot))
+            .filter_map(|slot| view.current_node(slot + 1).map(|node| (slot, node.handle()))).collect();
+        put32(&mut bytes, u32::try_from(retired.len()).map_err(|_| failure("graph link log retirements"))?);
+        for (slot, handle) in retired {
+            let retirement = retirements.get(&handle);
+            put32(&mut bytes, slot);
+            put32(&mut bytes, u32::from(retirement.is_some()));
+            put64(&mut bytes, retirement.copied().unwrap_or(0));
+        }
+        let frames: usize = changes.edits.iter().filter(|chunk| !chunk.bytes.is_empty()).count();
+        put32(&mut bytes, u32::try_from(frames).map_err(|_| failure("graph link log frames"))?);
+        for edits in changes.edits.iter().filter(|chunk| !chunk.bytes.is_empty()) {
+            put32(&mut bytes, u32::try_from(edits.bytes.len()).map_err(|_| failure("graph link log frame"))?);
+            put32(&mut bytes, crate::codec::crc32(&edits.bytes));
+            out(&bytes)?; written += bytes.len(); bytes.clear();
+            out(&edits.bytes)?;
+            written += edits.bytes.len();
+        }
+        if !bytes.is_empty() { out(&bytes)?; written += bytes.len(); }
+        Ok(written)
+    }
+
+    /// The checkpoint was captured at `generation` and is durable: the
+    /// changes it took ([`SaveChanges`]) need no later save.
+    pub(crate) fn saves_durable(&self, generation: u64) {
+        self.control.writer.lock().saves_durable(generation);
+    }
+
     pub fn open(bytes: &[u8]) -> Result<Self> {
-        let mut input = Decoder { bytes, offset: 0 };
+        Self::open_chain(bytes, &[])
+    }
+
+    /// A graph checkpoint's header ([`Self::encode_header`]): of a full
+    /// checkpoint (`RMHG3`/`RMHG4`), or of an incremental one (`RMHD1`).
+    fn read_header(input: &mut Decoder<'_>, delta: bool) -> Result<CheckpointHeader> {
         let header = input.take(8)?;
-        let legacy = header == b"RMHG\x03\0\0\0";
-        if !legacy && header != b"RMHG\x04\0\0\0" {
+        let legacy = !delta && header == b"RMHG\x03\0\0\0";
+        let link = delta && header == b"RMHL\x01\0\0\0";
+        if delta {
+            if header != b"RMHD\x01\0\0\0" && !link { return Err(corrupt("graph delta header/version (expected RMHD1 or RMHL1)")); }
+        } else if !legacy && header != b"RMHG\x04\0\0\0" {
             return Err(corrupt("header/version (expected RMHG3 or RMHG4)"));
         }
         let dim = input.u32()?;
@@ -1468,7 +1599,7 @@ impl MutableHnsw {
         let ef_construction =
             usize::try_from(input.u64()?).map_err(|_| corrupt("construction width"))?;
         let seed = input.u64()?;
-        let mut entry = input.u64()?;
+        let entry = input.u64()?;
         let len = input.u32()?;
         let publication = input.u64()?;
         let has_watermark = input.u32()?;
@@ -1477,6 +1608,166 @@ impl MutableHnsw {
             return Err(corrupt("watermark"));
         }
         let watermark = (has_watermark == 1).then_some(watermark_value);
+        Ok(CheckpointHeader { legacy, link, dim, similarity, m, ef_construction, seed, entry, len, publication, watermark })
+    }
+
+    /// The link log entries of an incremental checkpoint's graph section
+    /// (tests: the replay index the open would hold at once).
+    #[cfg(test)]
+    pub(crate) fn link_log_entries(delta: &[u8]) -> Result<usize> {
+        let mut input = Decoder { bytes: delta, offset: 0 };
+        let header = Self::read_header(&mut input, true)?;
+        for _ in 0..input.u32()? { input.u32()?; Self::skip_slot(&mut input)?; }
+        if !header.link { return Ok(0); }
+        let retirements = input.u32()? as usize;
+        input.take(retirements * 16)?;
+        let mut entries = 0;
+        for _ in 0..input.u32()? {
+            let length = input.u32()? as usize;
+            input.u32()?;
+            let end = input.offset + length;
+            while input.offset < end { Self::link_entry_slot(&mut input, end)?; entries += 1; }
+        }
+        Ok(entries)
+    }
+
+    /// Step over one link log entry ending by `end`: its slot.
+    fn link_entry_slot(entries: &mut Decoder<'_>, end: usize) -> Result<u32> {
+        let slot = match entries.take(1)?[0] {
+            LINK_EDIT => {
+                let slot = entries.u32()?;
+                entries.take(1)?;
+                let counts = entries.take(4)?;
+                let ids = usize::from(u16::from_le_bytes([counts[0], counts[1]])) + usize::from(u16::from_le_bytes([counts[2], counts[3]]));
+                entries.take(ids * 4)?;
+                slot
+            }
+            REMOVE_EDIT => entries.u32()?,
+            _ => return Err(corrupt("graph link log entry kind")),
+        };
+        if entries.offset > end { return Err(corrupt("graph link log entry")); }
+        Ok(slot)
+    }
+
+    /// Step over one slot record ([`Self::encode_slot`]).
+    fn skip_slot(input: &mut Decoder<'_>) -> Result<()> {
+        input.u32()?;
+        match input.u32()? {
+            0 => return Ok(()),
+            1 => {}
+            _ => return Err(corrupt("slot metadata")),
+        }
+        input.take(8 + 8 + 4)?;
+        let level = input.u32()? as usize;
+        if level > 63 { return Err(corrupt("node level")); }
+        input.take(4 + 8)?;
+        for _ in 0..=level {
+            let count = input.u32()? as usize;
+            if count > input.remaining() / 4 { return Err(corrupt("neighbor count")); }
+            input.take(count * 4)?;
+        }
+        Ok(())
+    }
+
+    /// Open a full graph checkpoint `bytes` with the incremental checkpoints
+    /// of its chain (`deltas`, oldest first, see [`Self::stream_delta`])
+    /// applied: each slot's newest record, the newest header. The result is
+    /// the graph the full checkpoint of the newest capture opens to, checked
+    /// the same way (symmetric links, entry).
+    pub fn open_chain(bytes: &[u8], deltas: &[&[u8]]) -> Result<Self> {
+        let mut base_input = Decoder { bytes, offset: 0 };
+        let base = Self::read_header(&mut base_input, false)?;
+        let legacy = base.legacy;
+        if legacy && !deltas.is_empty() { return Err(corrupt("graph delta over a legacy checkpoint")); }
+        let mut newest = base.clone();
+        let mut records: std::collections::HashMap<u32, (usize, usize)> = std::collections::HashMap::new();
+        // Retirements (delta, value) and the link log's frames (delta, start,
+        // end), its entries counted per bucket of slots: replayed a range of
+        // slots at a time (`ReplayRanges`), in a bounded window.
+        let mut retired: std::collections::HashMap<u32, (usize, Option<u64>)> = std::collections::HashMap::new();
+        let mut frames_at: Vec<(usize, usize, usize)> = Vec::new();
+        let mut bucket_edits: Vec<u64> = Vec::new();
+        let mut total_edits = 0u64;
+        // The replay workspace is charged before it grows: a budget that
+        // cannot cover it refuses the open here, before the graph is built.
+        let mut workspace = ReplayMemory::new()?;
+        for (index, delta) in deltas.iter().enumerate() {
+            let mut input = Decoder { bytes: delta, offset: 0 };
+            let header = Self::read_header(&mut input, true)?;
+            if header.dim != base.dim || header.similarity != base.similarity || header.m != base.m
+                || header.ef_construction != base.ef_construction || header.seed != base.seed
+                || header.len < newest.len || header.publication < newest.publication {
+                return Err(corrupt("graph delta does not follow its chain"));
+            }
+            let count = input.u32()? as usize;
+            if count > input.remaining() / 12 { return Err(corrupt("graph delta record count")); }
+            workspace.charge(ReplayMemory::RECORDS, map_bytes::<u32, (usize, usize)>(records.len() + count))?;
+            records.try_reserve(count).map_err(|_| failure("graph delta index allocation"))?;
+            for _ in 0..count {
+                let slot = input.u32()?;
+                if slot >= header.len { return Err(corrupt("graph delta slot")); }
+                records.insert(slot, (index, input.offset));
+                Self::skip_slot(&mut input)?;
+            }
+            if header.link {
+                // Retirements, then the checksummed frames of link edits:
+                // indexed by slot, applied in order after the slot's newest
+                // whole record.
+                let count = input.u32()? as usize;
+                if count > input.remaining() / 16 { return Err(corrupt("graph link log retirements")); }
+                workspace.charge(ReplayMemory::RETIRED, map_bytes::<u32, (usize, Option<u64>)>(retired.len() + count))?;
+                retired.try_reserve(count).map_err(|_| failure("graph link log retirement allocation"))?;
+                for _ in 0..count {
+                    let slot = input.u32()?;
+                    let has = input.u32()?;
+                    let value = input.u64()?;
+                    if slot >= header.len || has > 1 || (has == 0 && value != 0) { return Err(corrupt("graph link log retirement")); }
+                    retired.insert(slot, (index, (has == 1).then_some(value)));
+                }
+                let frames = input.u32()? as usize;
+                if frames > input.remaining() / 8 { return Err(corrupt("graph link log frame count")); }
+                let buckets = (header.len >> REPLAY_BUCKET_SHIFT) as usize + 1;
+                workspace.charge(ReplayMemory::INDEX, (buckets * 8 + (frames_at.len() + frames) * 24) as u64)?;
+                bucket_edits.try_reserve_exact(buckets.saturating_sub(bucket_edits.len())).map_err(|_| failure("graph link log index allocation"))?;
+                bucket_edits.resize(buckets.max(bucket_edits.len()), 0);
+                frames_at.try_reserve_exact(frames).map_err(|_| failure("graph link log index allocation"))?;
+                for _ in 0..frames {
+                    let length = input.u32()? as usize;
+                    let checksum = input.u32()?;
+                    let start = input.offset;
+                    let payload = input.take(length)?;
+                    if crate::codec::crc32(payload) != checksum { return Err(corrupt("graph link log frame checksum")); }
+                    let end = start + length;
+                    let mut entries = Decoder { bytes: delta, offset: start };
+                    while entries.offset < end {
+                        let slot = Self::link_entry_slot(&mut entries, end)?;
+                        if slot >= header.len { return Err(corrupt("graph link log entry")); }
+                        bucket_edits[(slot >> REPLAY_BUCKET_SHIFT) as usize] += 1;
+                        total_edits += 1;
+                    }
+                    frames_at.push((index, start, end));
+                }
+            }
+            if input.remaining() != 0 { return Err(corrupt("graph delta trailing bytes")); }
+            newest = header;
+        }
+        // The link log is replayed a range of slots at a time: each range's
+        // entries indexed (slot, delta, offset) and sorted into log order per
+        // slot, in a window of at most an eighth of the entries (at least
+        // [`REPLAY_WINDOW_MIN`]), charged before it is allocated.
+        let ranges = replay_ranges(&bucket_edits, total_edits);
+        let window = ranges.iter().map(|range| range.2).max().unwrap_or(0);
+        drop(bucket_edits);
+        workspace.charge(ReplayMemory::INDEX, (frames_at.len() * 24) as u64)?;
+        workspace.charge(ReplayMemory::WINDOW, window as u64 * std::mem::size_of::<(u32, u32, usize)>() as u64)?;
+        let mut edits: Vec<(u32, u32, usize)> = Vec::new();
+        edits.try_reserve_exact(window).map_err(|_| failure("graph link log index allocation"))?;
+        let mut next_range = 0;
+        let mut range_end = 0u32;
+        let mut next_edit = 0;
+        let mut scratch: Vec<u8> = Vec::new();
+        let CheckpointHeader { dim, similarity, m, ef_construction, seed, entry, len, publication, watermark, .. } = newest;
+        let mut entry = entry;
         if (len != 0 && watermark.is_none())
             || (len == 0 && (watermark.is_some() || publication != 0))
         {
@@ -1487,7 +1778,9 @@ impl MutableHnsw {
             || m > u32::MAX as usize / 2
             || ef_construction == 0
             || len == u32::MAX
-            || len as usize > input.remaining() / 8
+            || base.len as usize > base_input.remaining() / 8
+            || (len - base.len) as usize > records.len()
+            || legacy && total_edits != 0
         {
             return Err(corrupt("dimensions/count"));
         }
@@ -1522,6 +1815,74 @@ impl MutableHnsw {
         let mut keys = HashSet::new();
         keys.try_reserve(count).map_err(|_|failure("checkpoint duplicate key allocation"))?;
         for slot in 0..len {
+            // The slot's newest record: of the newest delta naming it (the
+            // base's record of it, if any, superseded), else the base's;
+            // then the link edits and retirement logged after that record.
+            if slot >= range_end && next_range < ranges.len() {
+                // The next range's entries, in the window.
+                let (start, end, count) = ranges[next_range];
+                next_range += 1;
+                range_end = end;
+                edits.clear();
+                for &(index, from, to) in &frames_at {
+                    let mut entries = Decoder { bytes: deltas[index], offset: from };
+                    while entries.offset < to {
+                        let at = entries.offset;
+                        let edited = Self::link_entry_slot(&mut entries, to)?;
+                        if (start..end).contains(&edited) {
+                            if edits.len() == edits.capacity() { return Err(corrupt("graph link log entries changed while replayed")); }
+                            edits.push((edited, index as u32, at));
+                        }
+                    }
+                }
+                if edits.len() != count { return Err(corrupt("graph link log entries changed while replayed")); }
+                // (slot, delta, offset) is unique: log order within a slot.
+                edits.sort_unstable();
+                next_edit = 0;
+            }
+            let newest_whole = records.get(&slot).map(|&(index, _)| index);
+            let first_edit = next_edit;
+            while next_edit < edits.len() && edits[next_edit].0 == slot { next_edit += 1; }
+            let later = |index: usize| newest_whole.is_none_or(|whole| index > whole);
+            let slot_edits = &edits[first_edit..next_edit];
+            let has_edits = slot_edits.iter().any(|edit| later(edit.1 as usize));
+            let retirement = retired.get(&slot).copied().filter(|(index, _)| later(*index));
+            let mut delta_input: Decoder<'_>;
+            let (input, legacy) = if !has_edits && retirement.is_none() {
+                match records.get(&slot) {
+                    Some(&(index, offset)) => {
+                        if slot < base.len { Self::skip_slot(&mut base_input)?; }
+                        delta_input = Decoder { bytes: deltas[index], offset };
+                        (&mut delta_input, false)
+                    }
+                    None if slot < base.len => (&mut base_input, legacy),
+                    None => return Err(corrupt("graph delta chain misses a slot")),
+                }
+            } else {
+                let mut record = match records.get(&slot) {
+                    Some(&(index, offset)) => {
+                        if slot < base.len { Self::skip_slot(&mut base_input)?; }
+                        SlotRecord::read(&mut Decoder { bytes: deltas[index], offset })?
+                    }
+                    None if slot < base.len => SlotRecord::read(&mut base_input)?,
+                    None => return Err(corrupt("graph delta chain misses a slot")),
+                };
+                for &(_, index, offset) in slot_edits.iter().filter(|edit| later(edit.1 as usize)) {
+                    record.apply(&mut Decoder { bytes: deltas[index as usize], offset })?;
+                }
+                if let Some((_, value)) = retirement {
+                    if !record.present { return Err(corrupt("graph link log retirement of a vacant slot")); }
+                    record.retirement = value;
+                }
+                scratch.clear();
+                record.write(&mut scratch);
+                // SAFETY: `scratch` is only rewritten at the next slot, after
+                // this slot's decode (the last use of `delta_input`) is done;
+                // the slice is not used past it.
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(scratch.as_ptr(), scratch.len()) };
+                delta_input = Decoder { bytes, offset: 0 };
+                (&mut delta_input, false)
+            };
             let generation = input.u32()?;
             let present = input.u32()?;
             if generation == 0 || present > 1 {
@@ -1636,7 +1997,7 @@ impl MutableHnsw {
             active += 1;
             live_bound = slot + 2;
         }
-        if input.remaining() != 0 {
+        if base_input.remaining() != 0 {
             return Err(corrupt("trailing bytes"));
         }
         graph.control.publication.store(publication, Release);
@@ -1886,8 +2247,14 @@ impl<'a, S: MutableVectorSource + ?Sized> AdjacencyOverlay<'a, S> {
     /// [`select_kept`](Self::select_kept) with every distance on the stored
     /// codes (a quantized field: Vespa computes pruning distances on the
     /// tensor's stored cell type), where the row path decodes each row of
-    /// the list from its codes and compares the decoded rows. `None` when
-    /// the source has no such codes or the list mixes calibration epochs.
+    /// the list from its codes and compares the decoded rows. A row of
+    /// another calibration than the owner's (quantized before the field's
+    /// maintenance centroid froze) is compared on decoded rows, as the row
+    /// path compares it, the other pairs on their codes: the same distances
+    /// up to rounding (`mutation_plane::CodeSpace`). Giving the whole list
+    /// to the row path for one such row decoded nearly every list, since the
+    /// earliest nodes are in most of them. `None` when the owner has no
+    /// code row or the source no code scorer.
     fn select_kept_codes(&self, id: NodeHandle, old: &[u32], capacity: usize) -> Result<Option<Vec<u32>>> {
         let key = |id: NodeHandle| -> Result<u64> {
             if let Some((_, key, _)) = self.new.filter(|n| n.0 == id) { return Ok(key); }
@@ -1895,24 +2262,41 @@ impl<'a, S: MutableVectorSource + ?Sized> AdjacencyOverlay<'a, S> {
         };
         let Some((epoch, owner)) = self.source.code_row(id, key(id)?) else { return Ok(None) };
         let Some(distance) = self.source.code_scorer(epoch) else { return Ok(None) };
+        let mut from_owner = None;
         let mut candidates = Vec::with_capacity(old.len());
         for &other in old {
             let other = self.handle(other)?;
             match self.source.code_row(other, key(other)?) {
-                Some((e, words)) if e == epoch => candidates.push((distance(owner, words), other, words)),
-                _ => return Ok(None),
+                Some((e, words)) if e == epoch => candidates.push((distance(owner, words), other, Some(words))),
+                _ => {
+                    if from_owner.is_none() { from_owner = Some(self.bind_distance(id)?); }
+                    let d = from_owner.as_ref().expect("bound above").distance(self.row(other)?)?;
+                    candidates.push((d, other, None));
+                }
             }
         }
         if candidates.iter().any(|c| !c.0.is_finite()) {
             return Err(failure("nonfinite mutation distance"));
         }
         candidates.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).expect("finite distance"));
-        let mut selected: Vec<(NodeHandle, &[f32])> = Vec::with_capacity(capacity);
+        let mut selected: Vec<(NodeHandle, Option<&[f32]>)> = Vec::with_capacity(capacity);
         for (d, candidate, words) in candidates {
             if selected.len() >= capacity {
                 break;
             }
-            if selected.iter().all(|&(_, other)| distance(words, other) >= d) {
+            let mut valid = true;
+            let mut bound = None;
+            for &(other, other_words) in &selected {
+                let closer = match (words, other_words) {
+                    (Some(a), Some(b)) => distance(a, b) < d,
+                    _ => {
+                        if bound.is_none() { bound = Some(self.bind_distance(candidate)?); }
+                        bound.as_ref().expect("bound above").distance(self.row(other)?)? < d
+                    }
+                };
+                if closer { valid = false; break; }
+            }
+            if valid {
                 selected.push((candidate, words));
             }
         }
@@ -2075,19 +2459,25 @@ impl MutableHnsw {
         let mut changes = Vec::new();
         let mut old_links = Vec::new();
         let mut old_levels = Vec::new();
+        // The link edits this publication makes, logged on success (see
+        // `storage::EditLog`): the new node's lists are not (its whole
+        // record is saved), every other changed list is, as its ids removed
+        // and added.
+        let mut edits = Vec::new();
         for ((handle, level), values) in overlay.changed {
             let new = matches!(publication,Publication::Insert{id,..} if id==handle);
             if !new {
                 let node = view
                     .node(handle)
                     .ok_or_else(|| failure("publication owner disappeared"))?;
-                if node
+                let old = node
                     .links(level)
-                    .ok_or_else(|| failure("publication level absent"))?
-                    == values && !matches!(publication, Publication::RelocateLinks)
+                    .ok_or_else(|| failure("publication level absent"))?;
+                if old == values && !matches!(publication, Publication::RelocateLinks)
                 {
                     continue;
                 }
+                log_link_edit(&mut edits, handle.slot(), level, old, &values);
                 let old = LinksRef::from_raw(node.level_refs()[level].load(Acquire));
                 if old.is_valid() {
                     old_links.push(
@@ -2098,6 +2488,14 @@ impl MutableHnsw {
             }
             changes.push((handle, level, values));
         }
+        // Every record this publication changes goes in the next graph
+        // save (see `SaveChanges`).
+        for (handle, _, _) in &changes {
+            let inserted = matches!(publication, Publication::Insert{id,..} if id == *handle);
+            _writer.mark_saved_change(handle.slot(), inserted);
+        }
+        if let Publication::Remove { id, .. } = publication { _writer.mark_saved_change(id.slot(), false); }
+        if let Publication::Insert { id, .. } = publication { _writer.mark_saved_change(id.slot(), true); }
         // A chunked capture in progress keeps the graph as of its start:
         // record each node it has not copied yet before its first change.
         if _writer.capture_log.is_some() {
@@ -2311,7 +2709,10 @@ impl MutableHnsw {
         if let Publication::Remove { id, key, .. } = publication {
             _writer.visibility_retained.remove(&id);
             self.control.retire_committed(_writer, id, key);
+            edits.push(REMOVE_EDIT);
+            edits.extend_from_slice(&id.slot().to_le_bytes());
         }
+        _writer.save_edits.append(&edits);
         poison.armed = false;
         self.control.note_mutation();
         Ok(())
@@ -3523,7 +3924,11 @@ fn select_diverse<'s>(
     anchor: Option<&[f32]>,
     max: usize,
     selected: &mut Vec<Candidate>,
+    new: Option<(NodeHandle, u64)>,
 ) {
+    if let Some(new) = new.filter(|_| source.diverse_on_codes()) {
+        if select_diverse_codes(view, source, similarity, candidates, anchor, new, max, selected) { return; }
+    }
     selected.clear();
     // The selected candidates' rows, looked up once each (a selected
     // candidate always had one): the diversity check compares every later
@@ -3549,6 +3954,90 @@ fn select_diverse<'s>(
             rows.push(row);
         }
     }
+}
+/// [`select_diverse`] on stored code rows ([`MutableVectorSource::code_row`]),
+/// each candidate weighed by its code distance to the new node `new`, as the
+/// row path weighs it by its approximate row's distance to the new node's
+/// (`anchor`). A candidate without a code row of the new node's calibration
+/// (quantized before the field's maintenance centroid froze) is compared on
+/// approximate rows, as the row path compares it, the other pairs on their
+/// codes: the same distances up to rounding (`mutation_plane::CodeSpace`).
+/// Giving the whole list to the row path for one such candidate decoded
+/// nearly every list, since the earliest nodes are in most of them.
+/// `false` (nothing selected) unless the new node has a code row: the row
+/// path decides then.
+#[allow(clippy::too_many_arguments)]
+fn select_diverse_codes<'s>(
+    view: &MutableHnswSnapshot,
+    source: &'s (impl MutableVectorSource + ?Sized),
+    similarity: Similarity,
+    candidates: &[Candidate],
+    anchor: Option<&[f32]>,
+    new: (NodeHandle, u64),
+    max: usize,
+    selected: &mut Vec<Candidate>,
+) -> bool {
+    selected.clear();
+    let Some((epoch, own_row)) = source.code_row(new.0, new.1) else { return false };
+    let Some(distance) = source.code_scorer(epoch) else { return false };
+    /// A selected candidate: its code row of the new node's calibration, or
+    /// its approximate row (looked up when a pair first needs it).
+    struct Kept<'s> { code: Option<&'s [f32]>, approx: Option<&'s [f32]>, handle: NodeHandle, key: u64 }
+    let approx = |kept: &mut Kept<'s>| -> Option<&'s [f32]> {
+        if kept.approx.is_none() { kept.approx = source.get_node_approx(kept.handle, kept.key); }
+        kept.approx
+    };
+    let mut rows: Vec<Kept<'s>> = Vec::with_capacity(max.min(candidates.len()));
+    for &candidate in candidates {
+        if selected.len() >= max {
+            break;
+        }
+        let node = view.candidate_node(candidate);
+        let mut this = Kept { code: None, approx: None, handle: node.handle(), key: node.key() };
+        let own = match source.code_row(node.handle(), node.key()) {
+            Some((e, row)) if e == epoch => { this.code = Some(row); distance(row, own_row) }
+            _ => {
+                // As the row path: no approximate row, no candidate.
+                let Some(row) = approx(&mut this) else { continue };
+                match anchor {
+                    Some(anchor) if anchor.len() == row.len() => BoundMutationDistance::new(row, similarity).distance_value(anchor),
+                    _ => candidate.distance,
+                }
+            }
+        };
+        let mut keep = true;
+        for other in rows.iter_mut() {
+            let d = match (this.code, other.code) {
+                (Some(a), Some(b)) => distance(a, b),
+                _ => match (approx(&mut this), approx(other)) {
+                    (Some(a), Some(b)) if a.len() == b.len() => BoundMutationDistance::new(a, similarity).distance_value(b),
+                    _ => continue,
+                },
+            };
+            if d < own { keep = false; break; }
+        }
+        if keep {
+            selected.push(candidate);
+            rows.push(this);
+        }
+    }
+    true
+}
+/// A [`LINK_EDIT`] entry into `out` for slot `slot`'s list at `level`
+/// going from `old` to `new` (nothing when only its order changed): the
+/// ids removed, then the ids added. Replay applies it as a set change
+/// (removals, then additions appended), so a list's order may differ after
+/// a reopen; its members do not.
+fn log_link_edit(out: &mut Vec<u8>, slot: u32, level: usize, old: &[u32], new: &[u32]) {
+    let removed: Vec<u32> = old.iter().copied().filter(|id| !new.contains(id)).collect();
+    let added: Vec<u32> = new.iter().copied().filter(|id| !old.contains(id)).collect();
+    if removed.is_empty() && added.is_empty() { return; }
+    out.push(LINK_EDIT);
+    out.extend_from_slice(&slot.to_le_bytes());
+    out.push(level as u8);
+    out.extend_from_slice(&(removed.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(added.len() as u16).to_le_bytes());
+    for id in removed.iter().chain(&added) { out.extend_from_slice(&id.to_le_bytes()); }
 }
 fn put32(out: &mut Vec<u8>, n: u32) {
     out.extend_from_slice(&n.to_le_bytes());
@@ -3579,6 +4068,168 @@ fn corrupt(detail: &str) -> RusticError {
 struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,
+}
+/// One slot's checkpoint record ([`MutableHnsw::encode_slot`]), owned, for
+/// replaying link edits over it.
+/// Slots per bucket a link log's entries are counted in, at open.
+const REPLAY_BUCKET_SHIFT: u32 = 8;
+/// Entries a link log replay window holds at least.
+const REPLAY_WINDOW_MIN: u64 = 1 << 20;
+#[cfg(test)]
+thread_local! {
+    /// A smaller [`REPLAY_WINDOW_MIN`] for this thread's opens (tests).
+    pub(crate) static TEST_REPLAY_WINDOW_MIN: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Ranges of slots `(start, end, entries)` a link log of `total` entries
+/// (`buckets`: per bucket of slots) is replayed in: each at most a window of
+/// an eighth of the entries (at least [`REPLAY_WINDOW_MIN`]), or one bucket.
+fn replay_ranges(buckets: &[u64], total: u64) -> Vec<(u32, u32, usize)> {
+    #[cfg(test)]
+    let minimum = TEST_REPLAY_WINDOW_MIN.with(|minimum| minimum.get()).unwrap_or(REPLAY_WINDOW_MIN);
+    #[cfg(not(test))]
+    let minimum = REPLAY_WINDOW_MIN;
+    let window = total.div_ceil(8).max(minimum);
+    let mut ranges = Vec::new();
+    let (mut start, mut count) = (0usize, 0u64);
+    for (bucket, &entries) in buckets.iter().enumerate() {
+        if count > 0 && count + entries > window {
+            ranges.push(((start as u32) << REPLAY_BUCKET_SHIFT, (bucket as u32) << REPLAY_BUCKET_SHIFT, count as usize));
+            (start, count) = (bucket, 0);
+        }
+        if count == 0 { start = bucket; }
+        count += entries;
+    }
+    if count > 0 {
+        let end = ((buckets.len() as u64) << REPLAY_BUCKET_SHIFT).min(u64::from(u32::MAX)) as u32;
+        ranges.push(((start as u32) << REPLAY_BUCKET_SHIFT, end, count as usize));
+    }
+    ranges
+}
+
+/// Admission bytes of a hash map holding `entries` (`K`, `V`): its buckets
+/// (a power of two at 7/8 load) with their control bytes.
+fn map_bytes<K, V>(entries: usize) -> u64 {
+    if entries == 0 { return 0; }
+    let buckets = (entries.saturating_mul(8) / 7 + 1).next_power_of_two().max(4);
+    (buckets * (std::mem::size_of::<(K, V)>() + 1) + 16) as u64
+}
+
+/// The admission charge of a graph chain's replay workspace, by part.
+struct ReplayMemory { memory: crate::admission::Reservation, parts: [u64; 4] }
+impl ReplayMemory {
+    const RECORDS: usize = 0;
+    const RETIRED: usize = 1;
+    const INDEX: usize = 2;
+    const WINDOW: usize = 3;
+    fn new() -> Result<Self> {
+        Ok(Self { memory: crate::admission::shared().reserve(0, "graph chain replay workspace")?, parts: [0; 4] })
+    }
+    /// Part `part` holds `bytes` now: the charge grows before the part
+    /// does (refused past the budget) and shrinks after it did.
+    fn charge(&mut self, part: usize, bytes: u64) -> Result<()> {
+        let total = self.parts.iter().sum::<u64>() - self.parts[part] + bytes;
+        if total > self.memory.bytes() { self.memory.grow(total - self.memory.bytes(), "graph chain replay workspace")?; }
+        else { self.memory.shrink(self.memory.bytes() - total); }
+        self.parts[part] = bytes;
+        Ok(())
+    }
+}
+
+struct SlotRecord {
+    incarnation: u32,
+    present: bool,
+    key: u64,
+    born: u64,
+    inverse_norm: u32,
+    retirement: Option<u64>,
+    links: Vec<Vec<u32>>,
+}
+impl SlotRecord {
+    fn read(input: &mut Decoder<'_>) -> Result<Self> {
+        let incarnation = input.u32()?;
+        let present = input.u32()?;
+        let mut record = Self { incarnation, present: present == 1, key: 0, born: 0, inverse_norm: 0, retirement: None, links: Vec::new() };
+        if present > 1 { return Err(corrupt("slot metadata")); }
+        if !record.present { return Ok(record); }
+        record.key = input.u64()?;
+        record.born = input.u64()?;
+        record.inverse_norm = input.u32()?;
+        let level = input.u32()? as usize;
+        if level > 63 { return Err(corrupt("node level")); }
+        let has = input.u32()?;
+        let retirement = input.u64()?;
+        record.retirement = (has == 1).then_some(retirement);
+        for _ in 0..=level {
+            let count = input.u32()? as usize;
+            if count > input.remaining() / 4 { return Err(corrupt("neighbor count")); }
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count { ids.push(input.u32()?); }
+            record.links.push(ids);
+        }
+        Ok(record)
+    }
+    fn write(&self, out: &mut Vec<u8>) {
+        put32(out, self.incarnation);
+        put32(out, u32::from(self.present));
+        if !self.present { return; }
+        put64(out, self.key);
+        put64(out, self.born);
+        put32(out, self.inverse_norm);
+        put32(out, self.links.len().saturating_sub(1) as u32);
+        put32(out, u32::from(self.retirement.is_some()));
+        put64(out, self.retirement.unwrap_or(0));
+        for ids in &self.links {
+            put32(out, ids.len() as u32);
+            for &id in ids { put32(out, id); }
+        }
+    }
+    /// Apply one link log entry ([`storage::EditLog`]) read from `input`.
+    fn apply(&mut self, input: &mut Decoder<'_>) -> Result<()> {
+        match input.take(1)?[0] {
+            LINK_EDIT => {
+                input.u32()?;
+                let level = usize::from(input.take(1)?[0]);
+                let counts = input.take(4)?;
+                let removed = usize::from(u16::from_le_bytes([counts[0], counts[1]]));
+                let added = usize::from(u16::from_le_bytes([counts[2], counts[3]]));
+                if !self.present || level >= self.links.len() { return Err(corrupt("graph link log edit of an absent list")); }
+                let mut gone = Vec::with_capacity(removed);
+                for _ in 0..removed { gone.push(input.u32()?); }
+                let list = &mut self.links[level];
+                list.retain(|id| !gone.contains(id));
+                for _ in 0..added {
+                    let id = input.u32()?;
+                    if !list.contains(&id) { list.push(id); }
+                }
+            }
+            REMOVE_EDIT => {
+                input.u32()?;
+                self.present = false;
+                self.links.clear();
+                self.retirement = None;
+            }
+            _ => return Err(corrupt("graph link log entry kind")),
+        }
+        Ok(())
+    }
+}
+
+/// A graph checkpoint's header fields ([`MutableHnsw::read_header`]).
+#[derive(Clone)]
+struct CheckpointHeader {
+    legacy: bool,
+    /// A link log ([`MutableHnsw::stream_link_delta`]).
+    link: bool,
+    dim: u32,
+    similarity: Similarity,
+    m: usize,
+    ef_construction: usize,
+    seed: u64,
+    entry: u64,
+    len: u32,
+    publication: u64,
+    watermark: Option<u64>,
 }
 impl<'a> Decoder<'a> {
     fn remaining(&self) -> usize {

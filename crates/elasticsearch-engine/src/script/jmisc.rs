@@ -204,7 +204,7 @@ pub fn new_cmp(f: Val, name: &'static str) -> SResult<Val> {
         return Err(super::error::class_cast(format!("Cannot cast {} to java.util.Comparator", f.type_name())));
     };
     Ok(Val::Obj(Rc::new(Obj::Cmp(Rc::new(RefCell::new(move |rt: &mut Rt, a: &Val, b: &Val| {
-        rt.call_fn(&Val::Lambda(l), &[a.clone(), b.clone()]).map(|v| v.to_i64().unwrap_or(0))
+        rt.call_fn(&Val::Lambda(l.clone()), &[a.clone(), b.clone()]).map(|v| v.to_i64().unwrap_or(0))
     })), name))))
 }
 

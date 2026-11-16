@@ -1,5 +1,13 @@
 {{- $cluster := include "es.clusterName" . -}}
 elasticsearch cluster "{{ $cluster }}" is starting in namespace {{ .Release.Namespace }}.
+{{- if not .Values.security.enabled }}
+
+*******************************************************************************
+WARNING: security.enabled=false. This cluster has NO authentication and NO TLS:
+anyone who can reach it can read, change and delete every index. Use it for
+development only.
+*******************************************************************************
+{{- end }}
 
 Node groups:
 {{- range .Values.nodeGroups }}
@@ -11,9 +19,23 @@ Node groups:
      kubectl get pods -n {{ .Release.Namespace }} -l elasticsearch/cluster={{ $cluster }} -w
 
 2. Check cluster health from your machine:
+{{- if .Values.security.enabled }}
+     PASSWORD=$(kubectl get secret -n {{ .Release.Namespace }} {{ include "es.credentialsSecret" . }} -o go-template='{{ "{{" }}index .data "{{ include "es.credentialsKey" . }}" | base64decode{{ "}}" }}')
+{{- if .Values.security.tls.http.enabled }}
+{{- $v := include "es.certVolume" (dict "root" . "kind" "http") | fromYaml }}
+     kubectl get secret -n {{ .Release.Namespace }} {{ $v.secret.secretName }} -o go-template='{{ "{{" }}index .data "ca.crt" | base64decode{{ "}}" }}' > ca.crt
+     kubectl port-forward -n {{ .Release.Namespace }} svc/{{ $cluster }} 9200:{{ .Values.service.httpPort }}
+     curl --cacert ca.crt -u "elastic:$PASSWORD" 'https://localhost:9200/_cluster/health?pretty'
+     curl --cacert ca.crt -u "elastic:$PASSWORD" 'https://localhost:9200/_cat/nodes?v'
+{{- else }}
+     kubectl port-forward -n {{ .Release.Namespace }} svc/{{ $cluster }} 9200:{{ .Values.service.httpPort }}
+     curl -u "elastic:$PASSWORD" 'http://localhost:9200/_cluster/health?pretty'
+{{- end }}
+{{- else }}
      kubectl port-forward -n {{ .Release.Namespace }} svc/{{ $cluster }} 9200:{{ .Values.service.httpPort }}
      curl 'localhost:9200/_cluster/health?pretty'
      curl 'localhost:9200/_cat/nodes?v'
+{{- end }}
 
    In-cluster URL: {{ include "es.clientUrl" . }}
 

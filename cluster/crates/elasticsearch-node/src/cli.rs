@@ -146,7 +146,8 @@ pub fn main() {
     // Idle workers give their freed pages back while the parent breaker is
     // over its limit (a relaxed load otherwise); when it goes over, the
     // workers already parked are woken to do so.
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().on_thread_park(elasticsearch_engine::memory::idle_collect).build().expect("tokio runtime");
+    // Request threads walk bodies nested up to 1000 levels (ES's limit).
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(elasticsearch_http::pools::REQUEST_STACK).on_thread_start(|| elasticsearch_engine::parse_depth::register_thread_stack(elasticsearch_http::pools::REQUEST_STACK)).on_thread_park(elasticsearch_engine::memory::idle_collect).build().expect("tokio runtime");
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
     let _ = RUNTIME.set(rt.handle().clone());
     // One task per worker, each holding its worker until all have started

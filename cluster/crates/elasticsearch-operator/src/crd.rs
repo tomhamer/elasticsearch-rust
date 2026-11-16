@@ -65,6 +65,56 @@ pub struct ElasticsearchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "free_form_object")]
     pub pod_disruption_budget: Option<Value>,
+    /// HTTP layer settings (ECK's `spec.http`): the TLS certificate. HTTPS
+    /// is always on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpConfig>,
+}
+
+/// ECK `spec.http`.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsOptions>,
+}
+
+/// ECK `spec.http.tls`.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsOptions {
+    /// The operator-generated certificate (extra names; `disabled: true`,
+    /// plain-text HTTP, is rejected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_signed_certificate: Option<SelfSignedCertificate>,
+    /// Your own certificate: a Secret with `tls.crt`, `tls.key` and
+    /// optionally `ca.crt`. It must name `<name>-es-http.<namespace>.svc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<SecretRef>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfSignedCertificate {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_alt_names: Vec<SubjectAlternativeName>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectAlternativeName {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRef {
+    pub secret_name: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
@@ -230,8 +280,15 @@ spec:
     volumeClaimTemplates:
     - metadata: { name: elasticsearch-data }
       spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 5Gi } } }
+  http:
+    tls:
+      selfSignedCertificate:
+        subjectAltNames: [{ dns: search.example.com }, { ip: 10.0.0.7 }]
 "#;
         let es: Elasticsearch = serde_yaml::from_str(doc).unwrap();
+        let sans = &es.spec.http.as_ref().unwrap().tls.as_ref().unwrap().self_signed_certificate.as_ref().unwrap().subject_alt_names;
+        assert_eq!(sans[0].dns.as_deref(), Some("search.example.com"));
+        assert_eq!(sans[1].ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(es.spec.node_sets[0].count, 3);
         assert_eq!(es.spec.max_surge(), Some(3));
         assert_eq!(es.spec.max_unavailable(), Some(1));

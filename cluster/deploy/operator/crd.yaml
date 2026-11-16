@@ -43,6 +43,49 @@ spec:
         properties:
           spec:
             properties:
+              http:
+                description: |-
+                  HTTP layer settings (ECK's `spec.http`): the TLS certificate. HTTPS
+                  is always on.
+                nullable: true
+                properties:
+                  tls:
+                    description: ECK `spec.http.tls`.
+                    nullable: true
+                    properties:
+                      certificate:
+                        description: |-
+                          Your own certificate: a Secret with `tls.crt`, `tls.key` and
+                          optionally `ca.crt`. It must name `<name>-es-http.<namespace>.svc`.
+                        nullable: true
+                        properties:
+                          secretName:
+                            type: string
+                        required:
+                        - secretName
+                        type: object
+                      selfSignedCertificate:
+                        description: |-
+                          The operator-generated certificate (extra names; `disabled: true`,
+                          plain-text HTTP, is rejected).
+                        nullable: true
+                        properties:
+                          disabled:
+                            type: boolean
+                          subjectAltNames:
+                            items:
+                              properties:
+                                dns:
+                                  nullable: true
+                                  type: string
+                                ip:
+                                  nullable: true
+                                  type: string
+                              type: object
+                            type: array
+                        type: object
+                    type: object
+                type: object
               image:
                 description: |-
                   Container image; defaults to `<operator default image repository>:<version>`

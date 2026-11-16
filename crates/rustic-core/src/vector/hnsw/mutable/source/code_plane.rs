@@ -14,6 +14,13 @@
 //! entry through that publication's happens-before edge. Entries are never
 //! freed until the owner is: chunks only grow.
 //!
+//! Chunks double from [`FIRST`] slots up to [`BIG`] slots and are then all
+//! [`BIG`] slots (as the row plane's), reached through a two-level table:
+//! a large field allocates, and is charged for, at most one chunk ahead.
+//! (Chunks that kept doubling charged half the field's codes in one step,
+//! e.g. ~12 GB at 64M 128-d int8 nodes, on every shard at about the same
+//! time under uniform routing.)
+//!
 //! Entry layout (words): `[epoch lo, epoch hi, corrections and codes...]`,
 //! padded to whole 64-byte lines. Epoch 0 (never a real epoch) marks an
 //! entry that was not written; a reader falls back to the source row.
@@ -21,15 +28,26 @@
 use super::super::huge::ZeroedBlock;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-/// Slots of the first two chunks; chunk `k >= 1` holds `FIRST << (k - 1)`
-/// slots, so a small field allocates little and a large one few chunks.
+/// Slots of the first two chunks; chunk `k` in `1..SMALL` holds
+/// `FIRST << (k - 1)` slots.
 const FIRST: u32 = 1 << 10;
-/// Chunks covering every `u32` id.
-const CHUNKS: usize = 33 - FIRST.trailing_zeros() as usize;
+/// Slots of every chunk from id `BIG` on.
+const BIG: u32 = 1 << 16;
+/// Doubling chunks below `BIG`: 0 and 1 hold `FIRST`, then 2^11..2^15.
+const SMALL: usize = 7;
+/// Big chunks per second-level table.
+const LEAF: usize = 256;
+/// Second-level tables covering every `u32` id from `BIG` on.
+const ROOT: usize = ((1usize << 32) / BIG as usize).div_ceil(LEAF);
 
-/// Node `id`'s chunk and its index in it.
+/// Node `id`'s chunk (`< SMALL`: a doubling chunk; else `SMALL + big`
+/// index) and its index in the chunk.
 #[inline]
 fn locate(id: u32) -> (usize, usize) {
+    if id >= BIG {
+        let big = (id / BIG - 1) as usize;
+        return (SMALL + big, (id % BIG) as usize);
+    }
     let q = id >> FIRST.trailing_zeros();
     if q == 0 { return (0, id as usize); }
     let k = (32 - q.leading_zeros()) as usize;
@@ -38,22 +56,28 @@ fn locate(id: u32) -> (usize, usize) {
 /// Slots of chunk `k`.
 #[inline]
 fn chunk_slots(k: usize) -> usize {
-    if k == 0 { FIRST as usize } else { (FIRST as usize) << (k - 1) }
+    match k {
+        0 => FIRST as usize,
+        k if k < SMALL => (FIRST as usize) << (k - 1),
+        _ => BIG as usize,
+    }
 }
 
 struct Chunk {
     words: *mut AtomicU32,
     /// Owns `words` (huge pages when large).
     _block: ZeroedBlock,
-    _memory: crate::admission::Reservation,
+    _memory: Option<crate::admission::Reservation>,
 }
+type Leaf = [AtomicPtr<Chunk>; LEAF];
 
 pub(super) struct CodePlane {
     /// Words per entry (0 until the first write fixes it).
     stride: AtomicUsize,
-    /// Chunk `k` covers the ids [`locate`] maps to it; published with Release
-    /// once allocated, never replaced.
-    table: Box<[AtomicPtr<Chunk>]>,
+    /// Chunk `k` covers the ids [`locate`] maps to it; chunks and leaves
+    /// are published with Release once allocated, never replaced.
+    small: [AtomicPtr<Chunk>; SMALL],
+    root: Box<[AtomicPtr<Leaf>]>,
     bytes: AtomicUsize,
 }
 
@@ -65,20 +89,26 @@ unsafe impl Sync for CodePlane {}
 
 impl Default for CodePlane {
     fn default() -> Self {
-        let mut table = Vec::with_capacity(CHUNKS);
-        table.resize_with(CHUNKS, || AtomicPtr::new(std::ptr::null_mut()));
-        Self { stride: AtomicUsize::new(0), table: table.into_boxed_slice(), bytes: AtomicUsize::new(0) }
+        let mut root = Vec::with_capacity(ROOT);
+        root.resize_with(ROOT, || AtomicPtr::new(std::ptr::null_mut()));
+        Self { stride: AtomicUsize::new(0), small: Default::default(), root: root.into_boxed_slice(), bytes: AtomicUsize::new(0) }
     }
 }
 
 impl Drop for CodePlane {
     fn drop(&mut self) {
-        for entry in self.table.iter() {
+        let free = |entry: &AtomicPtr<Chunk>| {
             let chunk = entry.swap(std::ptr::null_mut(), Ordering::AcqRel);
-            if !chunk.is_null() {
-                // SAFETY: created by `Box::into_raw` in `chunk`, dropped once.
-                drop(unsafe { Box::from_raw(chunk) });
-            }
+            // SAFETY: created by `Box::into_raw` in `chunk`, dropped once.
+            if !chunk.is_null() { drop(unsafe { Box::from_raw(chunk) }); }
+        };
+        self.small.iter().for_each(free);
+        for leaf in self.root.iter() {
+            let leaf = leaf.swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if leaf.is_null() { continue; }
+            // SAFETY: created by `Box::into_raw` in `chunk`, dropped once.
+            let leaf = unsafe { Box::from_raw(leaf) };
+            leaf.iter().for_each(free);
         }
     }
 }
@@ -86,7 +116,19 @@ impl Drop for CodePlane {
 impl CodePlane {
     /// Heap bytes of the allocated chunks (and the chunk table).
     pub(super) fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed) + self.table.len() * std::mem::size_of::<AtomicPtr<Chunk>>()
+        self.bytes.load(Ordering::Relaxed) + self.root.len() * std::mem::size_of::<AtomicPtr<Leaf>>()
+    }
+
+    /// Chunk `k` (null: never allocated).
+    #[inline]
+    fn chunk_ptr(&self, k: usize) -> *const Chunk {
+        if k < SMALL { return self.small[k].load(Ordering::Acquire); }
+        let big = k - SMALL;
+        let Some(leaf) = self.root.get(big / LEAF) else { return std::ptr::null() };
+        let leaf = leaf.load(Ordering::Acquire);
+        if leaf.is_null() { return std::ptr::null(); }
+        // SAFETY: a published leaf lives as long as the plane.
+        unsafe { (*leaf)[big % LEAF].load(Ordering::Acquire) }
     }
 
     /// Words per entry, `0` before the first write.
@@ -129,8 +171,7 @@ impl CodePlane {
     pub(super) fn clear(&self, id: u32) {
         let stride = self.stride();
         let (k, index) = locate(id);
-        let Some(entry) = self.table.get(k) else { return };
-        let chunk = entry.load(Ordering::Acquire);
+        let chunk = self.chunk_ptr(k);
         if stride == 0 || chunk.is_null() { return; }
         // SAFETY: inside the chunk; single writer.
         unsafe {
@@ -141,14 +182,27 @@ impl CodePlane {
     }
 
     fn chunk(&self, index: usize, stride: usize) -> crate::error::Result<*const Chunk> {
-        let slot = self.table.get(index).ok_or_else(|| super::failure("code plane id out of range"))?;
+        let slot: &AtomicPtr<Chunk> = if index < SMALL { &self.small[index] } else {
+            let big = index - SMALL;
+            let root = self.root.get(big / LEAF).ok_or_else(|| super::failure("code plane id out of range"))?;
+            let mut leaf = root.load(Ordering::Acquire);
+            if leaf.is_null() {
+                let fresh: Box<Leaf> = Box::new(std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())));
+                leaf = Box::into_raw(fresh);
+                // Single writer: nothing else installs this leaf.
+                root.store(leaf, Ordering::Release);
+                self.bytes.fetch_add(std::mem::size_of::<Leaf>(), Ordering::Relaxed);
+            }
+            // SAFETY: published leaf, lives as long as the plane.
+            unsafe { &(*leaf)[big % LEAF] }
+        };
         let current = slot.load(Ordering::Acquire);
         if !current.is_null() { return Ok(current); }
         let bytes = chunk_slots(index) * stride * 4;
-        let memory = crate::admission::shared().reserve(bytes as u64, "mutable code plane")?;
         // Zeroed memory is a valid `AtomicU32` array and marks every entry
-        // unwritten (epoch 0).
-        let block = ZeroedBlock::new(bytes).ok_or_else(|| super::failure("code plane allocation"))?;
+        // unwritten (epoch 0). Past the budget's spill threshold, a spill
+        // file (see `huge::plane_chunk`).
+        let (block, memory) = super::super::huge::plane_chunk(bytes, "mutable code plane")?;
         let words = block.ptr().cast::<AtomicU32>();
         let chunk = Box::into_raw(Box::new(Chunk { words, _block: block, _memory: memory }));
         // Single writer: nothing else installs this chunk.
@@ -161,7 +215,7 @@ impl CodePlane {
     #[inline]
     pub(super) fn entry(&self, id: u32, stride: usize) -> Option<&[f32]> {
         let (k, index) = locate(id);
-        let chunk = self.table.get(k)?.load(Ordering::Acquire);
+        let chunk = self.chunk_ptr(k);
         if chunk.is_null() { return None; }
         let base = index * stride;
         // SAFETY: inside the chunk; the entry's writes happen before the
@@ -174,8 +228,7 @@ impl CodePlane {
     #[inline]
     pub(super) fn prefetch(&self, id: u32, stride: usize) {
         let (k, index) = locate(id);
-        let Some(entry) = self.table.get(k) else { return };
-        let chunk = entry.load(Ordering::Acquire);
+        let chunk = self.chunk_ptr(k);
         if chunk.is_null() { return; }
         // SAFETY: address arithmetic inside the chunk; prefetch never faults.
         let address = unsafe { (*chunk).words.add(index * stride) };
@@ -210,8 +263,7 @@ impl CodePlaneRef<'_> {
     #[inline]
     pub(crate) fn entry_address(self, id: u32) -> usize {
         let (k, index) = locate(id);
-        let Some(entry) = self.plane.table.get(k) else { return 0 };
-        let chunk = entry.load(Ordering::Acquire);
+        let chunk = self.plane.chunk_ptr(k);
         if chunk.is_null() { return 0; }
         // SAFETY: inside the chunk; prefetch never faults.
         let address = unsafe { (*chunk).words.add(index * self.stride) };
@@ -230,7 +282,7 @@ mod tests {
         let plane = CodePlane::default();
         assert_eq!(plane.stride(), 0);
         let words: Vec<u32> = (0..28).collect();
-        for (id, chunk) in [(1u32, 0), (2, 0), (FIRST + 5, 1), (4 * FIRST, 3), (u32::MAX, 22)] {
+        for (id, chunk) in [(1u32, 0), (2, 0), (FIRST + 5, 1), (4 * FIRST, 3), (BIG, SMALL), (3 * BIG + 7, SMALL + 2), (u32::MAX, SMALL + (u32::MAX / BIG - 1) as usize)] {
             assert_eq!(locate(id).0, chunk);
             assert!(locate(id).1 < chunk_slots(chunk));
             if id != u32::MAX { plane.write(id, 7 + u64::from(id) << 32 | 3, &words).unwrap(); }
@@ -247,5 +299,12 @@ mod tests {
         assert_eq!(locate(2 * FIRST).0, 2);
         assert!(plane.write(9, 0, &words).is_err(), "epoch 0 marks an empty entry");
         assert!(plane.write(9, 1, &[0; 40]).is_err(), "a wider entry than the stride");
+        // Past the doubling chunks every chunk is BIG slots: one write far
+        // out allocates (and charges) one bounded chunk.
+        let before = plane.bytes();
+        plane.write(200 * BIG + 1, 5, &words).unwrap();
+        assert!(plane.bytes() - before <= BIG as usize * stride * 4 + std::mem::size_of::<Leaf>());
+        assert_eq!(plane.entry(200 * BIG + 1, stride).unwrap()[2].to_bits(), 0);
+        assert!(plane.entry(201 * BIG, stride).is_none());
     }
 }

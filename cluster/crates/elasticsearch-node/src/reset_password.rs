@@ -583,7 +583,10 @@ impl Terminal for StdTerminal {
 /// `elasticsearch-reset-password` entry point.
 pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    // ES's `elasticsearch-cli` launcher exports HOSTNAME, which the
+    // auto-configured `cluster.initial_master_nodes` refers to.
+    env.entry("HOSTNAME".into()).or_insert_with(config::hostname);
     let mut term = StdTerminal;
     let code = match parse_args(&args) {
         Ok(o) if o.help => {

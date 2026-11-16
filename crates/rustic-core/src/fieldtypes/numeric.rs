@@ -77,13 +77,13 @@ pub fn nanos_to_millis(nanos: i64) -> i64 {
 /// nanoseconds (`...12:12:12.123456789Z` → 123456789), if present.
 pub fn fraction_nanos(s: &str) -> Option<u32> {
     let b = s.as_bytes();
-    // Find "ss.fff" after a "HH:mm:" pattern: the last ':' followed by two
-    // digits and a '.' or ','.
-    let colon = s.rfind(':')?;
-    let rest = &b[colon + 1..];
-    if rest.len() < 4 || !rest[0].is_ascii_digit() || !rest[1].is_ascii_digit() || (rest[2] != b'.' && rest[2] != b',') {
-        return None;
-    }
+    // Find "ss.fff" after a "HH:mm:" pattern: a ':' followed by two digits
+    // and a '.' or ','. Not just the last ':', which may be a zone
+    // offset's (`+01:00`, finding 445).
+    let rest = (0..b.len())
+        .filter(|&i| b[i] == b':')
+        .map(|i| &b[i + 1..])
+        .find(|r| r.len() >= 4 && r[0].is_ascii_digit() && r[1].is_ascii_digit() && (r[2] == b'.' || r[2] == b','))?;
     let digits: Vec<u8> = rest[3..].iter().take_while(|c| c.is_ascii_digit()).copied().collect();
     if digits.is_empty() {
         return None;
@@ -138,6 +138,9 @@ mod tests {
         assert_eq!(fraction_nanos("2018-10-29T12:12:12.123456789Z"), Some(123456789));
         assert_eq!(fraction_nanos("2018-10-29T12:12:12.5Z"), Some(500000000));
         assert_eq!(fraction_nanos("2018-10-29T12:12:12Z"), None);
+        // Finding 445: a zone offset's colon is not the seconds' colon.
+        assert_eq!(fraction_nanos("2025-01-01T01:00:00.123456789+01:00"), Some(123456789));
+        assert_eq!(fraction_nanos("2025-01-01T01:00:00+01:00"), None);
         assert_eq!(fraction_nanos("2018-10-29"), None);
         assert_eq!(nanos_from_parts(1540815132, 123456789), Ok(1540815132123456789));
         assert_eq!(nanos_from_parts(-1, 0), Err(NanosError::BeforeEpoch));

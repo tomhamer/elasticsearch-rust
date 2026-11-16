@@ -59,7 +59,7 @@ impl Generator<'_, '_> {
         let t = tf as f64;
         (t * (t.log10() / 5f64.log10()) + 1.0).round().max(0.0) as f32
     }
-    fn draw(&self, set: &mut CandSet) {
+    fn draw(&self, set: &mut CandSet) -> Result<()> {
         let mut term = set.original.term.clone();
         if let Some(p) = &self.pre {
             if let Some(last) = p.analyze(&term).into_iter().last() {
@@ -67,7 +67,7 @@ impl Generator<'_, '_> {
             }
         }
         let thr = if self.spell.mode == Mode::Always { 0.0 } else { Self::threshold(set.original.frequency) };
-        let words = suggest_similar(&self.dict, &term, self.size, &self.spell, Some(thr));
+        let words = suggest_similar(&self.dict, &term, self.size, &self.spell, Some(thr))?;
         for w in words {
             let c = Candidate { frequency: self.frequency(&w.term), distance: w.score as f64, score: self.score(w.freq, w.score as f64), term: w.term, user_input: false };
             match &self.post {
@@ -81,6 +81,7 @@ impl Generator<'_, '_> {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -217,6 +218,34 @@ struct Search<'s, 'a, 'b> {
     max: usize,
     cutoff: f64,
     out: Vec<Correction>,
+    /// Correction paths scored so far (each a language-model lookup).
+    visits: u64,
+    /// Most paths one suggestion may score.
+    budget: u64,
+}
+
+/// Most correction paths one phrase suggestion scores. ES enumerates the
+/// whole tree; with its defaults (`token_limit` 10, `max_errors` 1) that is
+/// at most a few hundred paths, so the bound only stops explicit overrides
+/// whose tree grows exponentially from running past any deadline.
+pub const MAX_PHRASE_PATHS: u64 = 1_000_000;
+
+/// Most tokens (tree depth) one phrase suggestion corrects, whatever
+/// `token_limit` allows (the search recurses once per token).
+pub const MAX_PHRASE_TOKENS: usize = 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: a smaller path budget.
+    pub(crate) static PATH_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn path_budget() -> u64 {
+    #[cfg(test)]
+    if let Some(b) = PATH_BUDGET.with(std::cell::Cell::get) {
+        return b;
+    }
+    MAX_PHRASE_PATHS
 }
 
 impl Search<'_, '_, '_> {
@@ -240,30 +269,47 @@ impl Search<'_, '_, '_> {
         }
     }
 
-    fn find(&mut self, sets: &[CandSet], path: &mut Vec<Candidate>, ord: usize, left: usize, path_score: f64) {
+    /// Score `path` at `ord`, counting the visit against the budget and
+    /// polling cancellation (every 1024 visits).
+    fn score(&mut self, path: &[Candidate], sets: &[CandSet], ord: usize) -> Result<f64> {
+        self.visits += 1;
+        if self.visits > self.budget {
+            return Err(EsError::illegal_argument(format!(
+                "phrase suggestion explores more than [{}] correction paths; lower [max_errors], [token_limit] or [shard_size]",
+                self.budget
+            )));
+        }
+        if self.visits % 1024 == 0 {
+            crate::search::check_cancelled()?;
+        }
+        Ok(self.scorer.score(path, sets, ord, self.gram))
+    }
+
+    fn find(&mut self, sets: &[CandSet], path: &mut Vec<Candidate>, ord: usize, left: usize, path_score: f64) -> Result<()> {
         let cur = &sets[ord];
         let last = ord == sets.len() - 1;
         path[ord] = cur.original.clone();
-        let s0 = path_score + self.scorer.score(path, sets, ord, self.gram);
+        let s0 = path_score + self.score(path, sets, ord)?;
         if last {
             self.update_top(path, s0);
             if left > 0 {
                 for c in &cur.candidates {
                     path[ord] = c.clone();
-                    let s = path_score + self.scorer.score(path, sets, ord, self.gram);
+                    let s = path_score + self.score(path, sets, ord)?;
                     self.update_top(path, s);
                 }
             }
         } else if left > 0 {
-            self.find(sets, path, ord + 1, left, s0);
+            self.find(sets, path, ord + 1, left, s0)?;
             for c in &cur.candidates {
                 path[ord] = c.clone();
-                let s = path_score + self.scorer.score(path, sets, ord, self.gram);
-                self.find(sets, path, ord + 1, left - 1, s);
+                let s = path_score + self.score(path, sets, ord)?;
+                self.find(sets, path, ord + 1, left - 1, s)?;
             }
         } else {
-            self.find(sets, path, ord + 1, 0, s0);
+            self.find(sets, path, ord + 1, 0, s0)?;
         }
+        Ok(())
     }
 }
 
@@ -320,6 +366,9 @@ pub fn run(text: &str, o: &Map<String, Value>, targets: &[SuggestTarget]) -> Res
     let separator = o.get("separator").and_then(Value::as_str).unwrap_or(" ").to_string();
     let require_unigram = o.get("force_unigrams").and_then(Value::as_bool).unwrap_or(true);
     let token_limit = o.get("token_limit").and_then(num).map(|x| x as usize).unwrap_or(10);
+    if token_limit < 1 {
+        return Err(EsError::illegal_argument("token_limit must be >= 1"));
+    }
     let model = parse_model(o)?;
     let hl = o.get("highlight").and_then(Value::as_object).map(|h| {
         (h.get("pre_tag").and_then(Value::as_str).map(str::to_string), h.get("post_tag").and_then(Value::as_str).map(str::to_string))
@@ -415,9 +464,12 @@ pub fn run(text: &str, o: &Map<String, Value>, targets: &[SuggestTarget]) -> Res
         if sets.is_empty() || sets.len() >= token_limit {
             continue;
         }
+        if sets.len() > MAX_PHRASE_TOKENS {
+            return Err(EsError::illegal_argument(format!("phrase suggestion corrects at most [{MAX_PHRASE_TOKENS}] tokens but the text has [{}]", sets.len())));
+        }
         for set in sets.iter_mut() {
             for g in &gens {
-                g.draw(set);
+                g.draw(set)?;
             }
             if set.candidates.len() > shard_size {
                 set.candidates.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| b.term.cmp(&a.term)));
@@ -431,9 +483,9 @@ pub fn run(text: &str, o: &Map<String, Value>, targets: &[SuggestTarget]) -> Res
             cutoff = log.exp() * confidence;
         }
         let missp = if max_errors >= 1.0 { max_errors as usize } else { (max_errors * sets.len() as f64).round() as usize };
-        let mut search = Search { scorer: &scorer, gram, max: shard_size, cutoff, out: Vec::new() };
+        let mut search = Search { scorer: &scorer, gram, max: shard_size, cutoff, out: Vec::new(), visits: 0, budget: path_budget() };
         let mut path: Vec<Candidate> = sets.iter().map(|s| s.original.clone()).collect();
-        search.find(&sets, &mut path, 0, missp.max(1), 0.0);
+        search.find(&sets, &mut path, 0, missp.max(1), 0.0)?;
         let mut corrections = search.out;
         corrections.sort_by(|a, b| better(b.score, &b.path, a.score, &a.path));
         for c in corrections {
@@ -538,6 +590,7 @@ fn collate_matches(t: &SuggestTarget, col: &Map<String, Value>, phrase: &str) ->
         allow_unmapped_fields: true,
         knn_prefilter: None,
         knn_prefilter_lookup: None,
+        dls_filter: None,
         allow_expensive_queries: true,
         mappings: Some(&**svc),
     };

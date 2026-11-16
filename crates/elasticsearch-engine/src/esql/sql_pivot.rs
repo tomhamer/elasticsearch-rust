@@ -1037,6 +1037,11 @@ const MEMO_FUNCTIONS: &[&str] = &[
     "BIT_LENGTH", "OCTET_LENGTH", "CONCAT", "LEFT", "RIGHT", "LTRIM", "RTRIM", "TRIM", "REPLACE", "ASCII",
     "CEIL", "CEILING", "FLOOR", "ABS", "ROUND", "TRUNCATE", "SIGN", "SQRT", "MOD",
     "TO_LONG", "TO_INTEGER", "TO_DOUBLE", "TO_STRING", "TO_BOOLEAN",
+    // The ES SQL variants SQL binds its LENGTH / CONCAT / REPLACE /
+    // GREATEST / LEAST to (pure functions too): without them NOAA's
+    // `SUM(LENGTH(SUBSTRING(station.name, 0, 5)))` ran per document again,
+    // 10x slower.
+    crate::esql::func::SQL_LENGTH, crate::esql::func::SQL_CONCAT, crate::esql::func::SQL_REPLACE, crate::esql::func::SQL_GREATEST, crate::esql::func::SQL_LEAST,
 ];
 
 /// The one input column of bound expression `e` when `e` is a pure function
@@ -1639,6 +1644,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// The sql track's `SUM(LENGTH(SUBSTRING(station.name, 0, 5)))`: SQL
+    /// binds LENGTH to its own variant, which is memoizable per station name
+    /// like the ES|QL functions (it ran per document, 10x slower).
+    #[test]
+    fn sql_string_functions_are_memoized() {
+        use crate::esql::parse::Expr;
+        let e = Expr::Call(crate::esql::func::SQL_LENGTH.into(), vec![Expr::Call("SUBSTRING".into(), vec![Expr::Idx(0), Expr::Lit(crate::esql::Val::Long(0)), Expr::Lit(crate::esql::Val::Long(5))], 0)], 0);
+        assert_eq!(super::memo_column(&e), Some(0));
+        let c = Expr::Call(crate::esql::func::SQL_CONCAT.into(), vec![Expr::Idx(2), Expr::Lit(crate::esql::Val::Str("x".into()))], 0);
+        assert_eq!(super::memo_column(&c), Some(2));
+    }
+
     #[test]
     fn pivot_key_expansion_checks_breaker_before_cloning() {
         let breakers=crate::memory::Breakers::leak_for_tests(1<<30);
@@ -1766,7 +1783,7 @@ mod tests {
             let local = crate::sql::execute(&node, &query, None, None).unwrap();
             let source = Arc::new(Remote { node: node.clone(), between, pages: AtomicUsize::new(0), closed: AtomicUsize::new(0) });
             let shared: crate::esql::remote::SharedShardSource = source.clone();
-            let remote = crate::sql::execute_with(&node, &query, None, None, None, Some(shared)).unwrap();
+            let remote = crate::sql::execute_with(&node, &query, None, None, None, None, Some(shared)).unwrap();
             assert!(source.pages.load(Ordering::SeqCst) >= 3, "{agg}: the shard was read in several pages");
             assert_eq!(remote.rows, local.rows, "{agg}");
             assert_eq!(source.closed.load(Ordering::SeqCst), 1, "{agg}: the point in time is closed");
@@ -1803,7 +1820,7 @@ mod tests {
         let local = crate::sql::execute(&node, &query, None, None).unwrap();
         let source = Arc::new(OldPeer { node: node.clone(), fetches: AtomicUsize::new(0) });
         let shared: crate::esql::remote::SharedShardSource = source.clone();
-        let remote = crate::sql::execute_with(&node, &query, None, None, None, Some(shared)).unwrap();
+        let remote = crate::sql::execute_with(&node, &query, None, None, None, None, Some(shared)).unwrap();
         assert_eq!(remote.rows, local.rows);
         assert_eq!(source.fetches.load(Ordering::SeqCst), 2, "the open page, then one full fetch");
     }
@@ -1817,7 +1834,7 @@ mod tests {
         let source = Arc::new(OldPeer { node: node.clone(), fetches: AtomicUsize::new(0) });
         let shared: crate::esql::remote::SharedShardSource = source.clone();
         OLD_PEER_MAX_OVERRIDE.with(|o| o.set(Some(1)));
-        let result = crate::sql::execute_with(&node, &query, None, None, None, Some(shared));
+        let result = crate::sql::execute_with(&node, &query, None, None, None, None, Some(shared));
         OLD_PEER_MAX_OVERRIDE.with(|o| o.set(None));
         let error = result.expect_err("an unbounded fallback read");
         assert_eq!(error.status, 400, "{error}");
@@ -1985,12 +2002,12 @@ mod rally_sql_tests {
             assert_eq!(json_rows(rows(&node, query)), expected, "{query}");
             // One shard: the HTTP entry point keeps the direct scan, which
             // stops reading once a page is full.
-            assert!(crate::sql::scan_with(&node, query, None, None, None, None).unwrap().is_some_and(|scan| scan.is_direct()), "{query}");
+            assert!(crate::sql::scan_with(&node, query, None, None, None, None, None).unwrap().is_some_and(|scan| scan.is_direct()), "{query}");
             let direct: Vec<Value> = paged(&node, query, true, 97).into_iter().flat_map(|(rows, _)| rows).collect();
             assert_eq!(direct, expected, "{query}");
         }
         // No row filter: the scan keeps serving.
-        assert!(crate::sql::scan_with(&node, "SELECT station.name FROM w WHERE station.elevation > 2800", None, None, None, None).unwrap().is_some());
+        assert!(crate::sql::scan_with(&node, "SELECT station.name FROM w WHERE station.elevation > 2800", None, None, None, None, None).unwrap().is_some());
     }
 
     #[test]
@@ -2001,7 +2018,7 @@ mod rally_sql_tests {
             let mut actual: Vec<String> = json_rows(rows(&node, query)).iter().map(Value::to_string).collect();
             expected.sort(); actual.sort();
             assert_eq!(actual, expected, "{query}");
-            assert!(crate::sql::scan_with(&node, query, None, None, None, None).unwrap().is_some(), "{query}");
+            assert!(crate::sql::scan_with(&node, query, None, None, None, None, None).unwrap().is_some(), "{query}");
         }
     }
 
@@ -2310,7 +2327,7 @@ mod rally_sql_tests {
             super::PIVOT_FAST_DISABLED.with(|d| d.set(generic));
         };
         let run = |query: &str, pages: usize| -> Vec<Value> {
-            match crate::sql::scan_with(&node, query, None, None, None, None).unwrap() {
+            match crate::sql::scan_with(&node, query, None, None, None, None, None).unwrap() {
                 Some(mut scan) => (0..pages).flat_map(|_| scan.page(&node, 1000).unwrap()).collect(),
                 None => json_rows(rows(&node, query).into_iter().take(pages * 1000).collect()),
             }

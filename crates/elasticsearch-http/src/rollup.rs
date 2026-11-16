@@ -6,8 +6,15 @@
 //! `_rollup` key (every job's rollup index does, so the first job needs a
 //! pre-existing one). Job configs live in the extension state (ES: persistent
 //! tasks) and are mirrored into the rollup index's `_meta._rollup`, which is
-//! what the caps APIs and `_rollup_search` read, exactly as ES does. A job's
-//! indexer is started and stopped by the API.
+//! what the caps APIs and `_rollup_search` read, exactly as ES does.
+//!
+//! Rollup job *execution* is not supported: there is no scheduler or
+//! indexer, so `_start` is rejected (an ES-shaped `illegal_argument_exception`)
+//! rather than reporting `started: true` for a job that would never index
+//! anything, and every job reports `job_state: stopped` with zero stats.
+//! Rollup search and caps over existing rollup indices work. See README
+//! "Unsupported features"; ES deprecates rollup jobs in favour of
+//! downsampling.
 //!
 //! `_rollup_search` is `TransportRollupSearchAction` in Rust: the request's
 //! aggregations pick the best job per `RollupJobIdentifierUtils`, are
@@ -598,7 +605,9 @@ fn rollable_caps_json(by_key: BTreeMap<String, Vec<JobCaps>>) -> Value {
 fn job_json(id: &str, job: &Value) -> Value {
     json!({
         "config": job["config"],
-        "status": {"job_state": job["state"].as_str().unwrap_or("stopped")},
+        // Jobs never execute here (see the module docs): always stopped,
+        // including a job a previous version recorded as started.
+        "status": {"job_state": "stopped"},
         "stats": {
             "pages_processed": 0, "documents_processed": 0, "rollups_indexed": 0, "trigger_count": 0,
             "index_time_in_ms": 0, "index_total": 0, "index_failures": 0,
@@ -731,6 +740,16 @@ fn delete_job(node: &Node, id: &str) -> R {
     Ok(Resp::ack())
 }
 
+/// The `_start` refusal: rollup jobs are accepted and searchable, but this
+/// engine has no rollup indexer to run them.
+fn start_unsupported(id: &str) -> EsError {
+    EsError::new(
+        400,
+        "illegal_argument_exception",
+        format!("Cannot start task for Rollup Job [{id}]: rollup job execution is not supported by this cluster (rollup jobs are deprecated; use downsampling or a transform instead)"),
+    )
+}
+
 fn set_job_state(node: &Node, id: &str, start: bool) -> R {
     let st = ext(node);
     {
@@ -738,10 +757,13 @@ fn set_job_state(node: &Node, id: &str, start: bool) -> R {
         let Some(job) = jobs.get_mut(id) else {
             return Err(EsError::resource_not_found(format!("Task for Rollup Job [{id}] not found")));
         };
-        job["state"] = json!(if start { "started" } else { "stopped" });
+        if start {
+            return Err(start_unsupported(id));
+        }
+        job["state"] = json!("stopped");
     }
     st.persist()?;
-    Ok(Resp::ok(if start { json!({"started": true}) } else { json!({"stopped": true}) }))
+    Ok(Resp::ok(json!({"stopped": true})))
 }
 
 /// Number of rollup jobs (xpack usage).
@@ -1025,7 +1047,27 @@ fn find_best_jobs<'a>(name: &str, agg: &Value, caps: Vec<&'a JobCaps>, best: &mu
 
 /// `RollupRequestTranslator.translateAggregation`: the request aggregation
 /// rewritten onto the rollup document fields, plus the `_count` sums.
-fn translate_agg(name: &str, agg: &Value, out: &mut Map<String, Value>) -> Result<()> {
+/// The translated request's name of the user aggregation at position `i`
+/// of its level. The translated tree uses only generated names (`a{i}`, an
+/// average's `a{i}.v` / `a{i}.n`, a bucket's document count `c`), never the
+/// user's: a user aggregation named like a helper (`p.value`, `x._count`)
+/// cannot replace it (#565; ES isolates each tree in its own filter).
+fn tname(i: usize) -> String {
+    format!("a{i}")
+}
+
+/// Name of a bucket's document count helper among its translated subs.
+const BUCKET_COUNT: &str = "c";
+
+/// `RollupRequestTranslator`: the user aggregations of one level, translated.
+fn translate_level(aggs: &Map<String, Value>, out: &mut Map<String, Value>) -> Result<()> {
+    for (i, (name, agg)) in aggs.iter().enumerate() {
+        translate_agg(&tname(i), name, agg, out)?;
+    }
+    Ok(())
+}
+
+fn translate_agg(key: &str, name: &str, agg: &Value, out: &mut Map<String, Value>) -> Result<()> {
     let (ty, def, subs) = agg_parts(name, agg)?;
     let field = field_of(&ty, &def)?;
     match ty.as_str() {
@@ -1037,20 +1079,20 @@ fn translate_agg(name: &str, agg: &Value, out: &mut Map<String, Value>) -> Resul
                 d["time_zone"] = json!("UTC");
             }
             let mut sub_out = Map::new();
-            for (n, a) in subs.iter().flatten() {
-                translate_agg(n, a, &mut sub_out)?;
+            if let Some(subs) = &subs {
+                translate_level(subs, &mut sub_out)?;
             }
-            sub_out.insert(format!("{name}._count"), json!({"sum": {"field": format!("{field}.{ty}._count")}}));
-            out.insert(name.to_string(), json!({ ty: d, "aggs": sub_out }));
+            sub_out.insert(BUCKET_COUNT.into(), json!({"sum": {"field": format!("{field}.{ty}._count")}}));
+            out.insert(key.to_string(), json!({ ty: d, "aggs": sub_out }));
         }
         "avg" => {
-            out.insert(format!("{name}.value"), json!({"sum": {"field": format!("{field}.avg.value")}}));
-            out.insert(format!("{name}._count"), json!({"sum": {"field": format!("{field}.avg._count")}}));
+            out.insert(format!("{key}.v"), json!({"sum": {"field": format!("{field}.avg.value")}}));
+            out.insert(format!("{key}.n"), json!({"sum": {"field": format!("{field}.avg._count")}}));
         }
         "max" | "min" | "sum" | "value_count" => {
             let mut d = def.clone();
             d["field"] = json!(format!("{field}.{ty}.value"));
-            out.insert(name.to_string(), json!({ ty: d }));
+            out.insert(key.to_string(), json!({ ty: d }));
         }
         other => {
             return Err(ia(format!(
@@ -1062,8 +1104,21 @@ fn translate_agg(name: &str, agg: &Value, out: &mut Map<String, Value>) -> Resul
     Ok(())
 }
 
+/// The buckets of a bucket aggregation result, array or keyed.
+fn buckets_of(v: &Value) -> Vec<(Option<String>, &Value)> {
+    match v.get("buckets") {
+        Some(Value::Array(a)) => a.iter().map(|b| (None, b)).collect(),
+        Some(Value::Object(m)) => m.iter().map(|(k, b)| (Some(k.clone()), b)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Merge the translated aggregation results of a second job's search into
-/// the first's (guided by the translated request `tree`).
+/// the first's (guided by the translated request `tree`). Jobs summarize the
+/// same source buckets with complementary metrics: a bucket's document
+/// count is the same in each, so it is kept, not added (#564; ES
+/// `RollupResponseTranslator`), while the metrics combine. Array and keyed
+/// buckets both merge.
 fn merge_translated(tree: &Map<String, Value>, into: &mut Map<String, Value>, other: &Map<String, Value>) {
     for (name, def) in tree {
         let Some(o) = other.get(name) else { continue };
@@ -1076,22 +1131,47 @@ fn merge_translated(tree: &Map<String, Value>, into: &mut Map<String, Value>, ot
         match ty.as_str() {
             "date_histogram" | "histogram" | "terms" => {
                 let subs = def.get("aggs").and_then(Value::as_object).cloned().unwrap_or_default();
-                let (Some(cb), Some(ob)) = (cur.get_mut("buckets").and_then(Value::as_array_mut), o.get("buckets").and_then(Value::as_array)) else { continue };
-                for b in ob {
-                    if let Some(existing) = cb.iter_mut().find(|x| x.get("key") == b.get("key")) {
-                        let dc = existing["doc_count"].as_i64().unwrap_or(0) + b["doc_count"].as_i64().unwrap_or(0);
-                        existing["doc_count"] = json!(dc);
-                        if let (Some(em), Some(bm)) = (existing.as_object_mut(), b.as_object()) {
-                            merge_translated(&subs, em, bm);
+                let merge_bucket = |existing: &mut Value, b: &Value| {
+                    let dc = existing["doc_count"].as_i64().unwrap_or(0).max(b["doc_count"].as_i64().unwrap_or(0));
+                    existing["doc_count"] = json!(dc);
+                    if let (Some(em), Some(bm)) = (existing.as_object_mut(), b.as_object()) {
+                        // The count helper is the same in every job: kept.
+                        let count = match (em.get(BUCKET_COUNT).and_then(|c| c["value"].as_f64()), bm.get(BUCKET_COUNT).and_then(|c| c["value"].as_f64())) {
+                            (Some(x), Some(y)) => Some(x.max(y)),
+                            (x, y) => x.or(y),
+                        };
+                        merge_translated(&subs, em, bm);
+                        if let Some(c) = count {
+                            em.insert(BUCKET_COUNT.into(), json!({"value": c}));
                         }
-                    } else {
-                        cb.push(b.clone());
                     }
-                }
-                if ty == "terms" {
-                    cb.sort_by(|a, b| b["doc_count"].as_i64().cmp(&a["doc_count"].as_i64()).then_with(|| a["key"].to_string().cmp(&b["key"].to_string())));
-                } else {
-                    cb.sort_by(|a, b| a["key"].as_f64().partial_cmp(&b["key"].as_f64()).unwrap_or(Ordering::Equal));
+                };
+                match (cur.get_mut("buckets"), o.get("buckets")) {
+                    (Some(Value::Array(cb)), Some(Value::Array(ob))) => {
+                        for b in ob {
+                            if let Some(existing) = cb.iter_mut().find(|x| x.get("key") == b.get("key")) {
+                                merge_bucket(existing, b);
+                            } else {
+                                cb.push(b.clone());
+                            }
+                        }
+                        if ty == "terms" {
+                            cb.sort_by(|a, b| b["doc_count"].as_i64().cmp(&a["doc_count"].as_i64()).then_with(|| a["key"].to_string().cmp(&b["key"].to_string())));
+                        } else {
+                            cb.sort_by(|a, b| a["key"].as_f64().partial_cmp(&b["key"].as_f64()).unwrap_or(Ordering::Equal));
+                        }
+                    }
+                    (Some(Value::Object(cm)), Some(Value::Object(om))) => {
+                        for (k, b) in om {
+                            match cm.get_mut(k) {
+                                Some(existing) => merge_bucket(existing, b),
+                                None => {
+                                    cm.insert(k.clone(), b.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             "sum" | "value_count" => {
@@ -1113,7 +1193,7 @@ fn typed_name(ty: &str, name: &str, typed: bool, res: &Value) -> String {
         return name.to_string();
     }
     let prefix = if ty == "terms" {
-        let keys: Vec<&Value> = res["buckets"].as_array().into_iter().flatten().map(|b| &b["key"]).collect();
+        let keys: Vec<&Value> = buckets_of(res).into_iter().map(|(_, b)| &b["key"]).collect();
         if keys.iter().any(|k| k.is_string()) {
             "sterms"
         } else if keys.iter().any(|k| k.is_f64()) {
@@ -1127,22 +1207,57 @@ fn typed_name(ty: &str, name: &str, typed: bool, res: &Value) -> String {
     format!("{prefix}#{name}")
 }
 
-/// `RollupResponseTranslator.unrollAgg`: the translated aggregation results
-/// back in the shape of the request aggregations.
-fn unroll_aggs(orig: &Map<String, Value>, inner: &Map<String, Value>, typed: bool) -> Result<Map<String, Value>> {
+/// `typed_keys`: the result names of `orig`'s aggregations (and their
+/// bucket sub-aggregations) prefixed with their types, once the results are
+/// final (after the live combination, which matches plain names).
+fn apply_typed(orig: &Map<String, Value>, res: Map<String, Value>) -> Result<Map<String, Value>> {
+    let mut res = res;
     let mut out = Map::new();
     for (name, agg) in orig {
+        let (ty, _, subs) = agg_parts(name, agg)?;
+        let Some(mut v) = res.remove(name) else { continue };
+        if let Some(subs) = subs.filter(|_| matches!(ty.as_str(), "date_histogram" | "histogram" | "terms")) {
+            let fix = |b: &mut Value| -> Result<()> {
+                if let Some(bo) = b.as_object_mut() {
+                    let keys: Vec<String> = subs.keys().cloned().collect();
+                    let mut taken = Map::new();
+                    for k in &keys {
+                        if let Some(x) = bo.remove(k) {
+                            taken.insert(k.clone(), x);
+                        }
+                    }
+                    bo.extend(apply_typed(&subs, taken)?);
+                }
+                Ok(())
+            };
+            match v.get_mut("buckets") {
+                Some(Value::Array(a)) => a.iter_mut().try_for_each(fix)?,
+                Some(Value::Object(m)) => m.values_mut().try_for_each(fix)?,
+                _ => {}
+            }
+        }
+        out.insert(typed_name(&ty, name, true, &v), v);
+    }
+    out.extend(res);
+    Ok(out)
+}
+
+/// `RollupResponseTranslator.unrollAgg`: the translated aggregation results
+/// back in the shape (and names) of the request aggregations.
+fn unroll_aggs(orig: &Map<String, Value>, inner: &Map<String, Value>, top: bool) -> Result<Map<String, Value>> {
+    let mut out = Map::new();
+    for (i, (name, agg)) in orig.iter().enumerate() {
+        let key = tname(i);
         let (ty, def, subs) = agg_parts(name, agg)?;
         match ty.as_str() {
             "date_histogram" | "histogram" | "terms" => {
-                let Some(ia_) = inner.get(name) else { continue };
+                let Some(ia_) = inner.get(&key) else { continue };
                 let mut res = ia_.clone();
                 let min_doc_count = def.get("min_doc_count").and_then(Value::as_i64).unwrap_or(if ty == "terms" { 1 } else { 0 });
-                let count_key = format!("{name}._count");
                 let subs = subs.unwrap_or_default();
                 let unroll_bucket = |b: &Value| -> Result<Option<Value>> {
                     let bo = b.as_object().cloned().unwrap_or_default();
-                    let count = bo.get(&count_key).and_then(|c| c["value"].as_f64()).map(|v| v.round() as i64).unwrap_or_else(|| bo.get("doc_count").and_then(Value::as_i64).unwrap_or(0));
+                    let count = bo.get(BUCKET_COUNT).and_then(|c| c["value"].as_f64()).map(|v| v.round() as i64).unwrap_or_else(|| bo.get("doc_count").and_then(Value::as_i64).unwrap_or(0));
                     if count < min_doc_count || (ty == "terms" && count == 0) {
                         return Ok(None);
                     }
@@ -1153,7 +1268,7 @@ fn unroll_aggs(orig: &Map<String, Value>, inner: &Map<String, Value>, typed: boo
                         }
                     }
                     nb.insert("doc_count".into(), json!(count));
-                    nb.extend(unroll_aggs(&subs, &bo, typed)?);
+                    nb.extend(unroll_aggs(&subs, &bo, false)?);
                     Ok(Some(Value::Object(nb)))
                 };
                 match res.get_mut("buckets") {
@@ -1180,24 +1295,111 @@ fn unroll_aggs(orig: &Map<String, Value>, inner: &Map<String, Value>, typed: boo
                     }
                     _ => {}
                 }
-                let key = typed_name(&ty, name, typed, &res);
-                out.insert(key, res);
+                out.insert(name.clone(), res);
             }
             "avg" => {
-                let sum = inner.get(&format!("{name}.value")).and_then(|v| v["value"].as_f64()).unwrap_or(0.0);
-                let count = inner.get(&format!("{name}._count")).and_then(|v| v["value"].as_f64()).unwrap_or(0.0);
+                let sum = inner.get(&format!("{key}.v")).and_then(|v| v["value"].as_f64()).unwrap_or(0.0);
+                let count = inner.get(&format!("{key}.n")).and_then(|v| v["value"].as_f64()).unwrap_or(0.0);
                 let value = if count > 0.0 { json!(sum / count) } else { Value::Null };
-                out.insert(typed_name("avg", name, typed, &Value::Null), json!({"value": value}));
+                // The sum and count stay (dropped after the live combination)
+                // so a live average reduces with them.
+                out.insert(name.clone(), if top { json!({"value": value, AVG_SUM: sum, AVG_COUNT: count}) } else { json!({"value": value}) });
             }
             "max" | "min" | "sum" | "value_count" => {
-                if let Some(v) = inner.get(name) {
-                    out.insert(typed_name(&ty, name, typed, v), v.clone());
+                if let Some(v) = inner.get(&key) {
+                    out.insert(name.clone(), v.clone());
                 }
             }
             _ => {}
         }
     }
     Ok(out)
+}
+
+/// An unrolled average's sum and count, kept until the live combination.
+const AVG_SUM: &str = "_rollup_sum";
+const AVG_COUNT: &str = "_rollup_count";
+
+/// The live search's request body: each top-level `avg` runs as `stats`
+/// (same name and options), whose sum and count reduce with the rolled-up
+/// average's (#563).
+fn live_body(body: &Value) -> Value {
+    let mut b = body.clone();
+    for key in ["aggs", "aggregations"] {
+        if let Some(m) = b.get_mut(key).and_then(Value::as_object_mut) {
+            for agg in m.values_mut() {
+                if let Some(o) = agg.as_object_mut() {
+                    if let Some(def) = o.remove("avg") {
+                        o.insert("stats".into(), def);
+                    }
+                }
+            }
+        }
+    }
+    b
+}
+
+/// Combine the live indices' aggregations with the unrolled ones
+/// (`RollupResponseTranslator.combineResponses`): a bucket the live search
+/// has wins over the rolled-up one; top-level metrics reduce with the
+/// rolled-up ones (sums and counts add, min / max combine, averages from
+/// their sums and counts), as ES's reduce of the live and unrolled
+/// aggregations does (#563).
+fn combine_with_live(orig: &Map<String, Value>, live: &Map<String, Value>, rolled: Map<String, Value>) -> Result<Map<String, Value>> {
+    let mut out = Map::new();
+    let mut rolled = rolled;
+    for (name, agg) in orig {
+        let (ty, _, _) = agg_parts(name, agg)?;
+        let (l, r) = (live.get(name), rolled.remove(name));
+        let v = match (l, r) {
+            (None, None) => continue,
+            (Some(l), None) if ty == "avg" => json!({"value": l["avg"].clone()}),
+            (Some(l), None) => l.clone(),
+            (None, Some(r)) => r,
+            (Some(l), Some(r)) => match ty.as_str() {
+                "sum" | "value_count" => json!({"value": l["value"].as_f64().unwrap_or(0.0) + r["value"].as_f64().unwrap_or(0.0)}),
+                "max" | "min" => match (l["value"].as_f64(), r["value"].as_f64()) {
+                    (Some(a), Some(b)) => json!({"value": if ty == "max" { a.max(b) } else { a.min(b) }}),
+                    (Some(a), None) | (None, Some(a)) => json!({"value": a}),
+                    (None, None) => json!({"value": Value::Null}),
+                },
+                "avg" => {
+                    let sum = l["sum"].as_f64().unwrap_or(0.0) + r[AVG_SUM].as_f64().unwrap_or(0.0);
+                    let count = l["count"].as_f64().unwrap_or(0.0) + r[AVG_COUNT].as_f64().unwrap_or(0.0);
+                    json!({"value": if count > 0.0 { json!(sum / count) } else { Value::Null }})
+                }
+                _ => {
+                    let mut cur = l.clone();
+                    if let (Some(cb), Some(rb)) = (cur.get_mut("buckets").and_then(Value::as_array_mut), r.get("buckets").and_then(Value::as_array)) {
+                        for b in rb {
+                            if !cb.iter().any(|x| x.get("key") == b.get("key")) {
+                                cb.push(b.clone());
+                            }
+                        }
+                        cb.sort_by(|a, b| a["key"].as_f64().partial_cmp(&b["key"].as_f64()).unwrap_or(Ordering::Equal));
+                    } else if let (Some(cm), Some(rm)) = (cur.get_mut("buckets").and_then(Value::as_object_mut), r.get("buckets").and_then(Value::as_object)) {
+                        for (k, b) in rm {
+                            cm.entry(k.clone()).or_insert_with(|| b.clone());
+                        }
+                    }
+                    cur
+                }
+            },
+        };
+        out.insert(name.clone(), v);
+    }
+    Ok(out)
+}
+
+/// Drop the top-level averages' kept sums and counts (nested averages
+/// never combine with live ones and carry none).
+fn drop_avg_state(m: &mut Map<String, Value>) {
+    for v in m.values_mut() {
+        if let Some(o) = v.as_object_mut() {
+            o.remove(AVG_SUM);
+            o.remove(AVG_COUNT);
+        }
+    }
 }
 
 /// `TransportRollupSearchAction.rewriteQuery`: the query on rolled-up fields.
@@ -1319,30 +1521,6 @@ fn final_response(inners: &[Value], live: Option<&Value>, aggs: Option<Map<Strin
     Value::Object(out)
 }
 
-/// Combine the live indices' aggregations with the unrolled ones: a bucket or
-/// metric the live search has wins (`RollupResponseTranslator.combineResponses`).
-fn combine_with_live(live: &Map<String, Value>, rolled: Map<String, Value>) -> Map<String, Value> {
-    let mut out = live.clone();
-    for (k, v) in rolled {
-        match out.get_mut(&k) {
-            None => {
-                out.insert(k, v);
-            }
-            Some(cur) => {
-                if let (Some(cb), Some(rb)) = (cur.get_mut("buckets").and_then(Value::as_array_mut), v.get("buckets").and_then(Value::as_array)) {
-                    for b in rb {
-                        if !cb.iter().any(|x| x.get("key") == b.get("key")) {
-                            cb.push(b.clone());
-                        }
-                    }
-                    cb.sort_by(|a, b| a["key"].as_f64().partial_cmp(&b["key"].as_f64()).unwrap_or(Ordering::Equal));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// A `_rollup_search` sub-search: on a cluster through the coordinator
 /// (every shard of the targets), else on this node's engine.
 fn search_on(req: &Req, node: &Node, body: &Value, params: &HashMap<String, String>, index: Option<&str>, opts: ResolveOpts, access: Option<&crate::security::access::ReadAccess>) -> Result<String> {
@@ -1390,7 +1568,7 @@ fn rollup_search(node: &Node, req: &Req, index: Option<&str>) -> R {
     let mut inner_params = req.params.clone();
     inner_params.remove("typed_keys");
     inner_params.remove("rest_total_hits_as_int");
-    let live_resp = if live.is_empty() { None } else { Some(parse_resp(search_on(req, node, &body, &inner_params, Some(&live.join(",")), opts.clone(), access)?)?) };
+    let live_resp = if live.is_empty() { None } else { Some(parse_resp(search_on(req, node, &live_body(&body), &inner_params, Some(&live.join(",")), opts.clone(), access)?)?) };
     let aggs = body.get("aggs").or_else(|| body.get("aggregations")).and_then(Value::as_object).filter(|m| !m.is_empty());
     let Some(aggs) = aggs else {
         let inner = parse_resp(search_on(req, node, &body, &inner_params, Some(rollup_index.as_str()), opts, access)?)?;
@@ -1409,9 +1587,7 @@ fn rollup_search(node: &Node, req: &Req, index: Option<&str>) -> R {
         }
     }
     let mut translated = Map::new();
-    for (name, agg) in aggs {
-        translate_agg(name, agg, &mut translated)?;
-    }
+    translate_level(aggs, &mut translated)?;
     let query = rewrite_query(body.get("query"), &chosen)?;
     let mut inners = Vec::new();
     let mut merged: Option<Map<String, Value>> = None;
@@ -1429,9 +1605,13 @@ fn rollup_search(node: &Node, req: &Req, index: Option<&str>) -> R {
         }
         inners.push(r);
     }
-    let mut unrolled = unroll_aggs(aggs, &merged.unwrap_or_default(), typed)?;
+    let mut unrolled = unroll_aggs(aggs, &merged.unwrap_or_default(), true)?;
     if let Some(l) = live_resp.as_ref().and_then(|l| l["aggregations"].as_object()) {
-        unrolled = combine_with_live(l, unrolled);
+        unrolled = combine_with_live(aggs, l, unrolled)?;
+    }
+    drop_avg_state(&mut unrolled);
+    if typed {
+        unrolled = apply_typed(aggs, unrolled)?;
     }
     Ok(Resp::ok(final_response(&inners, live_resp.as_ref(), Some(unrolled), total_as_int)))
 }
@@ -1618,4 +1798,95 @@ fn snapshot_stats_json(mounted: &[Arc<IndexService>], level: &str, human: bool, 
         out["indices"] = Value::Object(indices);
     }
     out
+}
+
+#[cfg(test)]
+mod job_execution_tests {
+    use super::*;
+
+    fn obj(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    /// #565: helper names never collide with user names (`p.value`).
+    #[test]
+    fn helper_names_do_not_collide_with_user_aggregations() {
+        let aggs = obj(json!({"p": {"avg": {"field": "price"}}, "p.value": {"sum": {"field": "amount"}}, "x._count": {"sum": {"field": "amount"}}}));
+        let mut t = Map::new();
+        translate_level(&aggs, &mut t).unwrap();
+        assert_eq!(t.len(), 4, "{t:?}");
+        let inner = obj(json!({"a0.v": {"value": 30.0}, "a0.n": {"value": 2.0}, "a1": {"value": 200.0}, "a2": {"value": 7.0}}));
+        let mut out = unroll_aggs(&aggs, &inner, true).unwrap();
+        drop_avg_state(&mut out);
+        assert_eq!(out["p"], json!({"value": 15.0}));
+        assert_eq!(out["p.value"], json!({"value": 200.0}));
+        assert_eq!(out["x._count"], json!({"value": 7.0}));
+    }
+
+    /// #564: two complementary jobs over the same source buckets: the
+    /// document count is not doubled; both metrics survive (array and keyed).
+    #[test]
+    fn complementary_jobs_keep_bucket_counts() {
+        let aggs = obj(json!({"h": {"date_histogram": {"field": "ts", "fixed_interval": "1h"}, "aggs": {"sx": {"sum": {"field": "x"}}, "sy": {"sum": {"field": "y"}}}}}));
+        let mut t = Map::new();
+        translate_level(&aggs, &mut t).unwrap();
+        let job = |x: f64, y: f64| obj(json!({"a0": {"buckets": [{"key": 0, "doc_count": 3, "c": {"value": 100.0}, "a0": {"value": x}, "a1": {"value": y}}]}}));
+        let mut merged = job(10.0, 0.0);
+        merge_translated(&t, &mut merged, &job(0.0, 20.0));
+        let out = unroll_aggs(&aggs, &merged, true).unwrap();
+        let b = &out["h"]["buckets"][0];
+        assert_eq!(b["doc_count"], 100);
+        assert_eq!((b["sx"]["value"].as_f64(), b["sy"]["value"].as_f64()), (Some(10.0), Some(20.0)));
+        let keyed = |x: f64, y: f64| obj(json!({"a0": {"buckets": {"k": {"key": 0, "doc_count": 3, "c": {"value": 100.0}, "a0": {"value": x}, "a1": {"value": y}}}}}));
+        let mut merged = keyed(10.0, 0.0);
+        merge_translated(&t, &mut merged, &keyed(0.0, 20.0));
+        let out = unroll_aggs(&aggs, &merged, true).unwrap();
+        let b = &out["h"]["buckets"]["k"];
+        assert_eq!(b["doc_count"], 100);
+        assert_eq!(b["sy"]["value"].as_f64(), Some(20.0));
+    }
+
+    /// #563: live and rolled-up scalar metrics reduce together (empty and
+    /// nonempty live results), then typed keys are applied.
+    #[test]
+    fn live_and_rolled_metrics_reduce() {
+        let aggs = obj(json!({"s": {"sum": {"field": "amount"}}, "m": {"avg": {"field": "x"}}, "mx": {"max": {"field": "x"}}}));
+        let inner = obj(json!({"a0": {"value": 100.0}, "a1.v": {"value": 20.0}, "a1.n": {"value": 3.0}, "a2": {"value": 9.0}}));
+        let rolled = unroll_aggs(&aggs, &inner, true).unwrap();
+        let live = obj(json!({"s": {"value": 10.0}, "m": {"count": 1, "sum": 5.0, "avg": 5.0, "min": 5.0, "max": 5.0}, "mx": {"value": 12.0}}));
+        let mut out = combine_with_live(&aggs, &live, rolled.clone()).unwrap();
+        drop_avg_state(&mut out);
+        assert_eq!(out["s"]["value"].as_f64(), Some(110.0));
+        assert_eq!(out["m"]["value"].as_f64(), Some(6.25));
+        assert_eq!(out["mx"]["value"].as_f64(), Some(12.0));
+        let empty = obj(json!({"s": {"value": 0.0}, "m": {"count": 0, "sum": 0.0, "avg": null, "min": null, "max": null}, "mx": {"value": null}}));
+        let mut out = combine_with_live(&aggs, &empty, rolled).unwrap();
+        drop_avg_state(&mut out);
+        assert_eq!(out["s"]["value"].as_f64(), Some(100.0));
+        assert_eq!(out["m"]["value"].as_f64(), Some(20.0 / 3.0));
+        assert_eq!(out["mx"]["value"].as_f64(), Some(9.0));
+        let typed = apply_typed(&aggs, out).unwrap();
+        assert!(typed.contains_key("sum#s") && typed.contains_key("avg#m") && typed.contains_key("max#mx"), "{typed:?}");
+        assert!(!typed.values().any(|v| v.get(AVG_SUM).is_some()));
+        // The live search computes averages as stats.
+        assert_eq!(live_body(&json!({"aggs": {"m": {"avg": {"field": "x"}}}}))["aggs"]["m"], json!({"stats": {"field": "x"}}));
+    }
+
+    #[test]
+    fn start_is_rejected_and_jobs_report_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let e = set_job_state(&node, "missing", true).err().unwrap();
+        assert_eq!(e.status, 404);
+        ext(&node).rollup_jobs.write().insert("job1".into(), json!({"config": {"id": "job1"}, "state": "started"}));
+        let e = set_job_state(&node, "job1", true).err().unwrap();
+        assert_eq!((e.status, e.kind.as_str()), (400, "illegal_argument_exception"));
+        assert!(e.reason.contains("rollup job execution is not supported"), "{}", e.reason);
+        // A job a previous version recorded as started reports stopped.
+        let shown = job_json("job1", &ext(&node).rollup_jobs.read()["job1"]);
+        assert_eq!(shown["status"]["job_state"], "stopped");
+        let r = set_job_state(&node, "job1", false).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(ext(&node).rollup_jobs.read()["job1"]["state"], "stopped");
+    }
 }

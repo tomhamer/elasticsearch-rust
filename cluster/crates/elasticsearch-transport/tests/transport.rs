@@ -553,6 +553,9 @@ fn tls(p: &TestPki, mode: VerificationMode) -> TlsConfig {
         verification_mode: mode,
         client_authentication: ClientAuthentication::Required,
         trust_restrictions: None,
+        supported_protocols: vec![],
+        cipher_suites: vec![],
+        client_only: false,
     }
 }
 
@@ -685,6 +688,9 @@ fn testnode_tls(mode: VerificationMode, passphrase: Option<&str>) -> TlsConfig {
         verification_mode: mode,
         client_authentication: ClientAuthentication::Required,
         trust_restrictions: None,
+        supported_protocols: vec![],
+        cipher_suites: vec![],
+        client_only: false,
     }
 }
 
@@ -806,4 +812,137 @@ fn crate_indexing_data_cases() -> bool {
         && indexing_data("internal:index/shard/recovery/reuse_batch")
         && !indexing_data("internal:index/shard/recovery/start_recovery")
         && !indexing_data("internal:rest/forward")
+}
+
+// ------------------------------------------------- remote cluster connections
+
+/// A remote-cluster connection handshakes with a node of another cluster
+/// (the cluster-name check is the caller's), serves only the actions allowed
+/// to remote clusters, tells the handler who called, and stays apart from
+/// the cluster's own pool.
+#[tokio::test]
+async fn remote_cluster_connections_cross_cluster_names_and_allow_only_remote_actions() {
+    let local = start("local-cluster", "l0").await;
+    let remote = start("remote-cluster", "r0").await;
+    register_echo(&remote);
+    remote.register_handler("test:remote_echo", |req: Echo| async move {
+        let peer = inbound_remote_peer().expect("a remote-cluster caller");
+        Ok(Reply { msg: format!("{}@{}", req.msg, peer.cluster_name), doubled: req.n * 2, from: peer.node_name })
+    });
+    remote.allow_remote_action("test:remote_echo");
+    let addr = remote.bound_address();
+    // The cluster's own pool refuses another cluster.
+    assert!(local.connect(addr).await.is_err());
+    // A remote-cluster connection accepts it.
+    let id = local.connect_remote(addr, 0, RemoteConnectOptions::default()).await.unwrap();
+    assert_eq!(id.cluster_name, "remote-cluster");
+    assert_eq!(id.node.name, "r0");
+    assert!(local.remote_connection_identity(addr, 0).is_some());
+    let r: Reply = local.send_remote_request(addr, 0, "test:remote_echo", &Echo { msg: "hi".into(), n: 4 }, T).await.unwrap();
+    assert_eq!(r, Reply { msg: "hi@local-cluster".into(), doubled: 8, from: "l0".into() });
+    // Not allowed to remote clusters.
+    let e = local.send_remote_request::<_, Reply>(addr, 0, "test:echo", &Echo { msg: "x".into(), n: 1 }, T).await.unwrap_err();
+    match e {
+        TransportError::Remote(r) => {
+            assert_eq!(r.error_type, "security_exception");
+            assert_eq!(r.status, 403);
+            assert!(r.reason.contains("[test:echo]"), "{}", r.reason);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // A member of the remote cluster calling the same action is not a remote peer.
+    let member = start("remote-cluster", "r1").await;
+    let e = member.send_request::<_, Reply>(addr, "test:remote_echo", &Echo { msg: "m".into(), n: 1 }, T).await;
+    assert!(e.is_err(), "the handler requires a remote peer");
+    // Several sockets to one address (proxy mode).
+    for s in 1..3 {
+        local.connect_remote(addr, s, RemoteConnectOptions { compress: Some(RemoteCompress::True), ..Default::default() }).await.unwrap();
+    }
+    for s in 0..3 {
+        let r: Reply = local.send_remote_request(addr, s, "test:remote_echo", &Echo { msg: "s".repeat(20_000), n: s as u64 }, T).await.unwrap();
+        assert_eq!(r.doubled, 2 * s as u64);
+    }
+    // Remote connections are reported on their own channel.
+    let mut events = local.subscribe_remote();
+    local.disconnect_remote(addr, 1).await;
+    assert!(matches!(next_event(&mut events).await, ConnectionEvent::Disconnected { .. }));
+    assert!(local.remote_connection_identity(addr, 1).is_none());
+    // A forgotten slot does not reconnect on its own.
+    assert!(local.send_remote_request::<_, Reply>(addr, 1, "test:remote_echo", &Echo { msg: "x".into(), n: 1 }, T).await.is_err());
+    // A connection the peer closed reconnects with its kept options.
+    local.disconnect_remote(addr, 2).await;
+    local.connect_remote(addr, 2, RemoteConnectOptions::default()).await.unwrap();
+    let r: Reply = local.send_remote_request(addr, 2, "test:remote_echo", &Echo { msg: "back".into(), n: 3 }, T).await.unwrap();
+    assert_eq!(r.doubled, 6);
+}
+
+/// An alias may point at this node itself: the remote-cluster connection
+/// still goes over TCP and the handler still sees a remote peer.
+#[tokio::test]
+async fn remote_cluster_connection_to_self_is_a_real_connection() {
+    let a = start("self-cluster", "a").await;
+    a.register_handler("test:remote_echo", |req: Echo| async move {
+        let peer = inbound_remote_peer().expect("remote peer");
+        Ok(Reply { msg: req.msg, doubled: req.n, from: peer.cluster_name })
+    });
+    a.allow_remote_action("test:remote_echo");
+    let addr = a.bound_address();
+    a.connect_remote(addr, 0, RemoteConnectOptions::default()).await.unwrap();
+    let r: Reply = a.send_remote_request(addr, 0, "test:remote_echo", &Echo { msg: "me".into(), n: 1 }, T).await.unwrap();
+    assert_eq!(r.from, "self-cluster");
+    assert!(a.stats().server_open >= 1, "went over TCP");
+}
+
+/// Production review #291: transport `supported_protocols` and
+/// `cipher_suites` constrain negotiation. A TLS 1.3-only node and a TLS
+/// 1.2-only node cannot talk in either direction; matching policies can;
+/// a cipher list without a usable suite is refused at startup.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn tls_protocol_and_cipher_allowlists_are_enforced() {
+    let (good, _) = pki();
+    let with = |protocols: &[&str], ciphers: &[&str]| {
+        let mut c = tls(&good, VerificationMode::Certificate);
+        c.supported_protocols = protocols.iter().map(|p| p.to_string()).collect();
+        c.cipher_suites = ciphers.iter().map(|p| p.to_string()).collect();
+        c
+    };
+    let v13 = start_tls("v13", Some(with(&["TLSv1.3"], &[]))).await;
+    let v12 = start_tls("v12", Some(with(&["TLSv1.2"], &[]))).await;
+    let other13 = start_tls("o13", Some(with(&["TLSv1.3"], &[]))).await;
+    for s in [&v13, &v12, &other13] {
+        register_echo(s);
+    }
+    let echo = Echo { msg: "x".into(), n: 1 };
+    assert!(v13.send_request::<_, Reply>(v12.bound_address(), "test:echo", &echo, T).await.is_err(), "1.3-only must not reach a 1.2-only peer");
+    assert!(v12.send_request::<_, Reply>(v13.bound_address(), "test:echo", &echo, T).await.is_err(), "1.2-only must not reach a 1.3-only peer");
+    let r: Reply = v13.send_request(other13.bound_address(), "test:echo", &echo, T).await.unwrap();
+    assert_eq!(r.doubled, 2);
+    // Cipher allowlists: disjoint TLS 1.2 suites cannot agree.
+    let a = start_tls("ca", Some(with(&["TLSv1.2"], &["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]))).await;
+    let b = start_tls("cb", Some(with(&["TLSv1.2"], &["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]))).await;
+    let c = start_tls("cc", Some(with(&["TLSv1.2"], &["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]))).await;
+    register_echo(&b);
+    register_echo(&c);
+    assert!(a.send_request::<_, Reply>(b.bound_address(), "test:echo", &echo, T).await.is_err(), "no common cipher suite");
+    let r: Reply = a.send_request(c.bound_address(), "test:echo", &echo, T).await.unwrap();
+    assert_eq!(r.doubled, 2);
+    // Startup validation.
+    let settings = |k: &str, v: &str| {
+        let (k, v) = (k.to_string(), v.to_string());
+        move |key: &str| -> Option<String> {
+            match key {
+                "xpack.security.transport.ssl.enabled" => Some("true".into()),
+                "xpack.security.transport.ssl.certificate" => Some("c.pem".into()),
+                "xpack.security.transport.ssl.key" => Some("k.pem".into()),
+                _ if key == k => Some(v.clone()),
+                _ => None,
+            }
+        }
+    };
+    let list = |k: &'static str, v: &'static str| move |key: &str| if key == k { vec![v.to_string()] } else { vec![] };
+    let e = TlsConfig::from_settings(&settings("", ""), &list("xpack.security.transport.ssl.cipher_suites", "TLS_RSA_WITH_RC4_128_MD5"), std::path::Path::new("/tmp")).unwrap_err();
+    assert!(e.contains("cipher_suites"), "{e}");
+    let e = TlsConfig::from_settings(&settings("", ""), &list("xpack.security.transport.ssl.supported_protocols", "SSLv3"), std::path::Path::new("/tmp")).unwrap_err();
+    assert!(e.contains("supported_protocols"), "{e}");
 }

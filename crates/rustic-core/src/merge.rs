@@ -243,6 +243,24 @@ fn merge_segments_in_pool(dir: &dyn Directory, segments: &[Arc<Segment>], new_id
     merge_segments_mapped(dir, segments, new_id, doc_map, true, throttled, admit)
 }
 
+/// Refuse a merge into `version` that would drop what its inputs need to
+/// rebuild stored values: column-stored fields (`_version`, `_seq_no`,
+/// `_primary_term` kept only in columns) or keyword columns derived from
+/// postings (`_id`), which formats before their introduction cannot
+/// record. The inputs stay as they are (an emergency write-format cap
+/// below them merges nothing rather than losing values).
+fn downgrade_supported(segments: &[Arc<Segment>], version: u32) -> Result<()> {
+    let column_stored = version < crate::codec::COLUMN_STORED_SINCE && segments.iter().any(|s| !crate::segment::column_stored_fields(s).is_empty());
+    let derived = version < crate::codec::KEYWORD_FROM_POSTINGS_SINCE && segments.iter().any(|s| !crate::segment::keyword_from_postings_fields(s).is_empty());
+    if column_stored || derived {
+        return Err(RusticError::Unsupported(format!(
+            "cannot merge segments with {} into write format v{version}: it cannot record them; raise the write format cap",
+            if column_stored { "column-stored fields" } else { "keyword columns derived from postings" }
+        )));
+    }
+    Ok(())
+}
+
 /// How a merge's encoders admit their working memory.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MergeAdmission {
@@ -363,8 +381,28 @@ pub fn merge_auto_throttle_rate() -> u64 {
 static PENDING_MERGES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// A copy's pending merges went from `old` to `new` (see [`PENDING_MERGES`]).
+/// Each merge the policy newly wants is a merge submitted to ES 9's
+/// `ThreadPoolMergeExecutorService` (`submitMergeTask`), which adapts the
+/// IO rate to the merges submitted and not done ([`es_next_rate`]): a
+/// backlog past twice the processors raises the rate as it registers, not
+/// only as its merges get a slot (one per finished merge), so merges that
+/// cannot keep up get the disk, and then indexing is throttled
+/// ([`merge_auto_rate_at_max`]), as soon as ES would.
 pub fn note_pending_merges(old: usize, new: usize) {
-    PENDING_MERGES.fetch_add(new as i64 - old as i64, std::sync::atomic::Ordering::AcqRel);
+    let delta = new as i64 - old as i64;
+    let pending = PENDING_MERGES.fetch_add(delta, std::sync::atomic::Ordering::AcqRel) + delta;
+    if delta > 0 {
+        let active = ACTIVE_MERGES.load(std::sync::atomic::Ordering::Acquire) as i64 + pending.max(0);
+        let ceil = throttle_ceil_merges();
+        let _ = AUTO_RATE.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed,
+            |rate| Some(rate_after_submissions(rate, delta as u64, active, ceil)));
+    }
+}
+
+/// The rate after `submitted` merges were submitted with `active` merges
+/// submitted and not done (ES adapts it once per submitted merge).
+fn rate_after_submissions(rate: u64, submitted: u64, active: i64, ceil: i64) -> u64 {
+    (0..submitted.min(64)).fold(rate, |rate, _| es_next_rate(rate, active, ceil))
 }
 
 fn merges_backlogged() -> bool {
@@ -453,9 +491,22 @@ fn begin_merge_io(bytes: Option<u64>) -> ActiveMerge {
     if bytes.is_some() {
         let active = running + PENDING_MERGES.load(std::sync::atomic::Ordering::Acquire).max(0);
         let ceil = throttle_ceil_merges();
-        let _ = AUTO_RATE.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |rate| Some(es_next_rate(rate, active, ceil)));
+        let _ = AUTO_RATE.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |rate| Some(start_next_rate(rate, active, ceil)));
     }
     ActiveMerge
+}
+
+/// The rate as a merge starts: ES's rule for each merge task it runs
+/// ([`es_next_rate`]): down below [`THROTTLE_FLOOR_MERGES`], up 20% when it
+/// starts behind a backlog past [`throttle_ceil_merges`] ("merges falling
+/// behind: raise the rate"), else held. Raising only as merges register
+/// (and never as backlogged ones start) left the rate low whenever the
+/// backlog was mostly running rather than queued, which ES 9's merge pool
+/// makes the usual case: a 5M-doc bulk load spent 77% more time throttled
+/// than with this rule (2,790 s against 1,579 s) and ended with more
+/// segments.
+fn start_next_rate(rate: u64, active: i64, ceil: i64) -> u64 {
+    es_next_rate(rate, active, ceil)
 }
 
 /// The adaptive throttle's controller (pure; the node-wide rate is a thin
@@ -652,6 +703,30 @@ pub fn merge_pressure_rate() -> u64 {
     if r >= PRESSURE_CEILING { 0 } else { r }
 }
 
+/// A node-wide search-time merge rate (the IO-pressure or search-queue
+/// rate) as one running merge's share: the rate split over the merges
+/// running now, at least [`SEARCH_SHARE_FLOOR`] each.
+///
+/// Both rates bound what merges write while the node searches. Applied to
+/// each merge alone, the merge IO let through grew with the number of
+/// merges a bulk load left running into the first searches: after a wiki
+/// bulk load with a replica (two nodes on one box) idle text search p99
+/// was 2.5 s. Split, the search-time total stays the same whatever the
+/// concurrency (with both search-time limits off, text r1 idle p99 was 2.6 s
+/// even with the merge concurrency caps); merges with nobody searching are
+/// never limited by it.
+fn per_running_merge(rate: u64) -> u64 {
+    split_rate(rate, ACTIVE_MERGES.load(std::sync::atomic::Ordering::Acquire) as u64)
+}
+
+/// The least a running merge's share of a search-time rate falls to.
+const SEARCH_SHARE_FLOOR: u64 = 1 << 20;
+
+/// `rate` split over `running` merges (pure; see [`per_running_merge`]).
+fn split_rate(rate: u64, running: u64) -> u64 {
+    (rate / running.max(1)).max(SEARCH_SHARE_FLOOR.min(rate))
+}
+
 /// `limit` (`0`: unlimited) further bounded by `pressure` (pure).
 fn with_pressure(limit: u64, pressure: Option<u64>) -> u64 {
     match pressure {
@@ -665,7 +740,7 @@ fn with_pressure(limit: u64, pressure: Option<u64>) -> u64 {
 /// rate, whichever is lower.
 fn write_limit(search_aware: bool) -> u64 {
     let base = merge_io_limit();
-    match search_aware.then(search_rate).flatten() {
+    match search_aware.then(search_rate).flatten().map(per_running_merge) {
         Some(s) if base == 0 || s < base => s,
         _ => base,
     }
@@ -823,8 +898,8 @@ fn throttle_merge_write(bucket: &mut Option<(std::time::Instant, f64)>, bytes: u
     // `io`: the IO limit applies (a big merge, a vector rebuild); a small
     // merge takes the search pressure only.
     let limit_now = || {
-        let base = if io { write_limit(search_aware) } else { search_aware.then(search_rate).flatten().unwrap_or(0) };
-        with_pressure(base, pressure_rate())
+        let base = if io { write_limit(search_aware) } else { search_aware.then(search_rate).flatten().map(per_running_merge).unwrap_or(0) };
+        with_pressure(base, pressure_rate().map(per_running_merge))
     };
     let limit = limit_now();
     if limit == 0 {
@@ -981,12 +1056,23 @@ pub static MERGE_TOTALS: MergeTotals = MergeTotals {
 /// `merges.total_throttled_time`.
 pub static MERGE_OWN_THROTTLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// ES's `merges.total_throttled_time`, node-wide, in nanoseconds: the
+/// merges' own write-throttle sleeps and their search pacing sleeps
+/// ([`merge_pace`]). ES counts all the time its merges are held back
+/// there; with the pacing left out, a merge parked behind searches looked
+/// unthrottled in the stats.
+pub fn merge_throttled_ns() -> u64 {
+    MERGE_OWN_THROTTLE_NS.load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(PACE_SLEEP_NS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Merge throttle and pacing sleeps so far, node-wide, in nanoseconds.
 pub fn merge_sleep_ns() -> (u64, u64) {
     (THROTTLE_SLEEP_NS.load(std::sync::atomic::Ordering::Relaxed), PACE_SLEEP_NS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn merge_segments_mapped(dir: &dyn Directory, segments: &[Arc<Segment>], new_id: u32, doc_map: DocMap, attach_vectors: bool, throttled: bool, admit: MergeAdmission) -> Result<Segment> {
+    downgrade_supported(segments, crate::codec::write_version())?;
     // Only merges count toward (and adapt) the merge throttle.
     let input_bytes: u64 = segments.iter().map(|s| s.segment_bytes()).sum();
     let _active = throttled.then(|| begin_merge_io(Some(input_bytes)));
@@ -1024,10 +1110,31 @@ fn merge_segments_mapped_inner(dir: &dyn Directory, segments: &[Arc<Segment>], n
     let io = throttled && input_bytes >= MIN_BIG_MERGE_BYTES && !forced;
     let own_sleep = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut w = SegmentFileWriter::with_version(Box::new(ThrottledOutput { inner: dir.create_output_unsynced(&segment_file_name(new_id))?, throttled, io, bucket: None, slept: Some(own_sleep.clone()) }), version)?;
+    // From v38 every section goes straight into the segment file, written
+    // once as Lucene writes a merged segment's files: the dictionary's
+    // blocks between the postings runs, and the stored fields and doc
+    // values, built alongside the postings into a bounded buffer, then on
+    // into the file after them. Earlier formats spool the dictionary's
+    // blocks and the columns to scratch files and copy them back.
+    let streamed = version >= crate::codec::INTERLEAVED_TERMS_SINCE;
+    let head_cap = (crate::admission::shared().background_limit() / 16).clamp(4 << 20, 256 << 20);
+    #[cfg(test)]
+    let head_cap = match TEST_HEAD_CAP.load(std::sync::atomic::Ordering::Relaxed) { 0 => head_cap, n => n };
     let (postings, rest) = paced_join(
         || {
             timed(t_postings, || profile_stage(profile, "postings", || {
                 w.begin_section(SECTION_POSTINGS)?;
+                if streamed {
+                    let start = w.position();
+                    let mut postings = stream_postings_with(segments, &doc_map, &merged_norms, POSTINGS_WINDOW_TERMS, version >= crate::codec::IMPACTS_SINCE, version >= crate::codec::INLINE_POSTINGS_SINCE, version >= crate::codec::COMPACT_TERMS_SINCE, version >= crate::codec::INLINE_POSITIONS_SINCE, version >= crate::codec::PACKED_TERMS_SINCE, version >= crate::codec::INT_TERMS_SINCE, admit, true, |b| w.write(b), None)?;
+                    // The rest of the dictionary right after the postings.
+                    w.write(&postings.terms)?;
+                    let end = w.position();
+                    w.set_section(SECTION_POSTINGS, start, postings.postings_end);
+                    w.set_section(SECTION_TERMS, start, end - start);
+                    postings.terms = Vec::new();
+                    return Ok::<_, crate::error::RusticError>((postings, None, None));
+                }
                 // The merged dictionary's blocks spill to a scratch file
                 // as they fill; the terms section copies them back.
                 static NEXT_TERMS_SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1038,7 +1145,7 @@ fn merge_segments_mapped_inner(dir: &dyn Directory, segments: &[Arc<Segment>], n
                     Some(&mut |b: &[u8]| { spilled += b.len(); spill_out.write_all(b) }))?;
                 spill_out.finish()?;
                 let head = if spilled > 0 { Some(dir.open_read(&scratch.name)?) } else { None };
-                Ok::<_, crate::error::RusticError>((postings, head, scratch))
+                Ok::<_, crate::error::RusticError>((postings, head, Some(scratch)))
             }))
         },
         || -> Result<_> {
@@ -1048,10 +1155,28 @@ fn merge_segments_mapped_inner(dir: &dyn Directory, segments: &[Arc<Segment>], n
             // which need the merged postings' totals, are added after.
             let ((store, (fast, vectors)), extra) = paced_join(
                 || paced_join(
-                    || timed(t_store, || profile_stage(profile, "store", || if doc_map.is_sorted() { merge_store_sorted_versioned(dir, new_id, segments, &doc_map, version, &crate::admission::shared()) } else { merge_store(segments, &doc_map, version) })),
+                    || timed(t_store, || profile_stage(profile, "store", || if doc_map.is_sorted() {
+                        // A sorting merge's store: its head buffered here,
+                        // the rest written after the postings.
+                        let mut merge = SortedStoreMerge::new(segments, &doc_map, version, &crate::admission::shared())?;
+                        let buffered = std::cell::Cell::new(0u64);
+                        let mut head = Vec::new();
+                        let done = merge.run(&mut |chunk| {
+                            if let StoreChunk::Rewritten(b) = &chunk { buffered.set(buffered.get() + b.len() as u64); }
+                            head.push(chunk);
+                            Ok(())
+                        }, &|| buffered.get() >= head_cap)?;
+                        Ok(MergeStoreOut::Sorted { merge, head, done })
+                    } else {
+                        merge_store(segments, &doc_map, version).map(MergeStoreOut::Ready)
+                    })),
                     || {
                         paced_join(
-                            || timed(t_fast, || profile_stage(profile, "fast_fields", || spool_fast_fields(dir, new_id, segments, &doc_map, &merged_norms, admit, version))),
+                            || timed(t_fast, || profile_stage(profile, "fast_fields", || if streamed {
+                                buffer_fast_fields(segments, &doc_map, &merged_norms, admit, version, head_cap).map(MergeFastOut::Streamed)
+                            } else {
+                                spool_fast_fields(dir, new_id, segments, &doc_map, &merged_norms, admit, version).map(MergeFastOut::Spooled)
+                            })),
                             || timed(t_points, || profile_stage(profile, "point_map", || merge_point_map(segments, &doc_map))),
                         )
                     },
@@ -1062,19 +1187,40 @@ fn merge_segments_mapped_inner(dir: &dyn Directory, segments: &[Arc<Segment>], n
         },
     );
     let (postings, terms_head, _terms_scratch) = postings?;
-    let (mut store, fast, vectors, extra) = rest?;
+    let (store, fast, vectors, extra) = rest?;
     w.begin_section(SECTION_STORE)?;
-    for piece in store.pieces() {
-        w.write(piece)?;
-    }
-    let uids = store.uids.take();
-    drop(store);
+    let uids = match store {
+        MergeStoreOut::Ready(mut store) => {
+            for piece in store.pieces() {
+                w.write(piece)?;
+            }
+            let uids = store.uids.take();
+            drop(store);
+            uids
+        }
+        MergeStoreOut::Sorted { mut merge, head, done } => {
+            for chunk in head {
+                w.write(chunk.bytes())?;
+            }
+            if !done {
+                timed(t_store, || merge.run(&mut |chunk| w.write(chunk.bytes()), &|| false))?;
+            }
+            let (table, uids, metadata) = merge.finish(&crate::admission::shared())?;
+            w.write(&table)?;
+            drop(metadata);
+            uids
+        }
+    };
     w.begin_section(SECTION_FAST)?;
-    w.write(&fast.directory)?;
-    for chunk in fast.bodies.as_slice().chunks(1024 * 1024) {
-        w.write(chunk)?;
+    match fast {
+        MergeFastOut::Spooled(fast) => {
+            w.write(&fast.directory)?;
+            for chunk in fast.bodies.as_slice().chunks(1024 * 1024) {
+                w.write(chunk)?;
+            }
+        }
+        MergeFastOut::Streamed(head) => timed(t_fast, || write_fast_fields_streamed(&mut w, head, segments, &doc_map, &merged_norms, admit, version))?,
     }
-    drop(fast);
     w.begin_section(SECTION_VECTORS)?;
     w.write(&vectors)?;
     // The statistics entries, then the other entries' encoded bodies (no
@@ -1091,13 +1237,15 @@ fn merge_segments_mapped_inner(dir: &dyn Directory, segments: &[Arc<Segment>], n
         if !uid_entry.is_empty() { w.write(&uid_entry[4..])?; }
     }
     drop(extra);
-    w.begin_section(SECTION_TERMS)?;
-    if let Some(head) = &terms_head {
-        for chunk in head.as_slice().chunks(1024 * 1024) {
-            w.write(chunk)?;
+    if !streamed {
+        w.begin_section(SECTION_TERMS)?;
+        if let Some(head) = &terms_head {
+            for chunk in head.as_slice().chunks(1024 * 1024) {
+                w.write(chunk)?;
+            }
         }
+        w.write(&postings.terms)?;
     }
-    w.write(&postings.terms)?;
     timed(t_finish, || profile_stage(profile, "finish", || w.finish(num_docs)))?;
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1570,6 +1718,9 @@ struct MergedPostings {
     /// Sum of the merged terms' total term frequencies per field.
     field_ttf: BTreeMap<u16, u64>,
     terms: Vec<u8>,
+    /// Bytes from the postings section's start to its last postings byte
+    /// (an interleaved dictionary's blocks included).
+    postings_end: u64,
     _memory: crate::admission::Reservation,
 }
 
@@ -1882,8 +2033,23 @@ fn run_batches(peaks: &[u64], cap: u64) -> Vec<std::ops::Range<usize>> {
 /// Each window's lists are re-encoded in parallel over runs of roughly equal
 /// work and written in term order, so the section's bytes do not depend on
 /// the window or run boundaries.
-fn stream_postings(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNorms, window_terms: usize, impacts: bool, inline: bool, compact: bool, inline_positions: bool, packed: bool, int_keys: bool, admit: MergeAdmission, mut out: impl FnMut(&[u8]) -> Result<()>, mut spill: Option<&mut dyn FnMut(&[u8]) -> Result<()>>) -> Result<MergedPostings> {
+#[allow(clippy::too_many_arguments)]
+fn stream_postings(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNorms, window_terms: usize, impacts: bool, inline: bool, compact: bool, inline_positions: bool, packed: bool, int_keys: bool, admit: MergeAdmission, out: impl FnMut(&[u8]) -> Result<()>, spill: Option<&mut dyn FnMut(&[u8]) -> Result<()>>) -> Result<MergedPostings> {
+    stream_postings_with(segments, doc_map, norms, window_terms, impacts, inline, compact, inline_positions, packed, int_keys, admit, false, out, spill)
+}
+
+/// [`stream_postings`]; `interleave` (segment format
+/// [`crate::codec::INTERLEAVED_TERMS_SINCE`]+, no `spill`): the
+/// dictionary's closed blocks go to `out` too, between postings runs, as
+/// they fill (an interleaved dictionary, see [`crate::codec::terms`]):
+/// its offsets and the postings' count from the first byte given to `out`,
+/// and what it returns is the rest of the terms section, to be written
+/// right after.
+#[allow(clippy::too_many_arguments)]
+fn stream_postings_with(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNorms, window_terms: usize, impacts: bool, inline: bool, compact: bool, inline_positions: bool, packed: bool, int_keys: bool, admit: MergeAdmission, interleave: bool, mut out: impl FnMut(&[u8]) -> Result<()>, mut spill: Option<&mut dyn FnMut(&[u8]) -> Result<()>>) -> Result<MergedPostings> {
     use rayon::prelude::*;
+    let spills = spill.is_some() || interleave;
+    let mut postings_end = 0u64;
     let budget = crate::admission::shared();
     let mut memory = admit.reserve(&budget, 4096, "merge term dictionary")?;
     let mut merger = TermMerger::new(segments)?;
@@ -1941,7 +2107,7 @@ fn stream_postings(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNo
                     // bytes of lengths/counters, a block's first key (1 in
                     // 16 terms) and its index entries, at twice its length
                     // for geometric growth, and finish appends in place.
-                    if spill.is_none() {
+                    if !spills {
                         memory.grow((terms.key(t).len() as u64).saturating_mul(3).saturating_add(96), "merge term dictionary growth")?;
                     }
                     *field_ttf.entry(field).or_default() += loc.total_term_freq;
@@ -1951,6 +2117,11 @@ fn stream_postings(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNo
             }
             out(&bytes)?;
             base += bytes.len() as u64;
+            postings_end = base;
+            if interleave {
+                // The blocks not yet written land after these postings.
+                dict.skip(bytes.len());
+            }
             // The dictionary's closed blocks go to the spill as they fill: a
             // merge of segments with many unique terms (dynamic text fields,
             // one value per doc) held its whole merged dictionary until the
@@ -1959,9 +2130,15 @@ fn stream_postings(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNo
             // What the writer holds is then charged as measured (its
             // unspilled blocks, the first keys and the block index), not
             // per term as when the whole dictionary stays in memory.
-            if let Some(spill) = spill.as_mut() {
+            if spills {
                 if let Some(blocks) = dict.take_spill(TERMS_SPILL_BYTES) {
-                    spill(&blocks)?;
+                    match spill.as_mut() {
+                        Some(spill) => spill(&blocks)?,
+                        None => {
+                            out(&blocks)?;
+                            base += blocks.len() as u64;
+                        }
+                    }
                 }
                 let retained = (dict.retained_bytes() as u64).saturating_add((field_ttf.len() as u64).saturating_mul(2048)).saturating_add(4096);
                 if retained > memory.bytes() {
@@ -1976,7 +2153,7 @@ fn stream_postings(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNo
     let terms = dict.finish(doc_map.num_docs());
     let retained = (terms.capacity() as u64).saturating_add((field_ttf.len() as u64).saturating_mul(2048));
     memory.shrink(memory.bytes().saturating_sub(retained));
-    Ok(MergedPostings { field_ttf, terms, _memory: memory })
+    Ok(MergedPostings { field_ttf, terms, postings_end, _memory: memory })
 }
 
 // ---- fast fields ------------------------------------------------------------
@@ -2027,6 +2204,103 @@ impl Drop for MergeScratch<'_> {
     }
 }
 
+/// Tests: the bytes of stored chunks and columns a merge buffers while
+/// its postings are written (0: the default).
+#[cfg(test)]
+static TEST_HEAD_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A merge's stored fields as built alongside its postings.
+enum MergeStoreOut<'a> {
+    /// Every chunk (copied from the inputs or rewritten in memory).
+    Ready(MergedStore<'a>),
+    /// A sorting merge's head (`done`: all of it), the rest to be written
+    /// straight into the segment file ([`SortedStoreMerge`]).
+    Sorted { merge: SortedStoreMerge<'a>, head: Vec<StoreChunk<'a>>, done: bool },
+}
+
+/// A merge's doc values as built alongside its postings.
+enum MergeFastOut {
+    /// Spooled to a scratch file (formats before
+    /// [`crate::codec::FAST_TRAILER_SINCE`]).
+    Spooled(MergedFastFields),
+    /// The first columns, buffered ([`buffer_fast_fields`]).
+    Streamed(BufferedFastFields),
+}
+
+/// The leading columns of a streamed fast-field section, built while the
+/// postings are written, and the column group to go on from.
+struct BufferedFastFields {
+    pieces: Vec<(u16, u8, crate::admission::Allocation<Vec<u8>>)>,
+    next: Option<usize>,
+}
+
+/// Columns in the merge's order until about `cap` bytes are buffered (the
+/// rest is written straight into the segment file, see
+/// [`write_fast_fields_streamed`]).
+fn buffer_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNorms, admit: MergeAdmission, version: u32, cap: u64) -> Result<BufferedFastFields> {
+    let buffered = std::cell::Cell::new(0u64);
+    let mut pieces = Vec::new();
+    let mut emit = |field: u16, tag: u8, body: &[u8]| -> Result<()> {
+        let memory = crate::admission::shared().reserve((body.len() as u64).saturating_add(64), "buffered fast column")?;
+        buffered.set(buffered.get() + body.len() as u64);
+        pieces.push((field, tag, crate::admission::Allocation::new(body.to_vec(), memory)));
+        Ok(())
+    };
+    let stop = || buffered.get() >= cap;
+    let next = if doc_map.is_sorted() {
+        stream_fast_fields_sorted(segments, doc_map, norms, admit, version, 0, &stop, &mut emit)?
+    } else {
+        stream_fast_fields(segments, doc_map, norms, true, admit, version, 0, &stop, &mut emit)?
+    };
+    Ok(BufferedFastFields { pieces, next })
+}
+
+/// Write the fast-field section (just begun in `w`) in the trailer layout
+/// ([`crate::codec::fastfields::parse_column_directory`]): the buffered
+/// columns, the others as they are built, then the column directory.
+#[allow(clippy::too_many_arguments)]
+fn write_fast_fields_streamed(w: &mut SegmentFileWriter<'_>, head: BufferedFastFields, segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNorms,
+    admit: MergeAdmission, version: u32) -> Result<()> {
+    let start = w.position();
+    w.write(&[0u8])?;
+    let mut entries: Vec<(u16, u8, u64, u64)> = Vec::new();
+    {
+        // Consecutive bodies of one column concatenate (a column built in
+        // pieces, see `merge_keyword_by_ordinal`).
+        let mut emit = |field: u16, tag: u8, body: &[u8]| -> Result<()> {
+            let offset = w.position() - start;
+            w.write(body)?;
+            match entries.last_mut() {
+                Some((f, t, _, len)) if *f == field && *t == tag => *len += body.len() as u64,
+                _ => entries.push((field, tag, offset, body.len() as u64)),
+            }
+            Ok(())
+        };
+        for (field, tag, body) in head.pieces {
+            emit(field, tag, &body)?;
+        }
+        if let Some(next) = head.next {
+            if doc_map.is_sorted() {
+                stream_fast_fields_sorted(segments, doc_map, norms, admit, version, next, &|| false, &mut emit)?;
+            } else {
+                stream_fast_fields(segments, doc_map, norms, true, admit, version, next, &|| false, &mut emit)?;
+            }
+        }
+    }
+    entries.sort_unstable_by_key(|&(field, tag, _, _)| (field, tag));
+    let mut directory = Vec::new();
+    write_vint(entries.len() as u64, &mut directory);
+    for (field, tag, offset, len) in entries {
+        directory.extend_from_slice(&field.to_le_bytes());
+        directory.push(tag);
+        write_vint(offset, &mut directory);
+        write_vint(len, &mut directory);
+    }
+    let at = w.position() - start;
+    w.write(&directory)?;
+    w.write(&at.to_le_bytes())
+}
+
 /// `version`: the merged file's format, as its header.
 fn spool_fast_fields(dir: &dyn Directory, new_id: u32, segments: &[Arc<Segment>], doc_map: &DocMap, norms: &MergedNorms, admit: MergeAdmission, version: u32) -> Result<MergedFastFields> {
     static NEXT_SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2049,9 +2323,9 @@ fn spool_fast_fields(dir: &dyn Directory, new_id: u32, segments: &[Arc<Segment>]
         Ok(())
     };
     if doc_map.is_sorted() {
-        stream_fast_fields_sorted(segments, doc_map, norms, admit, version, &mut emit)?;
+        stream_fast_fields_sorted(segments, doc_map, norms, admit, version, 0, &|| false, &mut emit)?;
     } else {
-        stream_fast_fields(segments, doc_map, norms, true, admit, version, &mut emit)?;
+        stream_fast_fields(segments, doc_map, norms, true, admit, version, 0, &|| false, &mut emit)?;
     }
     output.finish()?;
     let bodies = dir.open_read(&scratch.name)?;
@@ -2073,7 +2347,7 @@ fn spool_fast_fields(dir: &dyn Directory, new_id: u32, segments: &[Arc<Segment>]
 #[cfg(test)]
 fn merge_fast_fields_impl(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms: &MergedNorms, keywords_by_ordinal: bool) -> Vec<u8> {
     let mut columns: Vec<(u16, u8, Vec<u8>)> = Vec::new();
-    stream_fast_fields(segments, doc_map, merged_norms, keywords_by_ordinal, MergeAdmission::Background(std::time::Duration::ZERO), crate::codec::write_version(), &mut |f, t, b| {
+    stream_fast_fields(segments, doc_map, merged_norms, keywords_by_ordinal, MergeAdmission::Background(std::time::Duration::ZERO), crate::codec::write_version(), 0, &|| false, &mut |f, t, b| {
         match columns.last_mut() {
             Some((lf, lt, body)) if *lf == f && *lt == t => body.extend_from_slice(b),
             _ => columns.push((f, t, b.to_vec())),
@@ -2178,8 +2452,13 @@ fn fast_column_memory(segments: &[Arc<Segment>], doc_map: &DocMap, field: u16, o
 }
 
 /// `keywords_by_ordinal` is false only for the test reference implementation.
+///
+/// Columns from group `from` on (in the order the merge writes them);
+/// `stop()` is asked before each batch of columns: `Some(group)` when it
+/// paused there (call again from it), `None` once every column is out.
+#[allow(clippy::too_many_arguments)]
 fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms: &MergedNorms, keywords_by_ordinal: bool, admit: MergeAdmission,
-    version: u32, emit: &mut dyn FnMut(u16, u8, &[u8]) -> Result<()>) -> Result<()> {
+    version: u32, from: usize, stop: &dyn Fn() -> bool, emit: &mut dyn FnMut(u16, u8, &[u8]) -> Result<()>) -> Result<Option<usize>> {
     let _metadata = fast_merge_metadata(segments)?;
     let profile = tracing::enabled!(target: "merge_profile", tracing::Level::DEBUG);
     let started = profile.then(std::time::Instant::now);
@@ -2200,6 +2479,8 @@ fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms:
             1 => 7,
             2 => 8,
             3 => 9,
+            // A boolean field multi-valued in some segment: its 0/1 column.
+            4 => 7,
             5 => 10,
             // Feature values merge with the multi-valued keyword column of
             // the field (the encoder picks the output layout).
@@ -2221,11 +2502,14 @@ fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms:
     }
     groups.sort_unstable();
     let from_postings = keyword_from_postings_union(segments);
-    for (field, out, tags) in groups {
+    // Each column is independent: they are built a few at a time on the
+    // merge pool, each into its own buffer, then written in order (the
+    // same bytes as one at a time), as a sorting merge builds them.
+    let one = |field: u16, out: u8, tags: &[u8], emit: &mut dyn FnMut(u16, u8, &[u8]) -> Result<()>| -> Result<()> {
         // No column where an input has none: the merged segment derives
         // the field's values from its (merged) postings and stored fields.
         if from_postings.contains(&field) && (out == TAG_KEYWORD || out == TAG_MULTI_KEYWORD) {
-            continue;
+            return Ok(());
         }
         merge_pace(num_docs as u64);
         // Feature columns hold no term table to map ordinals through.
@@ -2237,7 +2521,7 @@ fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms:
 
         if by_ordinal {
             merge_keyword_by_ordinal(segments, doc_map, field, out, version, emit)?;
-            continue;
+            return Ok(());
         }
         // Feature columns only: their tables and packed pairs merge
         // directly, without decoding each value to its string.
@@ -2247,7 +2531,7 @@ fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms:
             if let Some(body) = crate::codec::fastfields::merge_features(&inputs, &|i, old| doc_map.new_id(i, old), num_docs) {
                 emit(field, TAG_FEATURES, &body)?;
             }
-            continue;
+            return Ok(());
         }
         if out == 6 {
             // Norms: already merged (one copy per segment without deletions).
@@ -2259,11 +2543,11 @@ fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms:
                 col.set_total(*total);
             }
             emit_fast_columns(&ff, num_docs, version, emit)?;
-            continue;
+            return Ok(());
         }
         for (i, seg) in segments.iter().enumerate() {
             let reader = seg.fast_fields();
-            for &tag in &tags {
+            for &tag in tags {
             let live = (0..seg.num_docs).filter_map(|old| doc_map.new_id(i, old).map(|new| (old, new)));
             macro_rules! numeric {
                 ($get:ident, $single:ident, $multi:ident) => {
@@ -2291,6 +2575,15 @@ fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms:
                 1 => numeric!(get_i64, i64_column_mut, multi_i64_column_mut),
                 2 => numeric!(get_u64, u64_column_mut, multi_u64_column_mut),
                 3 => numeric!(get_f64, f64_column_mut, multi_f64_column_mut),
+                4 if out == 7 => {
+                    if let Some(c) = reader.get_bool(field) {
+                        for (old, new) in live {
+                            if c.has_value(old) {
+                                ff.multi_i64_column_mut(field).push(new, c.get(old) as i64);
+                            }
+                        }
+                    }
+                }
                 4 => {
                     if let Some(c) = reader.get_bool(field) {
                         let mut live = live.peekable();
@@ -2372,13 +2665,42 @@ fn stream_fast_fields(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms:
             }
         }
         emit_fast_columns(&ff, num_docs, version, emit)?;
+        Ok(())
+    };
+    let enabled = PACING_ENABLED.with(|p| p.get());
+    let admission = crate::admission::Context::capture();
+    let mut at = 0usize;
+    for batch in groups.chunks(FAST_COLUMN_BATCH) {
+        let first = at;
+        at += batch.len();
+        if first < from {
+            continue;
+        }
+        if stop() {
+            return Ok(Some(first));
+        }
+        use rayon::prelude::*;
+        let built: Vec<Result<Vec<(u16, u8, crate::admission::Allocation<Vec<u8>>)>>> = batch.par_iter().map(|(field, out, tags)| admission.run(|| with_pacing(enabled, || {
+            let mut pieces = Vec::new();
+            one(*field, *out, tags, &mut |f, t, b| {
+                let memory = crate::admission::shared().reserve((b.len() as u64).saturating_add(64), "buffered fast column")?;
+                pieces.push((f, t, crate::admission::Allocation::new(b.to_vec(), memory)));
+                Ok(())
+            })?;
+            Ok(pieces)
+        }))).collect();
+        for pieces in built {
+            for (f, t, b) in pieces? {
+                emit(f, t, &b)?;
+            }
+        }
     }
     if let Some(started) = started {
         tracing::debug!(target: "merge_profile", stage="fast_collect", elapsed_us=started.elapsed().as_micros() as u64, "segment merge stage (spans overlap)");
     }
     // The encoder builds disk indexes from raw values/presence. Building
     // the mutable columns' query indexes here only repeats scans and sorts.
-    Ok(())
+    Ok(None)
 }
 
 /// Keyword fields some input has no column for ([`crate::codec::EXTRA_KEYWORD_FROM_POSTINGS`]).
@@ -2663,7 +2985,15 @@ struct MergedStore<'a> {
 enum StoreChunk<'a> {
     Copied(&'a [u8]),
     Rewritten(crate::admission::Allocation<Vec<u8>>),
-    Mapped(FileSlice),
+}
+
+impl StoreChunk<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            StoreChunk::Copied(b) => b,
+            StoreChunk::Rewritten(b) => b.as_slice(),
+        }
+    }
 }
 
 impl<'a> MergedStore<'a> {
@@ -2671,7 +3001,6 @@ impl<'a> MergedStore<'a> {
         self.chunks.iter().map(|c| match c {
             StoreChunk::Copied(b) => *b,
             StoreChunk::Rewritten(b) => b.as_slice(),
-            StoreChunk::Mapped(b) => b.as_slice(),
         }).chain(std::iter::once(self.table.as_slice()))
     }
 }
@@ -2756,8 +3085,13 @@ impl IdPlan {
             return Ok(None);
         }
         let Some(field) = self.field.or_else(|| self.seen.get().copied()) else { return Ok(None) };
-        // The id references and the encoded column (about 2 bytes a doc).
-        let _memory = budget.reserve(ids.len() as u64 * 24 + 4096, "merge id column")?;
+        // The encoder's workspace: the id references, its body and its
+        // output (each at most the ids' bytes plus a few per doc). The
+        // column itself is then charged to the merge's retained metadata
+        // by the caller.
+        let refs = ids.len() as u64 * 24;
+        let body = ids.id_bytes() as u64 + ids.len() as u64 * 4 + 4096;
+        let _memory = budget.reserve(refs + 2 * body, "merge id column")?;
         Ok(Some((field, crate::codec::uid_column::encode(&ids.refs()))))
     }
 }
@@ -2801,19 +3135,24 @@ fn merge_store_with_budget<'a>(segments: &'a [Arc<Segment>], doc_map: &DocMap, v
             plan.push((i, c, dirty));
         }
     }
-    let rewrite = |&(i, c, dirty): &(usize, usize, bool)| -> Result<(StoreChunk<'a>, usize, IdList)> {
+    const IDS: &str = "merge ids";
+    let rewrite = |&(i, c, dirty): &(usize, usize, bool)| -> Result<(StoreChunk<'a>, usize, IdList, crate::admission::Reservation)> {
         let r = &readers[i];
         let (start, n) = r.chunk_docs(c);
+        // The chunk's ids, admitted as they are gathered (kept until they
+        // join the merged list).
         let mut chunk_ids = IdList::default();
+        let mut id_memory = budget.reserve(0, IDS)?;
         let mut cursor = ids.cursor(segments, i);
         if !dirty {
             // Every doc is live: the ids of the input's column (or none).
             if ids.out {
                 for d in start..start + n {
-                    chunk_ids.push(match &mut cursor { Some(cur) => cur.get(d)?, None => None });
+                    let id = match &mut cursor { Some(cur) => cur.get(d)?, None => None };
+                    chunk_ids.push_admitted(id, &mut id_memory, IDS)?;
                 }
             }
-            return Ok((StoreChunk::Copied(r.raw_chunk(c)), n as usize, chunk_ids));
+            return Ok((StoreChunk::Copied(r.raw_chunk(c)), n as usize, chunk_ids, id_memory));
         }
         merge_pace(PACE_UNITS / 8);
         // Raw input, kept bytes, compression output and compressor scratch
@@ -2841,17 +3180,17 @@ fn merge_store_with_budget<'a>(segments: &'a [Arc<Segment>], doc_map: &DocMap, v
                 // or read off the input's), or back into the doc.
                 let joined;
                 let body = match (ids.out, &mut cursor) {
-                    (true, Some(cur)) => { chunk_ids.push(cur.get(start + d)?); body }
+                    (true, Some(cur)) => { chunk_ids.push_admitted(cur.get(start + d)?, &mut id_memory, IDS)?; body }
                     (true, None) if r.chunk_compact(c) => {
                         let mut framed = Vec::with_capacity(len + 4);
                         let found = crate::codec::store::split_uid(body, &mut framed)?;
-                        chunk_ids.push(found.as_ref().map(|(_, id)| id.as_slice()));
+                        chunk_ids.push_admitted(found.as_ref().map(|(_, id)| id.as_slice()), &mut id_memory, IDS)?;
                         if let Some((f, _)) = found { ids.saw(f); }
                         kept.extend_from_slice(&framed);
                         live += 1;
                         continue;
                     }
-                    (true, None) => { chunk_ids.push(None); body }
+                    (true, None) => { chunk_ids.push_admitted(None, &mut id_memory, IDS)?; body }
                     (false, Some(cur)) => match cur.get(start + d)? {
                         Some(id) => {
                             let mut framed = Vec::with_capacity(len + id.len() + 8);
@@ -2878,7 +3217,7 @@ fn merge_store_with_budget<'a>(segments: &'a [Arc<Segment>], doc_map: &DocMap, v
             drop(kept);
             drop(raw);
             memory.shrink(memory.bytes());
-            return Ok((StoreChunk::Rewritten(crate::admission::Allocation::new(Vec::new(), memory)), 0, chunk_ids));
+            return Ok((StoreChunk::Rewritten(crate::admission::Allocation::new(Vec::new(), memory)), 0, chunk_ids, id_memory));
         }
         let compact = r.chunk_compact(c) && !downgrade;
         // Binary ids written back as keywords below v31.
@@ -2889,11 +3228,12 @@ fn merge_store_with_budget<'a>(segments: &'a [Arc<Segment>], doc_map: &DocMap, v
         // Keep the surviving compressed output admitted until its final file
         // write, including while parallel sibling tasks are still running.
         memory.shrink(memory.bytes().saturating_sub(encoded.capacity() as u64));
-        Ok((StoreChunk::Rewritten(crate::admission::Allocation::new(encoded, memory)), live, chunk_ids))
+        Ok((StoreChunk::Rewritten(crate::admission::Allocation::new(encoded, memory)), live, chunk_ids, id_memory))
     };
     let admission = crate::admission::Context::capture();
     let any_dirty = plan.iter().any(|p| p.2);
-    let built: Vec<(StoreChunk<'a>, usize, IdList)> = if any_dirty {
+    #[allow(clippy::type_complexity)]
+    let built: Vec<(StoreChunk<'a>, usize, IdList, crate::admission::Reservation)> = if any_dirty {
         let pacing = PACING_ENABLED.with(|p| p.get());
         plan.par_iter().map(|part| admission.run(|| with_pacing(pacing, || rewrite(part)))).collect::<Result<_>>()?
     } else {
@@ -2902,15 +3242,17 @@ fn merge_store_with_budget<'a>(segments: &'a [Arc<Segment>], doc_map: &DocMap, v
     let mut chunks = Vec::with_capacity(built.len());
     let mut table = Vec::with_capacity(built.len());
     let mut merged_ids = IdList::default();
-    for (chunk, docs, chunk_ids) in built {
-        merged_ids.extend(&chunk_ids);
+    let mut merged_memory = budget.reserve(0, IDS)?;
+    for (chunk, docs, chunk_ids, chunk_memory) in built {
+        merged_ids.extend_admitted(&chunk_ids, &mut merged_memory, IDS)?;
+        drop(chunk_ids);
+        drop(chunk_memory);
         if docs == 0 {
             continue;
         }
         let len = match &chunk {
             StoreChunk::Copied(b) => b.len(),
             StoreChunk::Rewritten(b) => b.len(),
-            StoreChunk::Mapped(b) => b.len(),
         };
         table.push((len, docs));
         chunks.push(chunk);
@@ -2921,7 +3263,11 @@ fn merge_store_with_budget<'a>(segments: &'a [Arc<Segment>], doc_map: &DocMap, v
     drop(readers);
     let uids = ids.finish(&merged_ids, budget)?;
     drop(merged_ids);
-    let retained = (chunks.capacity() * std::mem::size_of::<StoreChunk<'a>>()) as u64 + encoded_table.capacity() as u64;
+    drop(merged_memory);
+    // The id column is kept (with its charge) until the segment is written.
+    let column = uids.as_ref().map_or(0, |(_, c)| c.capacity() as u64);
+    let retained = (chunks.capacity() * std::mem::size_of::<StoreChunk<'a>>()) as u64 + encoded_table.capacity() as u64 + column;
+    metadata.grow(column, "merge id column")?;
     metadata.shrink(metadata.bytes().saturating_sub(retained));
     Ok(MergedStore { chunks, table: encoded_table, uids, _metadata: Some(metadata) })
 }
@@ -2931,107 +3277,246 @@ fn merge_store_with_budget<'a>(segments: &'a [Arc<Segment>], doc_map: &DocMap, v
 /// are consumed in order (inputs that are themselves sorted), at worst once
 /// per segment when they are not.
 #[cfg(test)]
-fn merge_store_sorted<'a>(dir: &dyn Directory, new_id: u32, segments: &'a [Arc<Segment>], doc_map: &DocMap) -> Result<MergedStore<'a>> {
+fn merge_store_sorted<'a>(dir: &dyn Directory, new_id: u32, segments: &'a [Arc<Segment>], doc_map: &'a DocMap) -> Result<MergedStore<'a>> {
     merge_store_sorted_with_budget(dir, new_id, segments, doc_map, &crate::admission::shared())
 }
 
 #[cfg(test)]
-fn merge_store_sorted_with_budget<'a>(dir: &dyn Directory, new_id: u32, segments: &'a [Arc<Segment>], doc_map: &DocMap,
+fn merge_store_sorted_with_budget<'a>(dir: &dyn Directory, new_id: u32, segments: &'a [Arc<Segment>], doc_map: &'a DocMap,
     budget: &Arc<crate::admission::Budget>) -> Result<MergedStore<'a>> {
     merge_store_sorted_versioned(dir, new_id, segments, doc_map, crate::codec::VERSION, budget)
 }
 
-/// [`merge_store_sorted_with_budget`] writing segment format `version`: when
-/// an input holds zstd chunks ([`crate::codec::store::StoredCompression::Best`])
-/// and `version` allows them, the output is re-chunked and compressed the
-/// same way, else as LZ4 chunks of the default size.
-fn merge_store_sorted_versioned<'a>(dir: &dyn Directory, new_id: u32, segments: &'a [Arc<Segment>], doc_map: &DocMap, version: u32,
+/// [`merge_store_sorted_with_budget`] writing segment format `version`: the
+/// whole merged store in memory (tests; merges stream it, see
+/// [`SortedStoreMerge`]).
+#[cfg(test)]
+fn merge_store_sorted_versioned<'a>(_dir: &dyn Directory, _new_id: u32, segments: &'a [Arc<Segment>], doc_map: &'a DocMap, version: u32,
     budget: &Arc<crate::admission::Budget>) -> Result<MergedStore<'a>> {
-    use crate::codec::store::StoredCompression;
-    let order = doc_map.order.as_deref().unwrap_or(&[]);
-    // Reader descriptors, per-segment traversal state, and the bounded
-    // 64-chunk raw/compressed parallel collectors (including overlap).
-    let initial = (segments.len() as u64).checked_mul(256).and_then(|n| n.checked_add(32768))
-        .ok_or_else(|| RusticError::Memory("sorted merge metadata size overflow".into()))?;
-    let mut metadata = budget.reserve(initial, "sorted merge metadata")?;
-    let mut readers: Vec<StoreReader<'a>> = Vec::with_capacity(segments.len());
-    for segment in segments { readers.push(segment.store()?); }
-    let mode = if readers.iter().any(|r| r.any_zstd()) { StoredCompression::Best } else { StoredCompression::Fast };
-    // Small chunks for large docs only where fetches want them (vectors).
-    let small_chunks = segments.iter().any(|s| s.has_vector_data());
-    let zstd = mode.zstd_at(version);
-    let compact_out = version >= crate::codec::COMPACT_STORED_SINCE;
-    let uid_out = version >= crate::codec::UID_STORED_SINCE;
-    let ids = IdPlan::new(segments, version);
-    let mut cursors: Vec<Option<IdCursor<'a>>> = (0..segments.len()).map(|i| ids.cursor(segments, i)).collect();
-    let mut merged_ids = IdList::default();
-    let mut traversal = 0u64;
-    for reader in &readers {
-        traversal = traversal.checked_add(u64::from(reader.num_docs()) * 4)
-            .and_then(|n| n.checked_add((reader.num_chunks() as u64).checked_mul(std::mem::size_of::<Option<crate::admission::Allocation<(Vec<u8>, Vec<(usize, usize)>)>>>() as u64)?))
-            .ok_or_else(|| RusticError::Memory("sorted merge traversal size overflow".into()))?;
-    }
-    metadata.grow(traversal, "sorted merge traversal metadata")?;
-    // Per segment: chunk of each doc, and the decompressed chunks with each
-    // doc's entry range (`vint len, bytes`).
-    let chunk_of: Vec<Vec<u32>> = readers
-        .iter()
-        .map(|r| {
-            let mut v = vec![0u32; r.num_docs() as usize];
-            for c in 0..r.num_chunks() {
-                let (start, n) = r.chunk_docs(c);
-                for d in start..start + n {
-                    v[d as usize] = c as u32;
+    let mut merge = SortedStoreMerge::new(segments, doc_map, version, budget)?;
+    let mut chunks = Vec::new();
+    merge.run(&mut |chunk| { chunks.push(chunk); Ok(()) }, &|| false)?;
+    let (table, uids, metadata) = merge.finish(budget)?;
+    Ok(MergedStore { chunks, table, uids, _metadata: Some(metadata) })
+}
+
+/// A sorting merge's stored fields, written once in output order: an input
+/// chunk whose docs all come out consecutively and in order (inputs whose
+/// doc ranges do not interleave under the sort, as time-sorted logs) is
+/// copied verbatim, as an unsorted merge copies a chunk without deletes;
+/// the other docs are re-chunked in output order and recompressed. Each
+/// input chunk is decompressed once while its segment's docs are consumed
+/// in order (inputs that are themselves sorted), at worst once per segment
+/// when they are not. When an input holds zstd chunks
+/// ([`crate::codec::store::StoredCompression::Best`]) and `version` allows
+/// them, re-chunked docs are compressed the same way, else as LZ4 chunks of
+/// the default size.
+///
+/// Chunks go to a sink in file order ([`SortedStoreMerge::run`]): a merge
+/// buffers a bounded head of them while its postings are being written,
+/// then writes the rest straight into the segment file, as Lucene's sorting
+/// stored-fields merge writes its output once (no scratch file).
+struct SortedStoreMerge<'a> {
+    segments: &'a [Arc<Segment>],
+    order: &'a [(usize, DocId)],
+    readers: Vec<StoreReader<'a>>,
+    mode: crate::codec::store::StoredCompression,
+    small_chunks: bool,
+    zstd: bool,
+    compact_out: bool,
+    uid_out: bool,
+    ids: IdPlan,
+    cursors: Vec<Option<IdCursor<'a>>>,
+    merged_ids: IdList,
+    /// The charge of `merged_ids`.
+    ids_memory: crate::admission::Reservation,
+    metadata: crate::admission::Reservation,
+    /// Per segment: chunk of each doc.
+    chunk_of: Vec<Vec<u32>>,
+    /// Per segment and chunk: may be copied verbatim when its docs come out
+    /// consecutively (no format or id change needed).
+    copyable: Vec<Vec<bool>>,
+    /// Whether a segment's docs are consumed in ascending order (then a
+    /// chunk can be released once passed).
+    monotonic: Vec<bool>,
+    cache: Vec<Vec<Option<crate::admission::Allocation<(Vec<u8>, Vec<(usize, usize)>)>>>>,
+    cur_chunk: Vec<Option<usize>>,
+    table: Vec<(usize, usize)>,
+    raw_chunks: Vec<crate::admission::Allocation<Vec<u8>>>,
+    counts: Vec<u32>,
+    cur: StoreBuffer,
+    n_cur: u32,
+    /// Docs of the open chunk over SIZED_DOC_BYTES (the chunk rule's average).
+    sized_cur: usize,
+    /// Next position in `order`.
+    pos: usize,
+    /// Chunks copied verbatim and docs re-chunked (merge profile).
+    copied: usize,
+    rechunked: usize,
+}
+
+impl<'a> SortedStoreMerge<'a> {
+    fn new(segments: &'a [Arc<Segment>], doc_map: &'a DocMap, version: u32, budget: &Arc<crate::admission::Budget>) -> Result<Self> {
+        use crate::codec::store::StoredCompression;
+        let order = doc_map.order.as_deref().unwrap_or(&[]);
+        // Reader descriptors, per-segment traversal state, and the bounded
+        // 64-chunk raw/compressed parallel collectors (including overlap).
+        let initial = (segments.len() as u64).checked_mul(256).and_then(|n| n.checked_add(32768))
+            .ok_or_else(|| RusticError::Memory("sorted merge metadata size overflow".into()))?;
+        let mut metadata = budget.reserve(initial, "sorted merge metadata")?;
+        let mut readers: Vec<StoreReader<'a>> = Vec::with_capacity(segments.len());
+        for segment in segments { readers.push(segment.store()?); }
+        let mode = if readers.iter().any(|r| r.any_zstd()) { StoredCompression::Best } else { StoredCompression::Fast };
+        // Small chunks for large docs only where fetches want them (vectors).
+        let small_chunks = segments.iter().any(|s| s.has_vector_data());
+        let zstd = mode.zstd_at(version);
+        let compact_out = version >= crate::codec::COMPACT_STORED_SINCE;
+        let zstd_out = version >= crate::codec::ZSTD_STORED_SINCE;
+        let uid_out = version >= crate::codec::UID_STORED_SINCE;
+        let ids = IdPlan::new(segments, version);
+        let cursors: Vec<Option<IdCursor<'a>>> = (0..segments.len()).map(|i| ids.cursor(segments, i)).collect();
+        let mut traversal = 0u64;
+        for reader in &readers {
+            traversal = traversal.checked_add(u64::from(reader.num_docs()) * 4)
+                .and_then(|n| n.checked_add((reader.num_chunks() as u64).checked_mul(std::mem::size_of::<Option<crate::admission::Allocation<(Vec<u8>, Vec<(usize, usize)>)>>>() as u64 + 1)?))
+                .ok_or_else(|| RusticError::Memory("sorted merge traversal size overflow".into()))?;
+        }
+        metadata.grow(traversal, "sorted merge traversal metadata")?;
+        let chunk_of: Vec<Vec<u32>> = readers
+            .iter()
+            .map(|r| {
+                let mut v = vec![0u32; r.num_docs() as usize];
+                for c in 0..r.num_chunks() {
+                    let (start, n) = r.chunk_docs(c);
+                    for d in start..start + n {
+                        v[d as usize] = c as u32;
+                    }
                 }
+                v
+            })
+            .collect();
+        // The unsorted merge's rule for a chunk it may copy (deletes aside:
+        // a chunk with a deleted doc never comes out whole).
+        let copyable: Vec<Vec<bool>> = readers.iter().enumerate().map(|(i, r)| (0..r.num_chunks()).map(|c| {
+            let uid_chunk = r.chunk_compact(c) && crate::codec::store::chunk_is_uid(r.raw_chunk(c));
+            !((!compact_out && r.chunk_compact(c))
+                || (!zstd_out && r.chunk_zstd(c))
+                || (!uid_out && uid_chunk)
+                || ids.rewrites(i, uid_chunk))
+        }).collect()).collect();
+        let mut last: Vec<i64> = vec![-1; segments.len()];
+        let mut monotonic = vec![true; segments.len()];
+        for &(i, old) in order {
+            if (old as i64) < last[i] {
+                monotonic[i] = false;
             }
-            v
+            last[i] = old as i64;
+        }
+        let cache = readers.iter().map(|r| (0..r.num_chunks()).map(|_| None).collect()).collect();
+        Ok(Self {
+            segments, order, mode, small_chunks, zstd, compact_out, uid_out, ids, cursors,
+            merged_ids: IdList::default(), ids_memory: budget.reserve(0, "merge ids")?, metadata, chunk_of, copyable, monotonic, cache,
+            cur_chunk: vec![None; segments.len()], table: Vec::new(), raw_chunks: Vec::new(), counts: Vec::new(),
+            cur: StoreBuffer::new()?, n_cur: 0, sized_cur: 0, pos: 0, copied: 0, rechunked: 0, readers,
         })
-        .collect();
-    // Whether a segment's docs are consumed in ascending order (then a
-    // chunk can be released once passed).
-    let mut last: Vec<i64> = vec![-1; segments.len()];
-    let mut monotonic = vec![true; segments.len()];
-    for &(i, old) in order {
-        if (old as i64) < last[i] {
-            monotonic[i] = false;
-        }
-        last[i] = old as i64;
     }
-    type Decoded = crate::admission::Allocation<(Vec<u8>, Vec<(usize, usize)>)>;
-    let mut cache: Vec<Vec<Option<Decoded>>> = readers.iter().map(|r| (0..r.num_chunks()).map(|_| None).collect()).collect();
-    let mut cur_chunk: Vec<Option<usize>> = vec![None; segments.len()];
-    static NEXT_STORE_SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = NEXT_STORE_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = MergeScratch { dir, name: format!(".merge-store-{new_id}-{}-{sequence}.tmp", std::process::id()) };
-    let mut output = dir.create_scratch_output(&scratch.name)?;
-    let mut table = Vec::new();
-    // Parallel compression uses a bounded batch instead of retaining the whole
-    // uncompressed merged store. Bodies are spooled as batches complete.
-    let mut raw_chunks: Vec<crate::admission::Allocation<Vec<u8>>> = Vec::new();
-    let mut counts: Vec<u32> = Vec::new();
-    let mut cur = StoreBuffer::new()?;
-    let mut n_cur = 0u32;
-    // Docs of the open chunk over SIZED_DOC_BYTES (the chunk rule's average).
-    let mut sized_cur = 0usize;
-    for &(i, old) in order {
-        merge_pace(16);
-        let c = chunk_of[i][old as usize] as usize;
-        if monotonic[i] {
-            if let Some(prev) = cur_chunk[i] {
-                if prev != c {
-                    cache[i][prev] = None;
+
+    /// Whether input chunk `c` of segment `i`, starting at output position
+    /// `pos`, comes out whole and in order there (then it is copied).
+    fn comes_out_whole(&self, pos: usize, i: usize, c: usize) -> bool {
+        if !self.copyable[i][c] {
+            return false;
+        }
+        let (start, n) = self.readers[i].chunk_docs(c);
+        let n = n as usize;
+        n > 0 && self.order.get(pos..pos + n).is_some_and(|run| run.iter().enumerate().all(|(k, &(s, d))| s == i && d == start + k as DocId))
+    }
+
+    /// Compress and hand on the closed raw chunks.
+    fn flush(&mut self, sink: &mut dyn FnMut(StoreChunk<'a>) -> Result<()>) -> Result<()> {
+        flush_store_batch(&mut self.raw_chunks, &mut self.counts, &mut self.table, &mut self.metadata, sink, self.zstd, self.compact_out, self.uid_out)
+    }
+
+    /// Close the open raw chunk (if it holds docs).
+    fn close_chunk(&mut self) -> Result<()> {
+        if self.n_cur > 0 {
+            let full = std::mem::replace(&mut self.cur, StoreBuffer::new()?);
+            self.raw_chunks.push(full.into_allocation());
+            self.counts.push(self.n_cur);
+            self.n_cur = 0;
+            self.sized_cur = 0;
+        }
+        Ok(())
+    }
+
+    /// Merge on from where the last call stopped, handing chunks to `sink`
+    /// in output order, until every doc is written (`true`) or `stop()`
+    /// asks to pause (`false`; checked between batches of chunks).
+    fn run(&mut self, sink: &mut dyn FnMut(StoreChunk<'a>) -> Result<()>, stop: &dyn Fn() -> bool) -> Result<bool> {
+        let order = self.order;
+        while self.pos < order.len() {
+            let (i, old) = order[self.pos];
+            merge_pace(16);
+            let c = self.chunk_of[i][old as usize] as usize;
+            let (start, n) = self.readers[i].chunk_docs(c);
+            if old == start && self.comes_out_whole(self.pos, i, c) {
+                // Docs re-chunked so far go first, then the chunk as it is.
+                self.close_chunk()?;
+                self.flush(sink)?;
+                if self.ids.out {
+                    for d in start..start + n {
+                        let id = match &mut self.cursors[i] { Some(cur) => cur.get(d)?, None => None };
+                        self.merged_ids.push_admitted(id, &mut self.ids_memory, "merge ids")?;
+                    }
+                }
+                let raw = self.readers[i].raw_chunk(c);
+                self.table.push((raw.len(), n as usize));
+                sink(StoreChunk::Copied(raw))?;
+                self.copied += 1;
+                self.pos += n as usize;
+                if stop() {
+                    return Ok(false);
+                }
+                continue;
+            }
+            self.rechunk_one(i, old, c)?;
+            self.pos += 1;
+            if self.mode.chunk_full_for(self.n_cur as usize, self.sized_cur, self.cur.bytes.len(), self.small_chunks) {
+                self.close_chunk()?;
+                // Best chunks are 15x larger: a smaller batch bounds the
+                // uncompressed bytes held at once.
+                if self.raw_chunks.len() >= if self.zstd { 8 } else { 64 } {
+                    self.flush(sink)?;
+                    if stop() {
+                        return Ok(false);
+                    }
                 }
             }
-            cur_chunk[i] = Some(c);
         }
-        if cache[i][c].is_none() {
-            let (start, n) = readers[i].chunk_docs(c);
+        self.close_chunk()?;
+        self.flush(sink)?;
+        Ok(true)
+    }
+
+    /// Append doc `old` of segment `i` (in its chunk `c`) to the open raw chunk.
+    fn rechunk_one(&mut self, i: usize, old: DocId, c: usize) -> Result<()> {
+        self.rechunked += 1;
+        if self.monotonic[i] {
+            if let Some(prev) = self.cur_chunk[i] {
+                if prev != c {
+                    self.cache[i][prev] = None;
+                }
+            }
+            self.cur_chunk[i] = Some(c);
+        }
+        let readers = &self.readers;
+        if self.cache[i][c].is_none() {
+            let (_, n) = readers[i].chunk_docs(c);
             let raw_bytes = readers[i].decoded_chunk_bytes(c).ok_or_else(|| RusticError::Corrupted("stored chunk size missing".into()))?;
             let bytes = (raw_bytes as u64).checked_add(u64::from(n) * std::mem::size_of::<(usize, usize)>() as u64)
                 .ok_or_else(|| RusticError::Memory("sorted merge decoded size overflow".into()))?;
             let decoded_memory = crate::admission::shared().reserve(bytes, "sorted merge decoded cache")?;
             let raw = readers[i].decompress(c)?;
-            let _ = start;
             let mut ranges = Vec::with_capacity(n as usize);
             let mut pos = 0usize;
             for _ in 0..n {
@@ -3043,9 +3528,9 @@ fn merge_store_sorted_versioned<'a>(dir: &dyn Directory, new_id: u32, segments: 
                 }
                 ranges.push((at, pos));
             }
-            cache[i][c] = Some(crate::admission::Allocation::new((raw, ranges), decoded_memory));
+            self.cache[i][c] = Some(crate::admission::Allocation::new((raw, ranges), decoded_memory));
         }
-        let (raw, ranges) = &**cache[i][c].as_ref().expect("decoded above");
+        let (raw, ranges) = &**self.cache[i][c].as_ref().expect("decoded above");
         let (start, _) = readers[i].chunk_docs(c);
         let (a, b) = ranges[(old - start) as usize];
         // Re-chunked docs of several inputs share output chunks, written in
@@ -3059,19 +3544,20 @@ fn merge_store_sorted_versioned<'a>(dir: &dyn Directory, new_id: u32, segments: 
         // The id: into the output's column (taken out of the doc or read
         // off the input's), or back into the doc.
         let joined;
-        let (body, a, b, raw): (&[u8], usize, usize, &[u8]) = match (ids.out, &mut cursors[i]) {
-            (true, Some(cur)) => { merged_ids.push(cur.get(old)?); (body, a, b, raw) }
+        let ids = &self.ids;
+        let (body, a, b, raw): (&[u8], usize, usize, &[u8]) = match (ids.out, &mut self.cursors[i]) {
+            (true, Some(cur)) => { self.merged_ids.push_admitted(cur.get(old)?, &mut self.ids_memory, "merge ids")?; (body, a, b, raw) }
             (true, None) if in_compact => {
                 let mut framed = Vec::with_capacity(len + 4);
                 let found = crate::codec::store::split_uid(body, &mut framed)?;
-                merged_ids.push(found.as_ref().map(|(_, id)| id.as_slice()));
+                self.merged_ids.push_admitted(found.as_ref().map(|(_, id)| id.as_slice()), &mut self.ids_memory, "merge ids")?;
                 if let Some((f, _)) = found { ids.saw(f); }
                 joined = framed;
                 let mut q = 0;
                 let l = read_vint(&joined, &mut q)? as usize;
                 (&joined[q..q + l], 0, joined.len(), &joined[..])
             }
-            (true, None) => { merged_ids.push(None); (body, a, b, raw) }
+            (true, None) => { self.merged_ids.push_admitted(None, &mut self.ids_memory, "merge ids")?; (body, a, b, raw) }
             (false, Some(cur)) => match cur.get(old)? {
                 Some(id) => {
                     let mut framed = Vec::with_capacity(len + id.len() + 8);
@@ -3086,10 +3572,11 @@ fn merge_store_sorted_versioned<'a>(dir: &dyn Directory, new_id: u32, segments: 
             (false, None) => (body, a, b, raw),
         };
         let len = body.len();
+        let cur = &mut self.cur;
         let before = cur.bytes.len();
-        if compact_out && in_compact && (uid_out || !in_uid) {
+        if self.compact_out && in_compact && (self.uid_out || !in_uid) {
             append_store_bytes(&mut cur.bytes, &mut cur.memory, &raw[a..b])?;
-        } else if compact_out {
+        } else if self.compact_out {
             // A bincode doc, or binary ids written below v31: re-encoded.
             let doc = crate::codec::store::decode_doc(body, in_compact)?;
             let mut one = Vec::with_capacity(len + 16);
@@ -3105,53 +3592,45 @@ fn merge_store_sorted_versioned<'a>(dir: &dyn Directory, new_id: u32, segments: 
         } else {
             append_store_bytes(&mut cur.bytes, &mut cur.memory, &raw[a..b])?;
         }
-        n_cur += 1;
+        self.n_cur += 1;
         if cur.bytes.len() - before > crate::codec::store::SIZED_DOC_BYTES + 1 {
-            sized_cur += 1;
+            self.sized_cur += 1;
         }
-        if mode.chunk_full_for(n_cur as usize, sized_cur, cur.bytes.len(), small_chunks) {
-            raw_chunks.push(std::mem::replace(&mut cur, StoreBuffer::new()?).into_allocation());
-            counts.push(n_cur);
-            n_cur = 0;
-            sized_cur = 0;
-            // Best chunks are 15x larger: a smaller batch bounds the
-            // uncompressed bytes held at once.
-            if raw_chunks.len() >= if zstd { 8 } else { 64 } {
-                flush_store_batch(&mut raw_chunks, &mut counts, &mut table, &mut metadata, output.as_mut(), zstd, compact_out, uid_out)?;
-            }
-        }
+        Ok(())
     }
-    if n_cur > 0 {
-        raw_chunks.push(cur.into_allocation());
-        counts.push(n_cur);
-    } else {
-        drop(cur);
+
+    /// After [`Self::run`] returned `true`: the store table, the id column
+    /// and the metadata kept with them.
+    #[allow(clippy::type_complexity)]
+    fn finish(mut self, budget: &Arc<crate::admission::Budget>) -> Result<(Vec<u8>, Option<(u16, Vec<u8>)>, crate::admission::Reservation)> {
+        let uids = self.ids.finish(&self.merged_ids, budget)?;
+        let merged_ids = std::mem::take(&mut self.merged_ids);
+        drop(merged_ids);
+        self.ids_memory.shrink(self.ids_memory.bytes());
+        // The id column is kept (with its charge) until the segment is written.
+        let column = uids.as_ref().map_or(0, |(_, c)| c.capacity() as u64);
+        self.metadata.grow(column, "merge id column")?;
+        tracing::debug!(target: "merge_profile", segments = self.segments.len(), copied_chunks = self.copied, rechunked_docs = self.rechunked, "sorted store merge");
+        // Encoder builds a triple table plus a geometrically growing varint
+        // output. Reserve their overlap before encoding, retaining final bytes.
+        let encode_bytes = (self.table.len() as u64).checked_mul(128).and_then(|n| n.checked_add(1024))
+            .ok_or_else(|| RusticError::Memory("sorted merge table size overflow".into()))?;
+        self.metadata.grow(encode_bytes, "sorted merge table encoding")?;
+        let encoded = encode_store_table(&self.table);
+        let Self { mut metadata, table, cache, chunk_of, cur_chunk, monotonic, readers, raw_chunks, counts, cursors, copyable, cur, .. } = self;
+        drop(table); drop(cache); drop(chunk_of); drop(cur_chunk); drop(monotonic); drop(cursors);
+        drop(readers); drop(raw_chunks); drop(counts); drop(copyable); drop(cur);
+        metadata.shrink(metadata.bytes().saturating_sub(encoded.capacity() as u64 + column));
+        Ok((encoded, uids, metadata))
     }
-    flush_store_batch(&mut raw_chunks, &mut counts, &mut table, &mut metadata, output.as_mut(), zstd, compact_out, uid_out)?;
-    output.finish()?;
-    drop(cursors);
-    let uids = ids.finish(&merged_ids, budget)?;
-    drop(merged_ids);
-    let bodies = dir.open_read(&scratch.name)?;
-    drop(scratch);
-    // Encoder builds a triple table plus a geometrically growing varint
-    // output. Reserve their overlap before encoding, retaining final bytes.
-    let encode_bytes = (table.len() as u64).checked_mul(128).and_then(|n| n.checked_add(1024))
-        .ok_or_else(|| RusticError::Memory("sorted merge table size overflow".into()))?;
-    metadata.grow(encode_bytes, "sorted merge table encoding")?;
-    let encoded = encode_store_table(&table);
-    let chunks = vec![StoreChunk::Mapped(bodies)];
-    drop(table); drop(cache); drop(chunk_of); drop(cur_chunk);
-    drop(last); drop(monotonic); drop(readers); drop(raw_chunks); drop(counts);
-    let retained = encoded.capacity() as u64 + (chunks.capacity() * std::mem::size_of::<StoreChunk<'a>>()) as u64;
-    metadata.shrink(metadata.bytes().saturating_sub(retained));
-    Ok(MergedStore { chunks, table: encoded, uids, _metadata: Some(metadata) })
 }
 
 /// Column streaming for a sorting merge: columns are filled in output
 /// doc order (multi-valued columns need ascending docs).
+/// `from`, `stop` and the result as [`stream_fast_fields`]'s.
+#[allow(clippy::too_many_arguments)]
 fn stream_fast_fields_sorted(segments: &[Arc<Segment>], doc_map: &DocMap, merged_norms: &MergedNorms, admit: MergeAdmission,
-    version: u32, emit: &mut dyn FnMut(u16, u8, &[u8]) -> Result<()>) -> Result<()> {
+    version: u32, from: usize, stop: &dyn Fn() -> bool, emit: &mut dyn FnMut(u16, u8, &[u8]) -> Result<()>) -> Result<Option<usize>> {
     let _metadata = fast_merge_metadata(segments)?;
     let num_docs = doc_map.num_docs();
     let order = doc_map.order.as_deref().unwrap_or(&[]);
@@ -3169,6 +3648,7 @@ fn stream_fast_fields_sorted(segments: &[Arc<Segment>], doc_map: &DocMap, merged
             1 => Some(7),
             2 => Some(8),
             3 => Some(9),
+            4 => Some(7),
             5 => Some(10),
             _ => None,
         }
@@ -3303,6 +3783,21 @@ fn stream_fast_fields_sorted(segments: &[Arc<Segment>], doc_map: &DocMap, merged
                     }
                 }};
             }
+            // A boolean field promoted to its 0/1 multi column: booleans of
+            // single-valued segments join it, in output order.
+            if out == 7 && readers.iter().any(|r| r.get_bool(field).is_some()) {
+                let mut values: Vec<(DocId, i64)> = Vec::new();
+                for (new, &(i, old)) in order.iter().enumerate() {
+                    if let Some(c) = readers[i].get_bool(field) { if c.has_value(old) { values.push((new as DocId, c.get(old) as i64)); } }
+                    if let Some(c) = readers[i].get_multi_i64(field) { for v in c.values(old) { values.push((new as DocId, v)); } }
+                }
+                if !values.is_empty() {
+                    let col = ff.multi_i64_column_mut(field);
+                    for (doc, v) in values { col.push(doc, v); }
+                }
+                emit_fast_columns(&ff, num_docs, version, emit)?;
+                return Ok(());
+            }
             match out {
                 1 | 7 => sorted_numeric!(get_i64, get_multi_i64, i64_column_mut, multi_i64_column_mut),
                 2 | 8 => sorted_numeric!(get_u64, get_multi_u64, u64_column_mut, multi_u64_column_mut),
@@ -3332,7 +3827,16 @@ fn stream_fast_fields_sorted(segments: &[Arc<Segment>], doc_map: &DocMap, merged
     };
     let enabled = PACING_ENABLED.with(|p| p.get());
     let admission = crate::admission::Context::capture();
+    let mut at = 0usize;
     for batch in groups.chunks(FAST_COLUMN_BATCH) {
+        let first = at;
+        at += batch.len();
+        if first < from {
+            continue;
+        }
+        if stop() {
+            return Ok(Some(first));
+        }
         use rayon::prelude::*;
         let built: Vec<Result<Vec<(u16, u8, crate::admission::Allocation<Vec<u8>>)>>> = batch.par_iter().map(|&(field, out)| admission.run(|| with_pacing(enabled, || {
             let mut pieces = Vec::new();
@@ -3349,7 +3853,7 @@ fn stream_fast_fields_sorted(segments: &[Arc<Segment>], doc_map: &DocMap, merged
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Consume raw chunks so each allocation is released as compression finishes.
@@ -3383,8 +3887,11 @@ fn append_store_bytes(out: &mut Vec<u8>, memory: &mut crate::admission::Reservat
     Ok(())
 }
 
-fn flush_store_batch(raw: &mut Vec<crate::admission::Allocation<Vec<u8>>>, counts: &mut Vec<u32>, table: &mut Vec<(usize, usize)>, metadata: &mut crate::admission::Reservation,
-    output: &mut dyn crate::codec::directory::OutputFile, zstd: bool, compact: bool, uid: bool) -> Result<()> {
+fn flush_store_batch<'a>(raw: &mut Vec<crate::admission::Allocation<Vec<u8>>>, counts: &mut Vec<u32>, table: &mut Vec<(usize, usize)>, metadata: &mut crate::admission::Reservation,
+    sink: &mut dyn FnMut(StoreChunk<'a>) -> Result<()>, zstd: bool, compact: bool, uid: bool) -> Result<()> {
+    if raw.is_empty() {
+        return Ok(());
+    }
     use rayon::prelude::*;
     let admission = crate::admission::Context::capture();
     let needed = table.len().checked_add(raw.len()).ok_or_else(|| RusticError::Memory("sorted merge table length overflow".into()))?;
@@ -3408,8 +3915,8 @@ fn flush_store_batch(raw: &mut Vec<crate::admission::Allocation<Vec<u8>>>, count
             Ok(crate::admission::Allocation::new(encoded, memory))
         }).collect::<Result<_>>()?;
     for (chunk, docs) in compressed.into_iter().zip(counts.drain(..)) {
-        output.write_all(&chunk)?;
         table.push((chunk.len(), docs as usize));
+        sink(StoreChunk::Rewritten(chunk))?;
     }
     Ok(())
 }
@@ -4324,7 +4831,7 @@ mod tests {
             let map = DocMap::from_order(&segments, order.clone());
             let norms = merge_norms(&segments, &map).unwrap();
             let mut cols: Vec<(u16, u8, Vec<u8>)> = Vec::new();
-            stream_fast_fields_sorted(&segments, &map, &norms, MergeAdmission::Foreground, version, &mut |f, t, b| { cols.push((f, t, b.to_vec())); Ok(()) }).unwrap();
+            stream_fast_fields_sorted(&segments, &map, &norms, MergeAdmission::Foreground, version, 0, &|| false, &mut |f, t, b| { cols.push((f, t, b.to_vec())); Ok(()) }).unwrap();
             let col = cols.iter().find(|c| c.0 == 0).expect("the feature column is kept");
             let values: Box<dyn Fn(DocId) -> Vec<String>> = if col.1 == crate::codec::fastfields::TAG_FEATURES {
                 let r = crate::codec::fastfields::FeaturesReader::open(&col.2).unwrap();
@@ -4914,6 +5421,17 @@ mod tests {
         }));
     }
 
+    /// A search-time rate is split over the running merges, never below
+    /// the floor (nor above the rate itself).
+    #[test]
+    fn search_time_rates_split_over_the_running_merges() {
+        assert_eq!(split_rate(64 << 20, 0), 64 << 20);
+        assert_eq!(split_rate(64 << 20, 1), 64 << 20);
+        assert_eq!(split_rate(64 << 20, 16), 4 << 20);
+        assert_eq!(split_rate(8 << 20, 24), SEARCH_SHARE_FLOOR, "floored");
+        assert_eq!(split_rate(512 << 10, 4), 512 << 10, "a rate below the floor is not raised");
+    }
+
     /// ES-style adaptive merge throttle, tested on its pure controller (the
     /// node-wide rate other tests' merges change is only a wrapper):
     /// backlogged merge starts raise the rate, others lower it, within the
@@ -5157,6 +5675,16 @@ mod tests {
         assert_eq!(es_next_rate(r, 2, 32), r, "two active: held");
         assert_eq!(es_next_rate(r, 32, 32), r, "at the ceiling: held");
         assert_eq!(es_next_rate(r, 33, 32), next_auto_rate(r, true), "past the ceiling: up 20%");
+        // Registered (submitted) merges move it once each; a start only
+        // lowers it when alone (the backlogged ones were counted as registered).
+        assert_eq!(rate_after_submissions(r, 3, 40, 32), next_auto_rate(next_auto_rate(next_auto_rate(r, true), true), true));
+        assert_eq!(rate_after_submissions(r, 3, 20, 32), r, "under the ceiling: held");
+        assert_eq!(start_next_rate(r, 40, 32), next_auto_rate(r, true), "a start behind a backlog raises it (ES)");
+        assert_eq!(start_next_rate(r, 20, 32), r, "under the ceiling: held");
+        assert_eq!(start_next_rate(r, 1, 32), next_auto_rate(r, false), "a lone start lowers it");
+        let mut up = AUTO_START;
+        for _ in 0..40 { up = rate_after_submissions(up, 1, 33, 32); }
+        assert_eq!(up, AUTO_MAX, "40 merges registered past the ceiling reach the maximum");
         let mut rate = r;
         for _ in 0..100 { rate = es_next_rate(rate, 5, 32); }
         assert_eq!(rate, r, "a steady bulk load's merges do not drain the rate");
@@ -5585,6 +6113,118 @@ mod tests {
         // The file passes its checksum.
         let data = dir.open_read(&segment_file_name(77)).unwrap();
         crate::codec::open_segment_file(data, true).unwrap();
+    }
+
+    /// v38 merges write each byte of the merged segment once, straight into
+    /// its file (no scratch file: dictionary blocks between the postings,
+    /// columns and sorted stored fields after them, past a small buffered
+    /// head), and read back exactly as v37 merges (which spool and copy):
+    /// unsorted, sorted with inputs that do not interleave (their chunks
+    /// copied), and sorted interleaving.
+    #[test]
+    fn v38_merges_write_once_and_read_like_v37() {
+        #[derive(Debug, Default)]
+        struct Counting { inner: RamDirectory, scratch: std::sync::atomic::AtomicU64, written: std::sync::atomic::AtomicU64 }
+        impl Directory for Counting {
+            fn open_read(&self, name: &str) -> Result<FileSlice> { self.inner.open_read(name) }
+            fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+                let counter = if name.starts_with(".merge-") { &self.scratch } else { &self.written };
+                counter.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                self.inner.write(name, data)
+            }
+            fn exists(&self, name: &str) -> bool { self.inner.exists(name) }
+            fn delete(&self, name: &str) -> Result<()> { self.inner.delete(name) }
+            fn list(&self) -> Result<Vec<String>> { self.inner.list() }
+            fn list_admitted(&self, temporary: bool) -> crate::error::Result<crate::codec::directory::AdmittedNames> { self.inner.list_admitted(temporary) }
+        }
+        let schema = vec![
+            Field::new(0, "id", FieldType::Keyword),
+            Field::new(1, "body", FieldType::Text),
+            Field::new(2, "n", FieldType::I64),
+            Field::new(3, "tag", FieldType::Keyword),
+            Field::new(4, "x", FieldType::F64),
+        ];
+        let doc = |seg: u32, i: u32| {
+            let mut d = Document::new();
+            d.add_keyword(0, &format!("id-{seg}-{i:06}-{:08x}", (seg * 7919 + i).wrapping_mul(2654435761)));
+            d.add_text(1, &format!("common w{} u{seg}x{i} {}", i % 11, if i % 2 == 0 { "even" } else { "odd" }));
+            d.add_i64(2, (seg * 100_000 + i) as i64);
+            d.add_keyword(3, &format!("t{}", i % 13));
+            d.add_f64(4, i as f64 * 0.5);
+            d
+        };
+        let dir = Counting::default();
+        let per = 30_000u32;
+        let segments: Vec<Arc<Segment>> = (0..3u32).map(|seg| {
+            let mut w = SegmentWriter::new(seg);
+            for i in 0..per { w.add_document(&doc(seg, i), &schema); }
+            Arc::new(w.write_to(&dir).unwrap())
+        }).collect();
+        (0..per).step_by(7).for_each(|d| segments[1].delete_doc(d).unwrap());
+        let live = |seg: usize| (0..per).filter(move |&d| seg != 1 || d % 7 != 0);
+        let ordered: Vec<(usize, DocId)> = live(2).map(|d| (2, d)).chain(live(0).map(|d| (0, d))).chain(live(1).map(|d| (1, d))).collect();
+        let interleaved: Vec<(usize, DocId)> = (0..per).flat_map(|d| [(1usize, d), (0, d), (2, d)]).filter(|&(s, d)| s != 1 || d % 7 != 0).collect();
+        TEST_HEAD_CAP.store(1, std::sync::atomic::Ordering::Relaxed);
+        for (k, order) in [None, Some(ordered), Some(interleaved)].into_iter().enumerate() {
+            let mut out = Vec::new();
+            for version in [37u32, 38] {
+                let id = 100 + 2 * k as u32 + (version - 37);
+                let (scratch0, written0) = (dir.scratch.load(std::sync::atomic::Ordering::Relaxed), dir.written.load(std::sync::atomic::Ordering::Relaxed));
+                crate::codec::TEST_WRITE_VERSION.with(|v| v.set(version));
+                let merged = match &order { None => merge_segments(&dir, &segments, id), Some(o) => merge_segments_with(&dir, &segments, id, Some(o.clone())) }.unwrap();
+                crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+                let scratch = dir.scratch.load(std::sync::atomic::Ordering::Relaxed) - scratch0;
+                let written = dir.written.load(std::sync::atomic::Ordering::Relaxed) - written0;
+                let file = dir.open_read(&segment_file_name(id)).unwrap();
+                crate::codec::open_segment_file(file.clone(), true).unwrap();
+                assert_eq!(merged.format_version(), version);
+                if version == 38 {
+                    assert_eq!(scratch, 0, "case {k}: no scratch bytes");
+                    assert_eq!(written, file.len() as u64, "case {k}: the segment written once");
+                    assert!(merged.term_dict().gap_bytes() > 0, "case {k}: the dictionary is interleaved");
+                    let body = file.len() as u64 - crate::codec::FOOTER_LEN as u64 - 8;
+                    assert!(merged.segment_bytes() <= body && merged.segment_bytes() + 24 >= body, "case {k}: sections counted once: {} of {body}", merged.segment_bytes());
+                } else {
+                    assert!(scratch > 0, "case {k}: v37 spools");
+                }
+                let du = merged.disk_usage().unwrap();
+                let mut sum = crate::segment::FieldDiskUsage::default();
+                for u in du.fields.values() { sum.add(u); }
+                assert_eq!(sum.terms, du.terms, "case {k} v{version}");
+                assert_eq!(sum.postings, du.postings, "case {k} v{version}");
+                out.push(merged);
+            }
+            let (a, b) = (&out[0], &out[1]);
+            assert_eq!(a.num_docs, b.num_docs);
+            let (ta, tb) = (a.term_dict().iter_all().unwrap(), b.term_dict().iter_all().unwrap());
+            assert_eq!(ta.len(), tb.len());
+            for ((ka, la), (kb, lb)) in ta.iter().zip(&tb) {
+                assert_eq!(ka, kb);
+                assert_eq!((la.doc_freq, la.total_term_freq), (lb.doc_freq, lb.total_term_freq), "{ka:?}");
+                if la.offset & crate::term_dictionary::INLINE_POSTINGS == 0 {
+                    assert_eq!(collect(a.postings_at(la).unwrap()), collect(b.postings_at(lb).unwrap()), "case {k} {ka:?}");
+                }
+                assert_eq!(b.term_dict().lookup(kb).unwrap(), Some(*lb));
+            }
+            let (fa, fb) = (a.fast_fields(), b.fast_fields());
+            assert_eq!(fa.fields(), fb.fields());
+            for d in 0..a.num_docs {
+                assert_eq!(fa.get_i64(2).unwrap().get(d), fb.get_i64(2).unwrap().get(d));
+                assert_eq!(fa.get_keyword(3).unwrap().get(d), fb.get_keyword(3).unwrap().get(d));
+                assert_eq!(fa.get_f64(4).unwrap().get(d), fb.get_f64(4).unwrap().get(d));
+                assert_eq!(format!("{:?}", a.get_doc(d).unwrap().unwrap()), format!("{:?}", b.get_doc(d).unwrap().unwrap()), "case {k} doc {d}");
+            }
+            let reopened = Segment::open(&dir, b.id).unwrap();
+            assert_eq!(reopened.term_dict().doc_freq(&crate::types::Term::new_text(1, "common")), b.num_docs);
+            if k == 1 {
+                // Inputs that do not interleave: their whole chunks copied.
+                let sb = b.store().unwrap();
+                let copied = (0..sb.num_chunks()).filter(|&c| (0..3).any(|s| { let r = segments[s].store().unwrap(); (0..r.num_chunks()).any(|i| r.raw_chunk(i) == sb.raw_chunk(c)) })).count();
+                assert!(copied * 2 > sb.num_chunks(), "{copied} of {} chunks copied", sb.num_chunks());
+            }
+        }
+        TEST_HEAD_CAP.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(dir.list().unwrap().iter().all(|name| !name.starts_with(".merge-")));
     }
 
     #[test]
@@ -6378,5 +7018,111 @@ mod shape_merge_tests {
         }
         // Into a format before shapes' own: refused.
         assert!(merge_extra_with_budget(&segments, &map, &norms, &BTreeMap::new(), crate::codec::SHAPE_TREE_SINCE - 1, &crate::admission::shared()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    use crate::codec::directory::RamDirectory;
+    use crate::segment::SegmentWriter;
+    use crate::types::{Document, Field, FieldType};
+
+    fn seal(dir: &RamDirectory, schema: &[Field], seg: u32, version: u32, ids: impl Fn(u32) -> String, n: u32) -> Arc<Segment> {
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(version));
+        let mut w = SegmentWriter::new(seg);
+        for d in 0..n {
+            let mut doc = Document::new();
+            doc.add_keyword(0, &ids(d));
+            doc.add_text(1, &format!("body {d}"));
+            w.add_document(&doc, schema);
+        }
+        let s = Arc::new(w.write_to(dir).unwrap());
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+        s
+    }
+
+    fn uid(seg: u32, d: u32) -> String {
+        use base64::Engine;
+        let mut b = [0u8; 15];
+        b[..4].copy_from_slice(&(seg * 100_000 + d).to_be_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// #285: an older compact segment (keyword ids in its stored docs)
+    /// merged with a current one (binary ids moved into the column): every
+    /// doc keeps its own id, in both orders and after a second merge.
+    #[test]
+    fn older_compact_ids_survive_a_merge_with_an_id_column() {
+        let schema = vec![Field::new(0, "_id", FieldType::Keyword), Field::new(1, "body", FieldType::Text)];
+        for old_first in [true, false] {
+            let dir = RamDirectory::new();
+            let old = seal(&dir, &schema, 1, crate::codec::UID_STORED_SINCE - 1, |d| format!("legacy-{d}"), 300);
+            let new = seal(&dir, &schema, 2, crate::codec::VERSION, |d| uid(2, d), 300);
+            let inputs = if old_first { vec![old, new] } else { vec![new, old] };
+            let want = |i: usize, d: u32| if (i == 0) == old_first { format!("legacy-{d}") } else { uid(2, d) };
+            crate::codec::TEST_WRITE_VERSION.with(|v| v.set(crate::codec::VERSION));
+            let merged = Arc::new(merge_segments(&dir, &inputs, 9).unwrap());
+            let again = merge_segments(&dir, &[merged.clone()], 10).unwrap();
+            crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+            for seg in [&*merged, &again] {
+                assert!(seg.uid_column_field().is_some());
+                let leaf = crate::query::reader::LeafReader::Segment(seg);
+                for i in 0..2usize {
+                    for d in 0..300u32 {
+                        let doc = i as u32 * 300 + d;
+                        assert_eq!(leaf.keyword_value(0, doc), Some(want(i, d)), "old first {old_first}, doc {doc}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #282: a merge's ids are admitted as they are gathered: a budget
+    /// that cannot hold them refuses the merge at its id reservation; a
+    /// large one merges.
+    #[test]
+    fn merge_ids_are_admitted() {
+        let schema = vec![Field::new(0, "_id", FieldType::Keyword), Field::new(1, "body", FieldType::Text)];
+        let dir = RamDirectory::new();
+        let long = |seg: u32| move |d: u32| format!("{seg}-{d}-{}", "x".repeat(400));
+        let sealed = [seal(&dir, &schema, 1, crate::codec::VERSION, long(1), 1500), seal(&dir, &schema, 2, crate::codec::VERSION, long(2), 1500)];
+        // Inputs with id columns: their chunks are copied, their ids read
+        // off the columns (no chunk rewrite to admit).
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(crate::codec::VERSION));
+        let segments: Vec<Arc<Segment>> = sealed.iter().enumerate().map(|(i, s)| Arc::new(merge_segments(&dir, &[s.clone()], 11 + i as u32).unwrap())).collect();
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+        assert!(segments.iter().all(|s| s.uid_column_field().is_some()));
+        let doc_map = admitted_doc_map(&segments, None, None).unwrap();
+        let small = crate::admission::Budget::new(256 << 10);
+        let refused = merge_store_with_budget(&segments, &doc_map, crate::codec::VERSION, &small).err().expect("refused");
+        assert!(matches!(&refused, RusticError::Memory(m) if m.contains("merge id")), "{refused:?}");
+        assert_eq!(small.used(), 0, "nothing left charged");
+        let large = crate::admission::Budget::new(1 << 30);
+        let merged = merge_store_with_budget(&segments, &doc_map, crate::codec::VERSION, &large).unwrap();
+        assert!(merged.uids.is_some());
+    }
+
+    /// #309: merging segments that keep values only in columns into a
+    /// write format that cannot record them is refused (nothing written).
+    #[test]
+    fn capped_merge_below_column_stored_is_refused() {
+        let schema = vec![Field::new(0, "id", FieldType::Keyword), Field::new(1, "_version", FieldType::I64).with_column_stored(true)];
+        let dir = RamDirectory::new();
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(crate::codec::VERSION));
+        let mut w = SegmentWriter::new(1);
+        for i in 0..50i64 {
+            let mut doc = Document::new();
+            doc.add_keyword(0, &format!("d{i}"));
+            doc.add_i64(1, i + 7);
+            w.add_document(&doc, &schema);
+        }
+        let seg = Arc::new(w.write_to(&dir).unwrap());
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(14));
+        let refused = merge_segments(&dir, &[seg.clone()], 5);
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+        assert!(matches!(refused, Err(RusticError::Unsupported(_))), "{:?}", refused.err());
+        assert!(!dir.exists(&crate::codec::segment_file_name(5)));
+        assert_eq!(seg.get_doc(3).unwrap().unwrap().get(1).and_then(|v| v.as_i64()), Some(10), "inputs intact");
     }
 }

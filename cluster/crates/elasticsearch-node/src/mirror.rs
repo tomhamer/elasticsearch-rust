@@ -41,17 +41,61 @@ pub struct UuidMap {
 }
 
 impl UuidMap {
-    pub fn load(path: &Path) -> UuidMap {
-        let mut m: UuidMap = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    /// Load the map at `path`. A missing file is an empty map (a new node);
+    /// any other read failure, or content that does not parse, is an error:
+    /// an unreadable map is never mistaken for an empty one.
+    pub fn load(path: &Path) -> std::io::Result<UuidMap> {
+        let mut m: UuidMap = match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("index uuid map [{}] is corrupt: {e}", path.display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => UuidMap::default(),
+            Err(e) => return Err(std::io::Error::new(e.kind(), format!("cannot read index uuid map [{}]: {e}", path.display()))),
+        };
         m.path = Some(path.to_path_buf());
-        m
+        Ok(m)
     }
 
+    /// [`Self::load`] at node start. A map that cannot be read fails the
+    /// start. A corrupt one (torn or garbage content) is moved aside, kept
+    /// for inspection, and replaced by an empty map: the map is only a
+    /// cache of identities each copy also records itself (its metadata
+    /// file's cluster uuid, its shard copy record), and the metadata
+    /// application reconstructs them from there ([`incarnation`]); a copy
+    /// whose identity cannot be established is quarantined, never deleted.
+    pub fn load_at_start(path: &Path) -> std::io::Result<UuidMap> {
+        match Self::load(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let aside = path.with_extension(format!("corrupt-{}", elasticsearch_engine::date::now_millis()));
+                std::fs::rename(path, &aside)?;
+                if let Some(dir) = path.parent() {
+                    elasticsearch_engine::rustic_core::platform::sync_dir(dir)?;
+                }
+                tracing::error!(map = %path.display(), kept = %aside.display(), "{e}; identities are reconstructed from the local copies");
+                let mut m = UuidMap::default();
+                m.path = Some(path.to_path_buf());
+                Ok(m)
+            }
+            r => r,
+        }
+    }
+
+    /// Persist durably: temporary file, fsync, rename, fsync of the
+    /// directory. Any failure is returned (the previous file stays).
     pub(crate) fn save(&self) -> std::io::Result<()> {
         let Some(p) = &self.path else { return Ok(()) };
+        save_test_hook::check(p)?;
         let tmp = p.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
-        std::fs::rename(tmp, p)
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&serde_json::to_vec(self)?)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, p)?;
+        if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            elasticsearch_engine::rustic_core::platform::sync_dir(dir)?;
+        }
+        Ok(())
     }
 
     pub fn cluster_uuid(&self, index: &str) -> Option<&str> {
@@ -96,6 +140,263 @@ fn parse_u32(v: Option<&Value>, default: u32) -> u32 {
     v.and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))).and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
+/// Tests: make [`UuidMap::save`] fail for maps under a directory.
+pub(crate) mod save_test_hook {
+    #[cfg(test)]
+    static FAIL_UNDER: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
+    #[cfg(test)]
+    pub fn fail_under(dir: &std::path::Path, fail: bool) {
+        let mut v = FAIL_UNDER.lock();
+        v.retain(|d| d != dir);
+        if fail { v.push(dir.to_path_buf()); }
+    }
+    #[allow(unused_variables)]
+    pub fn check(path: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_UNDER.lock().iter().any(|d| path.starts_with(d)) {
+            return Err(std::io::Error::other("injected uuid map write failure"));
+        }
+        Ok(())
+    }
+}
+
+/// Which cluster index incarnation a local engine index is, from the
+/// evidence the copy itself and the uuid map hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Incarnation {
+    /// The incarnation asked about.
+    Same,
+    /// Proven to be another incarnation (the reason names the evidence).
+    Other(String),
+    /// Nothing proves either (or the evidence conflicts).
+    Unknown(String),
+}
+
+/// The incarnation of the local index `svc` relative to the cluster index
+/// uuid `cluster_uuid`. Evidence, any of which suffices when the rest does
+/// not contradict it: the cluster uuid recorded in the copy's own metadata
+/// file ([`IndexService::cluster_uuid`], persisted), the uuid map's entry
+/// for this exact local index (same local uuid), the shard copy record
+/// (`cluster-copy.json`, which names the index uuid), and the local uuid
+/// itself (the engine adopts the cluster uuid when it can). A map entry
+/// for another local uuid is stale and proves nothing.
+pub fn incarnation(svc: &elasticsearch_engine::index::IndexService, cluster_uuid: &str, uuids: &UuidMap) -> Incarnation {
+    let mut same: Vec<&'static str> = Vec::new();
+    let mut other: Vec<String> = Vec::new();
+    let mut note = |c: &str, source: &'static str| {
+        if c == cluster_uuid { same.push(source) } else { other.push(format!("{source} names incarnation [{c}]")) }
+    };
+    if let Some(c) = svc.cluster_uuid() {
+        note(c, "the copy's metadata");
+    }
+    if let Some((c, l)) = uuids.indices.get(&svc.name) {
+        if l == &svc.uuid {
+            note(c, "the uuid map");
+        }
+    }
+    if let Some(rec) = crate::shards::read_copy_record(svc.path()) {
+        note(&rec.index_uuid, "the shard copy record");
+    }
+    if svc.uuid == cluster_uuid {
+        same.push("the local uuid");
+    }
+    match (same.is_empty(), other.is_empty()) {
+        (false, true) => Incarnation::Same,
+        (true, false) => Incarnation::Other(other.join("; ")),
+        (true, true) => Incarnation::Unknown(format!("nothing records which incarnation local index [{}] is", svc.uuid)),
+        (false, false) => Incarnation::Unknown(format!("conflicting identity: {} name [{cluster_uuid}], but {}", same.join(", "), other.join("; "))),
+    }
+}
+
+/// Whether the index directory holds any shard data (a shard store, a
+/// copy record, a store set aside for reuse) rather than metadata only.
+pub fn holds_shard_data(index_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(index_path) else { return true };
+    entries.flatten().any(|e| {
+        let n = e.file_name();
+        let n = n.to_string_lossy();
+        n.starts_with("shard-") || n == "cluster-copy.json"
+    })
+}
+
+/// Make sure the local index `name` (if any) is the incarnation `im`
+/// before it is applied: an index proven to be another incarnation is
+/// removed (as a deleted index is), one whose identity cannot be
+/// established is quarantined when it holds shard data (never deleted) and
+/// removed when it is only a metadata shell, and a proven one has its
+/// mapping recorded. Returns false when the name is still held by a local
+/// index that is not `im` (a quarantine failed): nothing may be applied to
+/// it then.
+fn reconcile_incarnation(engine: &Engine, name: &str, im: &IndexMetadata, md: &Metadata, uuids: &mut UuidMap, rep: &mut ApplyReport) -> bool {
+    let Some(svc) = engine.get_index(name) else { return true };
+    if uuids.indices.get(name).is_some_and(|(c, l)| c == &im.uuid && l == &svc.uuid) && svc.cluster_uuid().is_none_or(|c| c == im.uuid) {
+        return true;
+    }
+    match incarnation(&svc, &im.uuid, uuids) {
+        Incarnation::Same => {
+            tracing::info!(index = %name, uuid = %im.uuid, local = %svc.uuid, "local index identity reconstructed from the copy");
+            uuids.indices.insert(name.to_string(), (im.uuid.clone(), svc.uuid.clone()));
+            rep.reconstructed.push(name.to_string());
+            true
+        }
+        Incarnation::Other(why) => {
+            drop(svc);
+            retire_local(engine, name, md, uuids, rep, &format!("another incarnation than [{}]: {why}", im.uuid))
+        }
+        Incarnation::Unknown(why) => {
+            let path = svc.path().to_path_buf();
+            drop(svc);
+            if !holds_shard_data(&path) {
+                tracing::info!(index = %name, "replacing a metadata-only local index of unknown identity: {why}");
+                remove_index(engine, name, uuids, rep);
+                return true;
+            }
+            quarantine_index(engine, name, &why, uuids, rep)
+        }
+    }
+}
+
+/// The cluster index uuids the local index `svc` is recorded under here:
+/// the uuid in its own metadata file, the uuid map's entry for this exact
+/// local index, its shard copy record. Empty: the index never took part in
+/// a committed state on this node (a dry run, a rolled-back creation).
+pub fn recorded_uuids(svc: &elasticsearch_engine::index::IndexService, uuids: &UuidMap) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |u: &str| if !out.iter().any(|o| o == u) { out.push(u.to_string()) };
+    if let Some(c) = svc.cluster_uuid() {
+        add(c);
+    }
+    if let Some((c, l)) = uuids.indices.get(&svc.name) {
+        if l == &svc.uuid {
+            add(c);
+        }
+    }
+    if let Some(rec) = crate::shards::read_copy_record(svc.path()) {
+        add(&rec.index_uuid);
+    }
+    out
+}
+
+/// What becomes of a local index the metadata does not hold (as this
+/// incarnation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Disposal {
+    /// Deleted: a tombstone names it, it holds no shard data, or it never
+    /// was part of a committed state here.
+    Delete(String),
+    /// Kept, out of service, as a dangling index (ES `DanglingIndicesState`):
+    /// listed by `GET _dangling`, importable or deletable through that API.
+    Dangling(String),
+}
+
+/// ES: a local index the cluster metadata lacks is deleted only when the
+/// index graveyard names it; otherwise it is dangling, never deleted.
+pub fn disposal(svc: &elasticsearch_engine::index::IndexService, md: &Metadata, uuids: &UuidMap) -> Disposal {
+    let recorded = recorded_uuids(svc, uuids);
+    if let Some(u) = recorded.iter().chain(std::iter::once(&svc.uuid)).find(|u| elasticsearch_cluster::graveyard::contains(md, u)) {
+        return Disposal::Delete(format!("a tombstone names index uuid [{u}]"));
+    }
+    if !holds_shard_data(svc.path()) {
+        return Disposal::Delete("it holds no shard data".into());
+    }
+    // Only what an application of a committed state writes counts: the
+    // uuid map also names indices a master's engine created for a
+    // publication that may have failed (rolled back, never committed).
+    let committed = svc.cluster_uuid().is_some() || crate::shards::read_copy_record(svc.path()).is_some();
+    if !committed {
+        return Disposal::Delete("it never was part of a committed cluster state on this node".into());
+    }
+    Disposal::Dangling(format!("no tombstone names index uuid {recorded:?}"))
+}
+
+/// Take the local index `name`, which `md` does not hold (as this
+/// incarnation), out of service: deleted or kept dangling ([`disposal`]).
+/// False when the name is still held (keeping it dangling failed).
+fn retire_local(engine: &Engine, name: &str, md: &Metadata, uuids: &mut UuidMap, rep: &mut ApplyReport, context: &str) -> bool {
+    let Some(svc) = engine.get_index(name) else { return true };
+    let verdict = disposal(&svc, md, uuids);
+    if matches!(verdict, Disposal::Dangling(_)) && svc.cluster_uuid().is_none() {
+        // Listed (and importable) under its cluster uuid, not its local one.
+        let from_record = crate::shards::read_copy_record(svc.path()).map(|r| r.index_uuid);
+        if let Some(u) = from_record.or_else(|| recorded_uuids(&svc, uuids).into_iter().next()) {
+            if let Err(e) = svc.set_cluster_uuid(&u) {
+                tracing::warn!(index = %name, "cannot record the dangling copy's index uuid: {}", e.reason);
+            }
+        }
+    }
+    drop(svc);
+    match verdict {
+        Disposal::Delete(why) => {
+            tracing::info!(index = %name, "deleting the local copy ({context}): {why}");
+            remove_index(engine, name, uuids, rep);
+            true
+        }
+        Disposal::Dangling(why) => match engine.quarantine_local_index_copy(name) {
+            Ok(to) => {
+                tracing::warn!(index = %name, kept = %to.display(), "local index not in the cluster metadata ({context}) kept as a dangling index: {why}");
+                uuids.indices.remove(name);
+                rep.dangling.push((name.to_string(), to));
+                true
+            }
+            Err(e) => {
+                rep.errors.push((name.to_string(), format!("cannot set aside dangling index ({context}, {why}): {}", e.reason)));
+                false
+            }
+        },
+    }
+}
+
+/// Delete set-aside copies (dangling or quarantined) whose index a
+/// tombstone of `md` names (ES deletes a dangling index once tombstoned).
+pub fn purge_tombstoned_set_aside(engine: &Engine, md: &Metadata) {
+    if elasticsearch_cluster::graveyard::tombstones(md).is_empty() {
+        return;
+    }
+    for (d, path) in crate::rest::dangling::quarantined_in(&engine.data) {
+        if elasticsearch_cluster::graveyard::contains(md, d.uuid.as_str()) {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => tracing::info!(index = %d.name, uuid = %d.uuid, "deleted a dangling copy its tombstone names"),
+                Err(e) => tracing::warn!(index = %d.name, uuid = %d.uuid, "cannot delete a tombstoned dangling copy: {e}"),
+            }
+        }
+    }
+}
+
+/// The set-aside copy (dangling or quarantined) of incarnation `uuid` of
+/// `name` in `engine`, if any: re-registered as the engine's index (ES's
+/// dangling import allocates the existing store).
+fn adopt_set_aside(engine: &Engine, name: &str, uuid: &str) -> Option<std::sync::Arc<elasticsearch_engine::index::IndexService>> {
+    let (_, path) = crate::rest::dangling::quarantined_in(&engine.data).into_iter().find(|(d, _)| d.uuid.as_str() == uuid && d.name.as_str() == name)?;
+    match engine.adopt_set_aside_index_copy(name, &path) {
+        Ok(svc) => {
+            tracing::info!(index = %name, %uuid, from = %path.display(), "re-registered the dangling copy of the index");
+            Some(svc)
+        }
+        Err(e) => {
+            tracing::warn!(index = %name, %uuid, "cannot re-register the dangling copy: {}", e.reason);
+            None
+        }
+    }
+}
+
+/// Move the local copy of `name` aside (see
+/// `Engine::quarantine_local_index_copy`); it is listed by the dangling
+/// indices API until an operator deletes it. False when it stays.
+fn quarantine_index(engine: &Engine, name: &str, why: &str, uuids: &mut UuidMap, rep: &mut ApplyReport) -> bool {
+    match engine.quarantine_local_index_copy(name) {
+        Ok(to) => {
+            tracing::error!(index = %name, kept = %to.display(), "local index copy of unknown identity quarantined (not deleted; listed by GET _dangling): {why}");
+            uuids.indices.remove(name);
+            rep.quarantined.push((name.to_string(), to));
+            true
+        }
+        Err(e) => {
+            rep.errors.push((name.to_string(), format!("cannot quarantine a local copy of unknown identity ({why}): {}", e.reason)));
+            false
+        }
+    }
+}
+
 /// Build cluster metadata from the master's engine, carrying over the
 /// cluster-owned parts of `prev` (uuids, primary terms, in-sync ids,
 /// customs the engine does not know about) and bumping per-index versions
@@ -104,11 +405,23 @@ pub fn extract(engine: &Engine, prev: &Metadata, uuids: &mut UuidMap) -> Metadat
     let mut md = prev.clone();
     md.indices.clear();
     for svc in engine.all_indices() {
+        // An index the cluster does not know that took part in a committed
+        // state (its copy records its cluster uuid or holds a shard copy
+        // record) is dangling, not new: it is never published from here
+        // (ES's master never adopts a local index; only an import does).
+        if !prev.indices.contains_key(&svc.name) && (svc.cluster_uuid().is_some() || crate::shards::read_copy_record(svc.path()).is_some()) {
+            tracing::debug!(index = %svc.name, "not publishing a dangling local index");
+            continue;
+        }
         let im = extract_index(engine, &svc, prev, uuids);
         md.indices.insert(svc.name.clone(), im);
     }
     uuids.indices.retain(|n, _| md.indices.contains_key(n));
-    let _ = uuids.save();
+    if let Err(e) = uuids.save() {
+        // The pairs stay in memory and are saved again with the next
+        // change; each copy also records its identity itself.
+        tracing::error!("failed to persist the index uuid map: {e}");
+    }
     extract_globals(engine, &mut md);
     crate::meta_extra::extract(engine, &mut md);
     if md != *prev {
@@ -130,7 +443,13 @@ pub fn extract_index(engine: &Engine, svc: &elasticsearch_engine::index::IndexSe
         prev.indices.get(&svc.name).map(|im| (*im.mappings).clone()).unwrap_or_else(|| meta.mappings.to_json())
     } else { meta.mappings.to_json() };
     let state = if meta.open { IndexState::Open } else { IndexState::Close };
-    let old = prev.indices.get(&svc.name).filter(|_| uuids.indices.get(&svc.name).map(|(_, l)| l == &svc.uuid).unwrap_or(true));
+    // A map entry for another local index means the engine re-created the
+    // index (a new incarnation) unless the copy itself records that it is
+    // `prev`'s (a stale map: the identity is the copy's own).
+    let old = prev.indices.get(&svc.name).filter(|p| match uuids.indices.get(&svc.name) {
+        Some((_, l)) if l != &svc.uuid => incarnation(svc, &p.uuid, uuids) == Incarnation::Same,
+        _ => true,
+    });
     if let (None, Some(p)) = (old, prev.indices.get(&svc.name)) {
         if p.in_sync_allocation_ids.values().any(|ids| !ids.is_empty()) {
             tracing::warn!(index = %svc.name, old_uuid = %p.uuid, new_uuid = %svc.uuid, "index with in-sync copies was re-created under the same name; its previous data is dropped");
@@ -503,6 +822,14 @@ pub struct ApplyReport {
     /// API in flight deleted them there (see [`HeldDeletes`]): their delete
     /// is published by the API's kept job, not undone by this application.
     pub withheld: Vec<String>,
+    /// Local indices whose identity was missing from the uuid map and was
+    /// reconstructed from the copy itself.
+    pub reconstructed: Vec<String>,
+    /// Local copies of unknown identity moved aside (name, new location).
+    pub quarantined: Vec<(String, PathBuf)>,
+    /// Local indices the metadata does not hold, kept as dangling indices
+    /// (name, new location).
+    pub dangling: Vec<(String, PathBuf)>,
 }
 
 /// Index incarnations (name, cluster uuid) that an engine API in flight on
@@ -527,27 +854,43 @@ pub fn apply_scoped(engine: &Engine, md: &Metadata, uuids: &mut UuidMap, extras:
     if extras {
         rep.errors.extend(crate::meta_extra::apply(engine, md));
     }
-    // Deleted indices, and indices recreated under the same name.
+    // Deleted indices, and indices recreated under the same name. A local
+    // index the map does not (correctly) name is identified from the copy
+    // itself, never deleted for want of a map entry.
+    let mut blocked = std::collections::BTreeSet::new();
     for svc in engine.all_indices() {
-        let keep = match (md.indices.get(&svc.name), uuids.indices.get(&svc.name)) {
-            (Some(im), Some((cluster, local))) => cluster == &im.uuid && local == &svc.uuid,
-            (Some(_), None) => false,
-            (None, _) => false,
-        };
-        if !keep {
-            remove_index(engine, &svc.name, uuids, &mut rep);
+        let name = svc.name.clone();
+        drop(svc);
+        match md.indices.get(&name) {
+            Some(im) => {
+                if !reconcile_incarnation(engine, &name, im, md, uuids, &mut rep) {
+                    blocked.insert(name);
+                }
+            }
+            None => {
+                retire_local(engine, &name, md, uuids, &mut rep, "absent from the cluster metadata");
+            }
         }
     }
+    purge_tombstoned_set_aside(engine, md);
     for (name, im) in &md.indices {
-        apply_index(engine, name, im, uuids, &mut rep);
+        if !blocked.contains(name) {
+            apply_index(engine, name, im, uuids, &mut rep);
+        }
     }
     apply_globals(engine, md);
     if let Err(e) = engine.persist_state() {
         rep.errors.push(("_state".into(), e.reason.clone()));
     }
-    let _ = uuids.save();
+    if let Err(e) = uuids.save() {
+        rep.errors.push((UUIDS_FAILURE.into(), format!("failed to persist the index uuid map: {e}")));
+    }
     rep
 }
+
+/// The [`ApplyReport::errors`] key of a uuid map that could not be saved
+/// (not an index: the next application retries it with the globals).
+pub const UUIDS_FAILURE: &str = "_uuids";
 
 /// [`apply_scoped`] for a state whose predecessor `prev` the engine already
 /// matches: only indices whose metadata changed (or that the engine lacks)
@@ -570,20 +913,36 @@ pub fn apply_changes_holding(engine: &Engine, prev: &Metadata, md: &Metadata, uu
         // Entry by entry: an engine API's unpublished change survives.
         rep.errors.extend(crate::meta_extra::apply_changed(engine, prev, md));
     }
-    for (name, p) in &prev.indices {
-        let replaced = md.indices.get(name).is_none_or(|im| im.uuid != p.uuid);
-        if replaced && engine.get_index(name).is_some() {
-            remove_index(engine, name, uuids, &mut rep);
+    for name in prev.indices.keys() {
+        // Deleted from the cluster (a name replaced by another incarnation
+        // is reconciled below, from what the local copy is): deleted when
+        // tombstoned, else kept dangling.
+        if !md.indices.contains_key(name) && engine.get_index(name).is_some() {
+            retire_local(engine, name, md, uuids, &mut rep, "deleted from the cluster metadata");
         }
     }
+    if prev.customs.get(elasticsearch_cluster::graveyard::CUSTOM) != md.customs.get(elasticsearch_cluster::graveyard::CUSTOM) {
+        purge_tombstoned_set_aside(engine, md);
+    }
     for (name, im) in &md.indices {
-        let mapped = uuids.indices.get(name).is_some_and(|(cluster, _)| cluster == &im.uuid);
+        // Mapped: the map names this incarnation for the local index there
+        // is (a stale entry, for another local index, is not).
+        let local = engine.get_index(name);
+        let mapped = match (&local, uuids.indices.get(name)) {
+            (Some(svc), Some((cluster, l))) => cluster == &im.uuid && l == &svc.uuid,
+            (None, Some((cluster, _))) => cluster == &im.uuid,
+            (_, None) => false,
+        };
+        let present = local.is_some();
+        drop(local);
         let same = prev.indices.get(name).is_some_and(|p| same_engine_view(p, im));
         // `retry`: indices whose last application failed are applied again.
-        if !same || !mapped || retry.contains(name) || engine.get_index(name).is_none() {
-            if !mapped && engine.get_index(name).is_some() {
-                // Another incarnation under this name.
-                remove_index(engine, name, uuids, &mut rep);
+        if !same || !mapped || retry.contains(name) || !present {
+            // Another incarnation under this name is removed; one of
+            // unknown identity is quarantined (and blocks the name while
+            // it cannot be).
+            if !reconcile_incarnation(engine, name, im, md, uuids, &mut rep) {
+                continue;
             }
             // The incarnation an engine API in flight saw: never created
             // here (also not if the API deletes it while this runs).
@@ -595,11 +954,13 @@ pub fn apply_changes_holding(engine: &Engine, prev: &Metadata, md: &Metadata, uu
     if globals {
         apply_globals(engine, md);
     }
-    if globals || !rep.created.is_empty() || !rep.deleted.is_empty() || !rep.updated.is_empty() {
+    if globals || !rep.created.is_empty() || !rep.deleted.is_empty() || !rep.updated.is_empty() || !rep.reconstructed.is_empty() || !rep.quarantined.is_empty() || !rep.dangling.is_empty() {
         if let Err(e) = engine.persist_state() {
             rep.errors.push(("_state".into(), e.reason.clone()));
         }
-        let _ = uuids.save();
+        if let Err(e) = uuids.save() {
+            rep.errors.push((UUIDS_FAILURE.into(), format!("failed to persist the index uuid map: {e}")));
+        }
     }
     rep
 }
@@ -635,7 +996,7 @@ fn apply_index_inner(engine: &Engine, name: &str, im: &IndexMetadata, uuids: &mu
             rep.withheld.push(name.clone());
             return;
         }
-        None => match create_sparse(engine, name, im) {
+        None => match adopt_set_aside(engine, name, &im.uuid).map(Ok).unwrap_or_else(|| create_sparse(engine, name, im)) {
             Ok(s) => {
                 uuids.indices.insert(name.clone(), (im.uuid.clone(), s.uuid.clone()));
                 rep.created.push(name.clone());
@@ -652,9 +1013,12 @@ fn apply_index_inner(engine: &Engine, name: &str, im: &IndexMetadata, uuids: &mu
         // immutable mapper conflict on the same service forever.
         return;
     }
-    // The copy's incarnation, readable without the uuid maps.
+    // The copy's incarnation, readable without the uuid maps (and durable
+    // in its metadata file: the identity survives a lost map).
     if uuids.indices.get(name).is_some_and(|(cluster, local)| cluster == &im.uuid && local == &svc.uuid) {
-        svc.set_cluster_uuid(&im.uuid);
+        if let Err(e) = svc.set_cluster_uuid(&im.uuid) {
+            rep.errors.push((name.clone(), format!("failed to persist the copy's index uuid: {}", e.reason)));
+        }
     }
     let mut changed = false;
     let want_open = im.state == IndexState::Open;
@@ -681,7 +1045,7 @@ fn apply_index_inner(engine: &Engine, name: &str, im: &IndexMetadata, uuids: &mu
     if !delta.is_empty() {
         // Non-dynamic keys can only change while closed; the master
         // already validated the change, so briefly close if needed.
-        let needs_close = svc.is_open() && delta.keys().any(|k| !es_settings::is_dynamic(k));
+        let needs_close = svc.is_open() && delta.keys().any(|k| !es_settings::is_dynamic(k) && !es_settings::is_private_dynamic(k));
         if needs_close {
             let _ = svc.set_open(false);
             engine.drop_fetch_contexts(name);
@@ -922,5 +1286,362 @@ mod tests {
         assert!(rep.errors.is_empty(), "{:?}", rep.errors);
         assert!(!svc.is_open());
         assert!(engine.fetch_contexts.lock().is_empty());
+    }
+
+    // ---- Index identity across restarts with a damaged uuid map ----
+
+    use elasticsearch_engine::index::{RecoverySource as EngineRecovery, ShardOpenSpec, WriteReq};
+    use elasticsearch_engine::shard::WriteCond;
+
+    /// Cluster metadata of a one-shard index `name` with cluster uuid
+    /// `uuid` (one the engine refuses as its own when it holds a `.`, so the
+    /// local uuid differs and the map matters).
+    fn cluster_md(name: &str, uuid: &str) -> Metadata {
+        let dir = tempfile::tempdir().unwrap();
+        let master = Engine::open(dir.path()).unwrap();
+        master.create_index(name, &json!({"settings": {"number_of_shards": 1}})).unwrap();
+        let mut md = extract(&master, &Metadata::default(), &mut UuidMap::default());
+        md.indices.get_mut(name).unwrap().uuid = uuid.into();
+        md
+    }
+
+    /// A node's engine + map as at its start.
+    fn start(dir: &Path) -> (std::sync::Arc<Engine>, UuidMap) {
+        let engine = Engine::open(&dir.join("engine")).unwrap();
+        let uuids = UuidMap::load_at_start(&dir.join("uuids.json")).unwrap();
+        (engine, uuids)
+    }
+
+    /// Mirror `md` on a fresh node at `dir`, open its shard 0 copy, write
+    /// `docs` documents and flush; with `record`, the copy record a started
+    /// copy has. Returns the local uuid.
+    fn node_with_data(dir: &Path, md: &Metadata, name: &str, docs: usize, record: bool) -> String {
+        let (engine, mut uuids) = start(dir);
+        let rep = apply(&engine, md, &mut uuids);
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        let svc = engine.get_index(name).unwrap();
+        let shard = svc.open_shard(0, ShardOpenSpec { allocation_id: "aid".into(), primary: true, primary_term: 1, recovery: EngineRecovery::Empty }).unwrap();
+        for i in 0..docs {
+            let r = svc.write(vec![WriteReq::Index { id: Some(format!("d{i}")), source: format!(r#"{{"n":{i}}}"#), routing: None, cond: WriteCond::default() }], false);
+            assert!(r[0].is_ok(), "{:?}", r[0]);
+        }
+        shard.shard.flush().unwrap();
+        if record {
+            crate::shards::write_copy_record(&svc, &crate::shards::CopyRecord { index: name.into(), index_uuid: md.indices[name].uuid.clone(), shard: 0,
+                allocation_id: "aid".into(), primary_term: 1, primary: true, history_uuid: Some("h".into()), global_checkpoint: Some(-1) }).unwrap();
+        }
+        svc.uuid.clone()
+    }
+
+    /// After a restart: the copy `local` is still registered under `name`
+    /// and opens with every document it had.
+    fn assert_intact(engine: &Engine, name: &str, local: &str, docs: usize) {
+        let svc = engine.get_index(name).unwrap_or_else(|| panic!("[{name}] was removed"));
+        assert_eq!(svc.uuid, local, "[{name}] was replaced by another local index");
+        let shard = svc.open_shard(0, ShardOpenSpec { allocation_id: "aid".into(), primary: true, primary_term: 1, recovery: EngineRecovery::ExistingStore }).unwrap();
+        assert_eq!(shard.shard.max_seq_no(), docs as i64 - 1, "documents lost");
+    }
+
+    /// Strip what the copy records about its incarnation in its metadata
+    /// file (a copy written before the identity was persisted there).
+    fn forget_persisted_identity(index_dir: &Path) {
+        let p = index_dir.join("index_meta.json");
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("cluster_uuid");
+        std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn missing_truncated_and_stale_maps_never_delete_an_intact_copy() {
+        for variant in ["missing", "truncated", "garbage", "stale", "empty-object"] {
+            for incremental in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let md = cluster_md("keep", "cluster.uuid.keep");
+                let local = node_with_data(dir.path(), &md, "keep", 5, false);
+                assert_ne!(local, "cluster.uuid.keep");
+                let map = dir.path().join("uuids.json");
+                let good = std::fs::read(&map).unwrap();
+                match variant {
+                    "missing" => std::fs::remove_file(&map).unwrap(),
+                    "truncated" => std::fs::write(&map, &good[..good.len() / 2]).unwrap(),
+                    "garbage" => std::fs::write(&map, b"\0\0\0\xff").unwrap(),
+                    "stale" => std::fs::write(&map, serde_json::to_vec(&json!({"indices": {"keep": ["cluster.uuid.keep", "someOtherLocalUuid0000"]}})).unwrap()).unwrap(),
+                    _ => std::fs::write(&map, b"{\"indices\":{}}").unwrap(),
+                }
+                let (engine, mut uuids) = start(dir.path());
+                let rep = if incremental { apply_changes(&engine, &md, &md, &mut uuids, true, &Default::default()) } else { apply(&engine, &md, &mut uuids) };
+                assert!(rep.deleted.is_empty() && rep.quarantined.is_empty(), "{variant}: {rep:?}");
+                assert!(rep.errors.is_empty(), "{variant}: {:?}", rep.errors);
+                assert_eq!(rep.reconstructed, vec!["keep".to_string()], "{variant}");
+                assert_intact(&engine, "keep", &local, 5);
+                // The map is repaired, durably.
+                assert_eq!(UuidMap::load(&map).unwrap().indices["keep"], ("cluster.uuid.keep".to_string(), local.clone()), "{variant}");
+                if matches!(variant, "truncated" | "garbage") {
+                    let kept = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("uuids.corrupt-"));
+                    assert!(kept, "{variant}: the corrupt map is kept for inspection");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_map_fails_the_start_and_is_never_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = cluster_md("keep", "cluster.uuid.keep");
+        let local = node_with_data(dir.path(), &md, "keep", 3, false);
+        let map = dir.path().join("uuids.json");
+        std::fs::remove_file(&map).unwrap();
+        // Reading it fails with something other than "not found".
+        std::fs::create_dir(&map).unwrap();
+        let err = UuidMap::load(&map).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(UuidMap::load_at_start(&map).is_err(), "an unreadable map must fail the start");
+        assert!(map.is_dir(), "an unreadable map is not moved aside");
+        // Repaired by the operator: the copy is still there.
+        std::fs::remove_dir(&map).unwrap();
+        let (engine, mut uuids) = start(dir.path());
+        let rep = apply(&engine, &md, &mut uuids);
+        assert!(rep.deleted.is_empty(), "{rep:?}");
+        assert_intact(&engine, "keep", &local, 3);
+    }
+
+    #[test]
+    fn identity_is_reconstructed_from_the_copy_record_of_an_older_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = cluster_md("keep", "cluster.uuid.keep");
+        let local = node_with_data(dir.path(), &md, "keep", 4, true);
+        {
+            let (engine, _) = start(dir.path());
+            forget_persisted_identity(engine.get_index("keep").unwrap().path());
+        }
+        std::fs::remove_file(dir.path().join("uuids.json")).unwrap();
+        let (engine, mut uuids) = start(dir.path());
+        assert_eq!(engine.get_index("keep").unwrap().cluster_uuid(), None);
+        let rep = apply(&engine, &md, &mut uuids);
+        assert!(rep.deleted.is_empty() && rep.quarantined.is_empty(), "{rep:?}");
+        assert_intact(&engine, "keep", &local, 4);
+        // And the identity is now in the copy's own metadata file.
+        let svc = engine.get_index("keep").unwrap();
+        assert_eq!(elasticsearch_engine::index::IndexCore::persisted_cluster_uuid(svc.path()).as_deref(), Some("cluster.uuid.keep"));
+    }
+
+    #[test]
+    fn a_copy_of_unknown_identity_is_quarantined_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = cluster_md("keep", "cluster.uuid.keep");
+        let local = node_with_data(dir.path(), &md, "keep", 6, false);
+        let old_path = {
+            let (engine, _) = start(dir.path());
+            let p = engine.get_index("keep").unwrap().path().to_path_buf();
+            forget_persisted_identity(&p);
+            p
+        };
+        std::fs::remove_file(dir.path().join("uuids.json")).unwrap();
+        let (engine, mut uuids) = start(dir.path());
+        let rep = apply(&engine, &md, &mut uuids);
+        assert!(rep.deleted.is_empty(), "{rep:?}");
+        assert_eq!(rep.quarantined.len(), 1, "{rep:?}");
+        let (_, kept) = &rep.quarantined[0];
+        assert!(!old_path.exists());
+        assert!(kept.join("shard-0").join("shard_state.json").exists(), "the shard data is kept whole");
+        assert!(kept.starts_with(dir.path().join("engine").join(Engine::QUARANTINE_DIR)));
+        // The name holds a fresh shell of the cluster's incarnation.
+        let shell = engine.get_index("keep").unwrap();
+        assert_ne!(shell.uuid, local);
+        assert_eq!(shell.cluster_uuid(), Some("cluster.uuid.keep"));
+        // Listed as dangling, under its local uuid (nothing else is known).
+        let d = crate::rest::dangling::quarantined_copy(kept).unwrap();
+        assert_eq!((d.name.as_str(), d.uuid.as_str()), ("keep", local.as_str()));
+        // A restart neither reopens nor deletes it.
+        drop((shell, engine));
+        let (engine, mut uuids) = start(dir.path());
+        let rep = apply(&engine, &md, &mut uuids);
+        assert!(rep.deleted.is_empty() && rep.quarantined.is_empty() && rep.errors.is_empty(), "{rep:?}");
+        assert!(kept.join("shard-0").join("shard_state.json").exists());
+    }
+
+    #[test]
+    fn a_metadata_only_shell_of_unknown_identity_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = cluster_md("shell", "cluster.uuid.shell");
+        {
+            let (engine, mut uuids) = start(dir.path());
+            assert!(apply(&engine, &md, &mut uuids).errors.is_empty());
+            forget_persisted_identity(engine.get_index("shell").unwrap().path());
+        }
+        std::fs::remove_file(dir.path().join("uuids.json")).unwrap();
+        let (engine, mut uuids) = start(dir.path());
+        let rep = apply(&engine, &md, &mut uuids);
+        assert_eq!(rep.deleted, vec!["shell".to_string()], "{rep:?}");
+        assert!(rep.quarantined.is_empty());
+        assert!(engine.get_index("shell").is_some());
+        assert!(!dir.path().join("engine").join(Engine::QUARANTINE_DIR).exists());
+    }
+
+    #[test]
+    fn a_genuine_older_incarnation_is_still_replaced() {
+        for tombstoned in [true, false] {
+            for (evidence, map_lost) in [("metadata", true), ("copy-record", true), ("map", false)] {
+                let dir = tempfile::tempdir().unwrap();
+                let old = cluster_md("idx", "cluster.uuid.old");
+                node_with_data(dir.path(), &old, "idx", 2, evidence == "copy-record");
+                if evidence != "metadata" {
+                    let (engine, _) = start(dir.path());
+                    forget_persisted_identity(engine.get_index("idx").unwrap().path());
+                }
+                if map_lost {
+                    std::fs::remove_file(dir.path().join("uuids.json")).unwrap();
+                }
+                let mut new = cluster_md("idx", "cluster.uuid.new");
+                if tombstoned {
+                    tombstone(&mut new, "idx", "cluster.uuid.old");
+                }
+                let (engine, mut uuids) = start(dir.path());
+                let rep = apply(&engine, &new, &mut uuids);
+                assert!(rep.quarantined.is_empty(), "{evidence}");
+                // Only the map recorded it (a copy from before the identity was
+                // persisted, never a started shard copy): nothing committed
+                // depends on it.
+                if tombstoned || evidence == "map" {
+                    assert_eq!(rep.deleted, vec!["idx".to_string()], "{evidence}: {rep:?}");
+                    assert!(rep.dangling.is_empty(), "{evidence}");
+                } else {
+                    // ES: no tombstone, so the old incarnation stays dangling.
+                    assert!(rep.deleted.is_empty(), "{evidence}: {rep:?}");
+                    assert_eq!(rep.dangling.len(), 1, "{evidence}: {rep:?}");
+                    let kept = &rep.dangling[0].1;
+                    assert!(kept.join("shard-0").join("shard_state.json").exists(), "{evidence}");
+                    let d = crate::rest::dangling::quarantined_copy(kept).unwrap();
+                    assert_eq!((d.name.as_str(), d.uuid.as_str()), ("idx", "cluster.uuid.old"), "{evidence}");
+                }
+                let svc = engine.get_index("idx").unwrap();
+                assert_eq!(svc.cluster_uuid(), Some("cluster.uuid.new"), "{evidence}");
+                assert!(!crate::mirror::holds_shard_data(svc.path()), "{evidence}");
+            }
+        }
+    }
+
+    fn tombstone(md: &mut Metadata, name: &str, uuid: &str) {
+        let key = elasticsearch_cluster::graveyard::CUSTOM;
+        let mut stones = md.customs.get(key).and_then(|g| g["tombstones"].as_array().cloned()).unwrap_or_default();
+        stones.push(json!({"index": {"index_name": name, "index_uuid": uuid}, "delete_date_in_millis": 1}));
+        md.customs.insert(key.into(), json!({"tombstones": stones}));
+    }
+
+    /// A local index the metadata does not hold: deleted when a tombstone
+    /// names it, else kept dangling (out of service, listed, its data whole);
+    /// an import (the index back in the metadata under its uuid) re-registers
+    /// that very copy, and a later tombstone deletes a dangling copy.
+    #[test]
+    fn absent_indices_are_deleted_only_when_tombstoned() {
+        for path in ["full", "incremental"] {
+            // Tombstoned: deleted.
+            let dir = tempfile::tempdir().unwrap();
+            let md = cluster_md("gone", "cluster.uuid.gone");
+            let local = node_with_data(dir.path(), &md, "gone", 3, true);
+            let mut after = Metadata::default();
+            tombstone(&mut after, "gone", "cluster.uuid.gone");
+            let (engine, mut uuids) = start(dir.path());
+            let rep = if path == "full" { apply(&engine, &after, &mut uuids) } else { apply_changes(&engine, &md, &after, &mut uuids, false, &Default::default()) };
+            assert_eq!(rep.deleted, vec!["gone".to_string()], "{path}: {rep:?}");
+            assert!(rep.dangling.is_empty() && engine.get_index("gone").is_none(), "{path}");
+            assert!(crate::rest::dangling::quarantined_in(&engine.data).is_empty(), "{path}");
+            let _ = local;
+
+            // Not tombstoned: dangling, then imported back intact.
+            let dir = tempfile::tempdir().unwrap();
+            let md = cluster_md("keep", "cluster.uuid.keep");
+            let local = node_with_data(dir.path(), &md, "keep", 4, true);
+            let (engine, mut uuids) = start(dir.path());
+            let empty = Metadata::default();
+            let rep = if path == "full" { apply(&engine, &empty, &mut uuids) } else { apply_changes(&engine, &md, &empty, &mut uuids, false, &Default::default()) };
+            assert!(rep.deleted.is_empty(), "{path}: {rep:?}");
+            assert_eq!(rep.dangling.len(), 1, "{path}: {rep:?}");
+            assert!(engine.get_index("keep").is_none(), "{path}: out of service");
+            let listed = crate::rest::dangling::quarantined_in(&engine.data);
+            assert_eq!(listed.len(), 1, "{path}");
+            assert_eq!((listed[0].0.name.as_str(), listed[0].0.uuid.as_str()), ("keep", "cluster.uuid.keep"), "{path}");
+            // The master never publishes it as a new index.
+            assert!(!extract(&engine, &empty, &mut uuids).indices.contains_key("keep"), "{path}");
+            // Imported: the same copy, every document.
+            let rep = apply_changes(&engine, &empty, &md, &mut uuids, false, &Default::default());
+            assert!(rep.errors.is_empty(), "{path}: {:?}", rep.errors);
+            assert_eq!(rep.created, vec!["keep".to_string()], "{path}");
+            assert_intact(&engine, "keep", &local, 4);
+            assert!(crate::rest::dangling::quarantined_in(&engine.data).is_empty(), "{path}");
+
+            // Dangling again, then tombstoned: the set-aside copy is deleted.
+            let rep = apply_changes(&engine, &md, &empty, &mut uuids, false, &Default::default());
+            assert_eq!(rep.dangling.len(), 1, "{path}");
+            let kept = rep.dangling[0].1.clone();
+            let mut later = Metadata::default();
+            tombstone(&mut later, "keep", "cluster.uuid.keep");
+            let rep = if path == "full" { apply(&engine, &later, &mut uuids) } else { apply_changes(&engine, &empty, &later, &mut uuids, false, &Default::default()) };
+            assert!(rep.errors.is_empty(), "{path}: {:?}", rep.errors);
+            assert!(!kept.exists(), "{path}: a tombstoned dangling copy is deleted");
+        }
+    }
+
+    /// An index the metadata never committed here (a rolled-back creation)
+    /// or that holds no shard data is simply deleted.
+    #[test]
+    fn uncommitted_or_dataless_absent_indices_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let md = cluster_md("shell", "cluster.uuid.shell");
+        let mut uuids = UuidMap::default();
+        assert!(apply(&engine, &md, &mut uuids).errors.is_empty());
+        let svc = engine.create_index("rolled-back", &json!({"settings": {"number_of_shards": 1}})).unwrap();
+        assert!(holds_shard_data(svc.path()));
+        drop(svc);
+        let rep = apply(&engine, &Metadata::default(), &mut uuids);
+        let mut deleted = rep.deleted.clone();
+        deleted.sort();
+        assert_eq!(deleted, vec!["rolled-back".to_string(), "shell".to_string()], "{rep:?}");
+        assert!(rep.dangling.is_empty());
+    }
+
+    #[test]
+    fn conflicting_identity_evidence_quarantines() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = cluster_md("keep", "cluster.uuid.keep");
+        node_with_data(dir.path(), &md, "keep", 2, false);
+        // The copy record names another incarnation than its metadata file.
+        {
+            let (engine, _) = start(dir.path());
+            let svc = engine.get_index("keep").unwrap();
+            crate::shards::write_copy_record(&svc, &crate::shards::CopyRecord { index: "keep".into(), index_uuid: "cluster.uuid.other".into(), shard: 0,
+                allocation_id: "aid".into(), primary_term: 1, primary: true, history_uuid: None, global_checkpoint: None }).unwrap();
+        }
+        // A consistent map entry is trusted as is (no per-application file
+        // reads); without it the copy's own evidence is weighed.
+        std::fs::remove_file(dir.path().join("uuids.json")).unwrap();
+        let (engine, mut uuids) = start(dir.path());
+        assert!(matches!(incarnation(&engine.get_index("keep").unwrap(), "cluster.uuid.keep", &uuids), Incarnation::Unknown(_)));
+        let rep = apply(&engine, &md, &mut uuids);
+        assert!(rep.deleted.is_empty(), "{rep:?}");
+        assert_eq!(rep.quarantined.len(), 1, "{rep:?}");
+    }
+
+    #[test]
+    fn uuid_map_saves_are_durable_and_failures_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = cluster_md("keep", "cluster.uuid.keep");
+        let (engine, mut uuids) = start(dir.path());
+        assert!(apply(&engine, &md, &mut uuids).errors.is_empty());
+        let map = dir.path().join("uuids.json");
+        let saved = std::fs::read(&map).unwrap();
+        assert!(!dir.path().join("uuids.tmp").exists());
+        save_test_hook::fail_under(dir.path(), true);
+        let mut changed = md.clone();
+        changed.indices.insert("more".into(), { let mut m = cluster_md("more", "cluster.uuid.more").indices["more"].clone(); m.name = "more".into(); m });
+        let rep = apply(&engine, &changed, &mut uuids);
+        save_test_hook::fail_under(dir.path(), false);
+        assert!(rep.errors.iter().any(|(k, _)| k == UUIDS_FAILURE), "{:?}", rep.errors);
+        assert_eq!(std::fs::read(&map).unwrap(), saved, "the previous map stays whole");
+        // Retried by the next application.
+        let rep = apply(&engine, &changed, &mut uuids);
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert!(UuidMap::load(&map).unwrap().indices.contains_key("more"));
     }
 }

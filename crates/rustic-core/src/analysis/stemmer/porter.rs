@@ -44,65 +44,63 @@ impl LucenePorter {
         self.b[i as usize]
     }
 
+    /// Whether `b[i]` is a consonant. A `y` is a consonant at the start
+    /// or after a vowel, so a run of `y`s alternates; this walks back to
+    /// the run's start iteratively (finding 305: the recursive form was
+    /// quadratic, and unbounded in stack depth, on long `y` runs).
     fn cons(&self, i: isize) -> bool {
+        let mut j = i;
+        while self.at(j) == 'y' && j > self.k0 {
+            j -= 1;
+        }
+        let base = match self.at(j) {
+            'a' | 'e' | 'i' | 'o' | 'u' => false,
+            _ => true,
+        };
+        // Each `y` after the base flips the classification.
+        base ^ ((i - j) % 2 == 1)
+    }
+
+    /// [`Self::cons`] of `i` given `prev = cons(i - 1)` (`None` at `k0`):
+    /// constant work for the forward scans below.
+    fn cons_after(&self, i: isize, prev: Option<bool>) -> bool {
         match self.at(i) {
             'a' | 'e' | 'i' | 'o' | 'u' => false,
-            'y' => {
-                if i == self.k0 {
-                    true
-                } else {
-                    !self.cons(i - 1)
-                }
-            }
+            'y' => prev.map_or(true, |p| !p),
             _ => true,
         }
     }
 
-    /// Number of consonant sequences between k0 and j.
+    /// Number of consonant sequences between k0 and j (vowel runs that
+    /// are followed by a consonant), in one forward pass.
     fn m(&self) -> usize {
         let mut n = 0;
+        let mut prev = None;
+        let mut in_vowels = false;
         let mut i = self.k0;
-        loop {
-            if i > self.j {
-                return n;
+        while i <= self.j {
+            let c = self.cons_after(i, prev);
+            if !c {
+                in_vowels = true;
+            } else if in_vowels {
+                n += 1;
+                in_vowels = false;
             }
-            if !self.cons(i) {
-                break;
-            }
+            prev = Some(c);
             i += 1;
         }
-        i += 1;
-        loop {
-            loop {
-                if i > self.j {
-                    return n;
-                }
-                if self.cons(i) {
-                    break;
-                }
-                i += 1;
-            }
-            i += 1;
-            n += 1;
-            loop {
-                if i > self.j {
-                    return n;
-                }
-                if !self.cons(i) {
-                    break;
-                }
-                i += 1;
-            }
-            i += 1;
-        }
+        n
     }
 
     fn vowelinstem(&self) -> bool {
+        let mut prev = None;
         let mut i = self.k0;
         while i <= self.j {
-            if !self.cons(i) {
+            let c = self.cons_after(i, prev);
+            if !c {
                 return true;
             }
+            prev = Some(c);
             i += 1;
         }
         false
@@ -525,7 +523,9 @@ impl crate::analysis::TokenFilter for StemFilter {
         tokens
             .into_iter()
             .map(|mut t| {
-                t.text = porter_stem(&t.text);
+                if !t.keyword {
+                    t.text = porter_stem(&t.text);
+                }
                 t
             })
             .collect()
@@ -541,6 +541,54 @@ mod tests {
             let got = porter_stem(input);
             assert_eq!(&got, expected, "porter_stem({input})");
         }
+    }
+
+    /// Finding 305: a long run of `y`s (consonant/vowel alternation) is
+    /// classified in linear time without recursion, and `y`-heavy words
+    /// stem as the textbook recursive definition says.
+    #[test]
+    fn long_y_runs_stem_in_linear_time() {
+        // Reference: the recursive definition (`y` is a consonant at the
+        // start or after a vowel), for short words.
+        fn cons_ref(b: &[char], i: usize) -> bool {
+            match b[i] {
+                'a' | 'e' | 'i' | 'o' | 'u' => false,
+                'y' => i == 0 || !cons_ref(b, i - 1),
+                _ => true,
+            }
+        }
+        // Reference `m`: consonant sequences [C](VC)^m[V] in b[..=j].
+        fn m_ref(b: &[char], j: usize) -> usize {
+            let cs: Vec<bool> = (0..=j).map(|i| cons_ref(b, i)).collect();
+            let mut i = cs.iter().position(|c| !c).unwrap_or(cs.len());
+            let mut n = 0;
+            while i < cs.len() {
+                match cs[i..].iter().position(|c| *c) {
+                    Some(p) => {
+                        n += 1;
+                        i += p;
+                        i += cs[i..].iter().position(|c| !c).unwrap_or(cs.len() - i);
+                    }
+                    None => break,
+                }
+            }
+            n
+        }
+        for w in ["yyy", "ayyyb", "eyyyyeed", "syzygy", "yay", "boyyyyed", "yyyyyyyyyyeed", "trouble", "oaten", "private", "tree", "by"] {
+            for j in 0..w.len() {
+                let st = super::LucenePorter { b: w.chars().collect(), j: j as isize, k: w.len() as isize - 1, k0: 0 };
+                assert_eq!(st.cons(j as isize), cons_ref(&st.b, j), "{w}[{j}]");
+                assert_eq!(st.m(), m_ref(&st.b, j), "m({w}, {j})");
+                assert_eq!(st.vowelinstem(), (0..=j).any(|i| !cons_ref(&st.b, i)), "vowelinstem({w}, {j})");
+            }
+        }
+        // 400k chars: the recursive form overflowed the stack / took
+        // quadratic time here.
+        let long = format!("{}eed", "y".repeat(400_000));
+        let t = std::time::Instant::now();
+        let out = porter_stem(&long);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(out.starts_with("yyy"));
     }
 
     #[test]

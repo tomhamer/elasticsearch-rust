@@ -20,6 +20,12 @@ pub(super) struct Epoch {
 pub(crate) struct EncodedRow {
     pub(super) epoch: Arc<Epoch>,
     pub(super) words: Vec<u32>,
+    /// A 1-bit field's maintenance row (see `MutationPlane`), empty for
+    /// other fields.
+    pub(super) mutation: Vec<u32>,
+    /// The calibration the maintenance row is quantized around (its
+    /// epoch's, or `MAINTENANCE_EPOCH`).
+    pub(super) mutation_epoch: u64,
     pub(super) _memory: Option<Arc<crate::admission::Reservation>>,
 }
 
@@ -82,6 +88,8 @@ pub(super) struct QuantizedOwner {
     drift_checked: std::sync::atomic::AtomicU64,
     dim: usize,
     similarity: Similarity,
+    /// The frozen maintenance centroid (see `mutation_plane::Maintenance`).
+    maintenance: std::sync::OnceLock<Arc<super::mutation_plane::Maintenance>>,
     // Rust drops fields in declaration order: release calibration/score
     // storage before returning its capacity to concurrent admissions.
     _memory: crate::admission::Reservation,
@@ -100,7 +108,7 @@ impl QuantizedOwner {
         let memory=budget.reserve((dim as u64).saturating_mul(256*16).saturating_add(65536),"mutable quantizer calibration")?;
         Ok(Self { budget, _memory:memory, calibration: parking_lot::Mutex::new(Calibration { spec, current: 0, seen: 0,
             since_fit: 0, next_warmup: 32, samples: Vec::new(), sum: vec![0.0; dim], count: 0, fitted_seen: 0 }),
-            epochs: parking_lot::RwLock::new(BTreeMap::new()), score: parking_lot::RwLock::new(None), score_count: Default::default(), drift_checked: Default::default(), dim, similarity })
+            epochs: parking_lot::RwLock::new(BTreeMap::new()), score: parking_lot::RwLock::new(None), score_count: Default::default(), drift_checked: Default::default(), dim, similarity, maintenance: std::sync::OnceLock::new() })
     }
     pub fn spec(&self) -> EsQuant { self.calibration.lock().spec }
 
@@ -195,7 +203,28 @@ impl QuantizedOwner {
         // Encoding never holds the graph writer, epoch registry or calibration
         // mutex. Prepared rows retain the epoch through cancellation/admission.
         let codes = EsCodes::build(epoch.q.clone(), self.similarity, rows.len(), self.dim, |i| rows[i]);
-        Ok((0..rows.len()).map(|i| EncodedRow { epoch: epoch.clone(), words: codes.row_words(i), _memory:Some(prepared.clone()) }).collect())
+        // A 1-bit field's maintenance rows (2- or 4-bit codes around the same
+        // centroid), while the f32 is at hand: pruning reads them instead
+        // of the f32, which is on disk once shed.
+        // 2-bit rows are quantized around the frozen maintenance centroid
+        // once there is one, so they compare on their codes.
+        let frozen = self.maintenance();
+        let maintenance = |i: usize| -> (u64, Vec<u32>) {
+            match &epoch.q {
+                EsQuantizer::Osq(osq) if osq.doc_bits == 1 => {
+                    let unit = if self.similarity == Similarity::Cosine { es_unit(rows[i]) } else { std::borrow::Cow::Borrowed(rows[i]) };
+                    match (&frozen, super::mutation_plane::bits()) {
+                        (Some(frozen), 2) => (super::mutation_plane::MAINTENANCE_EPOCH, super::mutation_plane::encode2(&frozen.osq, &unit)),
+                        (_, bits) => (epoch.id, super::mutation_plane::encode(osq, &unit, bits)),
+                    }
+                }
+                _ => (epoch.id, Vec::new()),
+            }
+        };
+        Ok((0..rows.len()).map(|i| {
+            let (mutation_epoch, mutation) = maintenance(i);
+            EncodedRow { epoch: epoch.clone(), words: codes.row_words(i), mutation, mutation_epoch, _memory:Some(prepared.clone()) }
+        }).collect())
     }
 
     /// Whether the running mean of the admitted rows is still the current
@@ -289,6 +318,34 @@ impl QuantizedOwner {
     }
     pub fn get(&self, id: u64) -> Option<Arc<Epoch>> { self.epochs.read().get(&id).cloned() }
 
+    /// The frozen maintenance centroid: fixed, from the current OSQ epoch,
+    /// once [`super::mutation_plane::MAINTENANCE_FREEZE_ROWS`] rows were
+    /// admitted (`None` before, and for other quantizers). Not persisted: a
+    /// restored field freezes it anew, and its restored nodes get rows
+    /// around it from the backfill.
+    pub(super) fn maintenance(&self) -> Option<Arc<super::mutation_plane::Maintenance>> {
+        if let Some(frozen) = self.maintenance.get() { return Some(frozen.clone()); }
+        let current = {
+            let state = self.calibration.lock();
+            if state.seen < super::mutation_plane::MAINTENANCE_FREEZE_ROWS { return None; }
+            self.epochs.read().get(&state.current).cloned()?
+        };
+        let EsQuantizer::Osq(osq) = &current.q else { return None };
+        if osq.doc_bits != 1 || osq.centroid.len() != self.dim { return None; }
+        Some(self.maintenance.get_or_init(|| Arc::new(super::mutation_plane::Maintenance {
+            osq: OsqQuantizer::from_centroid(osq.sim, osq.centroid.clone(), osq.doc_bits, osq.query_bits) })).clone())
+    }
+
+    /// The centroid rows of calibration `id` (an epoch, or the frozen
+    /// maintenance one) are quantized around.
+    pub(super) fn maintenance_centroid(&self, id: u64) -> Option<MaintenanceCentroid> {
+        if id == super::mutation_plane::MAINTENANCE_EPOCH {
+            return self.maintenance.get().cloned().map(MaintenanceCentroid::Frozen);
+        }
+        let epoch = self.get(id)?;
+        matches!(&epoch.q, EsQuantizer::Osq(_)).then_some(MaintenanceCentroid::Epoch(epoch))
+    }
+
     // Capture is called while the source/graph publication fence is held.
     // The immutable epochs remain retained until the checkpoint has streamed.
     pub fn checkpoint(&self) -> Result<crate::admission::Allocation<Vec<u8>>> {
@@ -350,7 +407,7 @@ impl QuantizedOwner {
             return Err(corrupt("calibration current/trailing bytes"));
         }
         let owner = Self { budget:crate::admission::shared(), _memory:memory, calibration: parking_lot::Mutex::new(calibration), epochs: parking_lot::RwLock::new(epochs), score: parking_lot::RwLock::new(None),
-            score_count: Default::default(), drift_checked: Default::default(), dim, similarity };
+            score_count: Default::default(), drift_checked: Default::default(), dim, similarity, maintenance: std::sync::OnceLock::new() };
         {
             let state = owner.calibration.lock();
             let current = owner.epochs.read().get(&state.current).map(|epoch| epoch.q.clone());
@@ -583,5 +640,19 @@ mod score_quantizer_tests {
         let refs: Vec<&[f32]> = data.iter().map(Vec::as_slice).collect();
         owner.prepare(&refs).unwrap();
         assert!(matches!(owner.score_quantizer(), Some(EsQuantizer::Lucene99(_))));
+    }
+}
+
+/// A maintenance centroid, held for as long as rows are compared with it.
+pub(super) enum MaintenanceCentroid {
+    Frozen(Arc<super::mutation_plane::Maintenance>),
+    Epoch(Arc<Epoch>),
+}
+impl MaintenanceCentroid {
+    pub(super) fn centroid(&self) -> &[f32] {
+        match self {
+            Self::Frozen(m) => &m.osq.centroid,
+            Self::Epoch(e) => match &e.q { EsQuantizer::Osq(osq) => &osq.centroid, EsQuantizer::Lucene99(_) => &[] },
+        }
     }
 }

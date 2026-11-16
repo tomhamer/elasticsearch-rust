@@ -38,13 +38,20 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/share/elasticsearch/bin/es-cluster-cleanup"]
           env:
-            - name: ES_URL
-              value: {{ include "es.clientUrl" . | quote }}
+            {{- include "es.clientEnv" . | trim | nindent 12 }}
             - name: ES_CLEANUP_TIMEOUT
               value: {{ .Values.masterScaleDown.cleanupTimeoutSeconds | quote }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with include "es.clientCaMount" . }}
+          volumeMounts:
+            {{- . | trim | nindent 12 }}
+          {{- end }}
           resources:
             requests: { cpu: 10m, memory: 16Mi }
             limits: { memory: 64Mi }
+      {{- with include "es.clientCaVolume" . }}
+      volumes:
+        {{- . | trim | nindent 8 }}
+      {{- end }}
 {{- end }}

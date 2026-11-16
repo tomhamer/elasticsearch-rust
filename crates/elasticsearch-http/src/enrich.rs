@@ -5,6 +5,8 @@ use axum::http::Method;
 use elasticsearch_engine::enrich;
 use elasticsearch_engine::error::EsError;
 use elasticsearch_engine::node::{Node, ES_VERSION};
+use elasticsearch_engine::security::owner::StoredAuthn;
+use elasticsearch_engine::security::Permission;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
@@ -31,7 +33,8 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
                 .await,
                 Method::PUT => blocking(move || {
                     let body = req.json()?;
-                    let warn = enrich::put_policy(&node, &name, &body)?;
+                    let headers = authorize_put(&node, &req, &name, &body)?;
+                    let warn = enrich::put_policy(&node, &name, &body, headers)?;
                     let mut r = Resp::ack();
                     if warn {
                         r.headers.push(("Warning", format!("299 Elasticsearch-{ES_VERSION}-{} \"{}\"", crate::cluster::BUILD_HASH, enrich::VERSION_DEPRECATION)));
@@ -85,18 +88,69 @@ impl enrich::PolicyIndexOps for RestPolicyOps {
     }
 }
 
-fn run(node: &Node, name: &str, task: &elasticsearch_engine::tasks::Task, rest: Option<&crate::ClusterRest>) -> Result<String, EsError> {
+fn run(node: &Node, name: &str, task: &elasticsearch_engine::tasks::Task, rest: Option<&crate::ClusterRest>, reader: Option<&enrich::SourceReader>) -> Result<String, EsError> {
     match rest {
-        Some(rest) => enrich::execute_policy_with(node, name, task, &RestPolicyOps(rest.clone())),
-        None => enrich::execute_policy(node, name, task),
+        Some(rest) => enrich::execute_policy_with(node, name, task, &RestPolicyOps(rest.clone()), reader),
+        None => enrich::execute_policy(node, name, task, reader),
     }
+}
+
+/// Source names `perm` does not hold `read` on (ES `HasPrivileges` with
+/// the policy's index patterns).
+fn unreadable(perm: &Permission, indices: &[String]) -> Vec<String> {
+    indices.iter().filter(|n| !perm.has_index_privilege(n, "read")).cloned().collect()
+}
+
+/// `PUT _enrich/policy/{name}` with security on: the caller must hold `read`
+/// on every source index pattern (ES `TransportPutEnrichPolicyAction`), and
+/// the policy keeps the caller's authentication for its executions.
+fn authorize_put(node: &Node, req: &Req, name: &str, body: &Value) -> Result<Option<StoredAuthn>, EsError> {
+    if !node.security.enabled() {
+        return Ok(None);
+    }
+    let Some(access) = req.access.as_deref() else { return Ok(None) };
+    let (policy, _) = enrich::parse_policy(name, body)?;
+    if !unreadable(access.permission(), &policy.indices).is_empty() {
+        return Err(EsError::new(403, "security_exception", format!("unable to store policy because no indices match with the specified index patterns [{}]", policy.indices.join(", "))));
+    }
+    Ok(Some(StoredAuthn::of(access.user())))
+}
+
+/// The subject an execution reads the policy's sources as (security on):
+/// the one stored with the policy (a policy stored with security off: the
+/// caller). The caller must also hold `read` on the sources, and so must
+/// the stored subject still; its document / field level security applies.
+fn source_reader(node: &Node, req: &Req, policy: &enrich::Policy) -> Result<Option<enrich::SourceReader>, EsError> {
+    if !node.security.enabled() {
+        return Ok(None);
+    }
+    const READ: &str = "indices:data/read/search";
+    let caller = req.access.as_deref();
+    if let Some(a) = caller {
+        let missing = unreadable(a.permission(), &policy.indices);
+        if !missing.is_empty() {
+            return Err(crate::security::denied(node, a.user(), a.permission(), READ, Some(missing.as_slice())));
+        }
+    }
+    let authn = match (&policy.headers, caller) {
+        (Some(h), _) => h.to_authn(),
+        (None, Some(a)) => a.user().clone(),
+        (None, None) => return Ok(None),
+    };
+    let perm = node.security.permission(&authn);
+    let missing = unreadable(&perm, &policy.indices);
+    if !missing.is_empty() {
+        return Err(crate::security::denied(node, &authn, &perm, READ, Some(missing.as_slice())));
+    }
+    Ok(Some(enrich::SourceReader { authn, perm }))
 }
 
 fn execute(node: &Arc<Node>, req: &Req, name: &str) -> R {
     let wait = req.bool_param("wait_for_completion")?.unwrap_or(true);
-    if enrich::store(node).get(name).is_none() {
+    let Some(policy) = enrich::store(node).get(name) else {
         return Err(EsError::resource_not_found(format!("policy [{name}] does not exist")));
-    }
+    };
+    let reader = source_reader(node, req, &policy)?;
     let mut headers = Map::new();
     if let Some(v) = req.headers.get("x-opaque-id").and_then(|v| v.to_str().ok()) {
         headers.insert("X-Opaque-Id".into(), json!(v));
@@ -105,7 +159,7 @@ fn execute(node: &Arc<Node>, req: &Req, name: &str) -> R {
     let rest = req.internal_cluster_rest();
     let task = node.tasks.register("cluster:admin/xpack/enrich/execute", Some(format!("policy execution [{name}]")), false, !wait, headers);
     if wait {
-        let r = run(node, name, &task, rest.as_ref());
+        let r = run(node, name, &task, rest.as_ref(), reader.as_ref());
         node.tasks.finish(&task, Ok(Value::Null));
         r?;
         return Ok(Resp::ok(json!({"status": {"phase": "COMPLETE"}})));
@@ -116,7 +170,7 @@ fn execute(node: &Arc<Node>, req: &Req, name: &str) -> R {
     std::thread::Builder::new()
         .name("es-enrich-execute".into())
         .spawn(move || {
-            let outcome = match run(&n, &name, &task, rest.as_ref()) {
+            let outcome = match run(&n, &name, &task, rest.as_ref(), reader.as_ref()) {
                 Ok(_) => Ok(json!({"status": {"phase": "COMPLETE"}})),
                 Err(e) => {
                     let mut v = e.error_object(false);

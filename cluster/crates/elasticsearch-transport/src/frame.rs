@@ -73,6 +73,10 @@ const FIXED_HEADER: usize = 1 + 1 + 8 + 2;
 /// Internal action names (ES uses the same for its handshake).
 pub(crate) const HANDSHAKE_ACTION: &str = "internal:tcp/handshake";
 pub(crate) const PING_ACTION: &str = "internal:tcp/ping";
+/// The handshake of a remote-cluster connection (ES opens these with a
+/// connection profile that accepts any cluster name): the acceptor serves
+/// only the actions allowed to remote clusters on it.
+pub(crate) const REMOTE_HANDSHAKE_ACTION: &str = "internal:tcp/handshake/remote_cluster";
 
 /// A decoded frame (payload already decompressed).
 #[derive(Debug)]

@@ -51,7 +51,9 @@ struct DistanceFeature {
 impl DistanceFeature {
     fn distance(&self, leaf: &LeafReader<'_>, doc: DocId) -> Option<f64> {
         match self.origin {
-            Origin::Long { field, origin } => leaf.i64_values(field, doc).into_iter().map(|v| (v as f64 - origin as f64).abs()).fold(None, |a: Option<f64>, d| Some(a.map_or(d, |a| a.min(d)))),
+            // The integer difference first: epoch nanos are beyond f64's
+            // exact range, and nearby instants must stay distinct.
+            Origin::Long { field, origin } => leaf.i64_values(field, doc).into_iter().map(|v| ((v as i128) - (origin as i128)).unsigned_abs() as f64).fold(None, |a: Option<f64>, d| Some(a.map_or(d, |a| a.min(d)))),
             Origin::Geo { geo, lat, lon, origin } => {
                 let pts: Vec<(f64, f64)> = match geo {
                     Some(g) if leaf.has_geo(g) => leaf.geo_values(g, doc),
@@ -129,12 +131,17 @@ pub fn distance_feature(body: &Value, ctx: &QueryContext) -> Result<Query> {
         EsType::Date | EsType::DateNanos => {
             let Some(id) = f.core_id else { return Ok(Query::MatchNone) };
             let nanos = f.declared == EsType::DateNanos;
-            let o_ms: i64 = match origin {
-                Value::Number(n) => n.as_i64().unwrap_or(0),
+            let o: i64 = match origin {
+                Value::Number(n) => {
+                    let ms = n.as_i64().unwrap_or(0);
+                    if nanos { ms * 1_000_000 } else { ms }
+                }
+                // A date_nanos origin keeps its nanoseconds (ES parses it at
+                // the field's resolution).
+                _ if nanos => crate::fieldtypes::query::nanos_origin(&f, origin, ctx)?,
                 _ => parse_date_math(&scalar_string(origin), &f.date_format, Tz::UTC, ctx.now, true)
                     .map_err(|e| shard_err(ctx, format!("failed to create query: {}", e.reason)))?,
             };
-            let o = if nanos { o_ms * 1_000_000 } else { o_ms };
             let p = time_nanos(&pivot_s).ok_or_else(|| shard_err(ctx, format!("failed to create query: failed to parse setting [distance_feature.pivot] with value [{pivot_s}] as a time value: unit is missing or unrecognized")))?;
             let pivot = if nanos { p } else { p / 1e6 };
             DistanceFeature { origin: Origin::Long { field: id, origin: o }, pivot, boost }
@@ -195,6 +202,18 @@ fn items(v: Option<&Value>, fields: &[String], ctx: &QueryContext) -> Result<Vec
                     None => fields.to_vec(),
                 };
                 let mut vals: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                // `per_field_analyzer` applies to a stored example as to an
+                // artificial one.
+                let pfa: BTreeMap<String, String> = o
+                    .get("per_field_analyzer")
+                    .and_then(Value::as_object)
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), scalar_string(v))).collect())
+                    .unwrap_or_default();
+                // A multi-field's values are its parent's source values.
+                let source_path = |f: &String| match ctx.lookup.get(f) {
+                    Some(rf) if rf.is_multi_field => f.rsplit_once('.').map(|x| x.0.to_string()).unwrap_or_else(|| f.clone()),
+                    _ => f.clone(),
+                };
                 if let Some(doc) = o.get("doc") {
                     // ES leaves an artificial doc's field selection unset (every field of the
                     // parsed doc, multi-fields included) unless the item names `fields`.
@@ -212,10 +231,7 @@ fn items(v: Option<&Value>, fields: &[String], ctx: &QueryContext) -> Result<Vec
                     };
                     for f in doc_fields {
                         let mut v = Vec::new();
-                        let src_path = match ctx.lookup.get(f) {
-                            Some(rf) if rf.is_multi_field => f.rsplit_once('.').map(|x| x.0.to_string()).unwrap_or_else(|| f.clone()),
-                            _ => f.clone(),
-                        };
+                        let src_path = source_path(f);
                         for x in crate::highlight::source_values(doc, &src_path) {
                             flat_strings(x, &mut v);
                         }
@@ -223,11 +239,6 @@ fn items(v: Option<&Value>, fields: &[String], ctx: &QueryContext) -> Result<Vec
                             vals.insert(f.clone(), v);
                         }
                     }
-                    let pfa: BTreeMap<String, String> = o
-                        .get("per_field_analyzer")
-                        .and_then(Value::as_object)
-                        .map(|m| m.iter().map(|(k, v)| (k.clone(), scalar_string(v))).collect())
-                        .unwrap_or_default();
                     out.push(Item::Doc(vals, None, pfa));
                 } else if let Some(id) = o.get("_id") {
                     let id = scalar_string(id);
@@ -235,7 +246,13 @@ fn items(v: Option<&Value>, fields: &[String], ctx: &QueryContext) -> Result<Vec
                     if let Some(look) = ctx.terms_lookup {
                         for f in &item_fields {
                             let mut v = Vec::new();
-                            for x in look(index, &id, f, routing).unwrap_or_default() {
+                            // A like document the caller may not read fails the query.
+                            let got = match look(index, &id, &source_path(f), routing) {
+                                Ok(v) => v,
+                                Err(e) if e.kind == "security_exception" => return Err(e),
+                                Err(_) => Vec::new(),
+                            };
+                            for x in got {
                                 flat_strings(&x, &mut v);
                             }
                             if !v.is_empty() {
@@ -244,7 +261,7 @@ fn items(v: Option<&Value>, fields: &[String], ctx: &QueryContext) -> Result<Vec
                         }
                     }
                     let same_index = index == ctx.index_name || ctx.aliases.iter().any(|a| a == index);
-                    out.push(Item::Doc(vals, if same_index { Some(id) } else { None }, BTreeMap::new()));
+                    out.push(Item::Doc(vals, if same_index { Some(id) } else { None }, pfa));
                 } else {
                     return Err(parsing("[more_like_this] query malformed: a like item must have [_id] or [doc]"));
                 }

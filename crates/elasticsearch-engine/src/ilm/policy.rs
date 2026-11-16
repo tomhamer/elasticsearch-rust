@@ -951,7 +951,19 @@ fn steps_for_action(phase: &str, action: &str, cfg: &Value) -> Vec<(String, Step
     let s = |n: &str, k: StepKind| (n.to_string(), k);
     match action {
         "set_priority" => vec![s("set_priority", Act)],
-        "unfollow" => vec![s("branch-check-unfollow-prerequisites", Branch)],
+        // ES `UnfollowAction`: a follower waits for its leader to finish
+        // indexing and for every follow task to catch up, then is paused,
+        // closed, converted to a regular index and reopened.
+        "unfollow" => vec![
+            s("branch-check-unfollow-prerequisites", Branch),
+            s("wait-for-indexing-complete", Wait),
+            s("wait-for-follow-shard-tasks", Wait),
+            s("pause-follower-index", Act),
+            s("close-follower-index", Act),
+            s("unfollow-follower-index", Act),
+            s("open-follower-index", Act),
+            s("wait-for-yellow-step", Wait),
+        ],
         "rollover" => vec![
             s("check-rollover-ready", Wait),
             s("attempt-rollover", Act),
@@ -1022,7 +1034,54 @@ fn steps_for_action(phase: &str, action: &str, cfg: &Value) -> Vec<(String, Step
             s("replace-datastream-backing-index", Act),
             s("delete", Act),
         ],
-        "searchable_snapshot" => vec![s("branch-check-prerequisites", Branch)],
+        // ES 9.5.5 `SearchableSnapshotAction.toSteps`.
+        "searchable_snapshot" => {
+            let fm = cfg["force_merge_index"].as_bool() != Some(false);
+            let on_clone = cfg["force_merge_on_clone"].as_bool() != Some(false);
+            let mut v = vec![
+                s("branch-check-prerequisites", Branch),
+                s("check-not-write-index", Act),
+                s("wait-for-shard-history-leases", Act),
+                s("check-ts-end-time-passed", Act),
+                s("branch-check-existing-snapshot", Branch),
+            ];
+            if fm {
+                if on_clone {
+                    v.extend([
+                        s("branch-skip-clone-check", Branch),
+                        s("readonly", Act),
+                        s("cleanup-generated-index", Act),
+                        s("generate-index-name", Act),
+                        s("clone", Act),
+                        s("wait-for-index-color-cloned-index", Act),
+                    ]);
+                }
+                v.extend([s("forcemerge", Act), s("segment-count", Act)]);
+            }
+            v.extend([
+                s("generate-snapshot-name", Act),
+                s("cleanup-snapshot", Act),
+                s("create-snapshot", Act),
+                s("wait-for-data-tier", Act),
+                s("mount-snapshot", Act),
+                s("wait-for-index-color", Act),
+                s("copy-execution-state", Act),
+                s("copy-settings", Act),
+            ]);
+            if cfg.get("replicate_for").is_some_and(|r| !r.is_null()) {
+                v.extend([s("check-replicate-for-time-passed", Wait), s("update-settings", Act)]);
+            }
+            if fm {
+                v.extend([s("branch-delete-force-merged-index", Branch), s("delete-force-merged-index", Act)]);
+            }
+            v.extend([
+                s("branch-on-datastream-check", Branch),
+                s("replace-datastream-backing-index", Act),
+                s("delete", Act),
+                s("swap-aliases", Act),
+            ]);
+            v
+        }
         "wait_for_snapshot" => vec![s("wait-for-snapshot", Wait)],
         "delete" => vec![s("wait-for-shard-history-leases", Act), s("check-ts-end-time-passed", Act), s("delete", Act)],
         _ => {
@@ -1041,9 +1100,14 @@ pub fn phase_actions(phase: &str, def: &Value) -> Vec<(String, Value)> {
         && !acts.contains_key("migrate")
         && !acts.contains_key("searchable_snapshot")
         && !acts.get("allocate").map(|a| ["include", "exclude", "require"].iter().any(|k| a[*k].as_object().map(|m| !m.is_empty()).unwrap_or(false))).unwrap_or(false);
+    // ES `TimeseriesLifecycleType`: actions that cannot run on a CCR
+    // follower bring an implicit `unfollow` before them.
+    let inject_unfollow = !acts.contains_key("unfollow") && ["rollover", "shrink", "searchable_snapshot"].iter().any(|a| acts.contains_key(*a));
     for a in ordered_actions(phase) {
         if let Some(cfg) = acts.get(*a) {
             out.push((a.to_string(), cfg.clone()));
+        } else if *a == "unfollow" && inject_unfollow {
+            out.push(("unfollow".into(), json!({})));
         } else if *a == "migrate" && inject_migrate {
             out.push(("migrate".into(), json!({"enabled": true})));
         }
@@ -1084,6 +1148,22 @@ pub fn all_step_keys(policy: &Value) -> Vec<StepKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfollow_steps_and_implicit_unfollow() {
+        let names = |phase: &str, def: Value| phase_steps(phase, &def).iter().map(|s| format!("{}/{}", s.key.action, s.key.name)).collect::<Vec<_>>();
+        let steps = names("warm", json!({"actions": {"unfollow": {}, "migrate": {"enabled": false}}}));
+        assert_eq!(steps[..8].to_vec(), vec![
+            "unfollow/branch-check-unfollow-prerequisites", "unfollow/wait-for-indexing-complete", "unfollow/wait-for-follow-shard-tasks",
+            "unfollow/pause-follower-index", "unfollow/close-follower-index", "unfollow/unfollow-follower-index", "unfollow/open-follower-index",
+            "unfollow/wait-for-yellow-step",
+        ]);
+        // Rollover, shrink and searchable_snapshot bring an implicit unfollow first.
+        let hot = phase_actions("hot", &json!({"actions": {"rollover": {"max_docs": 1}}}));
+        assert_eq!(hot.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), vec!["unfollow", "rollover"]);
+        let warm = phase_actions("warm", &json!({"actions": {"readonly": {}, "migrate": {"enabled": false}}}));
+        assert!(!warm.iter().any(|(a, _)| a == "unfollow"), "{warm:?}");
+    }
 
     #[test]
     fn parse_and_validate() {

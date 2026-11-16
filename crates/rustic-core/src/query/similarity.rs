@@ -37,6 +37,20 @@ pub trait SimWeight: Send + Sync {
 
     /// Explanation tree for [`SimWeight::score`] on the same inputs.
     fn explain(&self, tf: u32, field_len: u32) -> Explanation;
+
+    /// Score for a fractional frequency (Lucene scores span and sloppy
+    /// phrase matches with `sum(1 / (1 + width))`). Similarities with a
+    /// closed form override it; the default interpolates between the
+    /// neighbouring integer frequencies.
+    fn score_freq(&self, freq: f32, field_len: u32) -> f32 {
+        let (lo, hi) = (freq.floor(), freq.ceil());
+        if lo == hi {
+            return self.score(freq as u32, field_len);
+        }
+        let a = if lo <= 0.0 { 0.0 } else { self.score(lo as u32, field_len) };
+        let b = self.score(hi as u32, field_len);
+        a + (b - a) * (freq - lo)
+    }
 }
 
 impl SimWeight for Box<dyn SimWeight> {
@@ -50,6 +64,9 @@ impl SimWeight for Box<dyn SimWeight> {
     }
     fn explain(&self, tf: u32, field_len: u32) -> Explanation {
         (**self).explain(tf, field_len)
+    }
+    fn score_freq(&self, freq: f32, field_len: u32) -> f32 {
+        (**self).score_freq(freq, field_len)
     }
 }
 
@@ -114,6 +131,9 @@ impl SimWeight for SumWeight {
     }
     fn score_norm(&self, tf: u32, norm: u8) -> f32 {
         self.parts.iter().map(|p| p.score_norm(tf, norm)).sum()
+    }
+    fn score_freq(&self, freq: f32, field_len: u32) -> f32 {
+        self.parts.iter().map(|p| p.score_freq(freq, field_len)).sum()
     }
     fn explain(&self, tf: u32, field_len: u32) -> Explanation {
         let details: Vec<Explanation> = self.parts.iter().map(|p| p.explain(tf, field_len)).collect();
@@ -224,6 +244,11 @@ impl SimWeight for Bm25Weight {
         Bm25Weight::score_norm(self, tf, norm)
     }
 
+    fn score_freq(&self, freq: f32, field_len: u32) -> f32 {
+        let (k1, b, avg) = self.params_avg();
+        Bm25Weight::combine(self.weight(), freq, 1.0 / (k1 * ((1.0 - b) + b * field_len as f32 / avg)))
+    }
+
     fn explain(&self, tf: u32, field_len: u32) -> Explanation {
         let (df, n) = self.stats();
         let idf = bm25_idf(df, n.max(1));
@@ -308,6 +333,10 @@ impl SimWeight for Bm25PhraseWeight {
         self.inner.score_norm(tf, norm)
     }
 
+    fn score_freq(&self, freq: f32, field_len: u32) -> f32 {
+        SimWeight::score_freq(&self.inner, freq, field_len)
+    }
+
     fn explain(&self, tf: u32, field_len: u32) -> Explanation {
         let parts: Vec<Explanation> = self
             .terms
@@ -377,6 +406,13 @@ impl SimWeight for ClassicWeight {
         raw * classic_length_norm(field_len)
     }
 
+    fn score_freq(&self, freq: f32, field_len: u32) -> f32 {
+        if freq <= 0.0 {
+            return 0.0;
+        }
+        ((freq as f64).sqrt() as f32) * (self.boost * self.idf) * classic_length_norm(field_len)
+    }
+
     fn explain(&self, tf: u32, field_len: u32) -> Explanation {
         let len_norm = classic_length_norm(field_len);
         Explanation::new(
@@ -424,6 +460,9 @@ impl Similarity for BooleanSim {
 
 impl SimWeight for BooleanWeight {
     fn score(&self, _tf: u32, _field_len: u32) -> f32 {
+        self.boost
+    }
+    fn score_freq(&self, _freq: f32, _field_len: u32) -> f32 {
         self.boost
     }
     fn explain(&self, _tf: u32, _field_len: u32) -> Explanation {

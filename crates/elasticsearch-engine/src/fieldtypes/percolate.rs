@@ -16,6 +16,16 @@ use parking_lot::Mutex;
 
 /// Per-request matches, retained from verification for the fetch phase.
 type Verify = Arc<dyn Fn(&str) -> Option<f32> + Send + Sync>;
+/// A stored query's matched document slots (recomputed on demand).
+type SlotsOf = Arc<dyn Fn(&str) -> Option<Vec<u32>> + Send + Sync>;
+
+/// Stored-query entries a request retains (scores and slots each): a
+/// corpus of unique matching queries never grows request memory beyond it.
+const SLOT_CACHE: usize = 4096;
+
+/// Tests: the most slot entries a request retained.
+#[cfg(test)]
+static SLOTS_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct PercolateQuery {
     filter: FilterQuery,
@@ -25,7 +35,10 @@ struct PercolateQuery {
     verify: Verify,
     field: u16,
     slot_field: String,
+    /// Matched slots of stored queries seen while verifying, bounded by
+    /// [`SLOT_CACHE`]; others are recomputed for the hits fetched.
     slots: Arc<Mutex<HashMap<String, Vec<u32>>>>,
+    slots_of: SlotsOf,
     documents: Vec<Value>,
     memory: Arc<rustic_core::Index>,
     lookup: Arc<FieldLookup>,
@@ -118,7 +131,8 @@ pub(crate) fn add_hit_fields(query: &Query, leaf: &LeafReader<'_>, doc: DocId, f
     collect(query, &mut queries);
     for percolate in &queries {
         if let Some(source) = leaf.keyword_value(percolate.field, doc) {
-            if let Some(slots) = percolate.slots.lock().get(&source) {
+            let slots = percolate.slots.lock().get(&source).cloned().or_else(|| (percolate.slots_of)(&source));
+            if let Some(slots) = slots {
                 let field = if queries.len() == 1 { "_percolator_document_slot" } else { &percolate.slot_field };
                 fields.insert(field.into(), serde_json::json!(slots));
             }
@@ -135,7 +149,7 @@ pub(crate) fn highlight_hit(query: &Query, leaf: &LeafReader<'_>, doc: DocId,
     let mut result = Map::new();
     for percolate in &queries {
         let Some(source) = leaf.keyword_value(percolate.field, doc) else { continue };
-        let slots = percolate.slots.lock().get(&source).cloned().unwrap_or_default();
+        let slots = percolate.slots.lock().get(&source).cloned().or_else(|| (percolate.slots_of)(&source)).unwrap_or_default();
         if slots.is_empty() { continue; }
         let stored: Value = serde_json::from_str(&source).map_err(|e| EsError::internal(e.to_string()))?;
         let leaves = percolate.memory.leaves();
@@ -179,6 +193,7 @@ pub(crate) fn qctx<'a>(lookup: &'a FieldLookup, leaves: &'a [LeafReader<'a>]) ->
         allow_unmapped_fields: true,
         knn_prefilter: None,
         knn_prefilter_lookup: None,
+        dls_filter: None,
         allow_expensive_queries: true,
         mappings: None,
     }
@@ -248,6 +263,11 @@ pub fn extract_terms(q: &Value, lookup: &FieldLookup) -> Vec<String> {
 /// The `percolate` query.
 pub fn query(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     let field = o.get("field").and_then(Value::as_str).ok_or_else(|| EsError::parsing("[percolate] query is missing required [field] parameter"))?;
+    // ES `PercolateQueryBuilder.doToQuery`: refused before any memory index
+    // is built or stored query verified.
+    if !ctx.allow_expensive_queries {
+        return Err(ctx.shard_err_pub("[percolate] queries cannot be executed when 'search.allow_expensive_queries' is set to false."));
+    }
     let docs: Vec<Value> = match (o.get("document"), o.get("documents")) {
         (Some(d), _) => vec![d.clone()],
         (None, Some(Value::Array(a))) => a.clone(),
@@ -277,22 +297,19 @@ pub fn query(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     // Resolve dynamic fields in the percolate doc(s) so the in-memory index
     // schema includes them (e.g. `body` when the index mapping is minimal).
     let mut parsed_docs: Vec<(usize, crate::document::ParsedDoc)> = Vec::with_capacity(docs.len());
+    // Every document parsed to completion, as indexing parses it (dynamic
+    // mapping rounds until it converges, e.g. a new field's `copy_to`
+    // target found on the second round); a document that cannot be parsed
+    // fails the query, never drops out (ES `PercolateQueryBuilder`).
+    let limits = ctx.mappings.map(|svc| crate::fieldtypes::limits::Limits::from_settings(|k| svc.setting(k))).unwrap_or_default();
     for (i, d) in docs.iter().enumerate() {
-        let mut parsed = crate::document::parse_document(d, &i.to_string(), &m, &lookup)?;
-        if let crate::document::ParseOutcome::NeedsMapping(adds) = &parsed {
-            let mut next = m.clone();
-            for (path, mapper) in adds {
-                next.insert_at_with(path, mapper.clone(), Some(&lookup.registry));
-            }
-            next.assign_core_ids();
-            m = next;
-            lookup = Arc::new(crate::mapping::FieldLookup::build(&m, &lookup.registry));
+        let (pd, grown) = crate::document::parse_with_limits(d, &i.to_string(), &m, &lookup, &limits)?;
+        if let Some((nm, nlk)) = grown {
+            m = nm;
+            lookup = Arc::new(nlk);
             extended = true;
-            parsed = crate::document::parse_document(d, &i.to_string(), &m, &lookup)?;
         }
-        if let crate::document::ParseOutcome::Doc(pd) = parsed {
-            parsed_docs.push((i, pd));
-        }
+        parsed_docs.push((i, pd));
     }
     // Unextended, the clone has the context lookup's fields: reuse its schema.
     let schema = if extended { lookup.core_schema() } else { (*ctx.lookup.core_schema_cached()).clone() };
@@ -326,16 +343,21 @@ pub fn query(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     // bound so a corpus of unique queries cannot grow an unbounded cache.
     let verified = Mutex::new(HashMap::<String, Option<f32>>::new());
     let max_regex_length = ctx.max_regex_length;
+    // Stored queries run with the percolator index's query settings, as
+    // any query on it would (`index.query.default_field`; production
+    // review #230: they ran against every field).
+    let default_fields = ctx.default_fields.clone();
     // Capture the request's existing typed scorer-error channel, rather than
     // consulting thread-local state while scoring or converting errors to misses.
     let request_error = crate::script::env().map(|env| env.error.clone())
         .ok_or_else(|| EsError::illegal_argument("percolate query requires a search request error context"))?;
-    let verify: Verify = Arc::new(move |src: &str| -> Option<f32> {
-        if let Some(score) = verified.lock().get(src).copied() { return score; }
+    // A stored query's best score over the documents and its matched slots.
+    let evaluate = Arc::new(move |src: &str| -> Option<(f32, Vec<u32>)> {
         let qv: Value = serde_json::from_str(&src).ok()?;
         let leaves = mem.leaves();
         let mut ctx = qctx(&lk2, &leaves);
         ctx.max_regex_length = max_regex_length;
+        ctx.default_fields = default_fields.clone();
         let q = match parse_query(&qv, &ctx) {
             Ok(query) => query,
             Err(error) => {
@@ -363,16 +385,31 @@ pub fn query(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
             request_error.lock().get_or_insert(error.into());
             return None;
         }
-        let score = hits.iter().map(|h| h.2).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))));
-        if score.is_some() {
-            let mut matched_slots: Vec<u32> = hits.iter().filter_map(|(li, d, _)|
-                leaves[*li].keyword_value(ID_FIELD, *d)?.parse().ok()).collect();
-            matched_slots.sort_unstable();
-            matched_slots.dedup();
-            recorded_slots.lock().entry(src.to_string()).or_insert(matched_slots);
+        let score = hits.iter().map(|h| h.2).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))?;
+        let mut matched_slots: Vec<u32> = hits.iter().filter_map(|(li, d, _)|
+            leaves[*li].keyword_value(ID_FIELD, *d)?.parse().ok()).collect();
+        matched_slots.sort_unstable();
+        matched_slots.dedup();
+        Some((score, matched_slots))
+    });
+    let slots_eval = evaluate.clone();
+    let slots_of: SlotsOf = Arc::new(move |src: &str| slots_eval(src).map(|(_, slots)| slots));
+    let verify: Verify = Arc::new(move |src: &str| -> Option<f32> {
+        if let Some(score) = verified.lock().get(src).copied() { return score; }
+        let result = evaluate(src);
+        // Slots of the first [`SLOT_CACHE`] matching queries are kept for
+        // the fetch; later ones are recomputed for the hits returned.
+        if let Some((_, matched)) = &result {
+            let mut recorded = recorded_slots.lock();
+            if recorded.len() < SLOT_CACHE {
+                recorded.entry(src.to_string()).or_insert_with(|| matched.clone());
+            }
+            #[cfg(test)]
+            SLOTS_PEAK.fetch_max(recorded.len(), std::sync::atomic::Ordering::Relaxed);
         }
+        let score = result.map(|(score, _)| score);
         let mut cache = verified.lock();
-        if cache.len() < 4096 { cache.insert(src.to_string(), score); }
+        if cache.len() < SLOT_CACHE { cache.insert(src.to_string(), score); }
         score
     });
     let check_verify = verify.clone();
@@ -406,7 +443,7 @@ pub fn query(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     Ok(Query::Custom(Arc::new(PercolateQuery {
         filter: FilterQuery::new("percolate", Some(candidate.clone()), Arc::new(check)),
         candidate, marked_candidate, version_field: f.aux_id("terms"), verify,
-        field: qid, slot_field, slots, documents: docs, memory: highlight_memory, lookup, max_regex_length,
+        field: qid, slot_field, slots, slots_of, documents: docs, memory: highlight_memory, lookup, max_regex_length,
     })))
 }
 
@@ -415,6 +452,29 @@ mod limit_tests {
     use super::*;
     use crate::{index::WriteReq, node::Node, search::{ExecOpts, Target}, shard::WriteCond};
     use serde_json::json;
+
+    /// #341: matched-slot metadata is retained for at most `SLOT_CACHE`
+    /// stored queries; the hits past it still get their exact slots.
+    #[test]
+    fn slot_retention_is_bounded_and_fetch_stays_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let svc = node.create_index("perc", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {"properties": {"query": {"type": "percolator"}, "t": {"type": "text"}}}})).unwrap();
+        let n = SLOT_CACHE + 400;
+        let reqs = (0..n).map(|i| WriteReq::Index { id: Some(format!("q{i}")), source: json!({"query": {"bool": {"must": [{"match": {"t": "common"}}], "should": [{"match": {"t": format!("w{i}")}}]}}}).to_string(), routing: None, cond: WriteCond::default() }).collect();
+        for r in svc.write(reqs, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        SLOTS_PEAK.store(0, std::sync::atomic::Ordering::Relaxed);
+        let r = crate::ml::search(&node, "perc", &json!({"size": 10000, "query": {"percolate": {"field": "query", "documents": [{"t": "common"}, {"t": "other"}, {"t": "common again"}]}}})).unwrap();
+        let hits = r["hits"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), n);
+        assert!(hits.iter().all(|h| h["fields"]["_percolator_document_slot"] == json!([0, 2])), "{}", hits[n - 1]);
+        let peak = SLOTS_PEAK.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(peak <= SLOT_CACHE, "{peak}");
+    }
 
     #[test]
     fn configured_regex_cap_applies_to_stored_queries_and_lazy_verification() {
@@ -448,5 +508,33 @@ mod limit_tests {
         write("long", &"a".repeat(1001)).unwrap();
         // The failed request's captured error cannot contaminate the next request.
         assert_eq!(search().unwrap().total, 1);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_mapping_tests {
+    use serde_json::json;
+
+    /// #396: a percolated document needing a second dynamic-mapping round
+    /// (a new field's `copy_to` target) is parsed to completion, not dropped.
+    #[test]
+    fn documents_needing_two_mapping_rounds_still_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("rules", &json!({"mappings": {
+            "dynamic_templates": [{"new": {"match": "new_*", "match_mapping_type": "string", "mapping": {"type": "keyword", "copy_to": "all_tags"}}}],
+            "properties": {"status": {"type": "keyword"}, "query": {"type": "percolator"}}}})).unwrap();
+        let w = vec![crate::index::WriteReq::Index { id: Some("r".into()), source: json!({"query": {"term": {"status": "active"}}}).to_string(), routing: None, cond: Default::default() }];
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let run = |q: serde_json::Value| crate::ml::search(&node, "rules", &json!({"query": q})).unwrap();
+        let one = run(json!({"percolate": {"field": "query", "document": {"status": "active", "new_tag": "red"}}}));
+        assert_eq!(one["hits"]["hits"].as_array().map(Vec::len), Some(1), "{one}");
+        let two = run(json!({"percolate": {"field": "query", "documents": [{"status": "active", "new_tag": "red"}, {"status": "active"}]}}));
+        assert_eq!(two["hits"]["hits"][0]["fields"]["_percolator_document_slot"], json!([0, 1]), "{two}");
+        let rev = run(json!({"percolate": {"field": "query", "documents": [{"status": "active"}, {"status": "active", "new_tag": "red"}]}}));
+        assert_eq!(rev["hits"]["hits"][0]["fields"]["_percolator_document_slot"], json!([0, 1]), "{rev}");
     }
 }

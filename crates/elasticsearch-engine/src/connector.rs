@@ -559,12 +559,72 @@ fn read(node: &Node, index: &str, id: &str) -> Result<Option<Value>> {
     }
 }
 
+/// `read` with the seq_no / primary_term a conditional write checks.
+fn read_versioned(node: &Node, index: &str, id: &str) -> Result<Option<(Value, i64, u64)>> {
+    let Some(svc) = node.get_index(index) else { return Ok(None) };
+    match svc.get(id)? {
+        Some(g) => Ok(g.source.and_then(|s| serde_json::from_str(&s).ok()).map(|v| (v, g.seq_no, g.primary_term))),
+        None => Ok(None),
+    }
+}
+
 /// Index a document; `true` when it was created.
 fn write(node: &Node, index: &str, id: &str, src: &Value) -> Result<bool> {
+    write_cond(node, index, id, src, WriteCond::default())
+}
+
+fn write_cond(node: &Node, index: &str, id: &str, src: &Value, cond: WriteCond) -> Result<bool> {
     let svc = ensure_index(node, index)?;
-    let mut r = svc.write(vec![WriteReq::Index { id: Some(id.to_string()), source: src.to_string(), routing: None, cond: WriteCond::default() }], false);
+    let mut r = svc.write(vec![WriteReq::Index { id: Some(id.to_string()), source: src.to_string(), routing: None, cond }], false);
     let w = r.pop().ok_or_else(|| EsError::internal("no write result"))??;
     Ok(w.result == "created")
+}
+
+/// How often an update re-applies itself after a concurrent write.
+const UPDATE_RETRIES: usize = 64;
+
+/// Read-modify-write of `index/id` as ES's update action applies a partial
+/// update on the primary (`UpdateHelper`): `f` edits the current document,
+/// which is written back conditionally on the seq_no / primary_term it was
+/// read at. A concurrent write in between makes the edit run again on the
+/// newer document (re-validating any transition against it), so neither
+/// update is lost and a state change the other acknowledged is never
+/// overwritten. `missing`: the error for an absent document.
+fn modify(node: &Node, index: &str, id: &str, missing: &dyn Fn() -> EsError, mut f: impl FnMut(&mut Value) -> Result<()>) -> Out {
+    let mut attempt = 0;
+    loop {
+        let (mut doc, seq_no, primary_term) = read_versioned(node, index, id)?.ok_or_else(missing)?;
+        #[cfg(test)]
+        if let Some(mut hook) = tests::AFTER_READ.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        let before = doc.clone();
+        f(&mut doc)?;
+        if doc == before {
+            return Ok((200, result("noop")));
+        }
+        let cond = WriteCond { if_seq_no: Some(seq_no), if_primary_term: Some(primary_term), ..Default::default() };
+        match write_cond(node, index, id, &doc, cond) {
+            Ok(_) => return Ok((200, result("updated"))),
+            Err(e) if e.kind == "version_conflict_engine_exception" && attempt + 1 < UPDATE_RETRIES => {
+                attempt += 1;
+                // Back off (2 us doubling to ~1 ms) so a writer that keeps
+                // losing the race to hot concurrent writers is not starved.
+                std::thread::sleep(std::time::Duration::from_micros(1 << attempt.min(10)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// [`modify`] of a connector that is not soft-deleted (`getConnector(id, false)`).
+fn modify_connector(node: &Node, id: &str, mut f: impl FnMut(&mut Value) -> Result<()>) -> Out {
+    modify(node, CONNECTOR_INDEX, id, &|| not_found(id), |doc| {
+        if is_deleted(doc) {
+            return Err(not_found(id));
+        }
+        f(doc)
+    })
 }
 
 fn delete(node: &Node, index: &str, id: &str) -> Result<bool> {
@@ -574,15 +634,42 @@ fn delete(node: &Node, index: &str, id: &str) -> Result<bool> {
     Ok(w.result == "deleted")
 }
 
+/// Documents per page of [`scan_each`].
+const SCAN_PAGE: usize = 1000;
+
 /// Every document of `index` as `(id, source)`, in indexing order.
 fn scan_all(node: &Node, index: &str) -> Result<Vec<(String, Value)>> {
-    let Some(svc) = node.get_index(index) else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    scan_each(node, index, SCAN_PAGE, &mut |id, src| out.push((id, src)))?;
+    Ok(out)
+}
+
+/// Visit every document of `index` in indexing order (`_seq_no`), a page
+/// of `page` at a time with `search_after`: no result window caps it, and
+/// only what `f` keeps stays in memory.
+fn scan_each(node: &Node, index: &str, page: usize, f: &mut dyn FnMut(String, Value)) -> Result<()> {
+    let Some(svc) = node.get_index(index) else { return Ok(()) };
     let _ = svc.refresh();
     let targets = node.resolve(index, ResolveOpts { expand_hidden: true, ..Default::default() })?;
-    let req = crate::search::parse_request(&json!({"size": 10000, "query": {"match_all": {}}, "seq_no_primary_term": true, "sort": [{"_seq_no": "asc"}]}), &HashMap::new())?;
-    let o = crate::search::execute(&targets, &req, &crate::watcher::search_opts(node))?;
-    let v: Value = serde_json::from_str(&o.json).map_err(|e| EsError::internal(e.to_string()))?;
-    Ok(v["hits"]["hits"].as_array().cloned().unwrap_or_default().into_iter().map(|h| (h["_id"].as_str().unwrap_or("").to_string(), h["_source"].clone())).collect())
+    let mut after: Option<Value> = None;
+    loop {
+        let mut body = json!({"size": page, "query": {"match_all": {}}, "track_total_hits": false, "sort": [{"_seq_no": "asc"}]});
+        if let Some(a) = &after {
+            body["search_after"] = a.clone();
+        }
+        let req = crate::search::parse_request(&body, &HashMap::new())?;
+        let o = crate::search::execute(&targets, &req, &crate::watcher::search_opts(node))?;
+        let v: Value = serde_json::from_str(&o.json).map_err(|e| EsError::internal(e.to_string()))?;
+        let hits = v["hits"]["hits"].as_array().cloned().unwrap_or_default();
+        let n = hits.len();
+        for h in hits {
+            after = Some(h["sort"].clone());
+            f(h["_id"].as_str().unwrap_or("").to_string(), h["_source"].clone());
+        }
+        if n < page || after.as_ref().is_none_or(|a| !a.is_array()) {
+            return Ok(());
+        }
+    }
 }
 
 fn with_id(id: &str, src: &Value) -> Value {
@@ -621,26 +708,15 @@ fn result(r: &str) -> Value {
 
 /// Apply an update doc (`HashMap` ordered) to a stored connector.
 fn update_connector_doc(node: &Node, id: &str, upd: Map<String, Value>) -> Out {
-    let svc = node.get_index(CONNECTOR_INDEX);
-    let cur = read(node, CONNECTOR_INDEX, id)?;
-    let Some(mut doc) = cur else {
-        return Err(match svc {
-            Some(s) => EsError::document_missing(CONNECTOR_INDEX, &s.uuid, id),
-            None => EsError::index_not_found(CONNECTOR_INDEX),
-        });
+    let missing = || match node.get_index(CONNECTOR_INDEX) {
+        Some(s) => EsError::document_missing(CONNECTOR_INDEX, &s.uuid, id),
+        None => EsError::index_not_found(CONNECTOR_INDEX),
     };
-    let before = doc.clone();
-    merge(&mut doc, &Value::Object(hash_map(upd)));
-    if doc == before {
-        return Ok((200, result("noop")));
-    }
-    write(node, CONNECTOR_INDEX, id, &doc)?;
-    Ok((200, result("updated")))
-}
-
-/// A connector that is not soft-deleted (`getConnector(id, false)`).
-fn load_connector(node: &Node, id: &str) -> Result<Value> {
-    load_connector_incl(node, id, false)
+    let upd = Value::Object(hash_map(upd));
+    modify(node, CONNECTOR_INDEX, id, &missing, |doc| {
+        merge(doc, &upd);
+        Ok(())
+    })
 }
 
 fn load_connector_incl(node: &Node, id: &str, include_deleted: bool) -> Result<Value> {
@@ -657,14 +733,6 @@ fn is_deleted(doc: &Value) -> bool {
 
 /// Index names of Elastic-managed (native) connectors must start with this.
 const MANAGED_CONNECTOR_INDEX_PREFIX: &str = "content-";
-
-fn store_connector(node: &Node, id: &str, before: &Value, doc: &Value) -> Out {
-    if doc == before {
-        return Ok((200, result("noop")));
-    }
-    write(node, CONNECTOR_INDEX, id, doc)?;
-    Ok((200, result("updated")))
-}
 
 // ------------------------------------------------------------------ defaults
 
@@ -778,15 +846,20 @@ pub fn delete_connector(node: &Node, id: &str, delete_sync_jobs: bool, hard: boo
             return Err(not_found(id));
         }
     } else {
-        let mut doc = load_connector(node, id)?;
-        doc["deleted"] = json!(true);
-        write(node, CONNECTOR_INDEX, id, &doc)?;
+        modify_connector(node, id, |doc| {
+            doc["deleted"] = json!(true);
+            Ok(())
+        })?;
     }
     if delete_sync_jobs {
-        for (jid, s) in scan_all(node, SYNC_JOB_INDEX)? {
+        let mut jobs = Vec::new();
+        scan_each(node, SYNC_JOB_INDEX, SCAN_PAGE, &mut |jid, s| {
             if s["connector"]["id"].as_str() == Some(id) {
-                delete(node, SYNC_JOB_INDEX, &jid)?;
+                jobs.push(jid);
             }
+        })?;
+        for jid in jobs {
+            delete(node, SYNC_JOB_INDEX, &jid)?;
         }
     }
     Ok((200, json!({"acknowledged": true})))
@@ -920,14 +993,14 @@ pub fn update_service_type(node: &Node, id: &str, body: &Value, src: &Src) -> Ou
         errs.push("[service_type] cannot be [null] or [\"\"].".to_string());
     }
     need_id(id, errs)?;
-    let mut doc = load_connector(node, id)?;
-    let before = doc.clone();
-    let status = if doc["status"].as_str() == Some("created") { "created" } else { "needs_configuration" };
-    let mut m = Map::new();
-    m.insert("service_type".into(), json!(st));
-    m.insert("status".into(), json!(status));
-    merge(&mut doc, &Value::Object(hash_map(m)));
-    store_connector(node, id, &before, &doc)
+    modify_connector(node, id, |doc| {
+        let status = if doc["status"].as_str() == Some("created") { "created" } else { "needs_configuration" };
+        let mut m = Map::new();
+        m.insert("service_type".into(), json!(st));
+        m.insert("status".into(), json!(status));
+        merge(doc, &Value::Object(hash_map(m)));
+        Ok(())
+    })
 }
 
 /// `PUT /_connector/{id}/_index_name`.
@@ -944,15 +1017,17 @@ pub fn update_index_name(node: &Node, id: &str, body: &Value, src: &Src) -> Out 
             return Err(status_ex(format!("Index name [{i}] is used by another connector.")));
         }
     }
-    let cur = load_connector(node, id)?;
-    if let Some(i) = ix.as_deref().filter(|i| cur["is_native"].as_bool() == Some(true) && !i.starts_with(MANAGED_CONNECTOR_INDEX_PREFIX)) {
-        return Err(status_ex(format!(
-            "Index attached to an Elastic-managed connector must start with the prefix: [{MANAGED_CONNECTOR_INDEX_PREFIX}]. The index name in the payload [{i}] doesn't comply with this requirement."
-        )));
-    }
-    let mut m = Map::new();
-    m.insert("index_name".into(), json!(ix));
-    update_connector_doc(node, id, m)
+    modify_connector(node, id, |doc| {
+        if let Some(i) = ix.as_deref().filter(|i| doc["is_native"].as_bool() == Some(true) && !i.starts_with(MANAGED_CONNECTOR_INDEX_PREFIX)) {
+            return Err(status_ex(format!(
+                "Index attached to an Elastic-managed connector must start with the prefix: [{MANAGED_CONNECTOR_INDEX_PREFIX}]. The index name in the payload [{i}] doesn't comply with this requirement."
+            )));
+        }
+        let mut m = Map::new();
+        m.insert("index_name".into(), json!(ix));
+        merge(doc, &Value::Object(hash_map(m)));
+        Ok(())
+    })
 }
 
 /// `PUT /_connector/{id}/_native`.
@@ -960,19 +1035,21 @@ pub fn update_native(node: &Node, id: &str, body: &Value, src: &Src) -> Out {
     single(src, "connector_update_native_request", body, &[("is_native", Kind::Bool)])?;
     need_id(id, vec![])?;
     let native = body.get("is_native").map(as_bool).unwrap_or(false);
-    let cur = load_connector(node, id)?;
-    if let Some(ix) = cur["index_name"].as_str().filter(|ix| native && !ix.starts_with(MANAGED_CONNECTOR_INDEX_PREFIX)) {
-        return Err(status_ex(format!(
-            "The index name [{ix}] attached to the connector [{id}] must start with the required prefix: [{MANAGED_CONNECTOR_INDEX_PREFIX}] to be Elastic-managed. Please update the attached index first to comply with this requirement."
-        )));
-    }
-    // A connected connector has to reconnect (ES 9: only `connected` moves to `configured`).
-    let status = cur["status"].as_str().unwrap_or("created");
-    let status = if status == "connected" && connector_transition_ok(status, "configured") { "configured" } else { status };
-    let mut m = Map::new();
-    m.insert("is_native".into(), json!(native));
-    m.insert("status".into(), json!(status));
-    update_connector_doc(node, id, m)
+    modify_connector(node, id, |doc| {
+        if let Some(ix) = doc["index_name"].as_str().filter(|ix| native && !ix.starts_with(MANAGED_CONNECTOR_INDEX_PREFIX)) {
+            return Err(status_ex(format!(
+                "The index name [{ix}] attached to the connector [{id}] must start with the required prefix: [{MANAGED_CONNECTOR_INDEX_PREFIX}] to be Elastic-managed. Please update the attached index first to comply with this requirement."
+            )));
+        }
+        // A connected connector has to reconnect (ES 9: only `connected` moves to `configured`).
+        let status = doc["status"].as_str().unwrap_or("created").to_string();
+        let status = if status == "connected" && connector_transition_ok(&status, "configured") { "configured".to_string() } else { status };
+        let mut m = Map::new();
+        m.insert("is_native".into(), json!(native));
+        m.insert("status".into(), json!(status));
+        merge(doc, &Value::Object(hash_map(m)));
+        Ok(())
+    })
 }
 
 /// `PUT /_connector/{id}/_status`.
@@ -988,15 +1065,15 @@ pub fn update_status(node: &Node, id: &str, body: &Value, src: &Src) -> Out {
     }
     need_id(id, errs)?;
     let status = status.unwrap_or_default();
-    let mut doc = load_connector(node, id)?;
-    let cur = doc["status"].as_str().unwrap_or("created").to_string();
-    if !connector_transition_ok(&cur, &status) {
-        let msg = format!("Invalid transition attempt from [{cur}] to [{status}]. Such a status transition is not supported by the Connector Protocol.");
-        return Err(status_ex(msg.clone()).caused_by(EsError::new(400, "connector_invalid_status_transition_exception", msg)));
-    }
-    let before = doc.clone();
-    merge(&mut doc, &json!({"status": status}));
-    store_connector(node, id, &before, &doc)
+    modify_connector(node, id, |doc| {
+        let cur = doc["status"].as_str().unwrap_or("created").to_string();
+        if !connector_transition_ok(&cur, &status) {
+            let msg = format!("Invalid transition attempt from [{cur}] to [{status}]. Such a status transition is not supported by the Connector Protocol.");
+            return Err(status_ex(msg.clone()).caused_by(EsError::new(400, "connector_invalid_status_transition_exception", msg)));
+        }
+        merge(doc, &json!({"status": status}));
+        Ok(())
+    })
 }
 
 /// `PUT /_connector/{id}/_api_key_id`.
@@ -1256,24 +1333,25 @@ pub fn update_configuration(node: &Node, id: &str, body: &Value, src: &Src) -> O
         _ => {}
     }
     need_id(id, errs)?;
-    let mut doc = load_connector(node, id)?;
-    let before = doc.clone();
-    if config.is_some() {
-        doc["configuration"] = Value::Object(hash_map(parsed));
-    } else if let Some(vals) = values.and_then(Value::as_object) {
-        let unknown: Vec<&str> = vals.keys().filter(|k| doc["configuration"].get(k.as_str()).is_none()).map(String::as_str).collect();
-        if !unknown.is_empty() {
-            return Err(status_ex(format!(
-                "Unknown [configuration] fields in the request payload: [{}]. Remove them from request or register their schema first.",
-                unknown.join(", ")
-            )));
+    let parsed = Value::Object(hash_map(parsed));
+    modify_connector(node, id, |doc| {
+        if config.is_some() {
+            doc["configuration"] = parsed.clone();
+        } else if let Some(vals) = values.and_then(Value::as_object) {
+            let unknown: Vec<&str> = vals.keys().filter(|k| doc["configuration"].get(k.as_str()).is_none()).map(String::as_str).collect();
+            if !unknown.is_empty() {
+                return Err(status_ex(format!(
+                    "Unknown [configuration] fields in the request payload: [{}]. Remove them from request or register their schema first.",
+                    unknown.join(", ")
+                )));
+            }
+            for (k, v) in vals {
+                doc["configuration"][k]["value"] = v.clone();
+            }
         }
-        for (k, v) in vals {
-            doc["configuration"][k]["value"] = v.clone();
-        }
-    }
-    merge(&mut doc, &json!({"status": "configured"}));
-    store_connector(node, id, &before, &doc)
+        merge(doc, &json!({"status": "configured"}));
+        Ok(())
+    })
 }
 
 // ---- filtering
@@ -1411,29 +1489,29 @@ pub fn update_filtering(node: &Node, id: &str, body: &Value, src: &Src) -> Out {
         errs.push("[advanced_snippet] and [rules] cannot be both [null].".to_string());
     }
     need_id(id, errs)?;
-    let mut doc = load_connector(node, id)?;
-    let before = doc.clone();
-    let new_filtering = match full {
-        Some(list) => Value::Array(list),
-        None => {
-            let mut list = doc["filtering"].as_array().cloned().unwrap_or_default();
-            if list.is_empty() {
-                list = default_filtering(&now()).as_array().cloned().unwrap_or_default();
+    modify_connector(node, id, |doc| {
+        let new_filtering = match &full {
+            Some(list) => Value::Array(list.clone()),
+            None => {
+                let mut list = doc["filtering"].as_array().cloned().unwrap_or_default();
+                if list.is_empty() {
+                    list = default_filtering(&now()).as_array().cloned().unwrap_or_default();
+                }
+                let idx = list.iter().position(|f| f["domain"] == "DEFAULT").unwrap_or(0);
+                let draft = &mut list[idx]["draft"];
+                if let Some(s) = &snippet {
+                    draft["advanced_snippet"] = s.clone();
+                }
+                if let Some(r) = &rules {
+                    draft["rules"] = Value::Array(order_rules(r.clone()));
+                }
+                draft["validation"] = json!({"errors": [], "state": "edited"});
+                Value::Array(list)
             }
-            let idx = list.iter().position(|f| f["domain"] == "DEFAULT").unwrap_or(0);
-            let draft = &mut list[idx]["draft"];
-            if let Some(s) = snippet {
-                draft["advanced_snippet"] = s;
-            }
-            if let Some(r) = rules {
-                draft["rules"] = Value::Array(order_rules(r));
-            }
-            draft["validation"] = json!({"errors": [], "state": "edited"});
-            Value::Array(list)
-        }
-    };
-    doc["filtering"] = hash_deep(new_filtering);
-    store_connector(node, id, &before, &doc)
+        };
+        doc["filtering"] = hash_deep(new_filtering);
+        Ok(())
+    })
 }
 
 fn parse_validation(src: &Src, ptr: &str, v: &Value, wrap: &dyn Fn(&str, EsError) -> EsError) -> Result<Value> {
@@ -1466,35 +1544,36 @@ pub fn update_filtering_validation(node: &Node, id: &str, body: &Value, src: &Sr
         errs.push("[validation] cannot be [null].".to_string());
     }
     need_id(id, errs)?;
-    let mut doc = load_connector(node, id)?;
-    let before = doc.clone();
-    let mut list = doc["filtering"].as_array().cloned().unwrap_or_default();
-    let idx = list.iter().position(|f| f["domain"] == "DEFAULT").unwrap_or(0);
-    if let Some(f) = list.get_mut(idx) {
-        f["draft"]["validation"] = val.unwrap_or(Value::Null);
-    }
-    doc["filtering"] = hash_deep(Value::Array(list));
-    store_connector(node, id, &before, &doc)
+    let val = val.unwrap_or(Value::Null);
+    modify_connector(node, id, |doc| {
+        let mut list = doc["filtering"].as_array().cloned().unwrap_or_default();
+        let idx = list.iter().position(|f| f["domain"] == "DEFAULT").unwrap_or(0);
+        if let Some(f) = list.get_mut(idx) {
+            f["draft"]["validation"] = val.clone();
+        }
+        doc["filtering"] = hash_deep(Value::Array(list));
+        Ok(())
+    })
 }
 
 /// `PUT /_connector/{id}/_filtering/_activate`.
 pub fn activate_filtering(node: &Node, id: &str) -> Out {
     need_id(id, vec![])?;
-    let mut doc = load_connector(node, id)?;
-    let before = doc.clone();
-    let mut list = doc["filtering"].as_array().cloned().unwrap_or_default();
-    let idx = list.iter().position(|f| f["domain"] == "DEFAULT").unwrap_or(0);
-    if let Some(f) = list.get_mut(idx) {
-        let state = f["draft"]["validation"]["state"].as_str().unwrap_or("").to_string();
-        if state != "valid" {
-            return Err(status_ex(format!(
-                "Filtering draft needs to be validated by the connector service before activation. Current filtering draft validation state [{state}] is not equal to [valid]."
-            )));
+    modify_connector(node, id, |doc| {
+        let mut list = doc["filtering"].as_array().cloned().unwrap_or_default();
+        let idx = list.iter().position(|f| f["domain"] == "DEFAULT").unwrap_or(0);
+        if let Some(f) = list.get_mut(idx) {
+            let state = f["draft"]["validation"]["state"].as_str().unwrap_or("").to_string();
+            if state != "valid" {
+                return Err(status_ex(format!(
+                    "Filtering draft needs to be validated by the connector service before activation. Current filtering draft validation state [{state}] is not equal to [valid]."
+                )));
+            }
+            f["active"] = f["draft"].clone();
         }
-        f["active"] = f["draft"].clone();
-    }
-    doc["filtering"] = hash_deep(Value::Array(list));
-    store_connector(node, id, &before, &doc)
+        doc["filtering"] = hash_deep(Value::Array(list));
+        Ok(())
+    })
 }
 
 // ------------------------------------------------------------------ secrets
@@ -1667,16 +1746,15 @@ pub fn sync_job_delete(node: &Node, id: &str) -> Out {
     Ok((200, json!({"acknowledged": true})))
 }
 
-fn update_job(node: &Node, id: &str, missing: fn(&str) -> EsError, f: impl FnOnce(&Value) -> Result<Map<String, Value>>) -> Out {
-    let mut doc = read(node, SYNC_JOB_INDEX, id)?.ok_or_else(|| missing(id))?;
-    let upd = f(&doc)?;
-    let before = doc.clone();
-    merge(&mut doc, &Value::Object(hash_map(upd)));
-    if doc == before {
-        return Ok((200, result("noop")));
-    }
-    write(node, SYNC_JOB_INDEX, id, &doc)?;
-    Ok((200, result("updated")))
+/// Apply the update doc `f` builds from the current job document (an
+/// atomic [`modify`]: a heartbeat racing a cancellation re-reads the
+/// canceled job instead of writing its stale status back).
+fn update_job(node: &Node, id: &str, missing: fn(&str) -> EsError, mut f: impl FnMut(&Value) -> Result<Map<String, Value>>) -> Out {
+    modify(node, SYNC_JOB_INDEX, id, &|| missing(id), |doc| {
+        let upd = f(doc)?;
+        merge(doc, &Value::Object(hash_map(upd)));
+        Ok(())
+    })
 }
 
 /// `PUT /_connector/_sync_job/{id}/_check_in`.
@@ -1727,7 +1805,7 @@ pub fn sync_job_error(node: &Node, id: &str, body: &Value, src: &Src) -> Out {
             return Err(sync_transition_err(cur, "error"));
         }
         let mut m = Map::new();
-        m.insert("error".into(), err);
+        m.insert("error".into(), err.clone());
         m.insert("status".into(), json!("error"));
         Ok(m)
     })
@@ -1790,8 +1868,8 @@ pub fn sync_job_claim(node: &Node, id: &str, body: &Value, src: &Src) -> Out {
         m.insert("last_seen".into(), json!(ts));
         m.insert("started_at".into(), json!(ts));
         m.insert("status".into(), json!("in_progress"));
-        m.insert("worker_hostname".into(), host);
-        if let Some(c) = cursor {
+        m.insert("worker_hostname".into(), host.clone());
+        if let Some(c) = &cursor {
             m.insert("connector".into(), json!({"sync_cursor": c}));
         }
         Ok(m)
@@ -1815,16 +1893,20 @@ pub fn sync_job_list(node: &Node, p: &JobListParams) -> Out {
         enum_value(t, JOB_TYPES, "ConnectorSyncJobType")?;
     }
     let (from, size) = page(p.from, p.size)?;
-    let mut all: Vec<(usize, String, Value)> = scan_all(node, SYNC_JOB_INDEX)?
-        .into_iter()
-        .enumerate()
-        .filter(|(_, (_, s))| {
-            p.connector_id.is_none_or(|c| s["connector"]["id"].as_str() == Some(c))
-                && status.as_ref().is_none_or(|st| s["status"].as_str() == Some(st.as_str()))
-                && (types.is_empty() || types.iter().any(|t| s["job_type"].as_str() == Some(t.as_str())))
-        })
-        .map(|(i, (id, s))| (i, id, s))
-        .collect();
+    // Every job is considered (paged, not capped at a result window), and
+    // only the matching ones are kept: count and order cover all of them.
+    let mut all: Vec<(usize, String, Value)> = Vec::new();
+    let mut seen = 0usize;
+    scan_each(node, SYNC_JOB_INDEX, SCAN_PAGE, &mut |id, s| {
+        let i = seen;
+        seen += 1;
+        let keep = p.connector_id.is_none_or(|c| s["connector"]["id"].as_str() == Some(c))
+            && status.as_ref().is_none_or(|st| s["status"].as_str() == Some(st.as_str()))
+            && (types.is_empty() || types.iter().any(|t| s["job_type"].as_str() == Some(t.as_str())));
+        if keep {
+            all.push((i, id, s));
+        }
+    })?;
     all.sort_by(|a, b| {
         let ka = a.2["created_at"].as_str().and_then(sort_nanos).unwrap_or(0);
         let kb = b.2["created_at"].as_str().and_then(sort_nanos).unwrap_or(0);
@@ -1838,6 +1920,162 @@ pub fn sync_job_list(node: &Node, p: &JobListParams) -> Out {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Runs once on this thread right after [`modify`]'s next read: a
+        /// concurrent request landing between an update's read and write.
+        pub(super) static AFTER_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
+    }
+
+    fn after_next_read(f: impl FnMut() + 'static) {
+        AFTER_READ.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    fn src(v: &Value) -> Src {
+        Src::new(v.to_string().as_bytes())
+    }
+
+    fn connector(node: &Node, id: &str, index: &str) {
+        let body = json!({"index_name": index, "service_type": "google_drive", "name": id});
+        put(node, Some(id), &body, &src(&body)).unwrap();
+    }
+
+    fn job(node: &Node, connector: &str) -> String {
+        let body = json!({"id": connector});
+        sync_job_post(node, &body, &src(&body)).unwrap().1["id"].as_str().unwrap().to_string()
+    }
+
+    fn stored(node: &Node, index: &str, id: &str) -> Value {
+        read(node, index, id).unwrap().unwrap()
+    }
+
+    /// A job heartbeat that read `in_progress` before a cancellation was
+    /// acknowledged must not write `in_progress` back: the cancellation and
+    /// the heartbeat both survive.
+    #[test]
+    fn heartbeat_racing_cancellation_keeps_the_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        connector(&node, "c", "search-c");
+        let jid = job(&node, "c");
+        let body = json!({"worker_hostname": "w1"});
+        sync_job_claim(&node, &jid, &body, &src(&body)).unwrap();
+        let before = stored(&node, SYNC_JOB_INDEX, &jid);
+        assert_eq!(before["status"], "in_progress");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (n2, j2) = (node.clone(), jid.clone());
+        after_next_read(move || {
+            let (st, r) = sync_job_cancel(&n2, &j2).unwrap();
+            assert_eq!((st, r["result"].as_str()), (200, Some("updated")));
+        });
+        sync_job_check_in(&node, &jid).unwrap();
+        let after = stored(&node, SYNC_JOB_INDEX, &jid);
+        assert_eq!(after["status"], "canceling", "cancellation undone by a stale heartbeat: {after}");
+        assert!(after["cancelation_requested_at"].is_string(), "{after}");
+        assert_ne!(after["last_seen"], before["last_seen"], "the heartbeat landed too: {after}");
+        assert_eq!(after["worker_hostname"], "w1");
+    }
+
+    /// Connector updates of different fields that interleave between read
+    /// and write both survive.
+    #[test]
+    fn interleaved_connector_updates_both_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        connector(&node, "c", "search-c");
+        let n2 = node.clone();
+        after_next_read(move || {
+            let body = json!({"error": "boom"});
+            update_error(&n2, "c", &body, &src(&body)).unwrap();
+        });
+        let body = json!({"last_sync_status": "completed", "last_indexed_document_count": 42});
+        last_sync(&node, "c", &body, &src(&body)).unwrap();
+        let doc = stored(&node, CONNECTOR_INDEX, "c");
+        assert_eq!(doc["error"], "boom", "{doc}");
+        assert_eq!(doc["status"], "error", "{doc}");
+        assert_eq!(doc["last_sync_status"], "completed", "{doc}");
+        assert_eq!(doc["last_indexed_document_count"], 42, "{doc}");
+        // A transition is re-validated against the newer document: a status
+        // change racing a deletion fails instead of resurrecting it.
+        let n3 = node.clone();
+        after_next_read(move || {
+            delete_connector(&n3, "c", false, false).unwrap();
+        });
+        let body = json!({"service_type": "sharepoint"});
+        let e = update_service_type(&node, "c", &body, &src(&body)).unwrap_err();
+        assert_eq!(e.status, 404, "{e:?}");
+        assert_eq!(stored(&node, CONNECTOR_INDEX, "c")["deleted"], true);
+    }
+
+    /// Threads updating different connector and job fields at once: every
+    /// field ends at its writer's last value.
+    #[test]
+    fn concurrent_updates_to_different_fields_all_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        connector(&node, "c", "search-c");
+        const N: usize = 40;
+        let writers: Vec<Box<dyn Fn(&Node, usize) + Send + Sync>> = vec![
+            Box::new(|n, i| { let b = json!({"name": format!("name-{i}")}); update_name(n, "c", &b, &src(&b)).unwrap(); }),
+            Box::new(|n, i| { let b = json!({"api_key_id": format!("key-{i}")}); update_api_key_id(n, "c", &b, &src(&b)).unwrap(); }),
+            Box::new(|n, i| { let b = json!({"last_sync_error": format!("err-{i}")}); last_sync(n, "c", &b, &src(&b)).unwrap(); }),
+            Box::new(|n, i| { let b = json!({"pipeline": {"extract_binary_content": true, "name": format!("p-{i}"), "reduce_whitespace": true, "run_ml_inference": false}}); update_pipeline(n, "c", &b, &src(&b)).unwrap(); }),
+            Box::new(|n, _| { check_in(n, "c").unwrap(); }),
+        ];
+        let writers = Arc::new(writers);
+        let handles: Vec<_> = (0..writers.len())
+            .map(|w| {
+                let (node, writers) = (node.clone(), writers.clone());
+                std::thread::spawn(move || (0..N).for_each(|i| writers[w](&node, i)))
+            })
+            .collect();
+        handles.into_iter().for_each(|h| h.join().unwrap());
+        let doc = stored(&node, CONNECTOR_INDEX, "c");
+        let last = N - 1;
+        assert_eq!(doc["name"], format!("name-{last}"), "{doc}");
+        assert_eq!(doc["api_key_id"], format!("key-{last}"), "{doc}");
+        assert_eq!(doc["last_sync_error"], format!("err-{last}"), "{doc}");
+        assert_eq!(doc["pipeline"]["name"], format!("p-{last}"), "{doc}");
+        assert!(doc["last_seen"].is_string(), "{doc}");
+    }
+
+    /// More than 10,000 older jobs of another connector: a new pending job
+    /// is still discovered, counts cover every job, and deleting a
+    /// connector with its jobs removes all of them.
+    #[test]
+    fn job_discovery_pages_past_ten_thousand_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        connector(&node, "old", "search-old");
+        connector(&node, "new", "search-new");
+        const OLD: usize = 10_050;
+        let svc = ensure_index(&node, SYNC_JOB_INDEX).unwrap();
+        let reqs: Vec<WriteReq> = (0..OLD)
+            .map(|i| {
+                let doc = json!({"connector": {"id": "old"}, "created_at": "2020-01-01T00:00:00.000000000Z", "status": if i % 2 == 0 { "completed" } else { "pending" }, "job_type": "full"});
+                WriteReq::Index { id: Some(format!("old-{i}")), source: doc.to_string(), routing: None, cond: WriteCond::default() }
+            })
+            .collect();
+        for r in svc.write(reqs, false) {
+            r.unwrap();
+        }
+        let fresh = job(&node, "new");
+        let list = |connector_id: Option<&str>, status: Option<&str>, size: i64| {
+            sync_job_list(&node, &JobListParams { from: 0, size, connector_id, status, job_type: None }).unwrap().1
+        };
+        let found = list(Some("new"), Some("pending"), 100);
+        assert_eq!(found["count"], 1, "{found}");
+        assert_eq!(found["results"][0]["id"], fresh.as_str());
+        let newest = list(None, None, 1);
+        assert_eq!(newest["count"], OLD + 1);
+        assert_eq!(newest["results"][0]["id"], fresh.as_str(), "newest first across every job");
+        assert_eq!(list(Some("old"), Some("pending"), 10)["count"], OLD / 2);
+        assert_eq!(scan_all(&node, SYNC_JOB_INDEX).unwrap().len(), OLD + 1);
+        delete_connector(&node, "new", true, false).unwrap();
+        assert_eq!(list(Some("new"), None, 10)["count"], 0);
+        delete_connector(&node, "old", true, true).unwrap();
+        assert_eq!(list(None, None, 10)["count"], 0);
+    }
 
     #[test]
     fn positions() {

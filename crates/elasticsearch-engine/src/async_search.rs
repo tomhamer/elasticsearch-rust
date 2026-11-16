@@ -25,14 +25,62 @@ pub struct AsyncSearch {
     cv: Condvar,
     /// Response warnings the search raised (replayed on every retrieval).
     pub warnings: Mutex<Vec<String>>,
+    /// The submitting subject (security on): only it reads, extends or
+    /// deletes the result (ES `AsyncTaskIndexService` ownership).
+    owner: Mutex<Option<crate::security::owner::ResourceOwner>>,
 }
 
 struct Inner {
     state: AsyncState,
     retained: Option<crate::memory::Reservation>,
+    /// The completed search's own shard outcome (its `_shards` and
+    /// `timed_out`), read from the response once at completion.
+    outcome: Option<Outcome>,
     completion_millis: Option<i64>,
     expiration_millis: i64,
     expires: Instant,
+}
+
+/// A completed search's shard outcome, from its own response.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Outcome {
+    total: u64,
+    successful: u64,
+    skipped: u64,
+    failed: u64,
+    timed_out: bool,
+}
+
+impl Outcome {
+    /// ES async search: a completed search is partial unless it completed
+    /// on every shard (no shard failed, nothing timed out).
+    fn partial(&self) -> bool {
+        self.failed > 0 || self.timed_out
+    }
+
+    fn of(text: &str) -> Option<Outcome> {
+        #[derive(serde::Deserialize)]
+        struct Shards {
+            #[serde(default)]
+            total: u64,
+            #[serde(default)]
+            successful: u64,
+            #[serde(default)]
+            skipped: u64,
+            #[serde(default)]
+            failed: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Head {
+            #[serde(default)]
+            timed_out: bool,
+            #[serde(rename = "_shards")]
+            shards: Option<Shards>,
+        }
+        let h: Head = serde_json::from_str(text).ok()?;
+        let s = h.shards?;
+        Some(Outcome { total: s.total, successful: s.successful, skipped: s.skipped, failed: s.failed, timed_out: h.timed_out })
+    }
 }
 
 /// An `AsyncExecutionId`-encoded id for this node (decodes like ES's).
@@ -47,10 +95,21 @@ impl AsyncSearch {
             id: new_id(),
             start_millis: now,
             shards,
-            inner: Mutex::new(Inner { state: AsyncState::Running, retained: None, completion_millis: None, expiration_millis: now + keep_alive.as_millis() as i64, expires: Instant::now() + keep_alive }),
+            inner: Mutex::new(Inner { state: AsyncState::Running, retained: None, outcome: None, completion_millis: None, expiration_millis: now + keep_alive.as_millis() as i64, expires: Instant::now() + keep_alive }),
             cv: Condvar::new(),
             warnings: Mutex::new(Vec::new()),
+            owner: Mutex::new(None),
         })
+    }
+
+    /// Bind the search to the subject that submitted it.
+    pub fn set_owner(&self, owner: Option<crate::security::owner::ResourceOwner>) {
+        *self.owner.lock() = owner;
+    }
+
+    /// The submitting subject (`None`: submitted with security off).
+    pub fn owner(&self) -> Option<crate::security::owner::ResourceOwner> {
+        self.owner.lock().clone()
     }
 
     /// Copy a borrowed response only after reserving its retained storage.
@@ -70,7 +129,7 @@ impl AsyncSearch {
         g.state = AsyncState::Running;
         g.retained = None;
         match prepared {
-            Ok((text,memory)) => { g.retained = Some(memory); g.state = AsyncState::Done(Ok(text)); }
+            Ok((text,memory)) => { g.retained = Some(memory); g.outcome = Outcome::of(&text); g.state = AsyncState::Done(Ok(text)); }
             Err(error) => { g.state = AsyncState::Done(Err(error)); }
         }
         g.completion_millis = Some(crate::date::now_millis());
@@ -86,7 +145,7 @@ impl AsyncSearch {
             crate::memory::scoped(None,||breakers.reserve_request(text.capacity() as u64,"async search retained result"))
         }).transpose();
         match retained {
-            Ok(held)=>{g.retained=held;g.state=AsyncState::Done(r);},
+            Ok(held)=>{g.retained=held;g.outcome=r.as_ref().ok().and_then(|t|Outcome::of(t));g.state=AsyncState::Done(r);},
             Err(error)=>{g.retained=None;g.state=AsyncState::Done(Err(error));},
         }
         g.completion_millis = Some(crate::date::now_millis());
@@ -144,7 +203,9 @@ impl AsyncSearch {
                 );
             }
             AsyncState::Done(r) => {
-                let failed = r.is_err();
+                // Partial: the search failed, or its own response reports a
+                // failed shard or a timeout (never inferred from HTTP success).
+                let failed = r.is_err() || g.outcome.is_some_and(|o| o.partial());
                 m.insert("is_partial".into(), json!(failed));
                 m.insert("is_running".into(), json!(false));
                 m.insert("start_time_in_millis".into(), json!(self.start_millis));
@@ -188,7 +249,7 @@ impl AsyncSearch {
         m.insert("id".into(), json!(self.id));
         let (running, partial, ok) = match &g.state {
             AsyncState::Running => (true, true, None),
-            AsyncState::Done(Ok(_)) => (false, false, Some(200)),
+            AsyncState::Done(Ok(_)) => (false, g.outcome.is_some_and(|o| o.partial()), Some(200)),
             AsyncState::Done(Err(e)) => (false, true, Some(e.status)),
         };
         m.insert("is_running".into(), json!(running));
@@ -198,9 +259,17 @@ impl AsyncSearch {
         if let Some(c) = g.completion_millis {
             m.insert("completion_time_in_millis".into(), json!(c));
         }
-        let ok_shards = if ok == Some(200) { self.shards } else { 0 };
-        let failed = if ok.map(|s| s != 200).unwrap_or(false) { self.shards } else { 0 };
-        m.insert("_shards".into(), json!({"total": self.shards, "successful": ok_shards, "skipped": 0, "failed": failed}));
+        match (ok, g.outcome) {
+            // The search's own shard statistics.
+            (Some(200), Some(o)) => {
+                m.insert("_shards".into(), json!({"total": o.total, "successful": o.successful, "skipped": o.skipped, "failed": o.failed}));
+            }
+            _ => {
+                let ok_shards = if ok == Some(200) { self.shards } else { 0 };
+                let failed = if ok.map(|s| s != 200).unwrap_or(false) { self.shards } else { 0 };
+                m.insert("_shards".into(), json!({"total": self.shards, "successful": ok_shards, "skipped": 0, "failed": failed}));
+            }
+        }
         if let Some(s) = ok {
             m.insert("completion_status".into(), json!(s));
         }
@@ -229,6 +298,31 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
+    /// #320: a completed search's own shard outcome drives `is_partial` and
+    /// the status `_shards`, not the HTTP success of the search.
+    #[test]
+    fn completion_metadata_follows_the_search_response() {
+        let body = |failed: u64, timed_out: bool| format!(
+            "{{\"took\":3,\"timed_out\":{timed_out},\"_shards\":{{\"total\":2,\"successful\":{},\"skipped\":0,\"failed\":{failed}}},\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"eq\"}},\"max_score\":null,\"hits\":[]}}}}",
+            2 - failed
+        );
+        for (failed, timed_out, partial) in [(1, false, true), (0, true, true), (0, false, false)] {
+            let a = super::AsyncSearch::new(2, std::time::Duration::from_secs(60));
+            a.complete_borrowed(&body(failed, timed_out));
+            let (status, r) = a.response(true).unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(r["is_partial"], partial, "{r}");
+            assert_eq!(r["response"]["_shards"]["failed"], failed);
+            let st = a.status();
+            assert_eq!(st["is_partial"], partial, "{st}");
+            assert_eq!(st["_shards"], serde_json::json!({"total": 2, "successful": 2 - failed, "skipped": 0, "failed": failed}));
+            assert_eq!(st["completion_status"], 200);
+            let b = super::AsyncSearch::new(2, std::time::Duration::from_secs(60));
+            b.complete(Ok(body(failed, timed_out)));
+            assert_eq!(b.status()["is_partial"], partial);
+        }
+    }
+
     #[test]
     fn retained_results_are_admitted_and_released_with_store_owner() {
         let breakers=crate::memory::Breakers::leak_for_tests(1<<30);

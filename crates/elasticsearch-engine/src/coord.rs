@@ -22,6 +22,36 @@ pub type Coordinator = Arc<dyn Fn(&str, &str, Option<Value>) -> Result<Value> + 
 
 thread_local! {
     static SCOPED: RefCell<Option<Coordinator>> = const { RefCell::new(None) };
+    static INTERNAL: RefCell<Option<Coordinator>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with `c` as this thread's internal-origin coordinator: the
+/// cluster dispatcher running as the internal `_system` user, for writes ES
+/// makes under an internal origin once the request was authorized (ML's
+/// model store, `ML_ORIGIN`): the caller needs no privilege on those
+/// internal indices.
+pub fn scoped_internal<R>(c: Option<Coordinator>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Coordinator>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            INTERNAL.with(|s| *s.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(INTERNAL.with(|s| std::mem::replace(&mut *s.borrow_mut(), c)));
+    f()
+}
+
+/// The internal-origin coordinator ([`scoped_internal`]), else the
+/// caller's ([`current`]).
+pub fn internal() -> Option<Coordinator> {
+    INTERNAL.with(|s| s.borrow().clone()).or_else(current)
+}
+
+/// The internal-origin coordinator [`scoped_internal`] set, if any (to
+/// carry it to another thread).
+pub fn current_internal() -> Option<Coordinator> {
+    INTERNAL.with(|s| s.borrow().clone())
 }
 
 /// Run `f` with `c` as this thread's coordinator.
@@ -70,6 +100,22 @@ mod tests {
             assert!(current().is_some());
         });
         assert!(current().is_none());
+    }
+
+    #[test]
+    fn internal_prefers_the_internal_origin_coordinator() {
+        let caller: Coordinator = Arc::new(|_, _, _| Ok(Value::from("caller")));
+        let system: Coordinator = Arc::new(|_, _, _| Ok(Value::from("system")));
+        assert!(internal().is_none());
+        scoped(Some(caller), || {
+            // Without an internal-origin one: the caller's.
+            assert_eq!(internal().unwrap()("GET", "/", None).unwrap(), "caller");
+            scoped_internal(Some(system), || {
+                assert_eq!(internal().unwrap()("GET", "/", None).unwrap(), "system");
+                assert_eq!(current().unwrap()("GET", "/", None).unwrap(), "caller");
+            });
+            assert!(current_internal().is_none());
+        });
     }
 
     #[test]

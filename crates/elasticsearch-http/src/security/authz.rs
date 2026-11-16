@@ -26,6 +26,8 @@ pub async fn authorize_and_dispatch(node: Arc<Node>, mut req: Req, authn: Authn)
     req.access = Some(Arc::new(ReadAccess::build(&node, &authn, &perm, &act.action, &[])?));
     if !perm.is_superuser {
         req.extensions.insert(mapping_authz(&node, &authn, &perm));
+        let catalog = req.extensions.get::<crate::AuthorizationIndexCatalog>().map(|c| Arc::new(c.0.clone()));
+        req.extensions.insert(ingest_dest_authz(&node, &authn, &perm, catalog));
     }
     match act.target.clone() {
         Target::Authenticated => access::check_unscoped_read(&perm, &act.action)?,
@@ -38,11 +40,19 @@ pub async fn authorize_and_dispatch(node: Arc<Node>, mut req: Req, authn: Authn)
             access::check_unscoped_read(&perm, &act.action)?;
         }
         Target::AnyIndex => {
-            if !perm.check_index_action(&act.action) {
+            // ES|QL / SQL of a caller granted only remote clusters' indices
+            // (`remote_indices`): its remote parts are authorized there, its
+            // local ones by the query's index authorization below.
+            let remote_reader = query_read_action(&act.action).is_some() && has_remote_indices(&node, &authn);
+            if !perm.check_index_action(&act.action) && !remote_reader {
                 return Err(denied(&node, &authn, &perm, &act.action, None));
             }
             // ES|QL, SQL, analyze...: names live in the body, so reads cannot be filtered.
             access::check_unscoped_read(&perm, &act.action)?;
+            // ES|QL and SQL: the engine authorizes every index expression the query resolves.
+            if let Some((read, strict)) = query_read_action(&act.action) {
+                req.extensions.insert(query_index_authz(&node, &authn, &perm, read, strict));
+            }
         }
         Target::Fixed(fixed) => {
             let fixed: Vec<String> = fixed.iter().map(|n| n.to_string()).collect();
@@ -61,6 +71,7 @@ pub async fn authorize_and_dispatch(node: Arc<Node>, mut req: Req, authn: Authn)
         Target::Msearch => return msearch(node, req, authn, perm).await,
         Target::Reindex => reindex(&node, &authn, &perm, &mut req)?,
         Target::AliasesBody => aliases_body(&node, &authn, &perm, &mut req)?,
+        Target::DataStreamModifyBody => names = data_stream_modify_body(&node, &authn, &perm, &mut req, &act.action)?,
     }
     // Document- and field-level security (superusers are never restricted).
     if !perm.is_superuser {
@@ -112,6 +123,135 @@ fn mapping_authz(node: &Arc<Node>, a: &Authn, perm: &Permission) -> MappingAuthz
     }))
 }
 
+/// Http request extension: authorizes the destination an ingest pipeline
+/// reroutes a document to (`reroute` processor, or `_index` set by any
+/// processor) as the writing user's bulk item on that index (`create`: an
+/// `op_type=create` write), as ES re-resolves a rerouted request and
+/// authorizes it through the shard-level bulk request.
+#[derive(Clone)]
+pub struct IngestDestAuthz(pub Arc<dyn Fn(&str, bool) -> Result<(), EsError> + Send + Sync>);
+
+fn ingest_dest_authz(node: &Arc<Node>, a: &Authn, perm: &Permission, catalog: Option<Arc<std::collections::BTreeSet<String>>>) -> IngestDestAuthz {
+    let (node, a, perm) = (node.clone(), a.clone(), perm.clone());
+    IngestDestAuthz(Arc::new(move |dest: &str, create: bool| {
+        let ix = resolve_date_math(dest).unwrap_or_else(|_| dest.to_string());
+        let names = vec![ix.clone()];
+        let item = if create { "indices:data/write/index:op_type/create" } else { "indices:data/write/index:op_type/index" };
+        if !allowed(&node, &perm, "indices:data/write/bulk[s]", &ix) {
+            return Err(denied(&node, &a, &perm, "indices:data/write/bulk[s]", Some(&names)));
+        }
+        if !allowed(&node, &perm, item, &ix) || unauthorized_write_alias(&node, &perm, item, &ix).is_some() {
+            return Err(denied(&node, &a, &perm, item, Some(&names)));
+        }
+        let present = match &catalog {
+            Some(c) => c.contains(&ix),
+            None => node.get_index(&ix).is_some() || node.data_streams.read().contains_key(&ix) || node.all_indices().iter().any(|s| s.aliases().contains_key(&ix)),
+        };
+        if !present && !perm.check_index("indices:admin/auto_create", &ix) {
+            return Err(denied(&node, &a, &perm, "indices:admin/auto_create", Some(&names)));
+        }
+        Ok(())
+    }))
+}
+
+/// For an ES|QL or SQL query's action: the action ES runs on the indices
+/// the query reads (ES|QL `ComputeService`'s data node request, SQL's
+/// search) and whether the query's index resolution is strict (ES|QL).
+fn query_read_action(action: &str) -> Option<(&'static str, bool)> {
+    if action == "indices:data/read/esql" {
+        Some(("indices:data/read/esql/data", true))
+    } else if action == "indices:data/read/sql" || action.starts_with("indices:data/read/sql/") {
+        Some(("indices:data/read/search", false))
+    } else {
+        None
+    }
+}
+
+const FIELD_CAPS: &str = "indices:data/read/field_caps";
+
+/// One of the caller's roles grants indices of a remote cluster.
+fn has_remote_indices(node: &Node, authn: &Authn) -> bool {
+    let sec = &node.security;
+    sec.assigned_roles(authn.effective()).iter().any(|name| sec.role_descriptor(name).is_some_and(|d| d["remote_indices"].as_array().is_some_and(|a| !a.is_empty())))
+}
+
+/// The caller's authorization of the index expressions an ES|QL or SQL
+/// query resolves, as ES resolves them under the caller's privileges.
+/// ES|QL (`strict`): wildcards expand to the indices the caller may read,
+/// an explicit name the caller may not read is an unknown index. SQL: the
+/// field-caps resolution is lenient (wildcards expand to the names the
+/// caller may describe, unauthorized explicit names are dropped, leaving an
+/// unknown index when none is left), then the indices read need
+/// `read_action` (else a `security_exception`).
+fn query_index_authz(node: &Arc<Node>, a: &Authn, perm: &Permission, read_action: &'static str, strict: bool) -> crate::QueryIndexAuthz {
+    crate::QueryIndexAuthz(Arc::new(QueryAuthz { node: node.clone(), a: a.clone(), perm: perm.clone(), read_action, strict }))
+}
+
+struct QueryAuthz {
+    node: Arc<Node>,
+    a: Authn,
+    perm: Permission,
+    read_action: &'static str,
+    strict: bool,
+}
+
+impl elasticsearch_engine::esql::exec::QueryAuthorizer for QueryAuthz {
+    fn indices(&self, expr: &str, opts: &ResolveOpts, read: bool) -> Result<Option<elasticsearch_engine::esql::exec::AuthorizedIndices>, EsError> {
+        let (node, perm) = (&self.node, &self.perm);
+        // Superusers can read anything outside restricted (.security*) indices.
+        if perm.is_superuser && !expr.contains(".security") {
+            return Ok(None);
+        }
+        let mut opts = *opts;
+        opts.ignore_unavailable = !self.strict;
+        let r = resolve(node, perm, if self.strict { self.read_action } else { FIELD_CAPS }, expr, &opts);
+        if read && !self.strict {
+            let bad: Vec<String> = r.names.iter().filter(|n| !is_remote(n) && !allowed_name(node, perm, self.read_action, n)).cloned().collect();
+            if !bad.is_empty() {
+                return Err(denied(node, &self.a, perm, self.read_action, Some(&bad)));
+            }
+        }
+        if self.strict && !r.denied.is_empty() {
+            // An unauthorized index the authorized names resolve to anyway
+            // (an alias and its own index): ES resolves it through the
+            // alias, then refuses the explicit name's read (403).
+            let reached: std::collections::HashSet<String> = r.names.iter().filter(|n| !is_remote(n)).flat_map(|n| access::concretes(node, n)).collect();
+            let explicit: Vec<String> = r.denied.iter().filter(|d| access::concretes(node, d).iter().any(|c| reached.contains(c))).cloned().collect();
+            if !explicit.is_empty() {
+                return Err(denied(node, &self.a, perm, "indices:data/read/esql", Some(&explicit)));
+            }
+        }
+        Ok(Some(elasticsearch_engine::esql::exec::AuthorizedIndices { names: r.names, unknown: r.denied }))
+    }
+
+    fn enrich(&self, _policy: &str) -> Result<(), EsError> {
+        if self.perm.has_cluster_privilege("monitor_enrich") {
+            return Ok(());
+        }
+        Err(EsError::new(403, "security_exception", format!("user [{}] doesn't have sufficient privileges to perform enrich lookup: privilege [monitor_enrich] is missing", self.a.run_as.as_deref().unwrap_or(&self.a).username)))
+    }
+}
+
+/// A remote cluster expression (`cluster:index`), authorized by the remote
+/// cluster (as the engine splits them: `name::selector` is local).
+fn is_remote(p: &str) -> bool {
+    elasticsearch_engine::ccr::remote::is_remote_part(p)
+}
+
+/// `name::selector` (index component selector) split into the name and
+/// its selector (`None`: no selector).
+fn split_selector(p: &str) -> (&str, Option<&str>) {
+    match p.split_once("::") {
+        Some((name, selector)) => (name, Some(selector)),
+        None => (p, None),
+    }
+}
+
+/// The component an expression or resolved name reads (`::data` is the default).
+fn component(selector: Option<&str>) -> &str {
+    selector.unwrap_or("data")
+}
+
 fn has_wildcard(p: &str) -> bool {
     p == "_all" || p.contains('*')
 }
@@ -146,17 +286,30 @@ fn ds_candidates(node: &Node, opts: &ResolveOpts) -> Vec<String> {
 
 /// `perm` grants `action` on `name`, directly or through the data stream owning it.
 pub fn allowed(node: &Node, perm: &Permission, action: &str, name: &str) -> bool {
-    if perm.check_index(action, name) {
+    allowed_component(node, perm, action, name, false)
+}
+
+/// [`allowed`] on `name`'s `::failures` component (`failures`, which needs
+/// a failure-store privilege) or on its data.
+fn allowed_component(node: &Node, perm: &Permission, action: &str, name: &str, failures: bool) -> bool {
+    if perm.check_index_component(action, name, failures) {
         return true;
     }
     if name.starts_with(".ds-") || name.starts_with(".fs-") {
         let dss = node.data_streams.read();
-        // ES: privileges on a data stream cover its backing and failure-store indices.
-        if let Some((ds, _)) = dss.iter().find(|(_, d)| d.indices.iter().chain(d.failure_indices.iter()).any(|i| i == name)) {
-            return perm.check_index(action, ds);
+        // ES: privileges on a data stream cover its backing indices, and
+        // its failure-store privileges its failure indices.
+        if let Some((ds, d)) = dss.iter().find(|(_, d)| d.indices.iter().chain(d.failure_indices.iter()).any(|i| i == name)) {
+            return perm.check_index_component(action, ds, d.failure_indices.iter().any(|i| i == name));
         }
     }
     false
+}
+
+/// [`allowed`] of a resolved name, by the component its selector reads.
+fn allowed_name(node: &Node, perm: &Permission, action: &str, name: &str) -> bool {
+    let (base, selector) = split_selector(name);
+    allowed_component(node, perm, action, base, component(selector) == "failures")
 }
 
 fn hidden_candidates(node: &Node) -> Vec<String> {
@@ -168,6 +321,12 @@ pub struct Resolved {
     pub names: Vec<String>,
     pub denied: Vec<String>,
     pub had_wildcard: bool,
+    /// The expression's exclusions (`-name`, after the first part). They
+    /// remove authorized names here, and stay in a rewritten expression: an
+    /// excluded index behind a kept alias (`alias,-index`, as a cluster
+    /// shard request scopes an alias to the indices of one shard group) is
+    /// only removed once the engine expands the alias.
+    pub excluded: Vec<String>,
 }
 
 /// Resolve `expr` for `action`: wildcards expand to authorized names,
@@ -176,6 +335,7 @@ pub fn resolve(node: &Node, perm: &Permission, action: &str, expr: &str, opts: &
     let mut names: Vec<String> = Vec::new();
     let mut denied_names: Vec<String> = Vec::new();
     let mut had_wildcard = false;
+    let mut excluded: Vec<String> = Vec::new();
     let mut cands: Option<Vec<String>> = None;
     let parts: Vec<&str> = if expr.is_empty() { vec!["_all"] } else { expr.split(',').map(str::trim).filter(|p| !p.is_empty()).collect() };
     for (i, raw) in parts.iter().enumerate() {
@@ -183,14 +343,27 @@ pub fn resolve(node: &Node, perm: &Permission, action: &str, expr: &str, opts: &
             Some(r) if i > 0 => (true, r),
             _ => (false, *raw),
         };
-        if p.contains(':') && !p.starts_with('<') {
+        if is_remote(p) {
             // remote cluster expression: not ours to authorize
             names.push(raw.to_string());
             continue;
         }
-        let p = resolve_date_math(p).unwrap_or_else(|_| p.to_string());
+        let full = resolve_date_math(p).unwrap_or_else(|_| p.to_string());
+        // A component selector (`logs::failures`) names its index, alias or
+        // data stream: that name is authorized, the selector kept.
+        let (p, selector) = split_selector(&full);
+        let p = p.to_string();
+        let failures = component(selector) == "failures";
+        let with_selector = |n: &str| match selector {
+            Some(s) => format!("{n}::{s}"),
+            None => n.to_string(),
+        };
         if exclude {
-            names.retain(|n| !glob(&p, n));
+            excluded.push(raw.to_string());
+            names.retain(|n| {
+                let (base, sel) = split_selector(n);
+                !(glob(&p, base) && component(sel) == component(selector))
+            });
             continue;
         }
         if has_wildcard(&p) {
@@ -207,19 +380,41 @@ pub fn resolve(node: &Node, perm: &Permission, action: &str, expr: &str, opts: &
                 }
             });
             for n in c.iter() {
-                if glob(&pat, n) && allowed(node, perm, action, n) && !names.contains(n) {
-                    names.push(n.clone());
+                if glob(&pat, n) && allowed_component(node, perm, action, n, failures) {
+                    let n = with_selector(n);
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
                 }
             }
-        } else if allowed(node, perm, action, &p) {
-            if !names.contains(&p) {
-                names.push(p);
+        } else if allowed_component(node, perm, action, &p, failures) {
+            let n = with_selector(&p);
+            if !names.contains(&n) {
+                names.push(n);
             }
         } else if !opts.ignore_unavailable {
-            denied_names.push(p);
+            denied_names.push(full.clone());
         }
     }
-    Resolved { names, denied: denied_names, had_wildcard }
+    Resolved { names, denied: denied_names, had_wildcard, excluded }
+}
+
+/// The authorized expression a request is rewritten to: the names, and,
+/// after a kept alias or data stream, the exclusions (they apply to what it
+/// expands to: `alias,-index` keeps its other indices).
+fn rewritten_expr(node: &Node, r: &Resolved) -> String {
+    if r.names.is_empty() {
+        NO_INDICES.to_string()
+    } else if !r.excluded.is_empty() && r.names.iter().any(|n| !node_has_index(node, n)) {
+        format!("{},{}", r.names.join(","), r.excluded.join(","))
+    } else {
+        r.names.join(",")
+    }
+}
+
+/// `name` is a concrete index (not an alias or data stream) of this node.
+fn node_has_index(node: &Node, name: &str) -> bool {
+    node.get_index(split_selector(name).0).is_some()
 }
 
 fn exists(node: &Node, req: &Req, name: &str) -> bool {
@@ -235,6 +430,30 @@ fn exists(node: &Node, req: &Req, name: &str) -> bool {
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
+
+    /// An alias scoped by an exclusion (a cluster shard request through an
+    /// alias, `alias,-other`) keeps the exclusion for a non-superuser too:
+    /// the engine then resolves only the indices of this shard group.
+    #[test]
+    fn exclusions_after_an_alias_survive_authorization() {
+        use elasticsearch_engine::security::roles::Role;
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(directory.path()).unwrap();
+        for i in ["i1", "i2"] {
+            node.create_index(i, &json!({"aliases": {"al": {}}})).unwrap();
+        }
+        let role = Role::compile(&[&json!({"indices": [{"names": ["*"], "privileges": ["all"]}]})]);
+        let perm = Permission { role: Arc::new(role), limit: None, effective_roles: vec!["admin".into()], missing_roles: vec![], is_superuser: false };
+        let r = resolve(&node, &perm, "indices:data/read/search", "al,-i2", &ResolveOpts::default());
+        assert_eq!(r.names, vec!["al".to_string()]);
+        let expr = rewritten_expr(&node, &r);
+        assert_eq!(expr, "al,-i2");
+        let got: Vec<String> = node.resolve(&expr, ResolveOpts::default()).unwrap().into_iter().map(|t| t.svc.name.clone()).collect();
+        assert_eq!(got, vec!["i1".to_string()]);
+        // Concrete names only: unchanged (the exclusions already applied).
+        let r = resolve(&node, &perm, "indices:data/read/search", "i*,-i2", &ResolveOpts::default());
+        assert_eq!(rewritten_expr(&node, &r), "i1");
+    }
 
     #[test]
     fn applied_metadata_controls_existence_during_recovery() {
@@ -254,6 +473,19 @@ mod catalog_tests {
 
 fn authorize_seg(node: &Node, a: &Authn, perm: &Permission, req: &mut Req, act: &Act, i: usize) -> Result<Vec<String>, EsError> {
     let present = req.segs.get(i).map(|s| !s.starts_with('_') || s == "_all").unwrap_or(false);
+    // Only remote clusters (`alias:index`, or a point in time held by remote
+    // clusters only): each remote cluster authorizes its part as this user;
+    // ES requires no privilege on the local cluster for them.
+    let remote_only = if present {
+        let parts: Vec<&str> = req.segs[i].split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+        !parts.is_empty() && parts.iter().all(|p| is_remote(p.strip_prefix('-').unwrap_or(p)))
+    } else {
+        act.action == "indices:data/read/search"
+            && req.json().ok().and_then(|b| b.get("pit").and_then(|p| p.get("id")).and_then(|v| v.as_str()).map(elasticsearch_engine::ccr::remote::remote_only_pit)).unwrap_or(false)
+    };
+    if remote_only {
+        return Ok(Vec::new());
+    }
     if !perm.check_index_action(&act.action) {
         // ES names the requested indices in the denial.
         let named: Vec<String> = if present && !has_wildcard(&req.segs[i]) { req.segs[i].split(',').map(str::to_string).collect() } else { Vec::new() };
@@ -294,7 +526,7 @@ fn authorize_seg(node: &Node, a: &Authn, perm: &Permission, req: &mut Req, act: 
             }
         }
     }
-    let joined = if r.names.is_empty() { NO_INDICES.to_string() } else { r.names.join(",") };
+    let joined = rewritten_expr(node, &r);
     if present {
         if r.had_wildcard || joined != expr {
             req.segs[i] = joined;
@@ -338,7 +570,13 @@ fn unauthorized_write_alias(node: &Node, perm: &Permission, action: &str, name: 
     }
     let is_write = |def: &Value, n_indices: usize| def.get("is_write_index").and_then(Value::as_bool).unwrap_or(n_indices == 1);
     let holders: Vec<_> = all.iter().filter(|s| s.aliases().contains_key(name)).collect();
-    let write_idx = if holders.len() == 1 { holders.first() } else { holders.iter().find(|s| s.aliases().get(name).map(|d| is_write(d, holders.len())).unwrap_or(false)) }?;
+    // A data stream alias writes to its write data stream's current write
+    // index, not to the first backing index carrying the flag.
+    let stream_write = node.alias_write_data_stream(name).and_then(|d| all.iter().find(|s| s.name == d.write_index()));
+    let write_idx = match stream_write {
+        Some(w) => w,
+        None => *(if holders.len() == 1 { holders.first() } else { holders.iter().find(|s| s.aliases().get(name).map(|d| is_write(d, holders.len())).unwrap_or(false)) })?,
+    };
     if perm.check_index(action, &write_idx.name) {
         return None;
     }
@@ -520,7 +758,7 @@ async fn mget(node: Arc<Node>, mut req: Req, a: Authn, perm: Permission) -> R {
         let mut keep = Vec::new();
         for (pos, d) in docs.drain(..).enumerate() {
             total += 1;
-            let ix = d.get("_index").and_then(Value::as_str).map(str::to_string).or_else(|| default_index.clone());
+            let ix = d.get("_index").and_then(index_text).or_else(|| default_index.clone());
             match ix {
                 Some(ix) if !perm.check_index(action, &ix) => {
                     let e = denied(&node, &a, &perm, action, Some(&[ix.clone()]));
@@ -543,7 +781,7 @@ async fn mget(node: Arc<Node>, mut req: Req, a: Authn, perm: Permission) -> R {
     match body.get("docs").and_then(Value::as_array) {
         Some(docs) => {
             for d in docs {
-                if let Some(ix) = d.get("_index").and_then(Value::as_str).map(str::to_string).or_else(|| default_index.clone()) {
+                if let Some(ix) = d.get("_index").and_then(index_text).or_else(|| default_index.clone()) {
                     if !read_names.contains(&ix) {
                         read_names.push(ix);
                     }
@@ -572,6 +810,15 @@ async fn mget(node: Arc<Node>, mut req: Req, a: Authn, perm: Permission) -> R {
         }
     }
     Ok(Resp { status, body: RespBody::retained_json(v, owner), headers })
+}
+
+/// A document's `_index` as the engine reads it (any scalar's text; `None` for `null`).
+fn index_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        x => Some(x.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------- msearch
@@ -697,6 +944,35 @@ fn reindex(node: &Node, a: &Authn, perm: &Permission, req: &mut Req) -> Result<(
 }
 
 // ---------------------------------------------------------------- aliases
+
+/// `POST /_data_stream/_modify`: the action on every data stream and index
+/// the body names (a backing index through its stream, a failure index
+/// through its stream's failure store), all checked before anything
+/// changes: a grant scoped to one data stream never modifies another.
+fn data_stream_modify_body(node: &Node, a: &Authn, perm: &Permission, req: &mut Req, action: &str) -> Result<Vec<String>, EsError> {
+    if !perm.check_index_action(action) {
+        return Err(denied(node, a, perm, action, None));
+    }
+    let body = req.json()?;
+    let mut names: Vec<String> = Vec::new();
+    for act in body["actions"].as_array().into_iter().flatten() {
+        let Some((_, spec)) = act.as_object().and_then(|o| o.iter().next()) else { continue };
+        let failures = spec["failure_store"].as_bool() == Some(true);
+        if let Some(ds) = spec["data_stream"].as_str() {
+            names.push(ds.to_string());
+            if !perm.is_superuser && !allowed_component(node, perm, action, ds, failures) {
+                return Err(denied(node, a, perm, action, Some(&[ds.to_string()])));
+            }
+        }
+        if let Some(ix) = spec["index"].as_str() {
+            names.push(ix.to_string());
+            if !perm.is_superuser && !allowed(node, perm, action, ix) {
+                return Err(denied(node, a, perm, action, Some(&[ix.to_string()])));
+            }
+        }
+    }
+    Ok(names)
+}
 
 fn aliases_body(node: &Node, a: &Authn, perm: &Permission, req: &mut Req) -> Result<(), EsError> {
     let action = "indices:admin/aliases";

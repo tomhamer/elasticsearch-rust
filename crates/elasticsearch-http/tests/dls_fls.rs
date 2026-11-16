@@ -432,3 +432,147 @@ async fn application_privilege_expansion_preserves_union_scope_and_updates() {
     assert_eq!(result["application"]["test-app"]["space:one"]["both"], false);
     assert_eq!(result["application"]["test-app"]["space:one"]["undeclared"], true);
 }
+
+/// Transforms check the caller's source (and destination) privileges at
+/// PUT, preview and start, and run every checkpoint as the user who created
+/// them: document- and field-level security apply to what they aggregate.
+#[tokio::test(flavor = "multi_thread")]
+async fn transforms_run_with_the_creators_privileges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    setup(&es).await;
+    for (name, body) in [
+        (
+            "tx_eng",
+            json!({"cluster": ["manage_transform"], "indices": [
+                {"names": ["docs"], "privileges": ["read", "view_index_metadata"], "query": {"term": {"dept": "eng"}}, "field_security": {"grant": ["*"], "except": ["salary"]}},
+                {"names": ["tx-*"], "privileges": ["all"]}
+            ]}),
+        ),
+        ("tx_nosource", json!({"cluster": ["manage_transform"], "indices": [{"names": ["tx-*"], "privileges": ["all"]}]})),
+    ] {
+        let (st, r) = es.put(&ADMIN, &format!("/_security/role/{name}"), body).await;
+        assert_eq!(st, 200, "role {name}: {r}");
+    }
+    for (user, role) in [("tina", "tx_eng"), ("nora", "tx_nosource")] {
+        let (st, r) = es.put(&ADMIN, &format!("/_security/user/{user}"), json!({"password": PW, "roles": [role]})).await;
+        assert_eq!(st, 200, "user {user}: {r}");
+    }
+    let tina = As::User("tina");
+    let nora = As::User("nora");
+    let cfg = |dest: &str| {
+        json!({
+            "source": {"index": "docs"},
+            "dest": {"index": dest},
+            "pivot": {"group_by": {"dept": {"terms": {"field": "dept"}}}, "aggs": {"people": {"value_count": {"field": "name"}}, "pay": {"sum": {"field": "salary"}}}}
+        })
+    };
+    // No read privilege on the source: PUT, preview and start are refused.
+    let (st, r) = es.put(&nora, "/_transform/nora-t", cfg("tx-nora")).await;
+    assert_eq!(st, 403, "{r}");
+    assert_eq!(r["error"]["type"], "security_exception", "{r}");
+    assert!(r["error"]["reason"].as_str().unwrap().contains("lacks the required permissions [docs:[read, view_index_metadata]]"), "{r}");
+    let (st, r) = es.post(&nora, "/_transform/_preview", cfg("tx-nora")).await;
+    assert_eq!(st, 403, "{r}");
+    let (st, r) = es.put(&ADMIN, "/_transform/admin-t", cfg("tx-admin")).await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = es.call(&nora, Method::POST, "/_transform/admin-t/_start", None).await;
+    assert_eq!(st, 403, "{r}");
+    // Preview as tina: only the eng documents (DLS), no salary (FLS).
+    let (st, r) = es.post(&tina, "/_transform/_preview", cfg("tx-tina")).await;
+    assert_eq!(st, 200, "{r}");
+    let rows = r["preview"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{r}");
+    assert_eq!(rows[0]["dept"], "eng", "{r}");
+    assert_eq!(rows[0]["people"], 2, "{r}");
+    assert!(rows[0]["pay"].as_f64().unwrap_or(0.0) == 0.0, "salary is hidden by FLS: {r}");
+    // Created and started by tina, the transform runs as tina.
+    let (st, r) = es.put(&tina, "/_transform/tina-t", cfg("tx-tina")).await;
+    assert_eq!(st, 200, "{r}");
+    let (_, r) = es.get(&tina, "/_transform/tina-t").await;
+    assert_eq!(r["transforms"][0]["authorization"]["roles"], json!(["tx_eng"]), "{r}");
+    assert!(r["transforms"][0].get("headers").is_none(), "stored credentials are never returned: {r}");
+    let (st, r) = es.call(&tina, Method::POST, "/_transform/tina-t/_start", None).await;
+    assert_eq!(st, 200, "{r}");
+    let mut done = Value::Null;
+    for _ in 0..200 {
+        let (_, v) = es.get(&tina, "/_transform/tina-t/_stats").await;
+        if v["transforms"][0]["state"] == "stopped" && v["transforms"][0]["checkpointing"]["last"]["checkpoint"] == 1 {
+            done = v;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!done.is_null(), "transform did not finish");
+    let (st, r) = es.post(&ADMIN, "/tx-tina/_search", json!({"size": 10})).await;
+    assert_eq!(st, 200, "{r}");
+    let hits = r["hits"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "only the groups tina can read: {r}");
+    assert_eq!(hits[0]["_source"]["dept"], "eng", "{r}");
+    assert_eq!(hits[0]["_source"]["people"], 2, "{r}");
+    assert!(hits[0]["_source"]["pay"].as_f64().unwrap_or(0.0) == 0.0, "{r}");
+}
+
+/// A transform created with an API key runs as that key: limited by the
+/// key's role descriptors and its owner's roles together (ES stores the
+/// key's authentication with the transform). The owner sees only eng
+/// documents (A, B); the key only names A and C; together: A alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_key_transforms_run_limited_by_key_and_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    setup(&es).await;
+    let (st, r) = es
+        .put(
+            &ADMIN,
+            "/_security/role/tx_keyed",
+            json!({"cluster": ["manage_transform", "manage_own_api_key"], "indices": [
+                {"names": ["docs"], "privileges": ["read", "view_index_metadata"], "query": {"term": {"dept": "eng"}}},
+                {"names": ["tx-*"], "privileges": ["all"]}
+            ]}),
+        )
+        .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = es.put(&ADMIN, "/_security/user/kim", json!({"password": PW, "roles": ["tx_keyed"]})).await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = es
+        .post(
+            &As::User("kim"),
+            "/_security/api_key",
+            json!({"name": "tx-key", "role_descriptors": {"r": {"cluster": ["manage_transform"], "indices": [
+                {"names": ["docs"], "privileges": ["read", "view_index_metadata"], "query": {"terms": {"name": ["A", "C"]}}},
+                {"names": ["tx-*"], "privileges": ["all"]}
+            ]}}}),
+        )
+        .await;
+    assert_eq!(st, 200, "{r}");
+    let key = As::Key(r["encoded"].as_str().unwrap().to_string());
+    let cfg = json!({
+        "source": {"index": "docs"},
+        "dest": {"index": "tx-key"},
+        "pivot": {"group_by": {"dept": {"terms": {"field": "dept"}}}, "aggs": {"people": {"value_count": {"field": "name"}}}}
+    });
+    let (st, r) = es.post(&key, "/_transform/_preview", cfg.clone()).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["preview"], json!([{"dept": "eng", "people": 1}]), "preview as key and owner: {r}");
+    let (st, r) = es.put(&key, "/_transform/keyed", cfg).await;
+    assert_eq!(st, 200, "{r}");
+    let (_, r) = es.get(&key, "/_transform/keyed").await;
+    assert_eq!(r["transforms"][0]["authorization"]["api_key"]["name"], "tx-key", "{r}");
+    let (st, r) = es.call(&key, Method::POST, "/_transform/keyed/_start", None).await;
+    assert_eq!(st, 200, "{r}");
+    let mut done = false;
+    for _ in 0..200 {
+        let (_, v) = es.get(&ADMIN, "/_transform/keyed/_stats").await;
+        if v["transforms"][0]["state"] == "stopped" && v["transforms"][0]["checkpointing"]["last"]["checkpoint"] == 1 {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(done, "transform did not finish");
+    let (st, r) = es.post(&ADMIN, "/tx-key/_search", json!({"size": 10})).await;
+    assert_eq!(st, 200, "{r}");
+    let rows: Vec<Value> = r["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_source"].clone()).collect();
+    assert_eq!(rows, vec![json!({"dept": "eng", "people": 1})], "the checkpoint ran limited by key and owner: {r}");
+}

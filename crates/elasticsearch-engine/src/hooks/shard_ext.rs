@@ -741,7 +741,7 @@ impl Shard {
                     let found = Self::lookup(&core, &id);
                     add_meta_fields(&mut doc, &id, source_json, version, seq_no, term, routing, ignored);
                     core.replace_document(found.as_ref().map(|found| &found.0), &doc).map(|_| {
-                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, primary_term: term });
+                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: false, deleted_at: 0, primary_term: term });
                         ws.hist.tombstones.remove(&id);
                         if let Some(m) = &marker {
                             self.ext.retries.lock().put(&id, RetryRec { marker: m.clone(), seq_no, version, term, result: if found.is_some() { "updated" } else { "created" }, deleted: false });
@@ -753,7 +753,7 @@ impl Shard {
                     let found = Self::lookup(&core, &id);
                     let deleted = match found { Some((a, _, _)) => core.delete_doc(&a).map(|_| ()), None => Ok(()) };
                     deleted.map(|_| {
-                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, primary_term: term });
+                        ws.versions.insert(version_key, VersionEntry { version, seq_no, deleted: true, deleted_at: crate::shard::gc_clock_ms(), primary_term: term });
                         ws.hist.tombstones.insert(id.clone(), (seq_no, version));
                         if let Some(m) = &marker {
                             self.ext.retries.lock().put(&id, RetryRec { marker: m.clone(), seq_no, version, term, result: if found.is_some() { "deleted" } else { "not_found" }, deleted: true });

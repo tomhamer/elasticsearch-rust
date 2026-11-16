@@ -954,53 +954,38 @@ fn collect_generic_events(node: &Node, r: &StackTracesRequest, out: &mut StackTr
     }
     let field = r.stacktrace_ids_field.clone().unwrap_or_default();
     let fields = r.aggregation_fields_effective().unwrap_or_default();
-    let mut src_fields = vec![field.clone()];
-    src_fields.extend(fields.iter().cloned());
+    // ES `searchGenericEvents`: the sample is drawn over every matching
+    // event by a `random_sampler` aggregation (no hit window), its stack
+    // trace ids counted by `counted_terms` (or `terms`) with the sub-group
+    // terms under each.
+    let counted = !targets.is_empty() && targets.iter().all(|t| field_type(&t.svc, &field).as_deref() == Some("counted_keyword"));
+    let mut group_by = json!({ if counted { "counted_terms" } else { "terms" }: {"field": field, "size": MAX_TRACE_EVENTS_RESULT_SIZE} });
+    if let Some(sub) = subgroup_aggs(&fields) {
+        group_by["aggs"] = sub;
+    }
     let body = json!({
-        "size": total.min(1_000_000), "track_total_hits": false, "query": query_of(r), "_source": src_fields,
-        "aggs": {"min_time": {"min": {"field": "@timestamp"}}, "max_time": {"max": {"field": "@timestamp"}}},
+        "size": 0, "track_total_hits": false, "query": query_of(r),
+        "aggs": {
+            "min_time": {"min": {"field": "@timestamp"}}, "max_time": {"max": {"field": "@timestamp"}},
+            "sample": {"random_sampler": {"probability": out.sampling_rate, "seed": request_seed(r) as i32}, "aggs": {"group_by": group_by}},
+        },
     });
     let resp = search(node, &targets, &body)?;
-    let counted: HashMap<String, bool> =
-        targets.iter().map(|t| (t.svc.name.clone(), field_type(&t.svc, &field).as_deref() == Some("counted_keyword"))).collect();
-    let mut rng = (out.sampling_rate < 1.0).then(|| JavaRandom::new(request_seed(r)));
-    // stacktrace id -> (count, per-subgroup doc values)
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut sub_docs: HashMap<String, Vec<Vec<String>>> = HashMap::new();
-    for h in resp["hits"]["hits"].as_array().cloned().unwrap_or_default() {
-        if let Some(rng) = rng.as_mut() {
-            if rng.next_double() >= out.sampling_rate {
-                continue;
-            }
-        }
-        let src = &h["_source"];
-        let mut vals: Vec<String> = list_of(path(src, &field)).iter().map(as_text).collect();
-        if !counted.get(h["_index"].as_str().unwrap_or("")).copied().unwrap_or(false) {
-            vals.sort();
-            vals.dedup();
-        }
-        for v in vals {
-            *counts.entry(v.clone()).or_insert(0) += 1;
-            if !fields.is_empty() {
-                let keys: Vec<String> = fields.iter().map(|f| list_of(path(src, f)).first().map(as_text).unwrap_or_default()).collect();
-                sub_docs.entry(v).or_default().push(keys);
-            }
-        }
-    }
+    let group_buckets: Vec<Value> = resp["aggregations"]["sample"]["group_by"]["buckets"].as_array().cloned().unwrap_or_default();
     // counted_terms bucket order: count desc, key asc; size 150000.
-    let mut buckets: Vec<(String, i64)> = counts.into_iter().collect();
+    let mut buckets: Vec<(String, i64, Value)> =
+        group_buckets.into_iter().map(|b| (b.get("key_as_string").or_else(|| b.get("key")).map(as_text).unwrap_or_default(), b["doc_count"].as_i64().unwrap_or(0), b)).collect();
     buckets.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     buckets.truncate(MAX_TRACE_EVENTS_RESULT_SIZE as usize);
     let mut events: BTreeMap<String, TraceEvent> = BTreeMap::new();
     let mut host_counts = Vec::new();
     let mut total_samples = 0i64;
-    for (id, c) in buckets {
+    for (id, c, bucket) in buckets {
         total_samples += c;
         host_counts.push(("unknown".to_string(), id.clone(), c, String::new(), String::new()));
         let ev = events.entry(id.clone()).or_default();
         ev.count += c;
         if !fields.is_empty() {
-            let bucket = synth_buckets(&fields, 0, sub_docs.get(&id).map(Vec::as_slice).unwrap_or(&[]));
             collect_subgroups(&fields, r.is_legacy_aggregation_field(), &bucket, ev);
         }
     }
@@ -1011,33 +996,6 @@ fn collect_generic_events(node: &Node, r: &StackTracesRequest, out: &mut StackTr
         min_time: super::java_round(agg_value(&resp, "min_time").unwrap_or(0.0)),
         max_time: super::java_round(agg_value(&resp, "max_time").unwrap_or(0.0)),
     }))
-}
-
-/// Terms-aggregation-shaped buckets (count desc, key asc, size 10) built
-/// from per-document sub-group keys.
-fn synth_buckets(fields: &[String], i: usize, docs: &[Vec<String>]) -> Value {
-    if i == fields.len() {
-        return json!({});
-    }
-    let mut groups: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
-    for d in docs {
-        if !d[i].is_empty() {
-            groups.entry(d[i].clone()).or_default().push(d.clone());
-        }
-    }
-    let mut v: Vec<(String, Vec<Vec<String>>)> = groups.into_iter().collect();
-    v.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-    v.truncate(10);
-    let buckets: Vec<Value> = v
-        .into_iter()
-        .map(|(k, ds)| {
-            let mut b = synth_buckets(fields, i + 1, &ds);
-            b["key"] = json!(k);
-            b["doc_count"] = json!(ds.len());
-            b
-        })
-        .collect();
-    json!({ format!("{CUSTOM_EVENT_SUB_AGGREGATION_NAME}{}", fields[i]): {"buckets": buckets} })
 }
 
 /// `KvIndexResolver.resolve`: the indices behind a K/V alias whose
@@ -1249,6 +1207,38 @@ pub fn execute(node: &Node, r: &StackTracesRequest) -> Result<StackTracesRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #333: user-provided events are sampled across every match by an
+    /// aggregation, not out of a hit window: more matches than
+    /// `index.max_result_window` still profile, every trace counted.
+    #[test]
+    fn generic_events_sample_every_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("ev", &json!({"mappings": {"properties": {"trace": {"type": "keyword"}, "@timestamp": {"type": "date"}}}})).unwrap();
+        let reqs: Vec<crate::index::WriteReq> = (0..10_050)
+            .map(|i| crate::index::WriteReq::Index { id: Some(i.to_string()), source: json!({"trace": format!("t{}", i % 3), "@timestamp": 1_700_000_000_000i64 + i}).to_string(), routing: None, cond: Default::default() })
+            .collect();
+        for r in svc.write(reqs, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let mut r = parse_request(Some(r#"{"indices": ["ev"], "stacktrace_ids_field": "trace", "sample_size": 20000}"#)).unwrap();
+        r.user_provided_indices = true;
+        let mut out = StackTracesResponse::default();
+        let c = collect_generic_events(&node, &r, &mut out).unwrap().unwrap();
+        assert_eq!(out.sampling_rate, 1.0);
+        assert_eq!(out.total_samples, 10_050);
+        assert_eq!(c.events.len(), 3);
+        assert_eq!(c.events["t0"].count, 3350);
+        // A smaller sample still draws from every match (scaled counts).
+        r.sample_size = 1000;
+        let mut out = StackTracesResponse::default();
+        let c = collect_generic_events(&node, &r, &mut out).unwrap().unwrap();
+        assert!(out.sampling_rate < 0.5);
+        assert!((out.total_samples - 10_050).abs() < 3_000, "{}", out.total_samples);
+        assert_eq!(c.events.len(), 3);
+    }
 
     #[test]
     fn decode_types() {

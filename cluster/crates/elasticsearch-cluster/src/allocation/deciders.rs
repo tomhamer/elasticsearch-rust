@@ -681,6 +681,20 @@ fn same_shard(a: &Allocation, shard: &ShardRouting, node: &DiscoveryNode) -> Opt
             return no(N, format!("a copy of this shard is already allocated to this node [{}]", shard_str(c)));
         }
     }
+    // ES `SameShardAllocationDecider`: with `same_shard.host`, no other node
+    // on this node's host (address, then name) may hold a copy (production
+    // review #290: the setting was accepted and ignored).
+    if a.s.same_shard_host {
+        for c in &t.copies {
+            let Some(other) = c.node_id.as_deref().filter(|id| *id != node.id).and_then(|id| a.state.nodes.get(id)) else { continue };
+            if !node.ip.is_empty() && other.ip == node.ip {
+                return no(N, format!("a copy of this shard is already allocated to host address [{}], on node [{}], and [cluster.routing.allocation.same_shard.host] is [true] which forbids more than one node on each host from holding a copy of this shard", node.ip, shard_str(c)));
+            }
+            if !node.host.is_empty() && other.host == node.host {
+                return no(N, format!("a copy of this shard is already allocated to host name [{}], on node [{}], and [cluster.routing.allocation.same_shard.host] is [true] which forbids more than one node on each host from holding a copy of this shard", node.host, shard_str(c)));
+            }
+        }
+    }
     y(N, "this node does not hold a copy of this shard")
 }
 
@@ -930,19 +944,89 @@ fn stateless_shard_role(_a: &Allocation, shard: &ShardRouting, node: &DiscoveryN
 }
 
 fn tier_check(a: &Allocation, meta: &IndexMetadata, node: &DiscoveryNode) -> Option<Single> {
+    tier_decision(&a.state, meta, node)
+}
+
+/// The tier of `meta`'s preference that nodes of `state` provide first.
+fn preferred_available_tier(state: &ClusterState, meta: &IndexMetadata) -> Option<String> {
+    tier_preference(meta).into_iter().find(|t| state.nodes.values().any(|n| node_has_tier(n, t)))
+}
+
+fn tier_decision(state: &ClusterState, meta: &IndexMetadata, node: &DiscoveryNode) -> Option<Single> {
     const N: &str = "data_tier";
     let pref = tier_preference(meta);
     if pref.is_empty() {
         return y(N, "index has no tier preference");
     }
     let joined = pref.join(",");
-    let Some(tier) = pref.iter().find(|t| a.state.nodes.values().any(|n| node_has_tier(n, t))) else {
+    let Some(tier) = pref.iter().find(|t| state.nodes.values().any(|n| node_has_tier(n, t))) else {
         return no(N, format!("index has a preference for tiers [{joined}], but no nodes for any of those tiers are available in the cluster"));
     };
     if node_has_tier(node, tier) {
         y(N, format!("index has a preference for tiers [{joined}] and node has tier [{tier}]"))
     } else {
         no(N, format!("index has a preference for tiers [{joined}] and node does not meet the required [{tier}] tier"))
+    }
+}
+
+/// The index-level include / exclude / require filters of `meta` allow
+/// `node` (`FilterAllocationDecider` built from empty cluster settings, as
+/// ILM's routed steps build it).
+fn index_filters_allow(meta: &IndexMetadata, node: &DiscoveryNode) -> bool {
+    let req = index_filters(meta, "require");
+    let inc = index_filters(meta, "include");
+    let exc = index_filters(meta, "exclude");
+    (req.is_empty() || filters_match(&req, true, node)) && (inc.is_empty() || filters_match(&inc, false, node)) && (exc.is_empty() || !filters_match(&exc, false, node))
+}
+
+/// Where ILM's routed lifecycle steps stand for one index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleRouting {
+    /// Every copy is started on a node the constraints allow.
+    Routed,
+    /// Not every shard copy is active (`ActiveShardCount.ALL`).
+    CopiesInactive,
+    /// This many copies are not started on a node the constraints allow
+    /// (`getPendingAllocations`); with the tier the index's preference
+    /// resolves to (`None`: no node of any preferred tier).
+    Pending { shards: usize, tier: Option<String> },
+}
+
+/// ILM's `AllocationRoutedStep` (`migrate == false`: the index-level
+/// include / exclude / require filters and the data tier preference) and
+/// `DataTierMigrationRoutedStep` (`migrate == true`: the tier preference
+/// only) evaluated on the routing table of `state`: first every shard copy
+/// must be active, then every copy must be started on a node those
+/// constraints let it remain on.
+pub fn lifecycle_routing(state: &ClusterState, meta: &IndexMetadata, migrate: bool) -> LifecycleRouting {
+    let tables: Vec<&IndexShardRoutingTable> = (0..meta.number_of_shards).filter_map(|k| state.routing_table.shard_table(&meta.name, k)).collect();
+    // A relocation target is part of its source copy (ES lists it inside
+    // the relocating `ShardRouting`), not a copy of its own.
+    let copies = |t: &IndexShardRoutingTable| t.copies.iter().filter(|c| !is_relocation_target(c)).cloned().collect::<Vec<_>>();
+    let all_active = tables.len() == meta.number_of_shards as usize
+        && tables.iter().all(|t| {
+            let c = copies(t);
+            c.len() == meta.number_of_replicas as usize + 1 && c.iter().all(|c| c.active())
+        });
+    if !all_active {
+        return LifecycleRouting::CopiesInactive;
+    }
+    if migrate && tier_preference(meta).is_empty() {
+        return LifecycleRouting::Routed;
+    }
+    let allowed = |node: &DiscoveryNode| {
+        let tier_ok = tier_decision(state, meta, node).is_none_or(|s| s.kind == DecisionType::Yes);
+        tier_ok && (migrate || index_filters_allow(meta, node))
+    };
+    let pending = tables
+        .iter()
+        .flat_map(|t| copies(t))
+        .filter(|c| c.state != ShardState::Started || !c.node_id.as_deref().and_then(|id| state.nodes.get(id)).is_some_and(|n| allowed(n)))
+        .count();
+    if pending == 0 {
+        LifecycleRouting::Routed
+    } else {
+        LifecycleRouting::Pending { shards: pending, tier: preferred_available_tier(state, meta) }
     }
 }
 

@@ -86,7 +86,7 @@ mod tests {
     use super::*;
 
     fn tok(text: &str) -> Token {
-        Token { text: text.into(), position: 2, offset_from: 0, offset_to: text.len() as u32 }
+        Token { text: text.into(), position: 2, offset_from: 0, offset_to: text.len() as u32, keyword: false }
     }
     fn texts(t: &[Token]) -> Vec<&str> {
         t.iter().map(|t| t.text.as_str()).collect()

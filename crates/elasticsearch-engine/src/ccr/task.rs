@@ -380,7 +380,7 @@ fn cleanup_orphans(node: &Node, svc: &CcrService) {
 }
 
 /// `ShardFollowNodeTask.shouldRetry`.
-fn should_retry(e: &EsError) -> bool {
+pub fn should_retry(e: &EsError) -> bool {
     matches!(
         e.kind.as_str(),
         "shard_not_found_exception"
@@ -415,7 +415,7 @@ fn should_retry(e: &EsError) -> bool {
 }
 
 /// `ShardFollowNodeTask.computeDelay` (without the jitter).
-fn retry_delay(retry: u32, max_ms: i64) -> Duration {
+pub fn retry_delay(retry: u32, max_ms: i64) -> Duration {
     let n = 1u64 << retry.saturating_sub(1).min(24);
     Duration::from_millis((50 * n).min(max_ms.max(1) as u64))
 }
@@ -627,7 +627,7 @@ fn step(node: &Arc<Node>, svc: &CcrService, fsvc: &Arc<IndexService>, uuid: &str
 }
 
 /// `Translog.Operation.estimateSize` (ids / reasons in UTF-16 code units).
-fn op_size(op: &ChangeOp) -> u64 {
+pub fn op_size(op: &ChangeOp) -> u64 {
     let u16len = |s: &str| s.encode_utf16().count();
     (match op {
         ChangeOp::Index { id, source_json, routing, .. } => 2 * u16len(id) + source_json.len() + routing.as_deref().map_or(0, |r| 2 * u16len(r)) + 32,
@@ -636,7 +636,7 @@ fn op_size(op: &ChangeOp) -> u64 {
     }) as u64
 }
 
-fn retermed(op: ChangeOp, term: u64) -> ChangeOp {
+pub fn retermed(op: ChangeOp, term: u64) -> ChangeOp {
     match op {
         ChangeOp::Index { id, source_json, routing, seq_no, version, .. } => ChangeOp::Index { id, source_json, routing, seq_no, version, primary_term: term },
         ChangeOp::Delete { id, seq_no, version, .. } => ChangeOp::Delete { id, seq_no, version, primary_term: term },

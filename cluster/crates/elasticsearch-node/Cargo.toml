@@ -13,6 +13,8 @@ path = "src/bin/elasticsearch-node.rs"
 gpu = ["elasticsearch-engine/gpu"]
 default = ["mutable-hnsw"]
 mutable-hnsw = ["elasticsearch-engine/mutable-hnsw"]
+# Real CPU inference for `.multilingual-e5-small` (candle).
+candle-models = ["elasticsearch-engine/candle-models"]
 
 [dependencies]
 rayon.workspace = true

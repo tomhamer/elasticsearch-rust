@@ -131,7 +131,7 @@ pub(crate) fn shape_hits(leaf: &LeafReader<'_>, field: u16, q: &ShapeQuery) -> R
                         // a point never contains an area (Lucene's point
                         // `withinTriangle` against a polygon or a box with
                         // area is never a CANDIDATE), so nothing matches.
-                        if lq.relation() == QueryRelation::Contains && data.tree.iter().all(|p| p.one_triangle_per_doc()) && query_has_area(q) {
+                        if lq.relation() == QueryRelation::Contains && data.tree.iter().all(|p| p.one_point_per_doc()) && query_has_area(q) {
                             return Ok(vec![0; words]);
                         }
                         // CONTAINS with doc values: a doc containing the
@@ -511,7 +511,8 @@ thread_local! {
 /// matches nothing.
 fn single_count(q: &ShapeQuery, lq: &(dyn LeafQuery + Sync), parts: &[rustic_core::fieldtypes::shape_bkd::ShapeBkd], limit: u64) -> Option<u64> {
     if lq.relation() == QueryRelation::Contains && query_has_area(q) {
-        return Some(0);
+        // Points never contain an area; a one-triangle polygon may.
+        return parts.iter().all(|p| p.one_point_per_doc()).then_some(0);
     }
     let mut n = 0u64;
     for p in parts {
@@ -986,7 +987,7 @@ impl rustic_core::query::CustomQuery for ShapeTreeQuery {
         if let (LeafReader::Segment(seg), Some(lq)) = (leaf, leaf_of(&self.query)) {
             if lq.relation() == QueryRelation::Contains && query_has_area(&self.query) {
                 if let Some(data) = seg.shape_data(self.field) {
-                    if !data.tree.is_empty() && data.tree.iter().all(|p| p.one_triangle_per_doc()) {
+                    if !data.tree.is_empty() && data.tree.iter().all(|p| p.one_point_per_doc()) {
                         return None;
                     }
                 }

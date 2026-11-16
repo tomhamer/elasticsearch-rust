@@ -1,22 +1,40 @@
-# Three-node elasticsearch cluster, mirroring Elastic's documented
-# docker-compose example without the certificate setup service and Kibana
-# (security is turned off with xpack.security.enabled=false).
+# Three-node elasticsearch cluster with security on, mirroring Elastic's
+# documented docker-compose example (without Kibana): a one-shot `setup`
+# service creates a CA, a certificate per node and the `elastic` password in
+# the `certs` volume; es01..es03 run with TLS on HTTP and transport and
+# require authentication.
 #
 #   cd cluster/deploy/docker
 #   docker compose up -d --build      # builds the image from the repo root
-#   curl localhost:9200/_cat/nodes?v
+#   docker compose cp es01:/usr/share/elasticsearch/config/certs/ca/ca.crt .
+#   PW=$(docker compose exec es01 cat config/certs/elastic-password)
+#   curl --cacert ca.crt -u "elastic:$PW" https://localhost:9200/_cat/nodes?v
 #   docker compose down               # keep data;  `down -v` deletes the volumes
 #
-# Tunables (environment or a .env file next to this file):
-#   ES_IMAGE (default elasticsearch-rs:dev), CLUSTER_NAME, ES_PORT, MEM_LIMIT
+# The `elastic` password is ELASTIC_PASSWORD (environment or a .env file
+# next to this file) if set, else a random one generated on the first run;
+# either way it is stored in the certs volume as `elastic-password`. It
+# becomes the node's bootstrap password, used until it is changed with the
+# security API or `elasticsearch-reset-password`.
+#
+# For a throwaway local cluster without TLS or authentication, use
+# docker-compose.insecure.yml instead (development only).
+#
+# Tunables (environment or .env): ES_IMAGE (default elasticsearch-rs:dev),
+#   ELASTIC_PASSWORD, CLUSTER_NAME, ES_PORT, MEM_LIMIT
 name: elasticsearch
+
+x-build: &build
+  context: ../../..
+  dockerfile: cluster/deploy/docker/Dockerfile
 
 x-es-node: &es-node
   image: ${ES_IMAGE:-elasticsearch-rs:dev}
-  build:
-    context: ../../..
-    dockerfile: cluster/deploy/docker/Dockerfile
+  build: *build
   restart: unless-stopped
+  depends_on:
+    setup:
+      condition: service_completed_successfully
   mem_limit: ${MEM_LIMIT:-2g}
   ulimits:
     nofile: { soft: 65535, hard: 65535 }
@@ -24,13 +42,64 @@ x-es-node: &es-node
     memlock: { soft: -1, hard: -1 }
   stop_grace_period: 2m
   healthcheck:
-    test: ["CMD-SHELL", "curl -fsS --max-time 4 'http://127.0.0.1:9200/_cluster/health?local=true' >/dev/null"]
+    # Verified TLS + authenticated `GET /_cluster/health?local=true` -> 200
+    # (settings below: ES_CA_CERT, ELASTIC_PASSWORD_FILE).
+    test: ["CMD", "/usr/share/elasticsearch/bin/es-healthcheck"]
     interval: 10s
     timeout: 5s
     start_period: 60s
     retries: 12
 
+x-es-env: &es-env
+  cluster.name: ${CLUSTER_NAME:-docker-cluster}
+  cluster.initial_master_nodes: es01,es02,es03
+  ELASTIC_PASSWORD_FILE: /usr/share/elasticsearch/config/certs/elastic-password
+  xpack.security.enabled: "true"
+  xpack.security.http.ssl.enabled: "true"
+  xpack.security.http.ssl.certificate_authorities: certs/ca/ca.crt
+  xpack.security.transport.ssl.enabled: "true"
+  xpack.security.transport.ssl.certificate_authorities: certs/ca/ca.crt
+  xpack.security.transport.ssl.verification_mode: certificate
+  # es-healthcheck: verify the HTTP certificate against the CA.
+  ES_CA_CERT: /usr/share/elasticsearch/config/certs/ca/ca.crt
+  ES_URL: https://localhost:9200
+
 services:
+  setup:
+    image: ${ES_IMAGE:-elasticsearch-rs:dev}
+    build: *build
+    # root, to create the volume layout and hand it to uid 1000 / gid 0.
+    user: "0"
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
+    command:
+      - bash
+      - -euo
+      - pipefail
+      - -c
+      - |
+        cd /usr/share/elasticsearch/config/certs
+        es-certgen ca ca --cn "Elasticsearch docker-compose CA"
+        for n in es01 es02 es03; do
+          es-certgen cert ca "$$n" "$$n" --dns "$$n,localhost" --ip 127.0.0.1
+        done
+        if [ ! -s elastic-password ]; then
+          if [ -n "$${ELASTIC_PASSWORD}" ]; then
+            printf '%s' "$${ELASTIC_PASSWORD}" > elastic-password
+          else
+            # 24 alphanumeric characters (no `tr < /dev/urandom | head`:
+            # SIGPIPE fails the pipeline under pipefail).
+            openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-24 | tr -d '\n' > elastic-password
+            echo "setup: generated the elastic password (read it from config/certs/elastic-password)"
+          fi
+        fi
+        chown -R 1000:0 .
+        find . -type d -exec chmod 0750 {} +
+        find . -type f -exec chmod 0640 {} +
+        echo "setup: certificates and password ready"
+
   es01:
     <<: *es-node
     container_name: es01
@@ -38,43 +107,62 @@ services:
     ports:
       - "${ES_PORT:-9200}:9200"
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs
       - esdata01:/usr/share/elasticsearch/data
     environment:
-      - node.name=es01
-      - cluster.name=${CLUSTER_NAME:-docker-cluster}
-      - cluster.initial_master_nodes=es01,es02,es03
-      - discovery.seed_hosts=es02,es03
-      - xpack.security.enabled=false
+      <<: *es-env
+      node.name: es01
+      discovery.seed_hosts: es02,es03
+      xpack.security.http.ssl.key: certs/es01/es01.key
+      xpack.security.http.ssl.certificate: certs/es01/es01.crt
+      xpack.security.transport.ssl.key: certs/es01/es01.key
+      xpack.security.transport.ssl.certificate: certs/es01/es01.crt
 
   es02:
     <<: *es-node
     container_name: es02
     hostname: es02
-    depends_on: [es01]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      es01:
+        condition: service_started
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs
       - esdata02:/usr/share/elasticsearch/data
     environment:
-      - node.name=es02
-      - cluster.name=${CLUSTER_NAME:-docker-cluster}
-      - cluster.initial_master_nodes=es01,es02,es03
-      - discovery.seed_hosts=es01,es03
-      - xpack.security.enabled=false
+      <<: *es-env
+      node.name: es02
+      discovery.seed_hosts: es01,es03
+      xpack.security.http.ssl.key: certs/es02/es02.key
+      xpack.security.http.ssl.certificate: certs/es02/es02.crt
+      xpack.security.transport.ssl.key: certs/es02/es02.key
+      xpack.security.transport.ssl.certificate: certs/es02/es02.crt
 
   es03:
     <<: *es-node
     container_name: es03
     hostname: es03
-    depends_on: [es02]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      es02:
+        condition: service_started
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs
       - esdata03:/usr/share/elasticsearch/data
     environment:
-      - node.name=es03
-      - cluster.name=${CLUSTER_NAME:-docker-cluster}
-      - cluster.initial_master_nodes=es01,es02,es03
-      - discovery.seed_hosts=es01,es02
-      - xpack.security.enabled=false
+      <<: *es-env
+      node.name: es03
+      discovery.seed_hosts: es01,es02
+      xpack.security.http.ssl.key: certs/es03/es03.key
+      xpack.security.http.ssl.certificate: certs/es03/es03.crt
+      xpack.security.transport.ssl.key: certs/es03/es03.key
+      xpack.security.transport.ssl.certificate: certs/es03/es03.crt
 
 volumes:
+  certs:
+    driver: local
   esdata01:
     driver: local
   esdata02:

@@ -11,7 +11,7 @@ use crate::search::{Cursor, SearchRequest, Target};
 use crate::settings::{self, FlatSettings};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +25,10 @@ pub use crate::version::{ES_VERSION, LUCENE_VERSION, MIN_INDEX_COMPAT, MIN_WIRE_
 #[path = "hooks/node_ext.rs"]
 mod hooks_ext;
 pub use hooks_ext::AdoptOptions;
+
+/// Receives `(task number, .tasks document)` of a finished task that
+/// stores its result (see [`Node::task_result_sink`]).
+pub type TaskResultSink = Arc<dyn Fn(u64, Value) + Send + Sync>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ResolveOpts {
@@ -81,6 +85,56 @@ pub struct ScrollCtx {
     /// `(index, shard)` targets freed with their copy
     /// ([`Node::free_shard_contexts`]): reported failed on every page.
     pub lost: Vec<(String, u32)>,
+    /// The authenticated subject that opened it (`None` with security
+    /// off): only that subject may continue or clear it (ES binds a scroll
+    /// to its creator).
+    pub owner: Option<String>,
+    /// Its shard contexts' share of the node's [`ScrollBudget`], given back
+    /// when the context is cleared, expires or is dropped.
+    pub permit: Option<ScrollPermit>,
+}
+
+/// The node's open scroll shard contexts (`search.max_open_scroll_context`),
+/// reserved atomically before a scroll's first search and shared by every
+/// shard engine of a cluster node (as [`FetchBudget`]): the cap is the
+/// node's, not an engine's.
+#[derive(Default)]
+pub struct ScrollBudget {
+    open: std::sync::atomic::AtomicUsize,
+}
+
+impl ScrollBudget {
+    /// Reserve `n` contexts unless that passes `max`.
+    pub fn try_reserve(self: &Arc<Self>, n: usize, max: usize) -> Option<ScrollPermit> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut cur = self.open.load(SeqCst);
+        loop {
+            if cur.saturating_add(n) > max {
+                return None;
+            }
+            match self.open.compare_exchange_weak(cur, cur + n, SeqCst, SeqCst) {
+                Ok(_) => return Some(ScrollPermit { budget: self.clone(), n }),
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// Contexts held.
+    pub fn open(&self) -> usize {
+        self.open.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// One scroll's reserved contexts of a [`ScrollBudget`].
+pub struct ScrollPermit {
+    budget: Arc<ScrollBudget>,
+    n: usize,
+}
+
+impl Drop for ScrollPermit {
+    fn drop(&mut self) {
+        self.budget.open.fetch_sub(self.n, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub struct PitCtx {
@@ -298,6 +352,8 @@ pub struct Node {
     /// What every engine of this node's contexts hold together: its own, or
     /// (a cluster's shard engine) engine 0's.
     pub fetch_budget: Mutex<Arc<FetchBudget>>,
+    /// Open scroll contexts over the node's engines ([`ScrollBudget`]).
+    pub scroll_budget: Mutex<Arc<ScrollBudget>>,
     /// Circuit breakers (the process's, configured from this node's settings).
     pub breakers: &'static crate::memory::Breakers,
     /// Task manager (`_tasks`, reindex/by-query tasks).
@@ -321,6 +377,16 @@ pub struct Node {
     /// Where rollover conditions read an index's stats (a cluster: the
     /// cluster-wide primaries, see [`crate::datastream::RolloverStatsHook`]).
     pub(crate) rollover_stats_hook: RwLock<Option<crate::datastream::RolloverStatsHook>>,
+    /// How BulkByScroll batches are acknowledged (a cluster: replicated to
+    /// the in-sync copies, see [`crate::reindex::ReplicationBarrier`]).
+    replication_barrier: RwLock<Option<Arc<dyn crate::reindex::ReplicationBarrier>>>,
+    /// Test hook: runs after a BulkByScroll source page is parsed, before
+    /// its writes are built (see [`Node::set_by_query_page_hook`]).
+    by_query_page_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Where a finished `wait_for_completion=false` task's `.tasks`
+    /// document goes instead of this engine's own `.tasks` index: a
+    /// cluster stores it cluster-wide, under the task's cluster id.
+    pub task_result_sink: RwLock<Option<TaskResultSink>>,
     /// Per local shard copy: the max seq_no last seen and since when (the
     /// idle flush in [`Node::maintenance`]).
     write_activity: Mutex<HashMap<usize, (i64, Instant)>>,
@@ -561,11 +627,52 @@ fn deep_merge(dst: &mut Value, src: &Value) {
 }
 
 impl Node {
+    /// Install the BulkByScroll write acknowledgement (see
+    /// [`crate::reindex::ReplicationBarrier`]).
+    pub fn set_replication_barrier(&self, barrier: Option<Arc<dyn crate::reindex::ReplicationBarrier>>) {
+        *self.replication_barrier.write() = barrier;
+    }
+
+    /// Tests only: `hook` runs on the worker after each local BulkByScroll
+    /// source page is parsed and before its writes are built (to pause a
+    /// by-query between reading a page and writing it).
+    #[doc(hidden)]
+    pub fn set_by_query_page_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.by_query_page_hook.write() = hook;
+    }
+
+    pub(crate) fn by_query_page_fetched(&self) {
+        let hook = self.by_query_page_hook.read().clone();
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    /// Block until every operation the local copy `svc` has sequenced is
+    /// acknowledged as a replicated write (no barrier: a standalone node,
+    /// whose own write is the acknowledgement).
+    pub fn await_replicated(&self, svc: &crate::index::IndexService) -> Result<()> {
+        let barrier = self.replication_barrier.read().clone();
+        match barrier {
+            Some(b) => b.await_replicated(svc),
+            None => Ok(()),
+        }
+    }
+
     /// `action.destructive_requires_name`: transient, then persistent, then
     /// node setting; ES 8 defaults it to `true`.
     pub fn destructive_requires_name(&self) -> bool {
         let as_bool = |v: &Value| v.as_str().map(|s| s != "false").unwrap_or(v.as_bool().unwrap_or(true));
         let key = "action.destructive_requires_name";
+        let cs = self.cluster_settings.read();
+        cs.1.get(key).or(cs.0.get(key)).map(as_bool).or_else(|| self.node_settings.read().get(key).map(as_bool)).unwrap_or(true)
+    }
+
+    /// `cluster.indices.close.enable` (transient, persistent, node; default
+    /// true).
+    pub fn close_index_enabled(&self) -> bool {
+        let as_bool = |v: &Value| v.as_str().map(|s| s != "false").unwrap_or(v.as_bool().unwrap_or(true));
+        let key = "cluster.indices.close.enable";
         let cs = self.cluster_settings.read();
         cs.1.get(key).or(cs.0.get(key)).map(as_bool).or_else(|| self.node_settings.read().get(key).map(as_bool)).unwrap_or(true)
     }
@@ -586,6 +693,11 @@ impl Node {
     pub fn open_with_security_named(data: &Path, security: Arc<crate::security::Security>, name: &str) -> Result<Arc<Node>> {
         std::fs::create_dir_all(data.join("indices"))?;
         std::fs::create_dir_all(data.join("_state"))?;
+        // Rebuilt (never committed) vector arrays that should live in the
+        // page cache map unlinked files here (see `set_spill_dir`).
+        if let Err(error) = rustic_core::vector::hnsw::set_spill_dir(data.join("vector-spill")) {
+            tracing::warn!("vector spill directory unavailable, vector arrays stay in memory: {error}");
+        }
         let state = load_cluster_state(&data.join("_state/cluster.json"))?;
         let cluster_uuid = state["cluster_uuid"].as_str().map(str::to_string).unwrap_or_else(new_uuid);
         let mut templates = Templates::default();
@@ -620,6 +732,7 @@ impl Node {
             fetch_contexts: Mutex::new(HashMap::new()),
             fetch_freed: Mutex::new(HashMap::new()),
             fetch_budget: Mutex::new(Arc::default()),
+            scroll_budget: Mutex::new(Arc::default()),
             breakers: crate::memory::process_breakers(),
             tasks: Default::default(),
             async_searches: Mutex::new(HashMap::new()),
@@ -633,6 +746,9 @@ impl Node {
             snapshots: crate::snapshot::SnapshotService::load(data),
             mapping_hook: RwLock::new(None),
             rollover_stats_hook: RwLock::new(None),
+            replication_barrier: RwLock::new(None),
+            by_query_page_hook: RwLock::new(None),
+            task_result_sink: RwLock::new(None),
             write_activity: Mutex::new(HashMap::new()),
         };
         // Publish the synonyms sets before the indices recover: a
@@ -649,11 +765,15 @@ impl Node {
             }
         }
         node.persist_state()?;
+        // Task numbers continue above the previous run's (#96).
+        node.tasks.persist_ids(data.join("_state/task_ids"))?;
         // Breakers are the process's: only the first node opened applies
         // its persisted breaker settings.
         crate::memory::configure_at_open(&node);
         crate::script::rate_limit::configure_at_open(&node)?;
-        Ok(Arc::new(node))
+        let node = Arc::new(node);
+        crate::ingest::geoip_download::register(&node);
+        Ok(node)
     }
 
     pub fn persist_state(&self) -> Result<()> {
@@ -876,6 +996,17 @@ impl Node {
             }
         }
         if !candidates.is_empty() {
+            // A data stream alias writes to its write data stream's current
+            // write index (ES `DataStreamAlias.writeDataStream`): its
+            // definition sits on every backing index, so the flag of an
+            // older generation never picks the index.
+            if let Some(ds) = self.alias_write_data_stream(&name) {
+                return if auto_create && ds.rollover_on_write {
+                    self.data_stream_write_index(&ds)
+                } else {
+                    self.get_index(ds.write_index()).ok_or_else(|| EsError::index_not_found(&ds.name))
+                };
+            }
             if let Some((s, _)) = candidates.iter().find(|(_, w)| *w == Some(true)) {
                 return Ok(s.clone());
             }
@@ -903,6 +1034,37 @@ impl Node {
             Err(e) if e.kind == "resource_already_exists_exception" => self.get_index(&name).ok_or(e),
             Err(e) => Err(e),
         }
+    }
+
+    /// The write data stream of data stream alias `alias` (ES
+    /// `DataStreamAlias.getWriteDataStream`): the stream whose backing
+    /// indices carry the alias with `is_write_index: true`. `None` when
+    /// `alias` is not a data stream alias or names no write data stream
+    /// (the plain alias rules then apply, as before).
+    pub fn alias_write_data_stream(&self, alias: &str) -> Option<crate::datastream::DataStream> {
+        if self.data_streams.read().is_empty() {
+            return None;
+        }
+        let mut flagged: Vec<String> = self.all_indices().iter()
+            .filter(|svc| svc.aliases().get(alias).and_then(|def| def.get("is_write_index")).and_then(Value::as_bool) == Some(true))
+            .map(|svc| svc.name.clone()).collect();
+        flagged.sort();
+        flagged.iter().find_map(|i| self.data_stream_of_index(i)).and_then(|d| self.data_stream(&d))
+    }
+
+    /// Whether a write to `name` (a data stream, or a data stream alias
+    /// through its write data stream) first performs an accepted lazy
+    /// rollover (`rollover_on_write`). A cluster coordinator then resolves
+    /// the write through the master, which rolls the stream over once.
+    pub fn pending_lazy_rollover(&self, name: &str) -> bool {
+        let Ok(name) = resolve_date_math(name) else { return false };
+        if self.get_index(&name).is_some() {
+            return false;
+        }
+        if let Some(ds) = self.data_stream(&name) {
+            return ds.rollover_on_write;
+        }
+        self.alias_write_data_stream(&name).is_some_and(|ds| ds.rollover_on_write)
     }
 
     /// The routing of a single-document operation addressed to `name`: an
@@ -939,6 +1101,14 @@ impl Node {
         let mut settings = json!({});
         let mut mappings = json!({});
         let mut aliases = json!({});
+        // Composable: highest priority match wins, and then no legacy
+        // template applies (ES `MetadataCreateIndexService`: legacy
+        // templates only when no composable template matches; production
+        // review #194).
+        if let Some((_, it)) = Self::best_index_template(&t, name) {
+            Self::compose_into(&t, it, &mut settings, &mut mappings, &mut aliases);
+            return (settings, mappings, aliases);
+        }
         // Legacy templates by ascending order.
         let mut legacy: Vec<&Value> = t
             .legacy
@@ -951,11 +1121,55 @@ impl Node {
             merge_mapping(&mut mappings, &unwrap_typed(&v["mappings"]));
             deep_merge(&mut aliases, &v["aliases"]);
         }
-        // Composable: highest priority match wins.
-        if let Some((_, it)) = Self::best_index_template(&t, name) {
-            Self::compose_into(&t, it, &mut settings, &mut mappings, &mut aliases);
-        }
         (settings, mappings, aliases)
+    }
+
+    /// ES `MetadataIndexTemplateService`: refuse to delete component
+    /// templates still composed into an index template (unless it lists
+    /// them in `ignore_missing_component_templates`), and index templates
+    /// that are the only ones a live data stream matches (production
+    /// review #367: the deletion succeeded and later indices were created
+    /// without the required mappings or pipeline). `t` is the template
+    /// store being changed; `names` the templates the request deletes.
+    pub fn check_template_removal(&self, t: &Templates, kind: &str, names: &[String]) -> Result<()> {
+        match kind {
+            "_component_template" => {
+                let mut in_use: BTreeSet<String> = BTreeSet::new();
+                let mut users: BTreeSet<String> = BTreeSet::new();
+                for (tname, it) in &t.index {
+                    let ignored: Vec<&str> = it["ignore_missing_component_templates"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                    for c in it["composed_of"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                        if names.iter().any(|n| n == c) && !ignored.contains(&c) {
+                            in_use.insert(c.to_string());
+                            users.insert(tname.clone());
+                        }
+                    }
+                }
+                if !in_use.is_empty() {
+                    let list = |s: &BTreeSet<String>| format!("[{}]", s.iter().cloned().collect::<Vec<_>>().join(", "));
+                    return Err(EsError::illegal_argument(format!("component templates {} cannot be removed as they are still in use by index templates {}", list(&in_use), list(&users))));
+                }
+            }
+            "_index_template" => {
+                let mut used: BTreeSet<String> = BTreeSet::new();
+                let mut streams: BTreeSet<String> = BTreeSet::new();
+                for ds in self.data_streams.read().keys() {
+                    let matching: Vec<&String> = t.index.iter()
+                        .filter(|(_, v)| v.get("data_stream").is_some() && pattern_list(&v["index_patterns"]).iter().any(|p| crate::mapping::wildcard_match(p, ds)))
+                        .map(|(n, _)| n).collect();
+                    if !matching.is_empty() && matching.iter().all(|n| names.contains(n)) {
+                        streams.insert(ds.clone());
+                        used.extend(matching.into_iter().cloned());
+                    }
+                }
+                if !streams.is_empty() {
+                    let list = |s: &BTreeSet<String>| format!("[{}]", s.iter().cloned().collect::<Vec<_>>().join(", "));
+                    return Err(EsError::illegal_argument(format!("unable to remove composable templates {} as they are in use by a data streams {}", list(&used), list(&streams))));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The highest-priority composable template whose patterns match `name`.
@@ -1186,17 +1400,32 @@ impl Node {
 
     /// Create an index (`PUT /{index}` body: settings, mappings, aliases).
     pub fn create_index(&self, name: &str, body: &Value) -> Result<Arc<IndexService>> {
-        if !name.starts_with(".ds-") {
+        self.create_index_opts(name, body, true)
+    }
+
+    /// [`Node::create_index`]; without `templates` the index is built from
+    /// `body` alone: a snapshot restore creates its target exactly from the
+    /// snapshot's metadata (ES: restore never applies current index
+    /// templates; production review #378).
+    pub fn create_index_opts(&self, name: &str, body: &Value, templates: bool) -> Result<Arc<IndexService>> {
+        // A new index's own settings: boolean ones strictly (a restore
+        // recreates stored metadata as it is).
+        if templates {
+            if let Some(s) = body.get("settings") {
+                crate::settings::validate_bool_index_settings(&crate::settings::normalize_index_settings(s))?;
+            }
+        }
+        if templates && !name.starts_with(".ds-") && !ccr_follower_body(body) {
             if let Some((tname, _)) = self.data_stream_template(name) {
                 return Err(EsError::illegal_argument(format!(
                     "cannot create index with name [{name}], because it matches with template [{tname}] that creates data streams only, use create data stream api instead"
                 )));
             }
         }
-        self.create_index_impl(name, body, None, true)
+        self.create_index_impl(name, body, None, true, templates)
     }
 
-    pub(crate) fn create_index_impl(&self, name: &str, body: &Value, uuid: Option<&str>, initialize_lifecycle: bool) -> Result<Arc<IndexService>> {
+    pub(crate) fn create_index_impl(&self, name: &str, body: &Value, uuid: Option<&str>, initialize_lifecycle: bool, templates: bool) -> Result<Arc<IndexService>> {
         let name = resolve_date_math(name)?;
         if let Err(why) = is_valid_name(&name) {
             return Err(EsError::invalid_index_name(&name, &why));
@@ -1239,7 +1468,18 @@ impl Node {
                 validate_alias_definition(alias, def)?;
             }
         }
-        let (mut settings, mut mappings, mut aliases) = self.template_for(&name);
+        // A CCR follower is restored from its leader (ES's restore applies
+        // no index template): its settings and mappings are the leader's.
+        let templates = templates && !ccr_follower_body(body);
+        // A stored template whose required component is gone fails the
+        // create rather than silently building a partial schema (#367).
+        if templates {
+            let t = self.templates.read();
+            if let Some((tname, it)) = Self::best_index_template(&t, &name) {
+                Self::check_missing_components(&t, it, tname)?;
+            }
+        }
+        let (mut settings, mut mappings, mut aliases) = if templates { self.template_for(&name) } else { (json!({}), json!({}), json!({})) };
         deep_merge(&mut settings, &normalize_settings_json(&body["settings"]));
         let req_mappings = unwrap_typed(&body["mappings"]);
         deep_merge(&mut mappings, &req_mappings);
@@ -1297,6 +1537,7 @@ impl Node {
                 alias_map.insert(resolve_date_math(k).unwrap_or_else(|_| k.clone()), clean_alias(v));
             }
         }
+        self.check_write_aliases(&BTreeMap::new(), &[], Some((name.as_str(), &alias_map)))?;
         // A new index's similarities are built as ES builds them (strict
         // ranges); an existing one opens whatever an older build accepted.
         crate::similarity::check_ranges(&flat)?;
@@ -1343,6 +1584,29 @@ impl Node {
         drop(indices);
         self.finish_local_index_deletion(name, svc);
         if changed { self.persist_state()?; }
+        Ok(())
+    }
+
+    /// [`Self::delete_index`] of incarnation `uuid` only: another index
+    /// under the name (the name was deleted and re-created since the
+    /// caller looked) is never deleted. The check and the removal happen
+    /// under the registry lock.
+    pub fn delete_index_if_uuid(&self, name: &str, uuid: &str) -> Result<()> {
+        let mut indices = self.indices.write();
+        let (svc, changed) = self.detach_backing_index_with(name, || match indices.get(name) {
+            None => Err(EsError::index_not_found(name)),
+            Some(cur) if cur.uuid != uuid => Err(EsError::new(
+                409,
+                "illegal_state_exception",
+                format!("index [{name}] is now incarnation [{}], not [{uuid}] that the delete was conditioned on: it is not deleted", cur.uuid),
+            )),
+            Some(_) => indices.remove(name).ok_or_else(|| EsError::index_not_found(name)),
+        })?;
+        drop(indices);
+        self.finish_local_index_deletion(name, svc);
+        if changed {
+            self.persist_state()?;
+        }
         Ok(())
     }
 
@@ -1411,7 +1675,91 @@ impl Node {
         Ok(())
     }
 
+    /// Where [`Self::quarantine_local_index_copy`] moves index copies, under
+    /// the engine's data directory (outside `indices/`: never reopened).
+    pub const QUARANTINE_DIR: &'static str = "quarantined-indices";
+
+    /// Take the local copy of `name` out of service and move its directory,
+    /// unchanged, to [`Self::QUARANTINE_DIR`] instead of deleting it: its
+    /// identity could not be established, so its data may be the only copy.
+    /// Returns the new location. On failure the copy is registered again
+    /// from its original directory (nothing is deleted either way).
+    pub fn quarantine_local_index_copy(&self, name: &str) -> Result<PathBuf> {
+        let svc = self.indices.write().remove(name).ok_or_else(|| EsError::index_not_found(name))?;
+        let from = self.retire_local_index(name, svc);
+        let root = self.data.join(Self::QUARANTINE_DIR);
+        let leaf = from.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(new_uuid);
+        let to = root.join(format!("{leaf}~{}", crate::date::now_millis()));
+        let moved = std::fs::create_dir_all(&root)
+            .and_then(|()| rustic_core::platform::sync_dir(&self.data))
+            .and_then(|()| std::fs::rename(&from, &to))
+            .and_then(|()| rustic_core::platform::sync_dir(&root))
+            .and_then(|()| from.parent().map_or(Ok(()), rustic_core::platform::sync_dir));
+        match moved {
+            Ok(()) => Ok(to),
+            Err(e) => {
+                // Still in place (or already moved and only an fsync failed):
+                // reopen whatever is at the original path so the copy is
+                // never left half-registered.
+                if from.join("index_meta.json").exists() {
+                    if let Ok(reopened) = IndexService::open(&from) {
+                        self.indices.write().entry(name.to_string()).or_insert_with(|| Arc::new(reopened));
+                    }
+                }
+                Err(EsError::new(500, "io_exception", format!("cannot quarantine the local copy of [{name}] at [{}]: {e}", from.display())))
+            }
+        }
+    }
+
+    /// Re-register a copy [`Self::quarantine_local_index_copy`] set aside
+    /// (a dangling index being imported) as the engine's index `name`: its
+    /// directory moves back under `indices/` and the index opens from it.
+    pub fn adopt_set_aside_index_copy(&self, name: &str, dir: &Path) -> Result<Arc<IndexService>> {
+        let _g = self.create_lock.lock();
+        if let Some(existing) = self.get_index(name) {
+            return Err(EsError::index_already_exists(name, &existing.uuid));
+        }
+        let leaf = dir.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let base = leaf.split('~').next().filter(|b| !b.is_empty()).map(str::to_string).unwrap_or_else(new_uuid);
+        let indices = self.data.join("indices");
+        let mut to = indices.join(&base);
+        if to.exists() {
+            to = indices.join(new_uuid());
+        }
+        let io = |e: std::io::Error| EsError::new(500, "io_exception", format!("cannot re-register the set-aside copy [{}]: {e}", dir.display()));
+        std::fs::rename(dir, &to).map_err(io)?;
+        rustic_core::platform::sync_dir(&indices).map_err(io)?;
+        if let Some(parent) = dir.parent() {
+            rustic_core::platform::sync_dir(parent).map_err(io)?;
+        }
+        let svc = match IndexService::open(&to) {
+            Ok(svc) if svc.name == name => Arc::new(svc),
+            other => {
+                // Put it back where it was: nothing is lost either way.
+                let _ = std::fs::rename(&to, dir);
+                return Err(match other {
+                    Ok(svc) => EsError::illegal_argument(format!("the set-aside copy at [{}] is index [{}], not [{name}]", dir.display(), svc.name)),
+                    Err(e) => e,
+                });
+            }
+        };
+        if let Some(other) = self.all_indices().into_iter().find(|s| s.uuid == svc.uuid) {
+            let _ = std::fs::rename(&to, dir);
+            return Err(EsError::illegal_argument(format!("index uuid [{}] is already used by index [{}]", svc.uuid, other.name)));
+        }
+        svc.set_mapping_update_hook(self.mapping_hook.read().clone());
+        self.indices.write().insert(name.to_string(), svc.clone());
+        Ok(svc)
+    }
+
     fn finish_local_index_deletion(&self, name: &str, svc: Arc<IndexService>) {
+        let path = self.retire_local_index(name, svc);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Everything of a local index deletion but the files: fence its copies
+    /// and drop every context reading it. Returns its directory.
+    fn retire_local_index(&self, name: &str, svc: Arc<IndexService>) -> PathBuf {
         crate::index::forget_recovery_attempts(&svc.uuid);
         self.scrolls.lock().retain(|_, s| !s.targets.iter().any(|t| t.svc.name == name));
         self.pits.lock().retain(|_, s| !s.targets.iter().any(|t| t.svc.name == name));
@@ -1425,7 +1773,7 @@ impl Node {
             sh.fence();
         }
         drop(svc);
-        let _ = std::fs::remove_dir_all(path);
+        path
     }
 
     /// Apply `_aliases` actions atomically.
@@ -1515,7 +1863,7 @@ impl Node {
                     results.push(json!({"action": {"type": "add", "indices": shown, "aliases": aliases}, "status": 200, "error": null}));
                     for t in &targets {
                         for al in &aliases {
-                            if self.get_index(al).is_some() && !removals.contains(al) && !pending_removals.contains(al) {
+                            if (self.get_index(al).is_some() && !removals.contains(al) && !pending_removals.contains(al)) || self.data_streams.read().contains_key(al.as_str()) {
                                 return Err(EsError::new(400, "invalid_alias_name_exception", format!("Invalid alias name [{al}]: an index or data stream exists with the same name as the alias")));
                             }
                             if crate::esql::views::exists(self, al) {
@@ -1559,6 +1907,7 @@ impl Node {
                 other => return Err(EsError::parsing(format!("Unknown alias action [{other}]"))),
             }
         }
+        self.check_write_aliases(&changes, &removals, None)?;
         for (idx, a) in changes {
             if let Some(svc) = self.get_index(&idx) {
                 svc.set_aliases(a)?;
@@ -1568,6 +1917,48 @@ impl Node {
             self.delete_index(&r)?;
         }
         Ok(results)
+    }
+
+    /// ES `IndexAbstraction.Alias`: an alias has at most one write index.
+    /// Checked over the alias graph as it would be after a change, before
+    /// anything is committed (production review #195: a second
+    /// `is_write_index: true` was acknowledged while writes kept going to
+    /// the first). `changes`: indices' new alias maps; `removed`: indices
+    /// going away; `created`: a new index and its aliases.
+    pub fn check_write_aliases(&self, changes: &BTreeMap<String, BTreeMap<String, Value>>, removed: &[String], created: Option<(&str, &BTreeMap<String, Value>)>) -> Result<()> {
+        let mut writers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut note = |index: &str, aliases: &BTreeMap<String, Value>| {
+            for (alias, def) in aliases {
+                if def.get("is_write_index").and_then(Value::as_bool) == Some(true) {
+                    writers.entry(alias.clone()).or_default().push(index.to_string());
+                }
+            }
+        };
+        for svc in self.all_indices() {
+            if removed.contains(&svc.name) || created.is_some_and(|(n, _)| n == svc.name) {
+                continue;
+            }
+            match changes.get(&svc.name) {
+                Some(a) => note(&svc.name, a),
+                None => note(&svc.name, &svc.aliases()),
+            }
+        }
+        if let Some((name, aliases)) = created {
+            note(name, aliases);
+        }
+        for (alias, mut indices) in writers {
+            // A data stream alias flags every backing index of its write
+            // data stream (one writer: the stream), the alias being added
+            // now included; only writers of distinct targets conflict.
+            let mut targets: Vec<String> = indices.iter().map(|i| self.data_stream_of_index(i).unwrap_or_else(|| i.clone())).collect();
+            targets.sort();
+            targets.dedup();
+            if targets.len() > 1 && self.alias_write_data_stream(&alias).is_none() {
+                indices.sort();
+                return Err(EsError::new(500, "illegal_state_exception", format!("alias [{alias}] has more than one write index [{}]", indices.join(","))));
+            }
+        }
+        Ok(())
     }
 
     /// Register a query_then_fetch reader context over `targets` (pinned
@@ -1815,6 +2206,8 @@ impl Node {
     pub fn maintenance(&self) {
         /// ES `index.flush_after_merge` default.
         const FLUSH_AFTER_MERGE_BYTES: u64 = 512 * 1024 * 1024;
+        /// ES 9.x `index.translog.flush_threshold_size` default.
+        const TRANSLOG_FLUSH_THRESHOLD_DEFAULT: u64 = 10 << 30;
         let now = Instant::now();
         {
             // About once a minute (ES syncs leases every 30s).
@@ -1827,6 +2220,7 @@ impl Node {
             }
         }
         drop(crate::search_ext::take_expired_sql_cursors(self, now));
+        crate::search_ext::reap_expired_async_results(self);
         self.scrolls.lock().retain(|_, s| s.expires > now);
         self.pits.lock().retain(|_, s| s.expires > now);
         self.fold_contexts.lock().retain(|_, s| s.expires > now);
@@ -1849,6 +2243,14 @@ impl Node {
                 .and_then(|v| crate::date::parse_time_value(&v))
                 .filter(|ms| *ms > 0)
                 .map_or(Duration::from_secs(60), |ms| Duration::from_millis(ms as u64));
+            // ES `index.translog.flush_threshold_size` (dynamic, default
+            // 10gb in 9.x: `IndexSettings.INDEX_TRANSLOG_FLUSH_THRESHOLD_SIZE_SETTING`):
+            // uncommitted translog beyond it makes the periodic check flush.
+            let flush_size = svc
+                .setting("index.translog.flush_threshold_size")
+                .and_then(|v| crate::settings::parse_byte_size(&v))
+                .filter(|b| *b > 0)
+                .map_or(TRANSLOG_FLUSH_THRESHOLD_DEFAULT, |b| b as u64);
             for sh in svc.local_shards() {
                 // A copy whose engine failed (tragic event) is recovered from
                 // its store, as ES reallocates and store-recovers a failed
@@ -1861,7 +2263,7 @@ impl Node {
                 }
                 // Uncommitted bytes: generations kept for history retention
                 // would otherwise trigger a flush every tick.
-                let big = sh.shard.uncommitted_translog_size() > 512 * 1024 * 1024
+                let big = sh.shard.uncommitted_translog_size() > flush_size
                     // ES `index.flush_after_merge` (512mb): a big merge
                     // makes the next periodic check flush, freeing its inputs.
                     || sh.shard.merged_away_committed_bytes() >= FLUSH_AFTER_MERGE_BYTES;
@@ -2083,13 +2485,7 @@ fn unwrap_typed(v: &Value) -> Value {
 /// `IndexNameExpressionResolver.checkForRemoteIndexExpression`: APIs that
 /// do not allow remote indices reject `cluster:index` expressions.
 pub fn reject_remote_indices(expr: &str) -> Result<()> {
-    let is_remote = |e: &str| {
-        let e = e.strip_prefix('-').unwrap_or(e);
-        match e.find(':') {
-            Some(i) => i > 0 && !e[i..].starts_with("::"),
-            None => false,
-        }
-    };
+    let is_remote = |e: &str| crate::ccr::remote::is_remote_part(e.strip_prefix('-').unwrap_or(e));
     let parts: Vec<&str> = expr.split(',').collect();
     if parts.iter().any(|p| is_remote(p)) {
         let remote: Vec<&str> = parts.into_iter().filter(|p| is_remote(p)).collect();
@@ -2289,4 +2685,10 @@ pub fn validate_alias_definition(alias: &str, def: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A create-index body of a CCR follower (`index.xpack.ccr.following_index`).
+fn ccr_follower_body(body: &Value) -> bool {
+    let flat = settings::normalize_index_settings(&body["settings"]);
+    flat.get(crate::ccr::FOLLOWING_INDEX_SETTING).is_some_and(|v| v == &json!("true") || v == &json!(true))
 }

@@ -91,7 +91,170 @@ async fn per_index(node: &Arc<ClusterNode>, req: &RestReq, api: &str) -> Result<
     Ok(parts)
 }
 
+/// `req` without its data-dependent pruning: no `index_filter` and
+/// `include_empty_fields` back at its default.
+fn without_pruning(req: &RestReq) -> elasticsearch_engine::error::Result<RestReq> {
+    let mut r = req.clone();
+    let params = req.params();
+    if params.contains_key("include_empty_fields") {
+        let query: Vec<String> = params.iter().filter(|(k, _)| k.as_str() != "include_empty_fields").map(|(k, v)| if v.is_empty() { k.clone() } else { format!("{k}={v}") }).collect();
+        let path = req.path().to_string();
+        r.set_uri_fmt(format_args!("{path}{}{}", if query.is_empty() { "" } else { "?" }, query.join("&")))?;
+    }
+    if let Some(mut b) = req.json() {
+        if let Some(o) = b.as_object_mut() {
+            o.remove("index_filter");
+        }
+        r.set_json(&b)?;
+    }
+    Ok(r)
+}
+
+/// `req` as `/{index}/{api}` with its own query string.
+fn for_index(req: &RestReq, index: &str, api: &str) -> elasticsearch_engine::error::Result<RestReq> {
+    let mut r = req.clone();
+    let query = req.query().to_string();
+    r.set_uri_fmt(format_args!("/{}/{api}{}{query}", elasticsearch_engine::coord::path_segment(index), if query.is_empty() { "" } else { "?" }))?;
+    Ok(r)
+}
+
+/// A size-0 search of `index` over every shard copy the cluster reads.
+async fn index_search(node: &Arc<ClusterNode>, req: &RestReq, index: &str, query: &str, body: &Value) -> Result<Value, RestResp> {
+    let mut r = req.clone();
+    let built = (|| -> elasticsearch_engine::error::Result<()> {
+        r.retain_headers(|(k, _)| !k.eq_ignore_ascii_case("content-length"))?;
+        r.set_method("POST")?;
+        r.set_uri(&format!("/{}/_search{query}", elasticsearch_engine::coord::path_segment(index)))?;
+        r.set_json(body)
+    })();
+    if let Err(e) = built {
+        return Err(es_err(&e));
+    }
+    let resp = front::dispatch(node, r).await;
+    if !resp.is_success() {
+        return Err(resp);
+    }
+    Ok(resp.body_json().unwrap_or(Value::Null))
+}
+
+/// ES's field-caps `index_filter` over a whole multi-shard index: the index
+/// is kept unless the filter rewrites to `match_none` (or misses the field's
+/// value range) on every shard, the search can-match pre-filter's test.
+async fn index_can_match(node: &Arc<ClusterNode>, req: &RestReq, index: &str, filter: &Value) -> Result<bool, RestResp> {
+    let v = index_search(node, req, index, "?pre_filter_shard_size=1", &json!({"size": 0, "track_total_hits": false, "query": filter})).await?;
+    let total = v["_shards"]["total"].as_u64().unwrap_or(0);
+    let skipped = v["_shards"]["skipped"].as_u64().unwrap_or(0);
+    Ok(total == 0 || skipped < total)
+}
+
+/// `include_empty_fields: false` over a whole multi-shard index: drop the
+/// fields of `caps` (one index's answer) that no document of any shard
+/// holds a value for. Metadata, object, nested and runtime fields stay, as
+/// in ES (their `fieldHasValue` is always true).
+async fn drop_empty_fields(node: &Arc<ClusterNode>, req: &RestReq, index: &str, mut caps: Value) -> Result<Value, RestResp> {
+    let runtime: BTreeSet<String> = node.state().metadata.indices.get(index).and_then(|im| im.mappings.get("runtime").and_then(Value::as_object).map(|r| r.keys().cloned().collect())).unwrap_or_default();
+    let candidates: Vec<String> = caps["fields"]
+        .as_object()
+        .map(|fs| {
+            fs.iter()
+                .filter(|(name, types)| {
+                    !runtime.contains(*name)
+                        && types.as_object().is_some_and(|t| t.iter().all(|(ty, c)| !matches!(ty.as_str(), "object" | "nested" | "unmapped") && c.get("metadata_field").and_then(Value::as_bool) != Some(true)))
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for chunk in candidates.chunks(256) {
+        let aggs: Map<String, Value> = chunk.iter().enumerate().map(|(i, f)| (format!("e{i}"), json!({"filter": {"exists": {"field": f}}}))).collect();
+        let v = index_search(node, req, index, "", &json!({"size": 0, "track_total_hits": false, "aggs": aggs})).await?;
+        if let Some(fs) = caps["fields"].as_object_mut() {
+            for (i, f) in chunk.iter().enumerate() {
+                if v["aggregations"][format!("e{i}")]["doc_count"].as_u64() == Some(0) {
+                    fs.remove(f);
+                }
+            }
+        }
+    }
+    Ok(caps)
+}
+
+/// Field caps with data-dependent pruning (`index_filter`,
+/// `include_empty_fields: false`) when a target index has several shards:
+/// a node answering from the copies it holds sees part of such an index,
+/// so its pruning is judged here over every shard, as ES does (an index is
+/// kept when any shard can match the filter, a field when any shard holds
+/// a value). Single-shard indices prune where they are read. `None`: no
+/// such request (the plain path answers).
+async fn field_caps_pruned_over_shards(node: &Arc<ClusterNode>, req: &RestReq) -> Option<RestResp> {
+    let empty_off = req.params().get("include_empty_fields").is_some_and(|v| v == "false");
+    let filter = req.json().and_then(|b| b.get("index_filter").filter(|f| !f.is_null()).cloned());
+    if !empty_off && filter.is_none() {
+        return None;
+    }
+    let targets = index_expr(req).unwrap_or_default();
+    let expr = if targets.is_empty() { "_all".to_string() } else { targets };
+    let opts = ResolveOpts::from_params(&req.params());
+    let engine = node.engine.clone();
+    let names: Vec<String> = match tokio::task::spawn_blocking(move || engine.resolve(&expr, opts).map(|t| t.iter().map(|t| t.svc.name.clone()).collect::<BTreeSet<String>>())).await {
+        Ok(Ok(n)) => n.into_iter().collect(),
+        _ => return None,
+    };
+    let st = node.state();
+    let shards = |n: &str| st.metadata.indices.get(n).map(|im| im.number_of_shards).unwrap_or(1);
+    if !names.iter().any(|n| shards(n) > 1) {
+        return None;
+    }
+    let unpruned = match without_pruning(req) {
+        Ok(r) => r,
+        Err(e) => return Some(es_err(&e)),
+    };
+    let mut parts: Vec<(String, Value)> = Vec::with_capacity(names.len());
+    for n in &names {
+        let multi = shards(n) > 1;
+        if multi {
+            if let Some(f) = &filter {
+                match index_can_match(node, req, n, f).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(r) => return Some(r),
+                }
+            }
+        }
+        let r = match for_index(if multi { &unpruned } else { req }, n, "_field_caps") {
+            Ok(r) => r,
+            Err(e) => return Some(es_err(&e)),
+        };
+        let resp = front::read_route(node, &r, n).await;
+        if !resp.is_success() {
+            return Some(resp);
+        }
+        let mut body = resp.body_json().unwrap_or(Value::Null);
+        if multi && empty_off {
+            body = match drop_empty_fields(node, req, n, body).await {
+                Ok(b) => b,
+                Err(r) => return Some(r),
+            };
+        }
+        parts.push((n.clone(), body));
+    }
+    let include_unmapped = req.params().get("include_unmapped").map(|v| v == "true" || v.is_empty()).unwrap_or(false);
+    Some(RestResp::json(200, &fanout::merge_field_caps(&parts, include_unmapped)))
+}
+
 pub async fn field_caps(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
+    let targets = index_expr(req).unwrap_or_default();
+    // A coordinating cluster's cross-cluster field caps: per-index answers.
+    if crate::front::ccs_parts(req) {
+        let expr = if targets.is_empty() { "_all".to_string() } else { targets };
+        return crate::front::ccs::field_caps_for_remote(node, req, &expr).await;
+    }
+    if elasticsearch_engine::ccr::remote::has_remote_expression(&targets) {
+        return crate::front::ccs::field_caps(node, req, &targets).await;
+    }
+    if let Some(resp) = field_caps_pruned_over_shards(node, req).await {
+        return resp;
+    }
     let parts = match per_index(node, req, "_field_caps").await {
         Ok(p) => p,
         Err(r) => return r,
@@ -103,14 +266,61 @@ pub async fn field_caps(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
 /// `_shard_stores`: the per-index `indices` entries are disjoint, so the
 /// cross-node answer is their union.
 pub async fn shard_stores(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
+    let selected = match resolve_from_params(node, req) {
+        Ok(names) => names,
+        Err(r) => return r,
+    };
+    // A red index has no active copy to ask; ES still lists its stores
+    // (that is what `_shard_stores` is for): only the copies below.
     let parts = match per_index(node, req, "_shard_stores").await {
         Ok(p) => p,
+        // One routed answer (the engine's view of every index asked).
+        Err(r) if r.is_success() => vec![(String::new(), r.body_json().unwrap_or(Value::Null))],
+        Err(r) if r.status == 503 => Vec::new(),
         Err(r) => return r,
     };
     let mut indices = BTreeMap::new();
     for (_, body) in parts {
         if let Some(Value::Object(m)) = body.get("indices") {
             indices.extend(m.clone());
+        }
+    }
+    // Copies whose store is marked corrupted, with their `store_exception`
+    // (ES `IndicesShardStoresResponse.StoreStatus`): such a copy is unused,
+    // and its shard is red unless another copy took over.
+    let status = req.params().get("status").cloned().unwrap_or_else(|| "yellow,red".into());
+    let wanted: Vec<&str> = status.split(',').map(str::trim).collect();
+    let state = node.state();
+    for (node_id, c) in node.cluster_corrupted_copies().await {
+        let Some(im) = state.metadata.indices.get(&c.index) else { continue };
+        if im.uuid != c.index_uuid || !selected.contains(&c.index) {
+            continue;
+        }
+        let Some(dn) = state.nodes.get(&node_id) else { continue };
+        if !indices.contains_key(&c.index) && !(wanted.contains(&"all") || wanted.contains(&"red")) {
+            continue;
+        }
+        let store = json!({
+            dn.id.clone(): {
+                "name": dn.name, "ephemeral_id": dn.ephemeral_id, "transport_address": dn.transport_address,
+                "external_id": dn.name,
+                "attributes": dn.attributes,
+                "roles": dn.roles.iter().map(|r| r.name()).collect::<Vec<_>>(),
+                "version": dn.version,
+            },
+            "allocation_id": c.allocation_id,
+            "allocation": "unused",
+            "store_exception": {"type": "corrupt_index_exception", "reason": c.reason},
+        });
+        let entry = indices.entry(c.index.clone()).or_insert_with(|| json!({"shards": {}}));
+        let stores = &mut entry["shards"][c.shard.to_string()]["stores"];
+        match stores {
+            Value::Array(list) => {
+                // The engine view may list this node's copy as plain data.
+                list.retain(|s| s.get(&dn.id).is_none());
+                list.push(store);
+            }
+            _ => *stores = json!([store]),
         }
     }
     RestResp::json(200, &json!({"indices": indices}))
@@ -239,7 +449,7 @@ pub fn clear_cache(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
 /// expression, configured) remote cluster, none of them connected.
 pub async fn resolve_cluster(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
     let name = req.segments().get(2).cloned().filter(|s| !s.is_empty());
-    let (local_expr, mut out) = match elasticsearch_engine::ccr::remote::resolve_cluster_remotes(&node.engine, name.as_deref()) {
+    let (local_expr, mut out) = match crate::front::ccs::resolve_cluster_remotes(node, req, name.as_deref()).await {
         Ok(planned) => planned,
         Err(e) => return es_err(&e),
     };

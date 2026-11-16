@@ -24,7 +24,15 @@ fn fx(mapping: Value, docs: &[Value]) -> Fx {
 }
 
 fn try_fx(mapping: Value, docs: &[Value]) -> Result<Fx> {
-    let reg = AnalysisRegistry::default();
+    try_fx_in(AnalysisRegistry::default(), mapping, docs)
+}
+
+/// [`fx`] with index analysis settings (`index.analysis` object).
+fn fx_with_analysis(analysis: Value, mapping: Value, docs: &[Value]) -> Fx {
+    try_fx_in(AnalysisRegistry::from_settings(&analysis).unwrap(), mapping, docs).unwrap()
+}
+
+fn try_fx_in(reg: AnalysisRegistry, mapping: Value, docs: &[Value]) -> Result<Fx> {
     let mut m = Mappings::parse(&mapping, &reg)?;
     m.assign_core_ids();
     let mut lookup = FieldLookup::build(&m, &reg);
@@ -83,6 +91,7 @@ fn qctx<'a>(f: &'a Fx, leaves: &'a [LeafReader<'a>]) -> QueryContext<'a> {
         allow_unmapped_fields: true,
         knn_prefilter: None,
         knn_prefilter_lookup: None,
+        dls_filter: None,
         allow_expensive_queries: true,
         mappings: None,
     }
@@ -142,11 +151,11 @@ fn aggs(f: &Fx, query: Option<Value>, a: Value) -> Result<Value> {
     let segs: Vec<AggSeg> = leaves
         .iter()
         .zip(matching)
-        .map(|(l, docs)| AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, scores: vec![1.0; docs.len()], docs })
+        .map(|(l, docs)| AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, scores: vec![1.0; docs.len()], docs })
         .collect();
     let fetch = |_s: usize, _d: DocId, _sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({})) };
     let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
     run_aggregations(&a, &segs, &env)
 }
 
@@ -243,6 +252,62 @@ fn join_queries_and_aggs() {
     // only one join field per index
     let e = Mappings::parse(&json!({"properties": {"a": {"type": "join", "relations": {"p": "c"}}, "b": {"type": "join", "relations": {"x": "y"}}}}), &AnalysisRegistry::default()).unwrap_err();
     assert!(e.reason.contains("Only one [parent-join] field"), "{}", e.reason);
+}
+
+/// Finding 264: a join query collects its inner side under the expensive
+/// query policy, the request breaker, the search deadline and the task's
+/// cancellation; it never answers from an incomplete inner side.
+#[test]
+fn join_inner_side_is_admitted_and_stoppable() {
+    let mut docs = Vec::new();
+    for i in 0..300 {
+        docs.push(json!({"_test_id": format!("p{i}"), "rel": "question"}));
+    }
+    for i in 0..300 {
+        docs.push(json!({"_test_id": format!("c{i}"), "rel": {"name": "answer", "parent": format!("p{i}")}}));
+    }
+    let f = fx(json!({"properties": {"rel": {"type": "join", "relations": {"question": "answer"}}}}), &docs);
+    let has_child = json!({"has_child": {"type": "answer", "query": {"match_all": {}}, "score_mode": "max"}});
+    let has_parent = json!({"has_parent": {"parent_type": "question", "query": {"match_all": {}}}});
+    let parent_id = json!({"parent_id": {"type": "answer", "id": "p1"}});
+    // Controls: complete joins without limits.
+    assert_eq!(search(&f, has_child.clone()).len(), 300);
+    assert_eq!(search(&f, has_parent.clone()).len(), 300);
+    let leaves = f.index.leaves();
+    let text = |e: &crate::error::EsError| format!("{} {} {:?}", e.kind, e.reason, e.caused_by);
+    // `search.allow_expensive_queries: false` rejects every joining query (ES `doToQuery`).
+    let mut ctx = qctx(&f, &leaves);
+    ctx.allow_expensive_queries = false;
+    for q in [&has_child, &has_parent, &parent_id] {
+        let e = parse_query(q, &ctx).unwrap_err();
+        assert!(text(&e).contains("[joining] queries cannot be executed when 'search.allow_expensive_queries' is set to false."), "{}", text(&e));
+    }
+    // A small request breaker trips while the matching parents are collected.
+    let tiny = crate::memory::Breakers::private_for_tests(1 << 30);
+    tiny.request.set_limit(1024);
+    let scope = crate::memory::RequestScope::new("join admission test", tiny);
+    let ctx = qctx(&f, &leaves);
+    for q in [&has_child, &has_parent] {
+        let e = crate::memory::scoped(Some(scope.clone()), || parse_query(q, &ctx)).unwrap_err();
+        assert!(crate::memory::is_breaking(&e), "{}", text(&e));
+    }
+    assert_eq!(tiny.request.used(), 0, "the failed joins released their charge");
+    drop(scope);
+    // Past the search's deadline: the join stops collecting and is built
+    // from what it read (ES stops collection at the deadline); the search,
+    // past its deadline too, answers `timed_out` (see the node test below).
+    let mut ctx = qctx(&f, &leaves);
+    ctx.deadline = std::time::Instant::now().checked_sub(std::time::Duration::from_millis(5));
+    for q in [&has_child, &has_parent] {
+        parse_query(q, &ctx).unwrap();
+    }
+    // A cancelled search task.
+    let ctx = qctx(&f, &leaves);
+    for q in [&has_child, &has_parent] {
+        let token = rustic_core::cancel::Token::cancelled_with("join test");
+        let e = rustic_core::cancel::with_search(Some(token), || parse_query(q, &ctx)).unwrap_err();
+        assert_eq!(e.kind, "task_cancelled_exception", "{}", text(&e));
+    }
 }
 
 #[test]
@@ -441,6 +506,54 @@ fn search_as_you_type_subfields() {
     assert_eq!(search(&f, json!({"match_phrase": {"t._2gram": "quick brown"}})), ids(&["1"]));
     assert_eq!(search(&f, json!({"match": {"t._3gram": "quick red fox"}})), ids(&["2"]));
     assert_eq!(sorted(search(&f, json!({"match_bool_prefix": {"t._index_prefix": "bro"}}))), ids(&["1", "3"]));
+}
+
+/// Finding 355: the generated shingle and prefix sub-fields analyze with
+/// the configured analyzers (here ASCII folding), not a fixed standard chain.
+#[test]
+fn search_as_you_type_subfields_use_the_configured_analyzer() {
+    let f = fx_with_analysis(
+        json!({"analyzer": {"fold": {"type": "custom", "tokenizer": "standard", "filter": ["lowercase", "asciifolding"]}}}),
+        json!({"properties": {"t": {"type": "search_as_you_type", "analyzer": "fold"}}}),
+        &[json!({"t": "Café Noir"}), json!({"t": "plain tea"})],
+    );
+    assert_eq!(search(&f, json!({"match_bool_prefix": {"t._2gram": "cafe n"}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"match_phrase": {"t._2gram": "café noir"}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"match": {"t._2gram": "CAFE NOIR"}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"match_bool_prefix": {"t._index_prefix": "caf"}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"multi_match": {"query": "cafe no", "type": "bool_prefix", "fields": ["t", "t._2gram", "t._3gram"]}})), ids(&["1"]));
+    // A different search analyzer applies to the sub-fields' queries too.
+    let f = fx_with_analysis(
+        json!({"analyzer": {"fold": {"type": "custom", "tokenizer": "standard", "filter": ["lowercase", "asciifolding"]}, "plain": {"type": "custom", "tokenizer": "standard", "filter": ["lowercase"]}}}),
+        json!({"properties": {"t": {"type": "search_as_you_type", "analyzer": "fold", "search_analyzer": "plain"}}}),
+        &[json!({"t": "Café Noir"})],
+    );
+    assert_eq!(search(&f, json!({"match": {"t._2gram": "cafe noir"}})), ids(&["1"]));
+    assert!(search(&f, json!({"match": {"t._2gram": "café noir"}})).is_empty());
+}
+
+/// Finding 430: token counts are position counts: stacked synonyms add
+/// nothing, and trailing removed stop words count with increments enabled.
+#[test]
+fn token_count_counts_positions() {
+    let f = fx_with_analysis(
+        json!({
+            "analyzer": {"syn": {"tokenizer": "keyword", "filter": ["eq"]}, "stops": {"tokenizer": "whitespace", "filter": ["st"]}},
+            "filter": {"eq": {"type": "synonym", "synonyms": ["car, auto"]}, "st": {"type": "stop", "stopwords": ["the"]}}
+        }),
+        json!({"properties": {
+            "a": {"type": "token_count", "analyzer": "syn", "enable_position_increments": false},
+            "b": {"type": "token_count", "analyzer": "syn"},
+            "c": {"type": "token_count", "analyzer": "stops"},
+            "d": {"type": "token_count", "analyzer": "stops", "enable_position_increments": false}
+        }}),
+        &[json!({"a": "car", "b": "car", "c": "car the", "d": "car the dog"}), json!({"c": "the"})],
+    );
+    assert_eq!(search(&f, json!({"term": {"a": 1}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"term": {"b": 1}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"term": {"c": 2}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"term": {"c": 1}})), ids(&["2"]));
+    assert_eq!(search(&f, json!({"term": {"d": 2}})), ids(&["1"]));
 }
 
 #[test]
@@ -692,6 +805,41 @@ fn annotated_and_semantic_text() {
     let (plain, ann) = super::index::parse_annotated("[Apple](Apple+Inc.&Company) rose");
     assert_eq!(plain, "Apple rose");
     assert_eq!(ann, vec!["Apple Inc.".to_string(), "Company".to_string()]);
+}
+
+/// Finding 352: annotation values are indexed at the position of their
+/// annotated text (not appended at the end) and a term query matches the
+/// exact annotation identity only.
+#[test]
+fn annotations_keep_their_positions_and_identity() {
+    let f = fx(
+        json!({"properties": {"a": {"type": "annotated_text"}}}),
+        &[
+            json!({"a": "[dog](Animal) sleeps"}),
+            json!({"a": "the animal and the apple"}),
+            json!({"a": "big [Apple](Apple+Inc.&Company) shares [rose](Verb) today"}),
+            json!({"a": "[nothing](Empty) the [](Gap)"}),
+        ],
+    );
+    let span = |a: &str, b: &str, in_order: bool| json!({"span_near": {"clauses": [{"span_term": {"a": a}}, {"span_term": {"a": b}}], "slop": 0, "in_order": in_order}});
+    assert_eq!(search(&f, span("Animal", "sleeps", true)), ids(&["1"]));
+    assert!(search(&f, span("sleeps", "Animal", true)).is_empty());
+    assert_eq!(search(&f, span("dog", "sleeps", true)), ids(&["1"]));
+    // `Company` shares `apple`'s position; `Verb` shares `rose`'s.
+    assert_eq!(search(&f, span("Company", "shares", true)), ids(&["3"]));
+    assert_eq!(search(&f, span("shares", "Verb", true)), ids(&["3"]));
+    assert_eq!(search(&f, span("Verb", "today", true)), ids(&["3"]));
+    assert!(search(&f, span("big", "shares", true)).is_empty());
+    // Exact identity: the entity, not the lowercase word.
+    assert_eq!(search(&f, json!({"term": {"a": "Animal"}})), ids(&["1"]));
+    assert_eq!(search(&f, json!({"term": {"a": "animal"}})), ids(&["2"]));
+    assert_eq!(search(&f, json!({"term": {"a": "Apple Inc."}})), ids(&["3"]));
+    assert_eq!(sorted(search(&f, json!({"term": {"a": "apple"}}))), ids(&["2", "3"]));
+    assert_eq!(search(&f, json!({"term": {"a": "Empty"}})), ids(&["4"]));
+    assert_eq!(search(&f, json!({"match_phrase": {"a": "big apple shares"}})), ids(&["3"]));
+    let toks = rustic_core::analysis::Analyzer::standard().analyze("x dog y");
+    let (_, spans) = super::index::parse_annotated_spans("x [dog](A&B) y");
+    assert_eq!(super::index::annotated_token_stream(&toks, &spans), "0\u{1}x\u{2}1\u{1}A\u{2}1\u{1}B\u{2}1\u{1}dog\u{2}2\u{1}y");
 }
 
 #[test]
@@ -1821,4 +1969,204 @@ fn scaled_float_range_bounds_match_es_long_range() {
             assert_eq!(got, want, "{lk} {a} {hk} {b}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #166: histogram-field gap filling is sized and admitted before it grows.
+
+fn breakers_at(b: &'static crate::memory::Breakers, limit: &str) {
+    b.apply_settings(&|key| match key {
+        "indices.breaker.request.limit" => Some(limit.into()),
+        "indices.breaker.total.limit" => Some("-1".into()),
+        _ => None,
+    });
+}
+
+#[test]
+fn histogram_field_gap_filling_is_admitted_before_it_grows() {
+    let mapping = json!({"properties": {"h": {"type": "histogram"}}});
+    // Reference: the gaps between the populated keys are empty buckets.
+    let f = fx(mapping.clone(), &[json!({"h": {"values": [0, 3], "counts": [1, 2]}})]);
+    let r = aggs(&f, None, json!({"x": {"histogram": {"field": "h", "interval": 1}}})).unwrap();
+    let got: Vec<(f64, u64)> = r["x"]["buckets"].as_array().unwrap().iter().map(|b| (b["key"].as_f64().unwrap(), b["doc_count"].as_u64().unwrap())).collect();
+    assert_eq!(got, vec![(0.0, 1), (1.0, 0), (2.0, 0), (3.0, 2)]);
+    // More buckets than `search.max_buckets` (65,536): refused before filling.
+    let wide = fx(mapping.clone(), &[json!({"h": {"values": [0, 100000], "counts": [1, 1]}})]);
+    let e = aggs(&wide, None, json!({"x": {"histogram": {"field": "h", "interval": 1}}})).unwrap_err();
+    assert_eq!(e.kind, "too_many_buckets_exception");
+    // A gap under the bucket limit but over a small request breaker.
+    let gap = fx(mapping, &[json!({"h": {"values": [0, 5000], "counts": [1, 1]}})]);
+    let spec = json!({"x": {"histogram": {"field": "h", "interval": 1}}});
+    let b = crate::memory::Breakers::leak_for_tests(1 << 31);
+    for (limit, ok) in [("256kb", false), ("64mb", true)] {
+        breakers_at(b, limit);
+        let scope = crate::memory::RequestScope::new("histogram gap", b);
+        let r = crate::memory::scoped(Some(scope), || aggs(&gap, None, spec.clone()));
+        assert_eq!(b.request.reserved(), 0, "released");
+        match (ok, r) {
+            (true, Ok(r)) => assert_eq!(r["x"]["buckets"].as_array().unwrap().len(), 5001),
+            (false, Err(e)) => assert!(crate::memory::is_breaking(&e), "{e:?}"),
+            (ok, r) => panic!("{limit}: expected ok={ok}, got {r:?}"),
+        }
+    }
+    // Cancellation is polled while filling.
+    super::aggs::poll_hook::arm(true);
+    let r = rustic_core::cancel::with_search(Some(rustic_core::cancel::Token::new()), || aggs(&gap, None, spec.clone()));
+    let polls = super::aggs::poll_hook::polls();
+    super::aggs::poll_hook::arm(false);
+    assert!(polls >= 1);
+    assert_eq!(r.unwrap_err().kind, "task_cancelled_exception");
+}
+
+// ---------------------------------------------------------------------------
+// #169: shard-state percentiles over histogram fields read their bins.
+
+/// The shard partial of `spec` (`name` of type `t`) over `f`, as a cluster
+/// shard response computes it.
+fn shard_state(f: &Fx, spec: &Value, name: &str) -> Value {
+    let _shard = crate::search::ReadShardCountScope::enter(Some(1));
+    aggs(f, None, spec.clone()).unwrap()[name].clone()
+}
+
+fn reduced(t: &str, conf: &Value, parts: &[Value]) -> Value {
+    let refs: Vec<&Value> = parts.iter().collect();
+    crate::aggs::partial::reduce_shard_states("p", t, conf.as_object().unwrap(), &refs).expect("shard states").unwrap()
+}
+
+#[test]
+fn shard_state_quantiles_read_histogram_bins() {
+    let hist = |values: Value, counts: Value| fx(json!({"properties": {"h": {"type": "histogram"}}}), &[json!({"h": {"values": values, "counts": counts}})]);
+    let nums = |vals: &[f64]| fx(json!({"properties": {"h": {"type": "double"}}}), &vals.iter().map(|v| json!({"h": v})).collect::<Vec<_>>());
+    let confs = [
+        ("percentiles", json!({"field": "h", "percents": [25, 50, 75, 100]})),
+        ("percentiles", json!({"field": "h", "percents": [25, 50, 75, 100], "hdr": {"number_of_significant_value_digits": 3}})),
+        ("percentile_ranks", json!({"field": "h", "values": [1.5, 2, 3]})),
+        ("boxplot", json!({"field": "h"})),
+        ("median_absolute_deviation", json!({"field": "h"})),
+    ];
+    for (t, conf) in &confs {
+        let spec = json!({"p": {*t: conf.clone()}});
+        // One shard: [1, 2, 2, 3] as bins and as values.
+        let h = reduced(t, conf, &[shard_state(&hist(json!([1, 2, 3]), json!([1, 2, 1])), &spec, "p")]);
+        let n = reduced(t, conf, &[shard_state(&nums(&[1.0, 2.0, 2.0, 3.0]), &spec, "p")]);
+        assert_eq!(h, n, "{t} {conf}");
+        let populated = match *t {
+            "boxplot" => !h["q2"].is_null(),
+            "median_absolute_deviation" => !h["value"].is_null(),
+            _ => h["values"].as_object().is_some_and(|o| !o.is_empty() && o.values().all(|v| !v.is_null())),
+        };
+        assert!(populated, "{t}: {h}");
+        // Two shards (the series split across them).
+        let h2 = reduced(t, conf, &[shard_state(&hist(json!([1, 2]), json!([1, 1])), &spec, "p"), shard_state(&hist(json!([2, 3]), json!([1, 1])), &spec, "p")]);
+        let n2 = reduced(t, conf, &[shard_state(&nums(&[1.0, 2.0]), &spec, "p"), shard_state(&nums(&[2.0, 3.0]), &spec, "p")]);
+        assert_eq!(h2, n2, "{t} two shards");
+    }
+    // The state counts the bins' observations; a doc without the field adds none.
+    let st = shard_state(&hist(json!([1, 2, 3]), json!([1, 2, 1])), &json!({"p": {"percentiles": {"field": "h"}}}), "p");
+    assert_eq!(st["__p"]["n"], 4);
+    let empty = fx(json!({"properties": {"h": {"type": "histogram"}, "x": {"type": "keyword"}}}), &[json!({"x": "a"})]);
+    let st = shard_state(&empty, &json!({"p": {"percentiles": {"field": "h"}}}), "p");
+    assert_eq!(st["__p"]["n"], 0);
+    let r = reduced("percentiles", &json!({"field": "h"}), &[st]);
+    assert!(r["values"].as_object().unwrap().values().all(Value::is_null), "{r}");
+}
+
+/// #223: a runtime geo_shape script that throws fails the aggregation; a
+/// script that emits nothing is a legitimate missing shape.
+#[test]
+fn runtime_geo_shape_script_failures_fail_the_aggregation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(tmp.path()).unwrap();
+    node.create_index("rs", &json!({"settings": {"number_of_shards": 1}, "mappings": {
+        "runtime": {
+            "r": {"type": "geo_shape", "script": {"source": "if (params._source.bad == true) { throw new IllegalArgumentException('boom') } emit(params._source.g)"}},
+            "q": {"type": "geo_shape", "script": {"source": "if (params._source.bad != true) { emit(params._source.g) }"}}
+        },
+        "properties": {"g": {"type": "geo_shape"}, "bad": {"type": "boolean"}}}})).unwrap();
+    let svc = node.get_index("rs").unwrap();
+    let reqs = vec![
+        crate::index::WriteReq::Index { id: Some("1".into()), source: json!({"g": "POINT (10 20)"}).to_string(), routing: None, cond: Default::default() },
+        crate::index::WriteReq::Index { id: Some("2".into()), source: json!({"g": "POINT (30 40)", "bad": true}).to_string(), routing: None, cond: Default::default() },
+    ];
+    for r in svc.write(reqs, false) {
+        r.unwrap();
+    }
+    svc.refresh().unwrap();
+    for agg in [json!({"geo_bounds": {"field": "r"}}), json!({"geo_centroid": {"field": "r"}}), json!({"geotile_grid": {"field": "r", "precision": 2}})] {
+        let e = crate::ml::search(&node, "rs", &json!({"size": 0, "aggs": {"a": agg.clone()}})).unwrap_err();
+        assert!(format!("{e:?}").contains("boom"), "{agg}: {e:?}");
+        // The no-emission control: one shape, no error.
+        let mut ok = agg.clone();
+        let t = ok.as_object().unwrap().keys().next().unwrap().clone();
+        ok[&t]["field"] = json!("q");
+        let r = crate::ml::search(&node, "rs", &json!({"size": 0, "aggs": {"a": ok}})).unwrap();
+        assert!(!r["aggregations"]["a"].is_null(), "{r}");
+    }
+    let r = crate::ml::search(&node, "rs", &json!({"size": 0, "aggs": {"a": {"geo_centroid": {"field": "q"}}}})).unwrap();
+    assert_eq!(r["aggregations"]["a"]["count"], 1, "{r}");
+}
+
+/// #264: a has_child / has_parent search past its `timeout` answers partial
+/// results with `timed_out: true` (ES), not an error.
+#[test]
+fn join_search_past_its_timeout_answers_timed_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(tmp.path()).unwrap();
+    node.create_index("qa", &json!({"settings": {"number_of_shards": 1}, "mappings": {"properties": {"rel": {"type": "join", "relations": {"question": "answer"}}}}})).unwrap();
+    let svc = node.get_index("qa").unwrap();
+    let mut reqs = Vec::new();
+    for i in 0..20000 {
+        reqs.push(crate::index::WriteReq::Index { id: Some(format!("p{i}")), source: json!({"rel": "question"}).to_string(), routing: None, cond: Default::default() });
+        reqs.push(crate::index::WriteReq::Index { id: Some(format!("c{i}")), source: json!({"rel": {"name": "answer", "parent": format!("p{i}")}}).to_string(), routing: Some(format!("p{i}")), cond: Default::default() });
+    }
+    for r in svc.write(reqs, false) {
+        r.unwrap();
+    }
+    svc.refresh().unwrap();
+    for q in [json!({"has_child": {"type": "answer", "query": {"match_all": {}}}}), json!({"has_parent": {"parent_type": "question", "query": {"match_all": {}}}})] {
+        let full = crate::ml::search(&node, "qa", &json!({"query": q, "track_total_hits": true})).unwrap();
+        assert_eq!(full["timed_out"], false);
+        assert_eq!(full["hits"]["total"]["value"], 20000);
+        // A 1ms timeout over 20,000 joined pairs: never an error; a partial
+        // answer is always flagged (some attempt does time out).
+        let mut timed_out = false;
+        for _ in 0..10 {
+            let r = crate::ml::search(&node, "qa", &json!({"query": q, "timeout": "1ms", "track_total_hits": true})).unwrap();
+            if r["timed_out"] == true {
+                timed_out = true;
+                break;
+            }
+            assert_eq!(r["hits"]["total"]["value"], 20000, "an unflagged answer is complete: {r}");
+        }
+        assert!(timed_out, "{q}: the 1ms search never timed out");
+    }
+}
+
+/// #327: a sealed segment of one-triangle polygons is not a segment of
+/// points: CONTAINS of an area inside a triangle matches it (hits and
+/// counts); points still contain no area.
+#[test]
+fn contains_area_matches_one_triangle_polygons() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(tmp.path()).unwrap();
+    for (name, docs) in [
+        ("tri", vec![json!({"g": "POLYGON ((0 0, 10 0, 0 10, 0 0))"}), json!({"g": "POLYGON ((20 20, 30 20, 20 30, 20 20))"})]),
+        ("pts", vec![json!({"g": "POINT (2 2)"}), json!({"g": "POINT (25 25)"})]),
+    ] {
+        let svc = node.create_index(name, &json!({"settings": {"number_of_shards": 1}, "mappings": {"properties": {"g": {"type": "geo_shape"}}}})).unwrap();
+        let w = docs.iter().enumerate().map(|(i, d)| crate::index::WriteReq::Index { id: Some(i.to_string()), source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        svc.flush().unwrap();
+    }
+    let q = json!({"geo_shape": {"g": {"shape": {"type": "envelope", "coordinates": [[1, 3], [3, 1]]}, "relation": "contains"}}});
+    let r = crate::ml::search(&node, "tri", &json!({"query": q, "track_total_hits": true})).unwrap();
+    assert_eq!(r["hits"]["total"]["value"], 1, "{r}");
+    assert_eq!(r["hits"]["hits"][0]["_id"], "0");
+    let r = crate::ml::search(&node, "tri", &json!({"size": 0, "query": q, "track_total_hits": true})).unwrap();
+    assert_eq!(r["hits"]["total"]["value"], 1, "count: {r}");
+    let r = crate::ml::search(&node, "pts", &json!({"query": q, "track_total_hits": true})).unwrap();
+    assert_eq!(r["hits"]["total"]["value"], 0, "{r}");
 }

@@ -76,7 +76,7 @@ fn http_ssl_is_off_unless_enabled() {
     assert!(http(&[]).unwrap().is_none());
     assert!(http(&[("enabled", "false"), ("certificate", "missing.crt")]).unwrap().is_none());
     let e = http(&[("enabled", "yes")]).unwrap_err();
-    assert_eq!(e, "Failed to parse value [yes] for setting [xpack.security.http.ssl.enabled] as only [true] or [false] are allowed.");
+    assert_eq!(e, "Failed to parse value [yes] as only [true] or [false] are allowed.");
 }
 
 #[test]

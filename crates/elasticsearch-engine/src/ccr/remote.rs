@@ -6,11 +6,14 @@
 //! `proxy_address` (proxy). An alias without addresses does not exist
 //! (`no_such_remote_cluster_exception`).
 //!
-//! The leader side of every CCR operation goes through [`LeaderCluster`].
-//! This engine does not implement an ES remote transport client. Configured
-//! addresses (including local/member addresses) therefore remain disconnected.
-//! Never substitute this node's indices for a remote cluster: that fabricates
-//! successful CCS/CCR results without a remote handshake or authorization.
+//! Connections are the cluster layer's: the node crate's remote cluster
+//! service opens them over its transport and reports their live state here
+//! ([`set_remote_connections`]); `_remote/info`, the CCS planner and the
+//! connection errors below read it. An engine without that service (the
+//! standalone engine, unit tests) has no remote transport, so every
+//! configured remote stays disconnected. Never substitute this node's
+//! indices for a remote cluster: that fabricates successful CCS/CCR results
+//! without a remote handshake or authorization.
 
 use crate::error::{EsError, Result};
 use crate::index::IndexService;
@@ -22,8 +25,51 @@ use std::sync::Arc;
 /// `transport_address`).
 pub const TRANSPORT_ADDRESS: &str = "127.0.0.1:9300";
 
+/// Live remote cluster connections, supplied by the cluster layer.
+pub trait RemoteConnections: Send + Sync {
+    /// Connected remote nodes (sniff) or sockets (proxy) of `alias`.
+    fn connected(&self, alias: &str) -> usize;
+    /// Why `alias` is not connected now (the last connect failure), if it is not.
+    fn connection_error(&self, alias: &str) -> Option<EsError>;
+    /// Whether `cluster.remote.<alias>.credentials` (API key based remote
+    /// cluster security) is in the keystore.
+    fn has_credentials(&self, _alias: &str) -> bool {
+        false
+    }
+}
+
+type ConnectionsRegistry = parking_lot::RwLock<std::collections::HashMap<std::path::PathBuf, Arc<dyn RemoteConnections>>>;
+
+fn connections_registry() -> &'static ConnectionsRegistry {
+    static R: std::sync::OnceLock<ConnectionsRegistry> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// A node's engines (engine 0 under `<path.data>/engine`, shard engines
+/// under `<path.data>/engine-shard-<k>`) share one remote cluster service.
+fn connections_key(node: &Node) -> std::path::PathBuf {
+    node.data.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| node.data.clone())
+}
+
+/// Install (or with `None` remove) the remote connections of `node`'s cluster layer.
+pub fn set_remote_connections(node: &Node, connections: Option<Arc<dyn RemoteConnections>>) {
+    let key = connections_key(node);
+    match connections {
+        Some(c) => {
+            connections_registry().write().insert(key, c);
+        }
+        None => {
+            connections_registry().write().remove(&key);
+        }
+    }
+}
+
+fn connections(node: &Node) -> Option<Arc<dyn RemoteConnections>> {
+    connections_registry().read().get(&connections_key(node)).cloned()
+}
+
 /// `cluster.remote.<alias>.<key>` (transient, persistent, then node settings).
-fn remote_setting(node: &Node, alias: &str, key: &str) -> Option<Value> {
+pub fn remote_setting(node: &Node, alias: &str, key: &str) -> Option<Value> {
     let full = format!("cluster.remote.{alias}.{key}");
     let nested = |m: &serde_json::Map<String, Value>| -> Option<Value> {
         if let Some(v) = m.get(&full) {
@@ -95,12 +141,24 @@ pub fn no_such_remote(alias: &str) -> EsError {
 /// sniff mode fails on the last seed with `ConnectTransportException`
 /// (`status()` is BAD_GATEWAY, 502; message `[node name][address] msg`, a seed
 /// node's name is empty); proxy mode with `NoSeedNodeLeftException` (500).
+/// Live connections of remote cluster `alias` (0: unavailable, or no
+/// remote cluster service).
+pub fn connected(node: &Node, alias: &str) -> usize {
+    connections(node).map_or(0, |c| c.connected(alias))
+}
+
 pub fn connection_error(node: &Node, alias: &str) -> EsError {
     let addresses = remote_addresses(node, alias);
     let Some(address) = addresses.last() else {
         return no_such_remote(alias);
     };
-    tracing::debug!(alias, "remote cluster transport is not implemented: the remote cluster is unreachable");
+    if let Some(e) = connections(node).and_then(|c| c.connection_error(alias)) {
+        return e;
+    }
+    if connections(node).is_some() {
+        // ES `RemoteConnectionManager.getAnyRemoteConnection` with no connection.
+        return EsError::new(502, "connect_transport_exception", format!("Unable to connect to [{alias}]"));
+    }
     let mode = remote_setting(node, alias, "mode").and_then(|v| v.as_str().map(str::to_ascii_lowercase)).unwrap_or_else(|| "sniff".into());
     if mode == "proxy" {
         let server_name = remote_setting(node, alias, "server_name").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "null".into());
@@ -115,6 +173,14 @@ pub fn connection_error(node: &Node, alias: &str) -> EsError {
 fn split_remote(part: &str) -> Option<(&str, &str)> {
     if part.starts_with('<') { return None; }
     part.split_once(':').filter(|(alias, indices)| !alias.is_empty() && !indices.starts_with(':'))
+}
+
+/// Whether one part of an index expression names a remote cluster
+/// (`alias:index`, also excluded: `-alias:index`). A component selector
+/// (`index::failures`) and date math (`<index-{now/d{...|+12:00}}>`) are
+/// local names, though they contain `:`.
+pub fn is_remote_part(part: &str) -> bool {
+    split_remote(part.trim()).is_some()
 }
 
 /// Whether an index expression names any remote cluster (syntax only).
@@ -141,6 +207,8 @@ pub struct CcsPlan {
     /// The local parts of the expression, in order.
     pub local: Vec<String>,
     pub skipped: Vec<SkippedRemote>,
+    /// Connected remote clusters to read: (alias, index expressions).
+    pub remote: Vec<(String, Vec<String>)>,
 }
 
 impl CcsPlan {
@@ -270,8 +338,12 @@ pub fn skip_unavailable(node: &Node, alias: &str) -> bool {
 pub fn ccs_plan(node: &Node, expr: &str) -> Result<CcsPlan> {
     let info = remote_info(node);
     let (local, remote_indices) = group_indices(node, expr)?;
-    let mut plan = CcsPlan { local, skipped: Vec::new() };
+    let mut plan = CcsPlan { local, skipped: Vec::new(), remote: Vec::new() };
     for (alias, indices) in remote_indices {
+        if connections(node).is_some_and(|c| c.connected(&alias) > 0) {
+            plan.remote.push((alias, indices));
+            continue;
+        }
         let error = connection_error(node, &alias);
         if !info[&alias]["skip_unavailable"].as_bool().unwrap_or(true) {
             return Err(error);
@@ -297,11 +369,25 @@ pub fn resolve_cluster_remotes(node: &Node, expr: Option<&str>) -> Result<(Optio
     Ok(((!local.is_empty()).then(|| local.join(",")), entries))
 }
 
-/// [`Node::resolve`] for APIs that accept cross-cluster expressions: the
+/// [`Node::resolve`] for engine APIs that read only this cluster: the
 /// remote parts are planned (required remotes fail, optional ones are
 /// skipped) and only the local part resolves; a purely remote expression
-/// resolves to nothing rather than to every local index.
+/// resolves to nothing rather than to every local index. A remote cluster
+/// that is connected cannot be read through these engine paths (the
+/// cluster layer serves cross-cluster reads): rather than silently leaving
+/// its data out, the request fails.
 pub fn resolve_local_part(node: &Node, expr: &str, opts: crate::node::ResolveOpts) -> Result<(Vec<crate::search::Target>, Option<CcsPlan>)> {
+    let (targets, plan) = resolve_parts(node, expr, opts)?;
+    if let Some(p) = plan.as_ref().filter(|p| !p.remote.is_empty()) {
+        let named: Vec<String> = p.remote.iter().flat_map(|(a, i)| i.iter().map(move |i| format!("{a}:{i}"))).collect();
+        return Err(EsError::illegal_argument(format!("Cross-cluster calls are not supported in this context but remote indices were requested: [{}]", named.join(", "))));
+    }
+    Ok((targets, plan))
+}
+
+/// [`resolve_local_part`] that keeps the connected remote clusters in the
+/// plan ([`CcsPlan::remote`]) for a caller that reads them itself.
+pub fn resolve_parts(node: &Node, expr: &str, opts: crate::node::ResolveOpts) -> Result<(Vec<crate::search::Target>, Option<CcsPlan>)> {
     if !has_remote_expression(expr) {
         return Ok((node.resolve(expr, opts)?, None));
     }
@@ -311,6 +397,36 @@ pub fn resolve_local_part(node: &Node, expr: &str, opts: crate::node::ResolveOpt
         None => Vec::new(),
     };
     Ok((targets, Some(plan)))
+}
+
+/// Inner-id prefix of a cross-cluster point in time (the cluster layer's
+/// `front::ccs`): `<node id>.~c<hex(JSON {cluster alias ("" = local): id})>`.
+pub const CCS_PIT_PREFIX: &str = "~c";
+
+/// Hex of `bytes` (cross-cluster point in time ids).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// [`hex_encode`]'s inverse.
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect()
+}
+
+/// The per-cluster ids of a cross-cluster point in time id (wrapped with
+/// its node id or not); `None` for any other id.
+pub fn ccs_pit_ids(id: &str) -> Option<serde_json::Map<String, Value>> {
+    let inner = id.split_once('.').map(|(_, i)| i).filter(|i| i.starts_with(CCS_PIT_PREFIX)).unwrap_or(id);
+    let raw = hex_decode(inner.strip_prefix(CCS_PIT_PREFIX)?)?;
+    serde_json::from_slice::<Value>(&raw).ok()?.as_object().cloned()
+}
+
+/// A cross-cluster point in time that holds no local part.
+pub fn remote_only_pit(id: &str) -> bool {
+    ccs_pit_ids(id).is_some_and(|ids| !ids.is_empty() && !ids.contains_key(""))
 }
 
 /// A connected leader cluster.
@@ -401,6 +517,201 @@ impl LeaderCluster {
     }
 }
 
+/// `cluster.remote.<alias>.mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteMode {
+    Sniff,
+    Proxy,
+}
+
+/// Every setting of one remote cluster alias (ES `RemoteClusterSettings`),
+/// with ES's defaults and fallbacks applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteConfig {
+    pub alias: String,
+    pub mode: RemoteMode,
+    /// `seeds` (sniff).
+    pub seeds: Vec<String>,
+    /// `proxy` (sniff mode, undocumented): connect through this address.
+    pub sniff_proxy: Option<String>,
+    /// `proxy_address` (proxy).
+    pub proxy_address: Option<String>,
+    /// `server_name` (proxy).
+    pub server_name: Option<String>,
+    /// `skip_unavailable` (true by default in 9.x).
+    pub skip_unavailable: bool,
+    /// `transport.ping_schedule` (falls back to the node's), millis; `None`: off.
+    pub ping_schedule_millis: Option<u64>,
+    /// `transport.compress` (falls back to the node's): `true`, `false`, `indexing_data`.
+    pub compress: String,
+    /// `node_connections` (sniff; falls back to `cluster.remote.connections_per_cluster`, 3).
+    pub node_connections: u64,
+    /// `proxy_socket_connections` (proxy; 18).
+    pub proxy_socket_connections: u64,
+}
+
+fn setting_text(v: Value) -> String {
+    match v {
+        Value::String(s) => s,
+        other => other.to_string(),
+    }
+}
+
+/// `cluster.remote.initial_connect_timeout` (node setting, 30s).
+pub fn initial_connect_timeout(node: &Node) -> String {
+    node.node_settings.read().get("cluster.remote.initial_connect_timeout").filter(|v| !v.is_null()).cloned().map(setting_text).unwrap_or_else(|| "30s".into())
+}
+
+/// `cluster.remote.node.attr` (node setting): only remote nodes with this
+/// attribute set to `true` are connected to.
+pub fn gateway_node_attr(node: &Node) -> Option<String> {
+    node.node_settings.read().get("cluster.remote.node.attr").filter(|v| !v.is_null()).cloned().map(setting_text)
+}
+
+fn node_setting_text(node: &Node, key: &str) -> Option<String> {
+    let ns = node.node_settings.read();
+    let mut v = ns.get(key).cloned();
+    if v.is_none() {
+        let mut cur = Some(&*ns);
+        let mut found = None;
+        for (i, part) in key.split('.').enumerate() {
+            let next = cur.and_then(|m| m.get(part));
+            if i == key.split('.').count() - 1 {
+                found = next.cloned();
+            }
+            cur = next.and_then(Value::as_object);
+        }
+        v = found;
+    }
+    v.filter(|v| !v.is_null()).map(setting_text)
+}
+
+/// The configuration of `alias` (whether or not it is enabled).
+pub fn remote_config(node: &Node, alias: &str) -> RemoteConfig {
+    let text = |k: &str| remote_setting(node, alias, k).map(setting_text);
+    let mode = match text("mode").map(|m| m.to_ascii_lowercase()).as_deref() {
+        Some("proxy") => RemoteMode::Proxy,
+        _ => RemoteMode::Sniff,
+    };
+    let seeds = remote_setting(node, alias, "seeds").map(|v| str_list(&v)).unwrap_or_default();
+    let skip_default = !crate::node::ES_VERSION.starts_with("8.");
+    let ping = text("transport.ping_schedule").or_else(|| node_setting_text(node, "transport.ping_schedule"));
+    let ping_schedule_millis = ping.and_then(|p| crate::date::parse_time_value(&p)).filter(|ms| *ms > 0).map(|ms| ms as u64);
+    let compress = text("transport.compress").or_else(|| node_setting_text(node, "transport.compress")).unwrap_or_else(|| "indexing_data".into()).to_ascii_lowercase();
+    let per_cluster = node_setting_text(node, "cluster.remote.connections_per_cluster").and_then(|s| s.parse::<u64>().ok()).unwrap_or(3);
+    RemoteConfig {
+        alias: alias.to_string(),
+        mode,
+        seeds,
+        sniff_proxy: text("proxy").filter(|s| !s.is_empty()),
+        proxy_address: text("proxy_address").filter(|s| !s.is_empty()),
+        server_name: text("server_name").filter(|s| !s.is_empty()),
+        skip_unavailable: text("skip_unavailable").map(|s| s == "true").unwrap_or(skip_default),
+        ping_schedule_millis,
+        compress,
+        node_connections: text("node_connections").and_then(|s| s.parse::<u64>().ok()).unwrap_or(per_cluster).max(1),
+        proxy_socket_connections: text("proxy_socket_connections").and_then(|s| s.parse::<u64>().ok()).unwrap_or(18).max(1),
+    }
+}
+
+/// The configuration of every enabled alias.
+pub fn remote_configs(node: &Node) -> std::collections::BTreeMap<String, RemoteConfig> {
+    remote_aliases(node).into_iter().map(|a| (a.clone(), remote_config(node, &a))).collect()
+}
+
+/// `RemoteConnectionStrategy.parseConfiguredAddress` / `parsePort`.
+pub fn parse_remote_address(address: &str) -> Result<(String, u16)> {
+    let Some(i) = address.rfind(':') else {
+        return Err(EsError::illegal_argument(format!("remote hosts need to be configured as [host:port], found [{address}] instead")));
+    };
+    let (host, port) = (&address[..i], &address[i + 1..]);
+    let port: i64 = port.parse().map_err(|_| EsError::illegal_argument("failed to parse port"))?;
+    if port <= 0 || port > u16::MAX as i64 {
+        return Err(EsError::illegal_argument(format!("port number must be > 0 but was: [{port}]")));
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok((host.to_string(), port as u16))
+}
+
+/// The keys of one alias's settings in a flat map (`cluster.remote.<alias>.<key>`).
+fn remote_keys(settings: &serde_json::Map<String, Value>) -> Vec<(String, String, Value)> {
+    let flat = crate::settings::flatten(&Value::Object(settings.clone()));
+    flat.into_iter()
+        .filter_map(|(k, v)| {
+            let rest = k.strip_prefix("cluster.remote.")?;
+            let (alias, key) = rest.split_once('.')?;
+            if matches!(alias, "node" | "connections_per_cluster" | "initial_connect_timeout" | "connect") {
+                return None;
+            }
+            Some((alias.to_string(), key.to_string(), v))
+        })
+        .collect()
+}
+
+/// `RemoteClusterSettings` validation of a cluster settings update, given
+/// the persistent and transient settings it would leave (ES checks every
+/// alias's mode-specific settings against its mode, rejects transport and
+/// `skip_unavailable` settings of an alias that is not enabled, and parses
+/// every address).
+pub fn validate_remote_settings(persistent: &serde_json::Map<String, Value>, transient: &serde_json::Map<String, Value>, node_settings: &serde_json::Map<String, Value>) -> Result<()> {
+    let mut by_alias: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>> = Default::default();
+    for source in [node_settings, persistent, transient] {
+        for (alias, key, v) in remote_keys(source) {
+            let entry = by_alias.entry(alias).or_default();
+            if v.is_null() {
+                entry.remove(&key);
+            } else {
+                entry.insert(key, v);
+            }
+        }
+    }
+    for (alias, keys) in by_alias {
+        if alias.is_empty() {
+            return Err(EsError::illegal_argument("remote clusters must not have the empty string as its key"));
+        }
+        let mode = keys.get("mode").map(|v| setting_text(v.clone()).to_ascii_lowercase()).unwrap_or_else(|| "sniff".into());
+        let configured = match mode.as_str() {
+            "sniff" | "proxy" => mode.to_ascii_uppercase(),
+            other => return Err(EsError::illegal_argument(format!("No enum constant org.elasticsearch.transport.RemoteConnectionStrategy.ConnectionStrategy.{}", other.to_ascii_uppercase()))),
+        };
+        for (key, v) in &keys {
+            let wanted = match key.as_str() {
+                "seeds" | "proxy" | "node_connections" => Some("SNIFF"),
+                "proxy_address" | "proxy_socket_connections" | "server_name" => Some("PROXY"),
+                _ => None,
+            };
+            if let Some(wanted) = wanted {
+                let empty = match v {
+                    Value::Array(a) => a.is_empty(),
+                    Value::String(s) => s.is_empty(),
+                    _ => false,
+                };
+                if wanted != configured && !empty {
+                    return Err(EsError::illegal_argument(format!(
+                        "Setting \"cluster.remote.{alias}.{key}\" cannot be used with the configured \"cluster.remote.{alias}.mode\" [required={wanted}, configured={configured}]"
+                    )));
+                }
+            }
+        }
+        let addresses: Vec<String> = if configured == "PROXY" {
+            keys.get("proxy_address").map(str_list).unwrap_or_default()
+        } else {
+            keys.get("seeds").map(str_list).unwrap_or_default()
+        };
+        for a in &addresses {
+            parse_remote_address(a)?;
+        }
+        if addresses.is_empty() {
+            for key in keys.keys() {
+                if key.starts_with("transport.") || key == "skip_unavailable" {
+                    return Err(EsError::illegal_argument(format!("Cannot configure setting [cluster.remote.{alias}.{key}] if remote cluster is not enabled.")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `GET /_remote/info` (`RemoteConnectionInfo.toXContent` per alias).
 pub fn remote_info(node: &Node) -> Value {
     let mut out = serde_json::Map::new();
@@ -408,7 +719,8 @@ pub fn remote_info(node: &Node) -> Value {
     for alias in remote_aliases(node) {
         let mode = remote_setting(node, &alias, "mode").and_then(|v| v.as_str().map(str::to_ascii_lowercase)).unwrap_or_else(|| "sniff".into());
         let addrs = remote_addresses(node, &alias);
-        let connected = false;
+        let live = connections(node).map(|c| c.connected(&alias)).unwrap_or(0);
+        let connected = live > 0;
         let setting = |k: &str| remote_setting(node, &alias, k).map(|v| match v {
             Value::String(s) => s,
             other => other.to_string(),
@@ -419,16 +731,19 @@ pub fn remote_info(node: &Node) -> Value {
         if mode == "proxy" {
             m.insert("proxy_address".into(), Value::String(addrs.first().cloned().unwrap_or_default()));
             m.insert("server_name".into(), Value::String(setting("server_name").unwrap_or_default()));
-            m.insert("num_proxy_sockets_connected".into(), Value::from(if connected { 18 } else { 0 }));
+            m.insert("num_proxy_sockets_connected".into(), Value::from(live));
             m.insert("max_proxy_socket_connections".into(), Value::from(setting("proxy_socket_connections").and_then(|s| s.parse::<u64>().ok()).unwrap_or(18)));
         } else {
             m.insert("seeds".into(), Value::Array(addrs.iter().cloned().map(Value::String).collect()));
-            m.insert("num_nodes_connected".into(), Value::from(if connected { 1 } else { 0 }));
-            m.insert("max_connections_per_cluster".into(), Value::from(setting("node_connections").and_then(|s| s.parse::<u64>().ok()).unwrap_or(3)));
+            m.insert("num_nodes_connected".into(), Value::from(live));
+            m.insert("max_connections_per_cluster".into(), Value::from(remote_config(node, &alias).node_connections));
         }
-        m.insert("initial_connect_timeout".into(), Value::String("30s".into()));
+        m.insert("initial_connect_timeout".into(), Value::String(initial_connect_timeout(node)));
         let skip = setting("skip_unavailable").map(|s| s == "true").unwrap_or(skip_default);
         m.insert("skip_unavailable".into(), Value::Bool(skip));
+        if connections(node).is_some_and(|c| c.has_credentials(&alias)) {
+            m.insert("cluster_credentials".into(), Value::String("::es_redacted::".into()));
+        }
         out.insert(alias, Value::Object(m));
     }
     Value::Object(out)

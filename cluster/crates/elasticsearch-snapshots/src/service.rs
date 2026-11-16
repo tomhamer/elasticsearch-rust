@@ -142,6 +142,25 @@ pub struct CreateSnapshotRequest {
     pub node_id: Option<String>,
     /// Snapshots the shards marked [`ShardSnapshotInput::remote`].
     pub remote: Option<RemoteUploader>,
+    /// The cluster's current metadata of an index (`None`: no such index),
+    /// read once every shard image is captured ([`IndexMetadataSource`]).
+    pub current_index_metadata: Option<IndexMetadataSource>,
+}
+
+/// ES finalizes a snapshot with the index metadata of the cluster state at
+/// finalization (`SnapshotsService.metadataForSnapshot`): mappings only
+/// grow, so a mapping read after every shard image was frozen covers every
+/// field those images hold. The metadata captured when the snapshot
+/// started may predate a field a later image indexes (production review
+/// #131). An index whose incarnation (UUID) changed meanwhile fails its
+/// shards: its images cannot be paired with either metadata.
+#[derive(Clone)]
+pub struct IndexMetadataSource(pub Arc<dyn Fn(&str) -> Option<Value> + Send + Sync>);
+
+impl std::fmt::Debug for IndexMetadataSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IndexMetadataSource")
+    }
 }
 
 /// Parsed body of `PUT _snapshot/{repo}/{snap}`; the node resolves `indices`
@@ -879,6 +898,31 @@ impl SnapshotsService {
                 .unwrap_or("_na_")
                 .to_string()
         };
+        // The metadata each index is published with: the cluster's, read
+        // now that every image is captured, for the same incarnation.
+        let mut final_metadata: BTreeMap<String, Value> = BTreeMap::new();
+        if let Some(source) = &req.current_index_metadata {
+            for i in &req.indices {
+                let captured = index_uuid(i);
+                let current = (source.0)(&i.index_name);
+                let current_uuid = current.as_ref().and_then(|m| crate::restore::flat_settings(m).get("index.uuid").and_then(|v| v.as_str()).map(str::to_string));
+                match current {
+                    Some(m) if current_uuid.as_deref() == Some(captured.as_str()) || captured == "_na_" => {
+                        final_metadata.insert(i.index_name.clone(), m);
+                    }
+                    _ => {
+                        let reason = format!("index [{}] was deleted or re-created while it was snapshotted", i.index_name);
+                        for st in running.shards[&i.index_name].values() {
+                            let mut st = st.lock();
+                            if st.stage != ShardStage::Failure {
+                                st.stage = ShardStage::Failure;
+                                st.reason = Some(reason.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut total = 0u32;
         for i in &req.indices {
             for s in &i.shards {
@@ -937,11 +981,28 @@ impl SnapshotsService {
                 .map(|i| FinalizeIndex {
                     name: i.index_name.clone(),
                     index_id: index_ids[&i.index_name].clone(),
-                    metadata: i.index_metadata_json.clone(),
+                    metadata: final_metadata.get(&i.index_name).cloned().unwrap_or_else(|| i.index_metadata_json.clone()),
                     shard_count: shard_count_of(i),
                 })
                 .collect(),
-            global_metadata: if req.include_global_state { req.global_metadata_json.clone() } else { None },
+            // Without global state the snapshot still describes its data
+            // streams (ES writes their metadata with every snapshot), so
+            // they can be restored whole.
+            global_metadata: if req.include_global_state {
+                req.global_metadata_json.clone()
+            } else if !req.data_streams.is_empty() {
+                req.global_metadata_json.as_ref().map(|g| {
+                    let streams: serde_json::Map<String, Value> = g["customs"][crate::restore::DATA_STREAMS_CUSTOM]
+                        .as_object()
+                        .map(|m| m.iter().filter(|(k, _)| req.data_streams.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default();
+                    let mut customs = Map::new();
+                    customs.insert(crate::restore::DATA_STREAMS_CUSTOM.to_string(), Value::Object(streams));
+                    json!({ "customs": customs })
+                })
+            } else {
+                None
+            },
             obsolete_shard_gens: obsolete,
         };
         repo.finalize_snapshot(finalize).await?;

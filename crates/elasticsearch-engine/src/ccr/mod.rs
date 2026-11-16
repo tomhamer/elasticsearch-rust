@@ -24,7 +24,7 @@
 //! The leader is reached through [`remote::LeaderCluster`].
 
 pub mod remote;
-mod task;
+pub mod task;
 
 use crate::error::{EsError, Result};
 use crate::index::IndexService;
@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use task::follow_stats_json;
+pub use task::{op_size, retermed, retry_delay, shard_status_json, should_retry, ShardTaskView};
 
 /// `CcrSettings.CCR_FOLLOWING_INDEX_SETTING`.
 pub const FOLLOWING_INDEX_SETTING: &str = "index.xpack.ccr.following_index";
@@ -228,22 +229,22 @@ impl FollowParams {
         }
     }
 
-    pub(crate) fn read_ops(&self) -> usize {
+    pub fn read_ops(&self) -> usize {
         self.max_read_request_operation_count.unwrap_or(DEFAULT_MAX_READ_REQUEST_OPERATION_COUNT).max(1) as usize
     }
-    pub(crate) fn read_bytes(&self) -> u64 {
+    pub fn read_bytes(&self) -> u64 {
         self.max_read_request_size.as_ref().map(|s| s.0).unwrap_or(32 << 20).max(1)
     }
-    pub(crate) fn write_ops(&self) -> usize {
+    pub fn write_ops(&self) -> usize {
         self.max_write_request_operation_count.unwrap_or(DEFAULT_MAX_WRITE_REQUEST_OPERATION_COUNT).max(1) as usize
     }
-    pub(crate) fn write_bytes(&self) -> u64 {
+    pub fn write_bytes(&self) -> u64 {
         self.max_write_request_size.as_ref().map(|s| s.0).unwrap_or(i64::MAX as u64).max(1)
     }
-    pub(crate) fn retry_delay_ms(&self) -> i64 {
+    pub fn retry_delay_ms(&self) -> i64 {
         self.max_retry_delay.as_ref().map(|s| s.0).unwrap_or(500).max(1)
     }
-    pub(crate) fn poll_timeout_ms(&self) -> i64 {
+    pub fn poll_timeout_ms(&self) -> i64 {
         self.read_poll_timeout.as_ref().map(|s| s.0).unwrap_or(60_000).max(1)
     }
 }
@@ -326,6 +327,9 @@ fn non_replicated(key: &str) -> bool {
         "index.routing.allocation.include._tier_preference",
         "index.bloom_filter_for_id_field.enabled",
         "index.verified_read_only",
+        // A follower runs its own lifecycle (ES: an ILM policy set on the
+        // follower, e.g. with `unfollow`; the leader's is not imposed).
+        "index.lifecycle.name",
     ];
     const PREFIX: &[&str] = &[
         "index.routing.allocation.exclude.",
@@ -345,7 +349,7 @@ pub fn filter_settings(s: &FlatSettings) -> FlatSettings {
 }
 
 /// `Settings.toString()`.
-fn settings_string(s: &FlatSettings) -> String {
+pub fn settings_string(s: &FlatSettings) -> String {
     let m: Map<String, Value> = s.iter().map(|(k, v)| (k.clone(), Value::String(setting_str(v)))).collect();
     Value::Object(m).to_string()
 }
@@ -359,7 +363,7 @@ fn setting_str(v: &Value) -> String {
 }
 
 /// Is `key` a registered index-scope setting (`IndexScopedSettings.get`)?
-fn known_index_setting(key: &str) -> bool {
+pub fn known_index_setting(key: &str) -> bool {
     static KNOWN: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let known = KNOWN.get_or_init(|| crate::settings::index_defaults(&FlatSettings::new()).into_keys().collect());
     const GROUPS: &[&str] = &[
@@ -410,7 +414,7 @@ fn known_index_setting(key: &str) -> bool {
 }
 
 /// Request `settings`: flattened, values as strings.
-fn parse_settings(parser: &str, v: &Value) -> Result<FlatSettings> {
+pub fn parse_settings(parser: &str, v: &Value) -> Result<FlatSettings> {
     match v {
         Value::Object(_) => Ok(crate::settings::flatten(v).into_iter().map(|(k, v)| {
             let v = match v {
@@ -462,7 +466,7 @@ impl AutoFollowPattern {
     }
 
     /// `AutoFollowPattern.match` for a leader index (or its data stream).
-    fn matches(&self, name: &str, data_stream: Option<&str>) -> bool {
+    pub fn matches(&self, name: &str, data_stream: Option<&str>) -> bool {
         auto_follow_match(&self.leader_index_patterns, &self.leader_index_exclusion_patterns, name, data_stream)
     }
 }
@@ -472,7 +476,7 @@ fn simple_match_any(patterns: &[String], name: &str) -> bool {
 }
 
 /// `AutoFollowPattern.match`.
-fn auto_follow_match(patterns: &[String], exclusions: &[String], name: &str, data_stream: Option<&str>) -> bool {
+pub fn auto_follow_match(patterns: &[String], exclusions: &[String], name: &str, data_stream: Option<&str>) -> bool {
     if !is_system_index(name) && !simple_match_any(exclusions, name) && simple_match_any(patterns, name) {
         return true;
     }
@@ -545,6 +549,9 @@ pub struct CcrService {
     worker: AtomicBool,
     /// A cluster's way of changing a follower's metadata (`None`: in place).
     pub(crate) metadata_hook: parking_lot::RwLock<Option<FollowerMetadataHook>>,
+    /// The node (set when follow work starts): ILM's `unfollow` steps run
+    /// from a lifecycle pass, which holds only a `&Node`.
+    node: parking_lot::RwLock<std::sync::Weak<Node>>,
 }
 
 /// What a follower's metadata sync changes (the leader's mapping, the
@@ -602,7 +609,7 @@ pub fn service(node: &Node) -> Arc<CcrService> {
         .or_insert_with(|| {
             let path = state_path(&node.data);
             let st: Persisted = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-            Arc::new(CcrService { path, connector: parking_lot::RwLock::new(LeaderCluster::connect), st: Mutex::new(st), rt: task::Runtime::default(), worker: AtomicBool::new(false), metadata_hook: parking_lot::RwLock::new(None) })
+            Arc::new(CcrService { path, connector: parking_lot::RwLock::new(LeaderCluster::connect), st: Mutex::new(st), rt: task::Runtime::default(), worker: AtomicBool::new(false), metadata_hook: parking_lot::RwLock::new(None), node: parking_lot::RwLock::new(std::sync::Weak::new()) })
         })
         .clone()
 }
@@ -641,6 +648,7 @@ impl CcrService {
 
     /// Start the follow/auto-follow thread unless it runs.
     pub(crate) fn ensure_worker(self: &Arc<Self>, node: &Arc<Node>) {
+        *self.node.write() = Arc::downgrade(node);
         if !self.st.lock().has_work() {
             return;
         }
@@ -764,7 +772,7 @@ impl PutFollowRequest {
         Ok(r)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let mut errs = Vec::new();
         self.params.validate(&mut errs);
         if self.remote_cluster.is_none() {
@@ -1101,7 +1109,7 @@ fn resume_follow_inner(node: &Arc<Node>, svc: &Arc<CcrService>, follower: &str, 
 }
 
 /// `TransportPauseFollowAction`.
-pub fn pause_follow(node: &Arc<Node>, follower: &str) -> Result<()> {
+pub fn pause_follow(node: &Node, follower: &str) -> Result<()> {
     let fsvc = node.get_index(follower).ok_or_else(|| EsError::index_not_found(follower))?;
     let svc = service(node);
     let mut st = svc.st.lock();
@@ -1155,7 +1163,65 @@ pub fn unfollow(node: &Arc<Node>, follower: &str) -> Result<()> {
     Ok(())
 }
 
-fn java_exception_class(kind: &str) -> String {
+/// ILM `wait-for-follow-shard-tasks` (ES `WaitForFollowShardTasksStep`)
+/// judged on a follow stats response (`GET <index>/_ccr/stats`): `None`
+/// when every shard follow task's follower global checkpoint reached the
+/// leader's, else the step info naming the tasks still behind.
+pub fn follow_tasks_in_sync(stats: &Value) -> Option<Value> {
+    let behind: Vec<Value> = stats["indices"].as_array().into_iter().flatten()
+        .flat_map(|i| i["shards"].as_array().cloned().unwrap_or_default())
+        .filter(|t| t["leader_global_checkpoint"].as_i64() != t["follower_global_checkpoint"].as_i64())
+        .map(|t| json!({"follower_index": t["follower_index"], "shard_id": t["shard_id"],
+            "leader_global_checkpoint": t["leader_global_checkpoint"], "follower_global_checkpoint": t["follower_global_checkpoint"]}))
+        .collect();
+    (!behind.is_empty()).then(|| json!({"message": format!("Waiting for [{}] shard follow tasks to be in sync", behind.len()), "shard_follow_tasks": behind}))
+}
+
+/// The follower is no longer followed / not a follower: ILM's pause and
+/// unfollow steps treat these answers as already done (ES ignores them).
+pub fn already_unfollowed(reason: &str) -> bool {
+    reason.contains("no shard follow tasks") || reason.contains("is not a follower index") || reason.contains("is not following")
+}
+
+/// ILM `unfollow` steps on this node's follower `follower` (ES
+/// `UnfollowAction`): `Ok(Some(info))` while a wait step waits.
+pub fn ilm_unfollow_step(node: &Node, follower: &str, step: &str) -> Result<Option<Value>> {
+    let svc = node.get_index(follower).ok_or_else(|| EsError::index_not_found(follower))?;
+    let ignore = |r: Result<()>| match r {
+        Err(e) if already_unfollowed(&e.reason) => Ok(()),
+        other => other,
+    };
+    match step {
+        "wait-for-follow-shard-tasks" => Ok(follow_stats(node, follower).ok().and_then(|v| follow_tasks_in_sync(&v))),
+        "pause-follower-index" => ignore(pause_follow(node, follower)).map(|_| None),
+        "close-follower-index" => {
+            if svc.is_open() {
+                svc.set_open(false)?;
+            }
+            Ok(None)
+        }
+        "unfollow-follower-index" => {
+            let Some(arc) = service(node).node.read().upgrade() else {
+                // No follow work ever ran here: nothing to convert.
+                return if svc.setting(FOLLOWING_INDEX_SETTING).as_deref() == Some("true") {
+                    Err(EsError::new(500, "illegal_state_exception", format!("CCR is not running on this node: cannot unfollow [{follower}]")))
+                } else {
+                    Ok(None)
+                };
+            };
+            ignore(unfollow(&arc, follower)).map(|_| None)
+        }
+        "open-follower-index" => {
+            if !svc.is_open() {
+                svc.set_open(true)?;
+            }
+            Ok(None)
+        }
+        other => Err(EsError::internal(format!("unknown unfollow step [{other}]"))),
+    }
+}
+
+pub fn java_exception_class(kind: &str) -> String {
     match kind {
         "no_such_remote_cluster_exception" => "org.elasticsearch.transport.NoSuchRemoteClusterException".into(),
         "connect_transport_exception" => "org.elasticsearch.transport.ConnectTransportException".into(),
@@ -1371,6 +1437,15 @@ const PUT_PATTERN_PARSER: &str = "put_auto_follow_pattern_request";
 
 /// `PUT /_ccr/auto_follow/{name}` (`TransportPutAutoFollowPatternAction`).
 pub fn put_auto_follow_pattern(node: &Arc<Node>, name: &str, body: &Value) -> Result<()> {
+    let parsed = parse_auto_follow_pattern(name, body)?;
+    check_license(node)?;
+    let AutoFollowPattern { remote_cluster, leader_index_patterns: patterns, leader_index_exclusion_patterns: exclusions, follow_index_pattern: follow_pattern, settings, params, .. } = parsed;
+    put_auto_follow_pattern_parsed(node, name, remote_cluster, patterns, exclusions, follow_pattern, settings, params)
+}
+
+/// `PutAutoFollowPatternAction.Request` parsing and validation (the
+/// pattern as it would be stored, active), without contacting the leader.
+pub fn parse_auto_follow_pattern(name: &str, body: &Value) -> Result<AutoFollowPattern> {
     let o = match body {
         Value::Object(o) => o.clone(),
         Value::Null => return Err(EsError::new(400, "parse_exception", "request body is required")),
@@ -1443,13 +1518,23 @@ pub fn put_auto_follow_pattern(node: &Arc<Node>, name: &str, body: &Value) -> Re
     if !errs.is_empty() {
         return Err(EsError::action_validation(&errs.iter().map(String::as_str).collect::<Vec<_>>()));
     }
-    check_license(node)?;
     let replicated = filter_settings(&settings);
     if !replicated.is_empty() {
         return Err(EsError::illegal_argument(format!("can not put auto-follow pattern that could override leader settings {}", settings_string(&replicated))));
     }
-    let remote_cluster = remote_cluster.unwrap_or_default();
-    let patterns = patterns.unwrap_or_default();
+    Ok(AutoFollowPattern {
+        remote_cluster: remote_cluster.unwrap_or_default(),
+        leader_index_patterns: patterns.unwrap_or_default(),
+        leader_index_exclusion_patterns: exclusions,
+        follow_index_pattern: follow_pattern,
+        settings,
+        active: true,
+        params,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_auto_follow_pattern_parsed(node: &Arc<Node>, name: &str, remote_cluster: String, patterns: Vec<String>, exclusions: Vec<String>, follow_pattern: Option<String>, settings: FlatSettings, params: FollowParams) -> Result<()> {
     let leader = service(node).connect(node, &remote_cluster)?;
     leader.check_license()?;
     let svc = service(node);
@@ -1488,7 +1573,7 @@ pub fn put_auto_follow_pattern(node: &Arc<Node>, name: &str, body: &Value) -> Re
     Ok(())
 }
 
-fn pattern_missing(name: &str) -> EsError {
+pub fn pattern_missing(name: &str) -> EsError {
     EsError::resource_not_found(format!("auto-follow pattern [{name}] is missing"))
 }
 
@@ -1546,7 +1631,7 @@ pub fn activate_auto_follow_pattern(node: &Arc<Node>, name: &str, active: bool) 
 }
 
 /// `AutoFollower.getFollowerIndexName`.
-fn follower_index_name(pattern: &AutoFollowPattern, leader: &str) -> String {
+pub fn follower_index_name(pattern: &AutoFollowPattern, leader: &str) -> String {
     match &pattern.follow_index_pattern {
         None => leader.to_string(),
         Some(fp) => {

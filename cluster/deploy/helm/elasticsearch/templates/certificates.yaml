@@ -1,0 +1,81 @@
+{{- $t := .Values.security.tls }}
+{{- if and .Values.security.enabled (eq $t.provider "cert-manager") }}
+{{- $root := . }}
+{{- $cluster := include "es.clusterName" . }}
+{{- $cm := $t.certManager }}
+{{- if not $cm.issuerRef.name }}
+# A CA for this cluster: self-signed root -> CA Certificate -> CA Issuer.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $cluster }}-selfsigned
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "es.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $cluster }}-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "es.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ printf "%s Elasticsearch CA" $cluster | quote }}
+  secretName: {{ $cluster }}-ca
+  duration: 43800h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: {{ $cluster }}-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $cluster }}-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "es.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ $cluster }}-ca
+{{- end }}
+{{- range $kind := list "http" "transport" }}
+{{- $own := ternary $t.http.secretName $t.transport.secretName (eq $kind "http") }}
+{{- if and (not $own) (or (eq $kind "transport") $t.http.enabled) }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $cluster }}-{{ $kind }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "es.labels" $root | nindent 4 }}
+spec:
+  secretName: {{ $cluster }}-{{ $kind }}-certs
+  commonName: {{ ternary (include "es.serviceHost" $root) (printf "%s-transport" $cluster) (eq $kind "http") | quote }}
+  duration: {{ $cm.duration }}
+  renewBefore: {{ $cm.renewBefore }}
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+    rotationPolicy: Always
+  usages: [server auth, client auth, digital signature, key encipherment]
+  dnsNames:
+    {{- include "es.httpDnsNames" $root | fromJsonArray | toYaml | nindent 4 }}
+  ipAddresses:
+    {{- include "es.httpIPs" $root | fromJsonArray | toYaml | nindent 4 }}
+  issuerRef:
+    name: {{ include "es.certManagerIssuerName" $root }}
+    kind: {{ $cm.issuerRef.kind | default "Issuer" }}
+    group: {{ $cm.issuerRef.group | default "cert-manager.io" }}
+{{- end }}
+{{- end }}
+{{- end }}

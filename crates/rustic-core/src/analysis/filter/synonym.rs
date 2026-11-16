@@ -211,6 +211,17 @@ impl SynonymFilter {
         Ok(Self { synonyms, ignore_case: false, keep_original: true, explicit })
     }
 
+    /// Build from rules already parsed (and their words analyzed) into
+    /// `(input, output)` term sequences; inputs in `explicit` come from
+    /// `=>` rules and are replaced, the others keep their original tokens.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (Vec<String>, Vec<String>)>, explicit: impl IntoIterator<Item = Vec<String>>) -> Self {
+        let mut synonyms = SynonymMap::default();
+        for (input, output) in pairs {
+            synonyms.add(input, output);
+        }
+        Self { synonyms, ignore_case: false, keep_original: true, explicit: explicit.into_iter().map(|k| (k, true)).collect() }
+    }
+
     /// Builder: case-insensitive matching. Rule terms (inputs and
     /// outputs) are lowercased, as Lucene does with `ignore_case`.
     pub fn ignore_case(mut self, yes: bool) -> Self {
@@ -238,6 +249,47 @@ impl SynonymFilter {
     }
 }
 
+/// A synonym match whose alternatives have different lengths (the graph
+/// Lucene's `SynonymGraphFilter` encodes with position lengths): each path
+/// lists the indices of its tokens in the filter's output, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SynonymGraphGroup {
+    pub paths: Vec<Vec<usize>>,
+}
+
+thread_local! {
+    static GRAPH: std::cell::RefCell<Option<Vec<SynonymGraphGroup>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (an analysis) recording the multi-word synonym graphs the
+/// synonym filters of this thread produce: query builders turn each into
+/// alternatives (ES `QueryBuilder.analyzeGraphBoolean`). Indices refer to
+/// the last synonym filter's output; `count` is that output's length (a
+/// later filter changing the token count invalidates them).
+pub fn record_graph<T>(f: impl FnOnce() -> T) -> (T, Vec<SynonymGraphGroup>, Option<usize>) {
+    let previous = GRAPH.with(|g| g.replace(Some(Vec::new())));
+    LAST_COUNT.with(|c| c.set(None));
+    let out = f();
+    let groups = GRAPH.with(|g| std::mem::replace(&mut *g.borrow_mut(), previous)).unwrap_or_default();
+    (out, groups, LAST_COUNT.with(|c| c.get()))
+}
+
+thread_local! {
+    static LAST_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a [`record_graph`] is recording on this thread.
+pub(crate) fn recording_graph() -> bool {
+    GRAPH.with(|g| g.borrow().is_some())
+}
+
+/// Publish a graph filter's groups (indices into its output of `count`
+/// tokens), replacing any earlier filter's (whose indices no longer hold).
+pub(crate) fn publish_graph(groups: Vec<SynonymGraphGroup>, count: usize) {
+    GRAPH.with(|g| if let Some(all) = g.borrow_mut().as_mut() { *all = groups; });
+    LAST_COUNT.with(|c| c.set(Some(count)));
+}
+
 impl TokenFilter for SynonymFilter {
     fn clone_box(&self) -> Box<dyn TokenFilter> {
         Box::new(self.clone())
@@ -249,6 +301,8 @@ impl TokenFilter for SynonymFilter {
         }
         let keys: Vec<String> = tokens.iter().map(|t| self.key(t)).collect();
         let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+        let recording = GRAPH.with(|g| g.borrow().is_some());
+        let mut groups: Vec<SynonymGraphGroup> = Vec::new();
         let mut shift: u32 = 0; // accumulated position shift
         let mut i = 0;
         while i < tokens.len() {
@@ -274,12 +328,16 @@ impl TokenFilter for SynonymFilter {
                     let base_pos = input[0].position + shift;
                     let is_explicit = self.explicit.contains_key(&keys[i..i + len].to_vec());
                     let mut longest_out = 0usize;
+                    let mut paths: Vec<Vec<usize>> = Vec::new();
                     if self.keep_original && !is_explicit {
+                        let mut path = Vec::new();
                         for (k, t) in input.iter().enumerate() {
                             let mut t = t.clone();
                             t.position = base_pos + k as u32;
+                            path.push(out.len());
                             out.push(t);
                         }
+                        paths.push(path);
                     }
                     for o in outs {
                         // Skip outputs identical to the input (already emitted).
@@ -287,25 +345,47 @@ impl TokenFilter for SynonymFilter {
                             continue;
                         }
                         longest_out = longest_out.max(o.len());
+                        paths.push((out.len()..out.len() + o.len()).collect());
                         for (k, word) in o.iter().enumerate() {
                             out.push(Token {
                                 text: word.clone(),
                                 position: base_pos + k as u32,
                                 offset_from: input[0].offset_from,
-                                offset_to: input[len - 1].offset_to,
-                            });
+                                offset_to: input[len - 1].offset_to, keyword: false });
                         }
                     }
                     if longest_out > len {
                         shift += (longest_out - len) as u32;
+                    }
+                    // Alternatives of different lengths form a graph.
+                    if recording && paths.len() > 1 && paths.iter().any(|p| p.len() != paths[0].len()) {
+                        groups.push(SynonymGraphGroup { paths });
                     }
                     i += len;
                 }
             }
         }
         // Keep stream ordered by position (stable), as Lucene emits it.
-        out.sort_by_key(|t| t.position);
-        out
+        let mut order: Vec<usize> = (0..out.len()).collect();
+        order.sort_by_key(|&i| out[i].position);
+        if recording {
+            let mut moved = vec![0usize; out.len()];
+            for (new, &old) in order.iter().enumerate() {
+                moved[old] = new;
+            }
+            for g in &mut groups {
+                for p in &mut g.paths {
+                    for i in p.iter_mut() {
+                        *i = moved[*i];
+                    }
+                }
+            }
+            let n = out.len();
+            GRAPH.with(|g| if let Some(all) = g.borrow_mut().as_mut() { *all = groups; });
+            LAST_COUNT.with(|c| c.set(Some(n)));
+        }
+        let mut slots: Vec<Option<Token>> = out.into_iter().map(Some).collect();
+        order.into_iter().map(|i| slots[i].take().expect("each token once")).collect()
     }
 }
 
@@ -324,7 +404,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, w)| {
-                let t = Token { text: w.to_string(), position: i as u32, offset_from: off, offset_to: off + w.len() as u32 };
+                let t = Token { text: w.to_string(), position: i as u32, offset_from: off, offset_to: off + w.len() as u32, keyword: false };
                 off += w.len() as u32 + 1;
                 t
             })

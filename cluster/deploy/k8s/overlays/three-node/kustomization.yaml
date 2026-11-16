@@ -1,4 +1,5 @@
 # Three master-eligible data nodes.
+#   cluster/deploy/k8s/create-secrets.sh elasticsearch    # certificates + elastic password, once
 #   kubectl apply -k cluster/deploy/k8s/overlays/three-node
 # After `GET _cluster/health` answers, remove bootstrap-configmap.yaml from
 # `resources` and `kubectl delete configmap -n elasticsearch elasticsearch-bootstrap`

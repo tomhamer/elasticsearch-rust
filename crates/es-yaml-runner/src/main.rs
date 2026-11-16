@@ -39,6 +39,9 @@ struct Args {
     verbose: bool,
     /// Include the x-pack security suites (`tests/es-yaml/xpack-test`).
     xpack: bool,
+    /// Exit 0 even when executed assertions fail (a run compared against a
+    /// known-failures baseline); runner errors still fail.
+    allow_failures: bool,
 }
 
 fn parse_args() -> Args {
@@ -52,6 +55,7 @@ fn parse_args() -> Args {
         json: None,
         verbose: false,
         xpack: false,
+        allow_failures: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -74,6 +78,7 @@ fn parse_args() -> Args {
                 }
             }
             "-v" | "--verbose" => a.verbose = true,
+            "--allow-failures" => a.allow_failures = true,
             // x-pack security suites against a security-enabled node (ES's XPackRestIT setup)
             "--security" => {
                 a.xpack = true;
@@ -94,7 +99,7 @@ fn parse_args() -> Args {
                 compat::COMPAT.store(v, std::sync::atomic::Ordering::Relaxed);
             }
             "-h" | "--help" => {
-                eprintln!("usage: es-yaml-runner [--filter <dir|path substr>]... [--test <name substr>] [--jobs N] [--report [file]] [--json file] [-v] [--security | --xpack] [--no-xpack] [--compat 8]");
+                eprintln!("usage: es-yaml-runner [--filter <dir|path substr>]... [--test <name substr>] [--jobs N] [--report [file]] [--json file] [-v] [--security | --xpack] [--no-xpack] [--compat 8] [--allow-failures]\nexit status: 0 all executed cases passed; 1 an assertion failed (unless --allow-failures); 3 a runner error (a file task panicked, a report could not be written)");
                 std::process::exit(0);
             }
             other => {
@@ -188,12 +193,15 @@ fn main() {
     let results: Vec<TestResult> = rt.block_on(async {
         let sem = Arc::new(tokio::sync::Semaphore::new(args.jobs.max(1)));
         let mut set = tokio::task::JoinSet::new();
+        // Each file task's file: a panicking task becomes a failed result.
+        let mut task_files: std::collections::HashMap<tokio::task::Id, String> = std::collections::HashMap::new();
         for (rel, path) in files {
+            let task_rel = rel.clone();
             let sem = sem.clone();
             let specs = specs.clone();
             let test_filter = args.test.clone();
             let transforms = transforms.clone();
-            set.spawn(async move {
+            let handle = set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore");
                 let dir = rel.split('/').next().unwrap_or("").to_string();
                 let text = match std::fs::read_to_string(&path) {
@@ -224,12 +232,18 @@ fn main() {
                 }
                 out
             });
+            task_files.insert(handle.id(), task_rel);
         }
         let mut all = Vec::new();
         while let Some(r) = set.join_next().await {
             match r {
                 Ok(v) => all.extend(v),
-                Err(e) => eprintln!("file task panicked: {e}"),
+                Err(e) => {
+                    let file = task_files.get(&e.id()).cloned().unwrap_or_else(|| "<unknown>".into());
+                    eprintln!("file task for {file} panicked: {e}");
+                    all.push(TestResult { dir: file.split('/').next().unwrap_or("").to_string(), file, name: "<file task>".into(),
+                        outcome: Outcome::Fail { msg: e.to_string(), category: RUNNER_PANIC.into() } });
+                }
             }
         }
         all
@@ -260,12 +274,70 @@ fn main() {
         started.elapsed().as_secs_f64()
     );
     println!("Scope: selected YAML cases. A pass rate is not full ES9 parity; failures and excluded/skipped cases must be reviewed.");
+    let mut report_errors = 0;
     if let Some(p) = &args.json {
-        report::write_json(p, &results);
+        if let Err(e) = report::write_json(p, &results) {
+            eprintln!("could not write the JSON report {}: {e}", p.display());
+            report_errors += 1;
+        }
     }
     if let Some(p) = &args.report {
         let version = std::fs::read_to_string(args.suite.join("VERSION")).unwrap_or_else(|_| "unknown".into());
-        report::write_markdown(p, &results, version.trim(), &args.filters);
-        eprintln!("report written to {}", p.display());
+        match report::write_markdown(p, &results, version.trim(), &args.filters) {
+            Ok(()) => eprintln!("report written to {}", p.display()),
+            Err(e) => {
+                eprintln!("could not write the report {}: {e}", p.display());
+                report_errors += 1;
+            }
+        }
+    }
+    let code = exit_code(&results, args.allow_failures, report_errors);
+    if code != 0 {
+        eprintln!("exit status {code}: {fail} failed case(s), {report_errors} report write error(s)");
+    }
+    std::process::exit(code);
+}
+
+/// Category of a file task that panicked (its cases never reported).
+const RUNNER_PANIC: &str = "runner: file task panicked";
+
+/// The process status: 3 for a runner error (a file task panicked, a report
+/// could not be written), else 1 when an executed case failed (0 with
+/// `allow_failures`), else 0. A conformance gate reads it directly.
+fn exit_code(results: &[TestResult], allow_failures: bool, report_errors: usize) -> i32 {
+    let panicked = results.iter().any(|r| matches!(&r.outcome, Outcome::Fail { category, .. } if category == RUNNER_PANIC));
+    if panicked || report_errors > 0 {
+        return 3;
+    }
+    if !allow_failures && results.iter().any(|r| matches!(r.outcome, Outcome::Fail { .. })) {
+        return 1;
+    }
+    0
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    fn result(outcome: Outcome) -> TestResult {
+        TestResult { file: "f/a.yml".into(), dir: "f".into(), name: "t".into(), outcome }
+    }
+
+    /// #382: a failing assertion, a panicked file task and a report write
+    /// error each fail the process; passes and skips do not.
+    #[test]
+    fn failures_and_runner_errors_set_the_exit_status() {
+        let pass = [result(Outcome::Pass), result(Outcome::Skip("x".into()))];
+        assert_eq!(exit_code(&pass, false, 0), 0);
+        let failed = [result(Outcome::Pass), result(Outcome::Fail { msg: "m".into(), category: "match".into() })];
+        assert_eq!(exit_code(&failed, false, 0), 1);
+        assert_eq!(exit_code(&failed, true, 0), 0, "--allow-failures");
+        let panicked = [result(Outcome::Fail { msg: "boom".into(), category: RUNNER_PANIC.into() })];
+        assert_eq!(exit_code(&panicked, true, 0), 3);
+        assert_eq!(exit_code(&pass, false, 1), 3, "a report write error");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(report::write_json(&dir.path().join("missing/r.json"), &pass).is_err());
+        assert!(report::write_markdown(&dir.path().join("missing/r.md"), &pass, "9", &[]).is_err());
+        assert!(report::write_json(&dir.path().join("r.json"), &pass).is_ok());
     }
 }

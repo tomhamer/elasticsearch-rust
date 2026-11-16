@@ -37,6 +37,84 @@ pub fn regex_enabled() -> bool {
     MODE.load(Ordering::Relaxed) != 2
 }
 
+/// `script.painless.regex.limit-factor` (node scope, default 6, min 1).
+static LIMIT_FACTOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(6);
+
+/// Apply `script.painless.regex.enabled` and `script.painless.regex.limit-factor`
+/// from the node settings (static, as in ES: an invalid value fails the start).
+pub fn configure(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), crate::error::EsError> {
+    let text = |k: &str| settings.get(k).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()));
+    if let Some(v) = text("script.painless.regex.enabled") {
+        set_regex_mode(&v).map_err(crate::error::EsError::illegal_argument)?;
+    }
+    if let Some(v) = text("script.painless.regex.limit-factor") {
+        let n: i64 = v.parse().map_err(|_| crate::error::EsError::illegal_argument(format!("Failed to parse value [{v}] for setting [script.painless.regex.limit-factor]")))?;
+        if n < 1 {
+            return Err(crate::error::EsError::illegal_argument(format!("Failed to parse value [{v}] for setting [script.painless.regex.limit-factor] must be >= 1")));
+        }
+        LIMIT_FACTOR.store(n.min(u32::MAX as i64) as u32, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+pub fn limit_factor() -> u32 {
+    LIMIT_FACTOR.load(Ordering::Relaxed)
+}
+
+/// Regex work (input bytes times automaton size, in units of
+/// [`WORK_UNIT_BYTES`] of automaton) done on this thread since the last
+/// [`take_work`]: the script charges it as execution fuel.
+thread_local! {
+    static WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Automaton bytes one unit of work per input byte stands for.
+const WORK_UNIT_BYTES: u64 = 4096;
+/// Work a single match may do per unit of `limit-factor` (limited mode):
+/// the scan's input bytes times its automaton's size in
+/// [`WORK_UNIT_BYTES`] units. ES bounds what a (backtracking) matcher reads
+/// to `limit-factor` times the input; the automaton here reads each byte
+/// once per scan, so its cost is bounded by automaton size times input
+/// instead. 2^30 units per factor (6 by default: ~6.4e9) admits a 200 KiB
+/// Unicode-class automaton over megabytes of text and refuses only
+/// automaton/input combinations far beyond normal use.
+const WORK_PER_FACTOR: u64 = 1 << 30;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: a smaller [`WORK_PER_FACTOR`] on this thread only.
+    static TEST_WORK_PER_FACTOR: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The work [`capture`] did since the last call (and reset).
+pub fn take_work() -> u64 {
+    WORK.with(|w| w.replace(0))
+}
+
+fn charge_match(re: &CompiledRegex, input: &[u16]) -> R<()> {
+    let bytes = (input.len() as u64).saturating_mul(3).max(1);
+    let size = (re.memory_usage() as u64 / WORK_UNIT_BYTES).max(1);
+    let work = bytes.saturating_mul(size);
+    WORK.with(|w| w.set(w.get().saturating_add(work)));
+    // `script.painless.regex.enabled: true` is unlimited, as in ES.
+    if MODE.load(Ordering::Relaxed) == 0 {
+        let factor = limit_factor() as u64;
+        #[cfg(test)]
+        let per_factor = TEST_WORK_PER_FACTOR.with(|t| t.get()).unwrap_or(WORK_PER_FACTOR);
+        #[cfg(not(test))]
+        let per_factor = WORK_PER_FACTOR;
+        if work > factor.saturating_mul(per_factor) {
+            const MAX_STRING_OUTPUT: usize = 64;
+            let text = String::from_utf16_lossy(input);
+            let wrapped = if input.len() <= MAX_STRING_OUTPUT { text } else { format!("{}...", String::from_utf16_lossy(&input[..MAX_STRING_OUTPUT - 3])) };
+            return Err(ScriptErr::breaker(crate::error::EsError::new(429, "circuit_breaking_exception", format!(
+                "[scripting] Regular expression considered too many characters, limit factor: [{factor}], char limit: [{}], wrapped: [{wrapped}], this limit can be changed by the [script.painless.regex.limit-factor] setting",
+                (input.len() as u64).saturating_mul(factor)
+            ))));
+        }
+    }
+    Ok(())
+}
+
 pub const DISABLED_MSG: &str = "Regexes are disabled. Set [script.painless.regex.enabled] to [true] in elasticsearch.yaml to allow them. Be careful though, regexes break out of Painless's protection against deep recursion and long loops.";
 
 // ---- patterns -------------------------------------------------------------
@@ -159,9 +237,18 @@ pub struct PatternData {
 }
 
 fn translate(src: &str, flags: i32) -> String {
-    let mut body = if flags & LITERAL != 0 { regex::escape(src) } else { java_to_rust(src) };
+    // Java's defaults are ASCII: `\d \w \s \b` and case-insensitive
+    // matching only become Unicode-aware with `U` (UNICODE_CHARACTER_CLASS)
+    // or, for case folding, `u` (UNICODE_CASE). The regex crate is
+    // Unicode-aware by default, so the ASCII forms are spelled out here.
+    let ascii_case = flags & CASE_INSENSITIVE != 0 && flags & (UNICODE_CASE | UNICODE_CHARACTER_CLASS) == 0;
+    let mut body = if flags & LITERAL != 0 {
+        src.chars().map(|c| literal_atom(c, ascii_case, false)).collect()
+    } else {
+        java_to_rust(src, flags)
+    };
     let mut pre = String::new();
-    if flags & CASE_INSENSITIVE != 0 {
+    if flags & CASE_INSENSITIVE != 0 && !ascii_case {
         pre.push('i');
     }
     if flags & MULTILINE != 0 {
@@ -179,36 +266,165 @@ fn translate(src: &str, flags: i32) -> String {
     body
 }
 
-/// Rewrite the Java-only escapes the `regex` crate spells differently.
-fn java_to_rust(src: &str) -> String {
+/// A literal character: escaped; an ASCII letter under ASCII-only case
+/// folding matches both its cases (`in_class`: as class members).
+fn literal_atom(c: char, ascii_case: bool, in_class: bool) -> String {
+    if ascii_case && c.is_ascii_alphabetic() {
+        let (l, u) = (c.to_ascii_lowercase(), c.to_ascii_uppercase());
+        return if in_class { format!("{l}{u}") } else { format!("[{l}{u}]") };
+    }
+    regex::escape(&c.to_string())
+}
+
+/// The other-case counterparts of the ASCII letters in the class range `a-b`.
+fn ascii_case_ranges(a: char, b: char) -> String {
+    let mut out = String::new();
+    for (lo, hi, shift) in [('a', 'z', -32i32), ('A', 'Z', 32)] {
+        let (from, to) = (a.max(lo), b.min(hi));
+        if from <= to {
+            let m = |c: char| char::from_u32((c as i32 + shift) as u32).unwrap_or(c);
+            out.push_str(&format!("{}-{}", m(from), m(to)));
+        }
+    }
+    out
+}
+
+/// Rewrite the Java-only escapes the `regex` crate spells differently, and
+/// Java's ASCII defaults (see [`translate`]).
+fn java_to_rust(src: &str, flags: i32) -> String {
+    let ascii_classes = flags & UNICODE_CHARACTER_CLASS == 0;
+    let ascii_case = flags & CASE_INSENSITIVE != 0 && flags & (UNICODE_CASE | UNICODE_CHARACTER_CLASS) == 0;
+    let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
-    let mut it = src.chars().peekable();
-    let mut in_quote = false;
-    while let Some(c) = it.next() {
+    let (mut i, mut in_quote, mut class_depth) = (0usize, false, 0usize);
+    // Copy chars[i..] up to and including the first `end` verbatim.
+    let copy_through = |out: &mut String, i: &mut usize, end: char| {
+        while *i < chars.len() {
+            let c = chars[*i];
+            out.push(c);
+            *i += 1;
+            if c == end {
+                break;
+            }
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
         if in_quote {
-            if c == '\\' && it.peek() == Some(&'E') {
-                it.next();
+            if c == '\\' && chars.get(i + 1) == Some(&'E') {
+                i += 2;
                 in_quote = false;
             } else {
-                out.push_str(&regex::escape(&c.to_string()));
+                out.push_str(&literal_atom(c, ascii_case, class_depth > 0));
+                i += 1;
             }
             continue;
         }
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            Some('Q') => in_quote = true,
-            Some('Z') => out.push_str("(?:\\n?\\z)"),
-            Some('h') => out.push_str("[ \\t\\xA0]"),
-            Some('R') => out.push_str("(?:\\r\\n|[\\n\\r\\x0B\\f])"),
-            Some('e') => out.push_str("\\x1B"),
-            Some(n) => {
+        if c == '\\' {
+            let Some(&n) = chars.get(i + 1) else {
                 out.push('\\');
-                out.push(n);
+                i += 1;
+                continue;
+            };
+            i += 2;
+            match n {
+                'Q' => in_quote = true,
+                'Z' => out.push_str("(?:\\n?\\z)"),
+                'h' => out.push_str("[ \\t\\xA0]"),
+                'R' => out.push_str("(?:\\r\\n|[\\n\\r\\x0B\\f])"),
+                'e' => out.push_str("\\x1B"),
+                'd' if ascii_classes => out.push_str("[0-9]"),
+                'D' if ascii_classes => out.push_str("[^0-9]"),
+                'w' if ascii_classes => out.push_str("[a-zA-Z_0-9]"),
+                'W' if ascii_classes => out.push_str("[^a-zA-Z_0-9]"),
+                's' if ascii_classes => out.push_str("[ \\t\\n\\x0B\\f\\r]"),
+                'S' if ascii_classes => out.push_str("[^ \\t\\n\\x0B\\f\\r]"),
+                'b' if ascii_classes && class_depth == 0 => out.push_str("(?-u:\\b)"),
+                'B' if ascii_classes && class_depth == 0 => out.push_str("(?-u:\\B)"),
+                n => {
+                    out.push('\\');
+                    out.push(n);
+                    // Escape arguments are copied as written.
+                    match n {
+                        'x' | 'p' | 'P' | 'N' if chars.get(i) == Some(&'{') => copy_through(&mut out, &mut i, '}'),
+                        'x' => {
+                            for _ in 0..2 {
+                                if i < chars.len() {
+                                    out.push(chars[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        'u' => {
+                            for _ in 0..4 {
+                                if i < chars.len() {
+                                    out.push(chars[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        'p' | 'P' | 'c' => {
+                            if i < chars.len() {
+                                out.push(chars[i]);
+                                i += 1;
+                            }
+                        }
+                        'k' if chars.get(i) == Some(&'<') => copy_through(&mut out, &mut i, '>'),
+                        _ => {}
+                    }
+                }
             }
-            None => out.push('\\'),
+            continue;
+        }
+        if c == '(' && chars.get(i + 1) == Some(&'?') && class_depth == 0 {
+            // Group syntax (inline flags, names) is not literal text.
+            out.push_str("(?");
+            i += 2;
+            if chars.get(i) == Some(&'<') && !matches!(chars.get(i + 1), Some('=' | '!')) {
+                copy_through(&mut out, &mut i, '>');
+            } else if chars.get(i) == Some(&'P') && chars.get(i + 1) == Some(&'<') {
+                copy_through(&mut out, &mut i, '>');
+            } else {
+                while i < chars.len() && (chars[i].is_ascii_alphabetic() || chars[i] == '-') {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        match c {
+            '[' => {
+                class_depth += 1;
+                out.push(c);
+                i += 1;
+                // A leading `^` negates the class.
+                if chars.get(i) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+            }
+            ']' if class_depth > 0 => {
+                class_depth -= 1;
+                out.push(c);
+                i += 1;
+            }
+            _ if ascii_case && class_depth > 0 && chars.get(i + 1) == Some(&'-') && chars.get(i + 2).is_some_and(|d| !matches!(d, ']' | '\\' | '[')) => {
+                // A class range: both cases of its ASCII letters.
+                let d = chars[i + 2];
+                out.push(c);
+                out.push('-');
+                out.push(d);
+                out.push_str(&ascii_case_ranges(c, d));
+                i += 3;
+            }
+            _ if ascii_case && c.is_ascii_alphabetic() => {
+                out.push_str(&literal_atom(c, true, class_depth > 0));
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
     out
@@ -224,10 +440,419 @@ fn flag_letters(f: i32) -> String {
     s
 }
 
+/// Java `Pattern.CANON_EQ` (JDK 9+ `Pattern.normalize` + `NFCCharProperty`),
+/// which rewrites the pattern, not the input:
+///
+/// * Text outside character classes (`normalizeSlice`): each grapheme
+///   whose decomposition starts a non-spacing mark becomes an alternation
+///   of its spelling and every canonically equivalent one (mark orders and
+///   partial compositions, `produceEquivalentAlternation`); others with a
+///   different NFD / NFC become `(?:seq|nfd|nfc)`. Like Java, this pass
+///   does not know `\Q...\E`: a quoted composite gets the alternation text
+///   inside the quote, where it is literal.
+/// * A character class is NFC-normalized as text (`normalizeClazz`).
+/// * A top-level class or `\p` / `\P` property (`NFCCharProperty`) also
+///   matches a multi-code-point spelling whose NFC is one code point the
+///   class accepts: each is spelled out ahead of the class, longest first.
+///   (Java additionally refuses a lone base that a mark follows; without
+///   look-around that refusal is not expressed.)
+///
+/// The input is matched as written, so offsets and groups are its own.
+fn canon_expand(src: &str, flags: i32) -> R<String> {
+    let normalized = canon_normalize(src)?;
+    Ok(canon_wrap_properties(&normalized, flags))
+}
+
+/// Alternation spellings a single literal grapheme may produce before the
+/// pattern is refused (Java throws `OutOfMemoryError("Pattern too
+/// complex")` past 12 marks; this bounds the work well before that).
+const CANON_ALTERNATIONS: usize = 4096;
+
+fn canon_too_complex() -> Box<ScriptErr> {
+    let mut e = ScriptErr::new("illegal_argument_exception", "invalid regular expression: Pattern too complex");
+    e.compile = true;
+    e
+}
+
+fn nfc_str(s: &str) -> String {
+    icu_normalizer::ComposingNormalizer::new_nfc().normalize(s)
+}
+
+fn nfd_str(s: &str) -> String {
+    icu_normalizer::DecomposingNormalizer::new_nfd().normalize(s)
+}
+
+fn non_spacing_mark(c: char) -> bool {
+    static MN: OnceLock<regex::Regex> = OnceLock::new();
+    let mut buf = [0u8; 4];
+    MN.get_or_init(|| regex::Regex::new(r"^\p{Mn}$").expect("Mn class")).is_match(c.encode_utf8(&mut buf))
+}
+
+fn combining_class(c: char) -> u8 {
+    // Compiled data: constructing the map borrows static tables (and the
+    // map is not `Sync`, so it is not kept in a static).
+    icu_normalizer::properties::CanonicalCombiningClassMap::new().get(c).0
+}
+
+/// Java `Pattern.normalize`, including its bracket bookkeeping (a `char`
+/// depth that wraps, `\\` skipped only at top level).
+fn canon_normalize(p: &str) -> R<String> {
+    let mut out = String::with_capacity(p.len());
+    let (mut last, mut last_start, mut cc) = ('\0', 0usize, 0u16);
+    let mut it = p.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if cc == 0 && c == '\\' && it.peek().map(|&(_, n)| n) == Some('\\') {
+            it.next();
+            last = '\0';
+            continue;
+        }
+        if c == '[' && last != '\\' {
+            if cc == 0 {
+                if last_start < i {
+                    canon_slice(&p[last_start..i], &mut out)?;
+                }
+                last_start = i;
+            }
+            cc = cc.wrapping_add(1);
+        } else if c == ']' && last != '\\' {
+            cc = cc.wrapping_sub(1);
+            if cc == 0 {
+                out.push_str(&nfc_str(&p[last_start..i + 1]));
+                last_start = i + 1;
+            }
+        }
+        last = c;
+    }
+    if last_start < p.len() {
+        canon_slice(&p[last_start..], &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Java `Pattern.normalizeSlice`.
+fn canon_slice(s: &str, out: &mut String) -> R<()> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let Some(first) = s.bytes().position(|b| !b.is_ascii()) else {
+        out.push_str(s);
+        return Ok(());
+    };
+    // Back up over the ASCII character a mark may combine with.
+    let mut off = first.saturating_sub(1);
+    out.push_str(&s[..off]);
+    while off < s.len() {
+        let rest = &s[off..];
+        let ch0 = rest.chars().next().expect("non-empty");
+        if ".$|()[]{}^?*+\\".contains(ch0) {
+            out.push(ch0);
+            off += ch0.len_utf8();
+            continue;
+        }
+        let seq = rest.graphemes(true).next().expect("non-empty");
+        off += seq.len();
+        let nfd = nfd_str(seq);
+        let mut nfd_chars = nfd.chars();
+        if let (Some(_), Some(ch1)) = (nfd_chars.next(), nfd_chars.next()) {
+            if non_spacing_mark(ch1) {
+                let mut alts = vec![seq.to_string()];
+                canon_equivalents(&nfd, &mut alts)?;
+                out.push_str("(?:");
+                out.push_str(&alts.join("|"));
+                out.push(')');
+                continue;
+            }
+        }
+        let nfc = nfc_str(seq);
+        if seq != nfc && nfd != nfc {
+            out.push_str(&format!("(?:{seq}|{nfd}|{nfc})"));
+        } else if seq != nfd {
+            out.push_str(&format!("(?:{seq}|{nfd})"));
+        } else {
+            out.push_str(seq);
+        }
+    }
+    Ok(())
+}
+
+/// Java `Pattern.produceEquivalentAlternation` into an insertion-ordered set.
+fn canon_equivalents(src: &str, dst: &mut Vec<String>) -> R<()> {
+    let mut chars = src.chars();
+    let Some(base) = chars.next() else { return Ok(()) };
+    let marks = chars.as_str();
+    if marks.is_empty() {
+        canon_add(dst, src.to_string())?;
+        return Ok(());
+    }
+    for perm in canon_permutations(&marks.chars().collect::<Vec<_>>())? {
+        let mut next = String::with_capacity(src.len());
+        next.push(base);
+        next.extend(perm);
+        let composed = canon_compose_one_step(&next);
+        canon_add(dst, next)?;
+        if let Some(composed) = composed {
+            canon_equivalents(&composed, dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn canon_add(dst: &mut Vec<String>, s: String) -> R<()> {
+    if !dst.contains(&s) {
+        if dst.len() >= CANON_ALTERNATIONS {
+            return Err(canon_too_complex());
+        }
+        dst.push(s);
+    }
+    Ok(())
+}
+
+/// Java `Pattern.producePermutations`: orders of the marks, skipping those
+/// that only swap marks of one combining class (not equivalent).
+fn canon_permutations(marks: &[char]) -> R<Vec<Vec<char>>> {
+    match marks.len() {
+        0 | 1 => return Ok(vec![marks.to_vec()]),
+        2 => {
+            return Ok(if combining_class(marks[0]) == combining_class(marks[1]) {
+                vec![marks.to_vec()]
+            } else {
+                vec![marks.to_vec(), vec![marks[1], marks[0]]]
+            })
+        }
+        n if n > 12 => return Err(canon_too_complex()),
+        _ => {}
+    }
+    let mut out = Vec::new();
+    'outer: for x in 0..marks.len() {
+        for y in 0..x {
+            if combining_class(marks[y]) == combining_class(marks[x]) {
+                continue 'outer;
+            }
+        }
+        let mut others = marks.to_vec();
+        others.remove(x);
+        for sub in canon_permutations(&others)? {
+            if out.len() >= CANON_ALTERNATIONS {
+                return Err(canon_too_complex());
+            }
+            let mut p = Vec::with_capacity(marks.len());
+            p.push(marks[x]);
+            p.extend(sub);
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Java `Pattern.composeOneStep`.
+fn canon_compose_one_step(s: &str) -> Option<String> {
+    let mut it = s.char_indices();
+    it.next();
+    it.next();
+    let cut = it.next().map_or(s.len(), |(i, _)| i);
+    let composed = nfc_str(&s[..cut]);
+    (composed != s[..cut]).then(|| composed + &s[cut..])
+}
+
+/// Every code point with a multi-code-point canonical spelling, with those
+/// spellings (each NFC-composes back to the code point): what an
+/// `NFCCharProperty` can match beyond single code points.
+fn canon_composites() -> &'static [(char, Vec<String>)] {
+    static COMPOSITES: OnceLock<Vec<(char, Vec<String>)>> = OnceLock::new();
+    COMPOSITES.get_or_init(|| {
+        use icu_normalizer::properties::{CanonicalDecomposition, Decomposed};
+        let decomposition = CanonicalDecomposition::new();
+        let mut out = Vec::new();
+        for c in (0u32..=0x10FFFF).filter_map(char::from_u32) {
+            if matches!(decomposition.decompose(c), Decomposed::Default) {
+                continue;
+            }
+            let own = c.to_string();
+            if nfc_str(&own) != own {
+                continue; // never the NFC of anything
+            }
+            let nfd = nfd_str(&own);
+            if nfd.chars().count() < 2 {
+                continue;
+            }
+            let mut spellings = vec![nfd.clone()];
+            if canon_equivalents(&nfd, &mut spellings).is_err() {
+                continue;
+            }
+            spellings.retain(|s| s.chars().count() >= 2 && nfc_str(s) == own);
+            if !spellings.is_empty() {
+                out.push((c, spellings));
+            }
+        }
+        out
+    })
+}
+
+/// Wrap each top-level class and `\p` / `\P` property of the normalized
+/// pattern with the multi-code-point spellings it accepts (see
+/// [`canon_expand`]). `\Q...\E` stays literal.
+fn canon_wrap_properties(p: &str, flags: i32) -> String {
+    let chars: Vec<char> = p.chars().collect();
+    let mut out = String::with_capacity(p.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            match chars.get(i + 1) {
+                Some('Q') => {
+                    // Through the closing `\E` (or the end) unchanged.
+                    let mut j = i + 2;
+                    while j < chars.len() && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'E')) {
+                        j += 1;
+                    }
+                    let end = (j + 2).min(chars.len());
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                Some('p') | Some('P') => {
+                    let end = if chars.get(i + 2) == Some(&'{') {
+                        chars[i + 2..].iter().position(|&c| c == '}').map_or(chars.len(), |k| i + 2 + k + 1)
+                    } else {
+                        (i + 3).min(chars.len())
+                    };
+                    let atom: String = chars[i..end].iter().collect();
+                    out.push_str(&canon_wrap_atom(&atom, flags));
+                    i = end;
+                }
+                Some(&n) => {
+                    out.push(c);
+                    out.push(n);
+                    i += 2;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if c == '[' {
+            let end = class_end(&chars, i);
+            let atom: String = chars[i..end].iter().collect();
+            out.push_str(&canon_wrap_atom(&atom, flags));
+            i = end;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// End (exclusive) of the class opening at `start`: nested classes,
+/// escapes and quotes inside it, and a `]` first in a class is literal.
+fn class_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = start;
+    let mut first = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if chars.get(i + 1) == Some(&'Q') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '\\' && chars.get(i + 1) == Some(&'E')) {
+                    i += 1;
+                }
+                i += 2;
+                first = false;
+                continue;
+            }
+            '\\' => {
+                i += 2;
+                first = false;
+                continue;
+            }
+            '[' => {
+                depth += 1;
+                first = true;
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    i += 1;
+                }
+                continue;
+            }
+            ']' if !first => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        first = false;
+        i += 1;
+    }
+    chars.len()
+}
+
+/// `(?:spellings|atom)` for a class or property atom; the atom alone when
+/// it accepts no composite (or cannot be read as a code point class).
+fn canon_wrap_atom(atom: &str, flags: i32) -> String {
+    use regex_syntax::hir::{Class, HirKind};
+    let translated = translate(atom, flags & !(CANON_EQ | LITERAL));
+    let Ok(hir) = regex_syntax::ParserBuilder::new().build().parse(&translated) else {
+        return atom.to_string();
+    };
+    // A one-code-point class (`[é]`) is simplified to a literal.
+    let ranges: Vec<(char, char)> = match hir.kind() {
+        HirKind::Class(Class::Unicode(class)) => class.ranges().iter().map(|r| (r.start(), r.end())).collect(),
+        HirKind::Literal(lit) => {
+            let mut chars = std::str::from_utf8(&lit.0).ok().map(str::chars).into_iter().flatten();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => vec![(c, c)],
+                _ => return atom.to_string(),
+            }
+        }
+        _ => return atom.to_string(),
+    };
+    let contains = |c: char| {
+        ranges.binary_search_by(|&(lo, hi)| if hi < c { std::cmp::Ordering::Less } else if lo > c { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }).is_ok()
+    };
+    // Grouped by everything after the first code point: `[firsts]rest`.
+    let mut groups: std::collections::BTreeMap<(std::cmp::Reverse<usize>, String), Vec<char>> = std::collections::BTreeMap::new();
+    for (c, spellings) in canon_composites() {
+        if !contains(*c) {
+            continue;
+        }
+        for s in spellings {
+            let mut it = s.chars();
+            let head = it.next().expect("multi-code-point spelling");
+            let rest = it.as_str().to_string();
+            let firsts = groups.entry((std::cmp::Reverse(rest.chars().count()), rest)).or_default();
+            if !firsts.contains(&head) {
+                firsts.push(head);
+            }
+        }
+    }
+    if groups.is_empty() {
+        return atom.to_string();
+    }
+    let mut out = String::from("(?:");
+    for ((_, rest), firsts) in &groups {
+        out.push('[');
+        for f in firsts {
+            out.push_str(&format!("\\x{{{:X}}}", *f as u32));
+        }
+        out.push(']');
+        for r in rest.chars() {
+            out.push_str(&format!("\\x{{{:X}}}", r as u32));
+        }
+        out.push('|');
+    }
+    out.push_str(atom);
+    out.push(')');
+    out
+}
+
 pub fn compile_pattern(src: &str, flags: i32) -> R<PatternData> {
     let _text=Allocation::new();
     _text.reserve((src.len() as u64).saturating_mul(1024).saturating_add(8192))?;
-    let java=translate(src,flags);
+    // `Pattern.CANON_EQ` rewrites the pattern ([`canon_expand`]).
+    let expanded;
+    let pattern_text = if flags & CANON_EQ != 0 && flags & LITERAL == 0 { expanded = canon_expand(src, flags)?; expanded.as_str() } else { src };
+    let java=translate(pattern_text,flags);
     check_translation_depth(&java)?;
     let translated=super::regex_text::byte_pattern(&java);
     let re = compile_regex(&translated).map_err(|e| {
@@ -331,6 +956,8 @@ pub fn new_matcher_units(pat:&Arc<PatternData>,input:&[u16])->R<Val> {
 }
 fn capture(re:&Arc<CompiledRegex>,input:&[u16],from:usize)->R<Option<Caps>> {
     if from>input.len(){return Ok(None);}
+    // Every scan is bounded and charged (`script.painless.regex.limit-factor`).
+    charge_match(re,&input[from..])?;
     if Scope::current().is_none() {
         if let Some(native)=&re.native {
             let text=super::regex_text::Text::new(input,from);
@@ -531,6 +1158,38 @@ pub fn regex_op(find:bool,text:&Val,pat:&Val)->R<Val> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn match_work_is_budgeted_by_the_limit_factor() {
+        // Calibration: ordinary Unicode-class automata over 1 MiB of text
+        // stay well inside the default budget (sizes printed for tuning).
+        let input: Vec<u16> = "word 123 ünïcødé ".encode_utf16().cycle().take(1 << 20).collect();
+        for (pattern, flags) in [(r"\w+", UNICODE_CHARACTER_CLASS), (r"\p{L}+\s\p{L}+", 0), (r"[\p{L}\p{N}._-]+@[\p{L}\p{N}.-]+", UNICODE_CHARACTER_CLASS), (r"(?:\w+\s+){3}\d+", UNICODE_CHARACTER_CLASS)] {
+            let p = compile_pattern(pattern, flags).unwrap();
+            eprintln!("regex budget calibration: {pattern:?} automaton {} bytes", p.re.memory_usage());
+            take_work();
+            capture(&p.re, &input, 0).unwrap_or_else(|e| panic!("{pattern}: {}", e.msg));
+            assert!(take_work() > 0, "the scan was not charged");
+        }
+        // A budget too small for the scan fails it with ES's breaker message.
+        TEST_WORK_PER_FACTOR.with(|t| t.set(Some(10)));
+        let p = compile_pattern(r"\p{L}+x", 0).unwrap();
+        let e = capture(&p.re, &input, 0).expect_err("over budget");
+        TEST_WORK_PER_FACTOR.with(|t| t.set(None));
+        assert!(e.breaker.is_some());
+        assert!(e.msg.starts_with("[scripting] Regular expression considered too many characters, limit factor: [6], char limit: ["), "{}", e.msg);
+        assert!(e.msg.ends_with("this limit can be changed by the [script.painless.regex.limit-factor] setting"), "{}", e.msg);
+    }
+
+    #[test]
+    fn regex_settings_parse_like_es() {
+        let settings = |k: &str, v: &str| serde_json::json!({ k: v }).as_object().unwrap().clone();
+        assert!(configure(&settings("script.painless.regex.limit-factor", "0")).is_err());
+        assert!(configure(&settings("script.painless.regex.limit-factor", "x")).is_err());
+        assert!(configure(&settings("script.painless.regex.enabled", "maybe")).is_err());
+        assert!(configure(&settings("script.painless.regex.limit-factor", "6")).is_ok());
+        assert_eq!(limit_factor(), 6);
+    }
     #[test]
     fn metric_explicit_regex_cache_matches_native_captures_and_releases() {
         let _budget = rustic_core::admission::private_shared(256 << 20);

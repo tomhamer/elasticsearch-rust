@@ -6,7 +6,9 @@ use crate::error::{EsError, Result};
 use crate::node::{Node, ResolveOpts, NODE_ID};
 use crate::script::{self, ScriptContext, Val};
 use serde_json::{json, Map, Value};
+use crate::security::owner::StoredAuthn;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Execution context (`ctx`).
 #[derive(Clone)]
@@ -21,8 +23,9 @@ pub struct Ctx {
     pub vars: Value,
     /// Node data directory (stored scripts).
     pub data: std::path::PathBuf,
-    /// Security: the user the watch runs as (`None`: unrestricted).
-    pub user: Option<String>,
+    /// Security: the subject the watch runs as (`None`: security off, or a
+    /// watch stored with security off, which runs as the internal origin).
+    pub identity: Option<Arc<StoredAuthn>>,
 }
 
 impl Ctx {
@@ -68,15 +71,18 @@ pub struct ExecOptions {
     pub debug: bool,
     /// Manual trigger data (`triggered_time` / `scheduled_time`).
     pub trigger_data: Option<Value>,
-    /// Security: the user the execution runs as (recorded as `user`).
-    pub user: Option<String>,
+    /// Security: the subject the execution runs as (its principal is
+    /// recorded as `user`).
+    pub identity: Option<StoredAuthn>,
+    /// The `.triggered_watches` record this execution runs for (a recovered
+    /// trigger keeps its record id; `None`: a new one).
+    pub record_id: Option<String>,
 }
 
-/// Security check of `action` on index `name` for the watch's user.
-pub fn user_allowed(node: &Node, user: Option<&str>, action: &str, name: &str) -> bool {
-    let Some(u) = user else { return true };
-    let Some(a) = node.security.lookup_user(u) else { return false };
-    let perm = node.security.permission(&a);
+/// Security check of `action` on index `name` for the watch's subject.
+pub fn user_allowed(node: &Node, identity: Option<&StoredAuthn>, action: &str, name: &str) -> bool {
+    let Some(id) = identity else { return true };
+    let perm = node.security.permission(&id.to_authn());
     perm.is_superuser || perm.check_index(action, name)
 }
 
@@ -162,6 +168,29 @@ pub fn path_get<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 // ---------------------------------------------------------------------------
 
 /// Run a search request definition; returns `(response, rendered request)`.
+/// The body (and routing) a clustered search input sends for `targets`
+/// resolved here: the coordinator searches concrete indices, so each
+/// target's alias filter is carried as a filter on its `_index` (finding
+/// 204: a filtered alias keeps selecting only its documents), and the
+/// routing is kept when every target routes the same way.
+fn remote_search_body(body: &Value, targets: &[crate::search::Target]) -> (Value, Option<String>) {
+    let mut send = body.clone();
+    if targets.iter().any(|t| t.alias_filter.is_some()) {
+        let per_target: Vec<Value> = targets
+            .iter()
+            .map(|t| match &t.alias_filter {
+                Some(f) => json!({"bool": {"filter": [{"term": {"_index": t.svc.name}}, f]}}),
+                None => json!({"term": {"_index": t.svc.name}}),
+            })
+            .collect();
+        let query = send.get("query").cloned().unwrap_or_else(|| json!({"match_all": {}}));
+        send["query"] = json!({"bool": {"must": [query], "filter": [{"bool": {"should": per_target, "minimum_should_match": 1}}]}});
+    }
+    let first = targets.first().and_then(|t| t.routing.clone());
+    let routing = first.filter(|r| targets.iter().all(|t| t.routing.as_deref() == Some(r.as_str())));
+    (send, routing)
+}
+
 pub fn run_search(node: &Node, req: &Value, ctx: &Ctx) -> Result<(Value, Value)> {
     let cj = ctx.to_json();
     let indices: Vec<String> = match req.get("indices") {
@@ -212,21 +241,35 @@ pub fn run_search(node: &Node, req: &Value, ctx: &Ctx) -> Result<(Value, Value)>
     let rest_total = req.get("rest_total_hits_as_int").and_then(Value::as_bool).unwrap_or(true);
     let expr = if indices.is_empty() { "_all".to_string() } else { indices.join(",") };
     let mut targets = node.resolve(&expr, ResolveOpts::from_params(&p))?;
-    if ctx.user.is_some() {
-        // run as the watch's user: indices it may not read are skipped
-        // (the default indices options ignore unavailable indices)
-        targets.retain(|t| user_allowed(node, ctx.user.as_deref(), "indices:data/read/search", &t.svc.name));
+    if let Some(id) = ctx.identity.as_deref() {
+        // Run as the watch's subject: indices it may not read are skipped
+        // (the default indices options ignore unavailable indices), and its
+        // document / field level security applies to the rest.
+        const SEARCH: &str = "indices:data/read/search";
+        let authn = id.to_authn();
+        let perm = node.security.permission(&authn);
+        targets.retain(|t| perm.is_superuser || perm.check_index(SEARCH, &t.svc.name));
+        if perm.has_dls_fls() {
+            for t in targets.iter_mut() {
+                let a = perm.index_access(SEARCH, &[t.svc.name.as_str()], &authn)?;
+                t.access = Some(Arc::new(a)).filter(|a| a.is_restricted());
+            }
+        }
     }
     let mut sr = crate::search::parse_request(&body, &HashMap::new())?;
     sr.rest_total_hits_as_int = rest_total;
-    let resp: Value = match super::remote().filter(|_| !targets.is_empty()) {
+    let resp: Value = match super::remote_as(ctx.identity.as_deref())?.filter(|_| !targets.is_empty()) {
         // On a cluster: over every shard of the (permitted) targets.
         Some(rest) => {
             let mut names: Vec<String> = targets.iter().map(|t| t.svc.name.clone()).collect();
             names.sort();
             names.dedup();
-            let uri = format!("/{}/_search?ignore_unavailable=true&allow_no_indices=true&rest_total_hits_as_int={rest_total}", super::path_expr(&names.join(",")));
-            rest("POST", &uri, Some(body.clone()))?
+            let (send, routing) = remote_search_body(&body, &targets);
+            let mut uri = format!("/{}/_search?ignore_unavailable=true&allow_no_indices=true&rest_total_hits_as_int={rest_total}", super::path_expr(&names.join(",")));
+            if let Some(r) = routing {
+                uri.push_str(&format!("&routing={}", super::path_expr(&r)));
+            }
+            rest("POST", &uri, Some(send))?
         }
         None => {
             let out = crate::search::execute(&targets, &sr, &super::search_opts(node))?;
@@ -257,15 +300,42 @@ pub fn run_search(node: &Node, req: &Value, ctx: &Ctx) -> Result<(Value, Value)>
     Ok((resp, rendered))
 }
 
+/// `extract`: keep only the selected paths, structurally (ES
+/// `XContentFilterKeysUtils.filterMapOrdered`): parents stay objects, and a
+/// path through an array selects in every element (#585).
 fn apply_extract(payload: &mut Value, def: &Value) {
     if let Some(keys) = def.get("extract").and_then(Value::as_array) {
-        let mut m = Map::new();
-        for k in keys.iter().filter_map(Value::as_str) {
-            if let Some(v) = path_get(payload, k) {
-                m.insert(k.to_string(), v.clone());
+        let keys: Vec<&str> = keys.iter().filter_map(Value::as_str).collect();
+        *payload = match filter_keys(payload, "", &keys) {
+            Some(v @ Value::Object(_)) => v,
+            _ => json!({}),
+        };
+    }
+}
+
+fn filter_keys(v: &Value, path: &str, keys: &[&str]) -> Option<Value> {
+    if !path.is_empty() && keys.contains(&path) {
+        return Some(v.clone());
+    }
+    let under = |p: &str| keys.iter().any(|k| *k == p || (k.len() > p.len() && k.starts_with(p) && k.as_bytes()[p.len()] == b'.'));
+    match v {
+        Value::Object(o) => {
+            let mut out = Map::new();
+            for (k, child) in o {
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                if under(&p) {
+                    if let Some(c) = filter_keys(child, &p, keys) {
+                        out.insert(k.clone(), c);
+                    }
+                }
             }
+            (!out.is_empty() || path.is_empty()).then_some(Value::Object(out))
         }
-        *payload = Value::Object(m);
+        Value::Array(a) => {
+            let out: Vec<Value> = a.iter().filter_map(|e| filter_keys(e, path, keys)).collect();
+            (!out.is_empty()).then_some(Value::Array(out))
+        }
+        _ => None,
     }
 }
 
@@ -303,7 +373,7 @@ pub fn run_input(node: &Node, input: &Value, ctx: &Ctx) -> Value {
             if let Err(e) = actions::check_whitelist(node, &r) {
                 return fail(e);
             }
-            match httpc::send(&r) {
+            match httpc::send(node, &r) {
                 Err(e) => json!({"type": "http", "status": "failure", "error": actions::http_error(&r, &e), "http": {"request": r.to_json_sim()}}),
                 Ok(resp) => {
                     let body = resp.body_str();
@@ -427,19 +497,28 @@ fn as_num(v: &Value) -> Option<f64> {
     }
 }
 
-/// A comparison operand: rendered, with date math resolved to epoch millis.
+/// A comparison operand (ES `AbstractCompareCondition.resolveConfiguredValue`):
+/// `<{date math}>` resolves to epoch millis; `{{path}}` to the typed value
+/// at that execution-context path (objects, arrays, booleans and null
+/// keep their type, #582); any other string is literal.
 fn operand(v: &Value, ctx: &Value, now: i64) -> (Value, bool) {
     if let Value::String(s) = v {
-        let r = render(s, ctx);
-        let inner = r.strip_prefix("<{").and_then(|x| x.strip_suffix("}>")).unwrap_or(&r).to_string();
-        if inner.starts_with("now") || inner.contains("||") {
+        if let Some(inner) = s.strip_prefix("<{").and_then(|x| x.strip_suffix("}>")) {
             if let Ok(f) = crate::date::DateFormatter::new("strict_date_optional_time||epoch_millis") {
-                if let Ok(ms) = crate::date::parse_date_math(&inner, &f, crate::date::Tz::UTC, now, false) {
+                if let Ok(ms) = crate::date::parse_date_math(inner, &f, crate::date::Tz::UTC, now, false) {
                     return (json!(ms), true);
                 }
             }
+            return (v.clone(), false);
         }
-        return (Value::String(r), false);
+        if let Some(path) = s.strip_prefix("{{").and_then(|x| x.strip_suffix("}}")).filter(|p| !p.is_empty()) {
+            let path = path.trim();
+            let found = match path {
+                "ctx" => Some(ctx.clone()),
+                p => path_get(ctx, p.strip_prefix("ctx.").unwrap_or(p)).cloned(),
+            };
+            return (found.unwrap_or(Value::Null), false);
+        }
     }
     (v.clone(), false)
 }
@@ -633,7 +712,7 @@ fn throttle_reason(aid: &str, def: &Value, astatus: &Value, watch_throttle: Opti
 pub fn execute(node: &Node, svc: &WatcherService, watch_id: &str, src: &Value, doc_version: i64, scheduled: Option<i64>, triggered: i64, opts: &ExecOptions) -> Result<(String, Value)> {
     let start = crate::date::now_millis();
     let nanos = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
-    let rid = format!("{}_{}-{}", watch_id, uuid::Uuid::new_v4(), nanos);
+    let rid = opts.record_id.clone().unwrap_or_else(|| format!("{}_{}-{}", watch_id, uuid::Uuid::new_v4(), nanos));
     let mut status = src["status"].clone();
     if !status.is_object() {
         status = json!({});
@@ -651,7 +730,7 @@ pub fn execute(node: &Node, svc: &WatcherService, watch_id: &str, src: &Value, d
         payload: json!({}),
         vars: json!({}),
         data: node.data.clone(),
-        user: opts.user.clone().filter(|_| node.security.enabled()),
+        identity: opts.identity.clone().filter(|_| node.security.enabled()).map(Arc::new),
     };
     if let Some(td) = &opts.trigger_data {
         // ScheduleTriggerEngine.simulateEvent: scheduled defaults to triggered
@@ -675,7 +754,48 @@ pub fn execute(node: &Node, svc: &WatcherService, watch_id: &str, src: &Value, d
             None => ctx.triggered.clone(),
         };
     }
-    svc.current.lock().insert(rid.clone(), CurrentExec { watch_id: watch_id.to_string(), record_id: rid.clone(), triggered_time: triggered, execution_time: start, phase: "input" });
+    // One execution per watch at a time (ES `ExecutionService.execute`:
+    // `currentExecutions.put` refuses a second one), from admission through
+    // the status update: an overlapping run, scheduled or manual, records
+    // NOT_EXECUTED_ALREADY_QUEUED and runs no input, condition or action
+    // (#583).
+    {
+        let mut cur = svc.current.lock();
+        if watch_id != "_inlined_" && cur.values().any(|c| c.watch_id == watch_id) {
+            drop(cur);
+            let trigger_event = if opts.manual {
+                json!({"type": "manual", "triggered_time": ctx.triggered, "manual": {"schedule": {"scheduled_time": ctx.scheduled}}})
+            } else {
+                json!({"type": "schedule", "triggered_time": triggered_s, "schedule": {"scheduled_time": sched_s}})
+            };
+            let mut record = Map::new();
+            record.insert("watch_id".into(), json!(watch_id));
+            record.insert("node".into(), json!(NODE_ID));
+            record.insert("state".into(), json!("not_executed_already_queued"));
+            record.insert("@timestamp".into(), json!(nanos));
+            record.insert("status".into(), status.clone());
+            record.insert("trigger_event".into(), trigger_event);
+            record.insert("input".into(), super::model::redact(&src["input"]));
+            record.insert("condition".into(), src["condition"].clone());
+            if let Some(m) = src.get("metadata") {
+                record.insert("metadata".into(), m.clone());
+            }
+            record.insert("messages".into(), json!(["Watch is already queued in thread pool"]));
+            let record = Value::Object(record);
+            if opts.record {
+                super::write_history(node, &rid, &record, start);
+            }
+            return Ok((rid, record));
+        }
+        cur.insert(rid.clone(), CurrentExec { watch_id: watch_id.to_string(), record_id: rid.clone(), triggered_time: triggered, execution_time: start, phase: "input" });
+    }
+    struct Release<'a>(&'a WatcherService, String);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.current.lock().remove(&self.1);
+        }
+    }
+    let _release = Release(svc, rid.clone());
     let triggered_doc = if !opts.manual {
         super::triggered_index(node).ok().map(|s| {
             let _ = super::put_doc(&s, &rid, &json!({"trigger_event": {"type": "schedule", "triggered_time": triggered_s, "schedule": {"scheduled_time": sched_s}}, "state": "waiting"}), Default::default());
@@ -831,7 +951,8 @@ pub fn execute(node: &Node, svc: &WatcherService, watch_id: &str, src: &Value, d
                 }
             }
             "failure" => {
-                entry["last_execution"] = json!({"timestamp": ts, "successful": false, "reason": a["reason"].as_str().unwrap_or("")});
+                let reason = a["reason"].as_str().or_else(|| a["error"]["reason"].as_str()).unwrap_or("");
+                entry["last_execution"] = json!({"timestamp": ts, "successful": false, "reason": reason});
             }
             "throttled" | "acknowledged" => {
                 entry["last_throttle"] = json!({"timestamp": ts, "reason": a["reason"].clone()});
@@ -871,8 +992,8 @@ pub fn execute(node: &Node, svc: &WatcherService, watch_id: &str, src: &Value, d
     record.insert("watch_id".into(), json!(watch_id));
     record.insert("node".into(), json!(NODE_ID));
     record.insert("state".into(), json!(state));
-    if let Some(u) = &ctx.user {
-        record.insert("user".into(), json!(u));
+    if let Some(id) = &ctx.identity {
+        record.insert("user".into(), json!(id.principal()));
     }
     let stamp = match &opts.trigger_data {
         Some(_) => ctx.triggered.clone(),
@@ -891,7 +1012,7 @@ pub fn execute(node: &Node, svc: &WatcherService, watch_id: &str, src: &Value, d
     let record = Value::Object(record);
 
     if opts.record {
-        super::api::store_status(node, svc, watch_id, &status);
+        super::api::store_status(node, svc, watch_id, &src["status"], &status);
         super::write_history(node, &rid, &record, start);
     }
     if let Some(s) = triggered_doc {
@@ -902,14 +1023,47 @@ pub fn execute(node: &Node, svc: &WatcherService, watch_id: &str, src: &Value, d
     Ok((rid, record))
 }
 
+/// The subject a stored watch runs as: the authentication stored with it
+/// by the put (ES's `_xpack_security_authentication` header). A watch from
+/// an earlier version recorded only the user name: that user, as it is now.
+/// `None` for a watch stored with security off (ES: the watcher origin).
+pub fn stored_identity(node: &Node, watch_id: &str, src: &Value) -> Result<Option<StoredAuthn>> {
+    let Some(h) = src["status"]["headers"]["_xpack_security_authentication"].as_str() else { return Ok(None) };
+    if !node.security.enabled() {
+        return Ok(None);
+    }
+    if let Some(id) = StoredAuthn::decode(h) {
+        return Ok(Some(id));
+    }
+    match node.security.lookup_user(h) {
+        Some(a) => Ok(Some(StoredAuthn::of(&a))),
+        None => Err(EsError::new(403, "security_exception", format!("watch [{watch_id}] runs as user [{h}], which no longer exists"))),
+    }
+}
+
 /// Scheduler entry: execute the stored watch `id` because its trigger fired.
+/// Execute a recovered trigger (a `.triggered_watches` record left by an
+/// execution that never finished, e.g. across a restart) with its original
+/// scheduled and triggered times; the record is retired when it completes.
+pub fn run_recovered(node: &Node, svc: &WatcherService, id: &str, record_id: &str, scheduled: i64, triggered: i64) -> Result<()> {
+    let src = match svc.cache.read().get(id) {
+        Some(w) => w.src.clone(),
+        None => return Ok(()),
+    };
+    let identity = stored_identity(node, id, &src)?;
+    let opts = ExecOptions { record: true, identity, record_id: Some(record_id.to_string()), ..Default::default() };
+    let version = svc.cache.read().get(id).map(|w| w.version as i64).unwrap_or(-1);
+    execute(node, svc, id, &src, version, Some(scheduled), triggered, &opts)?;
+    Ok(())
+}
+
 pub fn run_scheduled(node: &Node, svc: &WatcherService, id: &str, scheduled: i64, triggered: i64) -> Result<()> {
     let src = match svc.cache.read().get(id) {
         Some(w) => w.src.clone(),
         None => return Ok(()),
     };
-    let user = src["status"]["headers"]["_xpack_security_authentication"].as_str().map(str::to_string);
-    let opts = ExecOptions { record: true, user, ..Default::default() };
+    let identity = stored_identity(node, id, &src)?;
+    let opts = ExecOptions { record: true, identity, ..Default::default() };
     let version = svc.cache.read().get(id).map(|w| w.version as i64).unwrap_or(-1);
     execute(node, svc, id, &src, version, Some(scheduled), triggered, &opts)?;
     let _ = service(node);
@@ -919,6 +1073,43 @@ pub fn run_scheduled(node: &Node, svc: &WatcherService, id: &str, scheduled: i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding 204: the body a clustered search input sends for a filtered
+    /// alias selects exactly the alias's documents from the concrete index.
+    #[test]
+    fn clustered_search_keeps_alias_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("orders", &json!({"mappings": {"properties": {"status": {"type": "keyword"}}}})).unwrap();
+        let reqs = [("1", "failed"), ("2", "ok"), ("3", "failed")]
+            .iter()
+            .map(|(id, st)| crate::index::WriteReq::Index { id: Some(id.to_string()), source: json!({"status": st}).to_string(), routing: None, cond: Default::default() })
+            .collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        node.update_aliases(&[json!({"add": {"index": "orders", "alias": "failed-orders", "filter": {"term": {"status": "failed"}}}})]).unwrap();
+        let ids = |targets: &[crate::search::Target], body: &Value| -> Vec<String> {
+            let req = crate::search::parse_request(body, &HashMap::new()).unwrap();
+            let out = crate::search::execute(targets, &req, &super::super::search_opts(&node)).unwrap();
+            let v: Value = serde_json::from_str(&out.json).unwrap();
+            let mut ids: Vec<String> = v["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect();
+            ids.sort();
+            ids
+        };
+        let body = json!({"query": {"match_all": {}}});
+        let alias_targets = node.resolve("failed-orders", ResolveOpts::default()).unwrap();
+        let want = ids(&alias_targets, &body);
+        assert_eq!(want, vec!["1", "3"]);
+        // What the coordinator receives: the concrete index and this body.
+        let (send, routing) = remote_search_body(&body, &alias_targets);
+        let concrete = node.resolve("orders", ResolveOpts::default()).unwrap();
+        assert_eq!(ids(&concrete, &send), want);
+        assert_eq!(routing, None);
+        // An unfiltered target is sent unchanged.
+        assert_eq!(remote_search_body(&body, &concrete).0, body);
+    }
 
     #[test]
     fn self_referencing_payload() {
@@ -937,9 +1128,133 @@ mod tests {
         assert_eq!(unescape_mustache("{{{a}}} {{b}} {{#c}}"), "{{{a}}} {{{b}}} {{#c}}");
     }
 
+    fn exec_ctx(payload: Value) -> Ctx {
+        Ctx { id: "i".into(), watch_id: "w".into(), execution_time: 1_000_000, triggered: iso(0), scheduled: iso(0), metadata: json!({}), payload, vars: json!({}), data: Default::default(), identity: None }
+    }
+
+    fn put(node: &Node, id: &str, w: Value) {
+        super::super::api::put_watch(node, id, &w, &super::super::api::PutParams { active: true, version: None, if_seq_no: None, if_primary_term: None, identity: None }).unwrap();
+    }
+
+    fn run(node: &Node, id: &str, body: Value) -> Value {
+        super::super::api::execute_watch(node, Some(id), &body, false, None).unwrap()["watch_record"].clone()
+    }
+
+    /// #581: an empty, missing or non-array foreach object fails the
+    /// action (ES `ActionWrapper`); it never records a successful execution
+    /// that throttles the next real alert.
+    #[test]
+    fn empty_foreach_fails_and_never_throttles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        put(&node, "fe", json!({"trigger": {"schedule": {"interval": "1h"}}, "input": {"simple": {}}, "condition": {"always": {}}, "throttle_period": "1h",
+            "actions": {"log": {"foreach": "ctx.payload.alerts", "logging": {"text": "alert {{ctx.payload._value}}"}}}}));
+        for (payload, reason) in [(json!({"alerts": []}), "was an empty list"), (json!({}), "was null"), (json!({"alerts": "x"}), "was not a an array")] {
+            let r = run(&node, "fe", json!({"alternative_input": payload, "record_execution": true}));
+            let a = &r["result"]["actions"][0];
+            assert_eq!(a["status"], "failure", "{r}");
+            assert!(a["error"]["reason"].as_str().unwrap().contains(reason), "{a}");
+        }
+        let (_, st) = super::super::api::get_watch(&node, "fe").unwrap();
+        assert!(st["status"]["actions"]["log"].get("last_successful_execution").is_none(), "{st}");
+        // The real alert right after is executed, not throttled.
+        let r = run(&node, "fe", json!({"alternative_input": {"alerts": ["disk full"]}, "record_execution": true}));
+        assert_eq!(r["result"]["actions"][0]["status"], "success", "{r}");
+        assert_eq!(r["result"]["actions"][0]["number_of_actions_executed"], 1, "{r}");
+    }
+
+    /// #582: `{{path}}` references in compare conditions resolve to typed
+    /// context values (objects, arrays, booleans, null); other strings are
+    /// literal; date math still resolves.
+    #[test]
+    fn compare_references_keep_their_type() {
+        let ctx = exec_ctx(json!({"observed": {"healthy": true}, "expected": {"healthy": true}, "other": {"healthy": false},
+            "list": [1, 2], "same": [1, 2], "flag": true, "n": 7, "limit": 5, "s": "{{x}}"}));
+        let c = |k: &str, op: &str, v: &str| run_condition(&json!({"compare": {format!("ctx.payload.{k}"): {op: v}}}), &ctx)["met"].clone();
+        assert_eq!(c("observed", "not_eq", "{{ctx.payload.expected}}"), false);
+        assert_eq!(c("observed", "eq", "{{ctx.payload.expected}}"), true);
+        assert_eq!(c("observed", "eq", "{{ctx.payload.other}}"), false);
+        assert_eq!(c("observed", "not_eq", "{{ctx.payload.other}}"), true);
+        assert_eq!(c("list", "eq", "{{ctx.payload.same}}"), true);
+        assert_eq!(c("flag", "eq", "{{ctx.payload.flag}}"), true);
+        assert_eq!(c("n", "gt", "{{ctx.payload.limit}}"), true);
+        assert_eq!(c("missing", "eq", "{{ctx.payload.absent}}"), true, "null equals null");
+        assert_eq!(c("s", "eq", "{{x}}"), false, "x is not in the context: null");
+        assert_eq!(run_condition(&json!({"compare": {"ctx.execution_time": {"gte": "<{now-1h}>"}}}), &ctx)["status"], "success");
+    }
+
+    /// #583: a second execution of a watch while one is in flight records
+    /// `not_executed_already_queued` and runs nothing; once the first is
+    /// done the watch executes again.
+    #[test]
+    fn overlapping_executions_of_one_watch_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("out", &json!({})).unwrap();
+        put(&node, "slow", json!({"trigger": {"schedule": {"interval": "1h"}}, "input": {"simple": {"a": 1}}, "condition": {"always": {}},
+            "actions": {"idx": {"index": {"index": "out"}}}}));
+        let svc = super::super::service(&node);
+        svc.current.lock().insert("other-run".into(), CurrentExec { watch_id: "slow".into(), record_id: "other-run".into(), triggered_time: 0, execution_time: 0, phase: "actions" });
+        let r = run(&node, "slow", json!({"record_execution": true}));
+        assert_eq!(r["state"], "not_executed_already_queued", "{r}");
+        assert!(r.get("result").is_none(), "{r}");
+        node.get_index("out").unwrap().refresh().unwrap();
+        assert_eq!(node.get_index("out").unwrap().doc_count_realtime().0, 0);
+        svc.current.lock().remove("other-run");
+        let r = run(&node, "slow", json!({"record_execution": true}));
+        assert_eq!(r["state"], "executed", "{r}");
+        assert!(svc.current.lock().is_empty(), "the execution released its slot");
+    }
+
+    /// #584: a standalone index action runs the destination's default and
+    /// final pipelines, as the index API does (transform, drop, failure).
+    #[test]
+    fn index_action_runs_destination_pipelines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.ingest().put("strip", json!({"processors": [{"remove": {"field": "raw", "ignore_missing": true}}, {"set": {"field": "seen", "value": true}},
+            {"drop": {"if": "ctx.drop == true"}}]}), None).unwrap();
+        node.ingest().put("bad", json!({"processors": [{"fail": {"message": "rejected by pipeline"}}]}), None).unwrap();
+        node.create_index("dest", &json!({"settings": {"index.final_pipeline": "strip"}})).unwrap();
+        node.create_index("strict", &json!({"settings": {"index.default_pipeline": "bad"}})).unwrap();
+        let watch = |index: &str, payload: Value| json!({"trigger": {"schedule": {"interval": "1h"}}, "input": {"simple": payload}, "condition": {"always": {}},
+            "actions": {"idx": {"index": {"index": index, "doc_id": "d1", "refresh": "true"}}}});
+        put(&node, "w1", watch("dest", json!({"raw": "secret", "v": 1})));
+        let r = run(&node, "w1", json!({}));
+        assert_eq!(r["result"]["actions"][0]["status"], "success", "{r}");
+        let g = node.get_index("dest").unwrap().get("d1").unwrap().unwrap();
+        let src: Value = serde_json::from_str(g.source.as_deref().unwrap()).unwrap();
+        assert_eq!(src, json!({"v": 1, "seen": true}), "the final pipeline ran");
+        put(&node, "w2", watch("dest", json!({"drop": true, "v": 2})));
+        let r = run(&node, "w2", json!({}));
+        assert_eq!(r["result"]["actions"][0]["index"]["response"]["result"], "noop", "{r}");
+        put(&node, "w3", watch("strict", json!({"v": 3})));
+        let r = run(&node, "w3", json!({}));
+        assert_eq!(r["result"]["actions"][0]["status"], "failure", "{r}");
+        assert!(r["result"]["actions"][0]["reason"].as_str().unwrap_or("").contains("rejected by pipeline"), "{r}");
+    }
+
+    /// #585: `extract` keeps the selected paths nested (and through
+    /// arrays), so conditions and templates read them as without it.
+    #[test]
+    fn extract_keeps_nested_paths() {
+        let mut p = json!({"hits": {"total": 10, "max_score": 1.0, "hits": [{"_id": "a", "_source": {"name": "x", "big": 1}}, {"_id": "b", "_source": {"name": "y"}}]}, "took": 3});
+        apply_extract(&mut p, &json!({"extract": ["hits.total", "hits.hits._source.name"]}));
+        assert_eq!(p, json!({"hits": {"total": 10, "hits": [{"_source": {"name": "x"}}, {"_source": {"name": "y"}}]}}));
+        let ctx = exec_ctx(p.clone());
+        assert_eq!(run_condition(&json!({"compare": {"ctx.payload.hits.total": {"gte": 5}}}), &ctx)["met"], true);
+        assert_eq!(render("{{#ctx.payload.hits.hits}}[{{_source.name}}]{{/ctx.payload.hits.hits}}", &json!({"payload": p})), "[x][y]");
+        let mut q = json!({"aggregations": {"by": {"buckets": [{"key": "k", "doc_count": 2}]}}});
+        apply_extract(&mut q, &json!({"extract": ["aggregations.by"]}));
+        assert_eq!(q["aggregations"]["by"]["buckets"][0]["key"], "k");
+        let mut r = json!({"a": 1});
+        apply_extract(&mut r, &json!({"extract": ["missing"]}));
+        assert_eq!(r, json!({}));
+    }
+
     #[test]
     fn compare_and_period() {
-        let ctx = Ctx { id: "i".into(), watch_id: "w".into(), execution_time: 1_000_000, triggered: iso(0), scheduled: iso(0), metadata: json!({}), payload: json!({"hits": {"total": 7}, "arr": [{"v": 1}, {"v": 5}]}), vars: json!({}), data: Default::default(), user: None };
+        let ctx = Ctx { id: "i".into(), watch_id: "w".into(), execution_time: 1_000_000, triggered: iso(0), scheduled: iso(0), metadata: json!({}), payload: json!({"hits": {"total": 7}, "arr": [{"v": 1}, {"v": 5}]}), vars: json!({}), data: Default::default(), identity: None };
         assert_eq!(run_condition(&json!({"compare": {"ctx.payload.hits.total": {"gte": 5}}}), &ctx)["met"], true);
         assert_eq!(run_condition(&json!({"compare": {"ctx.payload.hits.total": {"lt": 5}}}), &ctx)["met"], false);
         assert_eq!(run_condition(&json!({"array_compare": {"ctx.payload.arr": {"path": "v", "gte": {"value": 5, "quantifier": "some"}}}}), &ctx)["met"], true);

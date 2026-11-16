@@ -1,0 +1,103 @@
+#!/bin/bash
+# Certificate generator for the image (OpenSSL), playing the role of ES's
+# `elasticsearch-certutil ca` / `cert` for the deployments in this repo
+# (docker compose setup service, plain Kubernetes manifests). PEM output:
+# RSA keys in PKCS#8, certificates with SHA-256 signatures.
+#
+#   es-certgen ca   OUT_DIR [--days N] [--cn NAME]
+#       -> OUT_DIR/ca.crt, OUT_DIR/ca.key            (default 1095 days)
+#   es-certgen cert CA_DIR OUT_DIR NAME [--dns D]... [--ip A]... [--days N]
+#       -> OUT_DIR/NAME.crt, OUT_DIR/NAME.key, OUT_DIR/ca.crt
+#          signed by CA_DIR/ca.{crt,key}; SANs: the --dns / --ip values
+#          (comma-separated lists are accepted); default 730 days; usable
+#          for both HTTP (serverAuth) and transport (serverAuth+clientAuth).
+#
+# Existing output files are never overwritten (exit 0 with a message), so a
+# setup container can run it on every start. Certificate keys are written
+# 0640, the CA key 0600.
+set -euo pipefail
+
+die() { echo "es-certgen: $*" >&2; exit 64; }
+command -v openssl >/dev/null || die "openssl is required"
+umask 027
+
+cmd="${1:-}"; [[ $# -gt 0 ]] && shift
+case "$cmd" in
+  ca)
+    out="${1:?usage: es-certgen ca OUT_DIR [--days N] [--cn NAME]}"; shift
+    days=1095; cn="Elasticsearch CA"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --days) days="$2"; shift 2 ;;
+        --cn) cn="$2"; shift 2 ;;
+        *) die "unknown option $1" ;;
+      esac
+    done
+    mkdir -p "$out"
+    if [[ -f "$out/ca.crt" && -f "$out/ca.key" ]]; then
+      echo "es-certgen: CA exists in $out; keeping it"; exit 0
+    fi
+    cfg="$(mktemp)"
+    trap 'rm -f "$cfg"' EXIT
+    cat > "$cfg" <<EOF
+[req]
+prompt = no
+distinguished_name = dn
+x509_extensions = v3_ca
+[dn]
+CN = ${cn}
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign,digitalSignature
+subjectKeyIdentifier = hash
+EOF
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$out/ca.key" 2>/dev/null
+    openssl req -x509 -new -key "$out/ca.key" -sha256 -days "$days" -config "$cfg" -out "$out/ca.crt"
+    chmod 0644 "$out/ca.crt"
+    echo "es-certgen: CA written to $out (ca.crt, ca.key)"
+    ;;
+  cert)
+    ca_dir="${1:?usage: es-certgen cert CA_DIR OUT_DIR NAME [--dns D]... [--ip A]... [--days N]}"
+    out="${2:?OUT_DIR required}"; name="${3:?NAME required}"; shift 3
+    days=730; sans=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --dns) IFS=',' read -r -a v <<< "$2"; for x in "${v[@]}"; do [[ -n "$x" ]] && sans+=("DNS:$x"); done; shift 2 ;;
+        --ip) IFS=',' read -r -a v <<< "$2"; for x in "${v[@]}"; do [[ -n "$x" ]] && sans+=("IP:$x"); done; shift 2 ;;
+        --days) days="$2"; shift 2 ;;
+        *) die "unknown option $1" ;;
+      esac
+    done
+    [[ -f "$ca_dir/ca.crt" && -f "$ca_dir/ca.key" ]] || die "no CA in $ca_dir (run: es-certgen ca $ca_dir)"
+    [[ ${#sans[@]} -gt 0 ]] || sans=("DNS:$name")
+    mkdir -p "$out"
+    if [[ -f "$out/$name.crt" && -f "$out/$name.key" ]]; then
+      echo "es-certgen: certificate $out/$name.crt exists; keeping it"; exit 0
+    fi
+    ext="$(mktemp)"; csr="$(mktemp)"
+    trap 'rm -f "$ext" "$csr"' EXIT
+    {
+      echo "basicConstraints=CA:FALSE"
+      echo "keyUsage=critical,digitalSignature,keyEncipherment"
+      echo "extendedKeyUsage=serverAuth,clientAuth"
+      echo "subjectKeyIdentifier=hash"
+      echo "authorityKeyIdentifier=keyid"
+      echo "subjectAltName=$(IFS=,; echo "${sans[*]}")"
+    } > "$ext"
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$out/$name.key" 2>/dev/null
+    openssl req -new -key "$out/$name.key" -subj "/CN=${name}" -out "$csr"
+    openssl x509 -req -in "$csr" -CA "$ca_dir/ca.crt" -CAkey "$ca_dir/ca.key" -CAcreateserial \
+      -sha256 -days "$days" -extfile "$ext" -out "$out/$name.crt" 2>/dev/null
+    rm -f "$ca_dir/ca.srl"
+    [[ "$(cd "$ca_dir" && pwd)" == "$(cd "$out" && pwd)" ]] || cp "$ca_dir/ca.crt" "$out/ca.crt"
+    chmod 0644 "$out/$name.crt" "$out/ca.crt"
+    chmod 0640 "$out/$name.key"
+    echo "es-certgen: $out/$name.crt (${sans[*]})"
+    ;;
+  ""|-h|--help)
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    die "unknown command [$cmd] (ca | cert)"
+    ;;
+esac

@@ -45,7 +45,10 @@ fn collect_docs(value: &Value, pointer: &str, out: &mut Vec<(String, DocQuery)>)
             for kind in ["geo_shape", "shape"] {
                 for (field, spec) in object.get(kind).and_then(Value::as_object).into_iter().flatten() {
                     let Some(shape) = spec.get("indexed_shape").and_then(Value::as_object) else { continue };
-                    if let (Some(index), Some(id)) = (shape.get("index").and_then(Value::as_str), shape.get("id").and_then(Value::as_str)) {
+                    // Without `index`: ES's default shapes index (never the
+                    // searched one).
+                    let index = shape.get("index").and_then(Value::as_str).unwrap_or(elasticsearch_engine::fieldtypes::query::DEFAULT_SHAPE_INDEX);
+                    if let Some(id) = shape.get("id").and_then(Value::as_str) {
                         out.push((format!("{pointer}/{kind}/{}", escape(field)), DocQuery::Shape {
                             kind: kind.into(), field: field.clone(), index: index.into(), id: id.into(),
                             path: shape.get("path").and_then(Value::as_str).unwrap_or("shape").into(),
@@ -129,6 +132,10 @@ fn apply_doc(body: &mut Value, pointer: &str, q: &DocQuery, fetch: &dyn Fn(&str,
                 // artificial doc would read all of its fields.
                 if let Some(f) = slot.get("fields").cloned().or_else(|| query_fields.clone()) {
                     doc["fields"] = f;
+                }
+                // The item's analysis overrides travel with it (#500).
+                if let Some(pfa) = slot.get("per_field_analyzer").cloned() {
+                    doc["per_field_analyzer"] = pfa;
                 }
                 *slot = doc;
                 if key == "like" && !include {
@@ -455,5 +462,24 @@ mod tests {
         assert_eq!(mlt["like"][1], "free text");
         assert_eq!(mlt["like"][2], json!({"_index": "docs", "doc": {}, "fields": ["body"]}));
         assert_eq!(must[2]["bool"]["must_not"].as_array().unwrap().len(), 2);
+    }
+
+    /// Review finding 550: an `indexed_shape` without `index` is read from
+    /// ES's default `shapes` index, not the searched one.
+    #[test]
+    fn indexed_shape_defaults_to_the_shapes_index() {
+        let mut body = json!({"query": {"geo_shape": {"area": {"indexed_shape": {"id": "region-a"}}}}});
+        let mut docs = Vec::new();
+        collect_docs(&body, "", &mut docs);
+        assert_eq!(docs.len(), 1);
+        let DocQuery::Shape { index, id, path, .. } = &docs[0].1 else { panic!() };
+        assert_eq!((index.as_str(), id.as_str(), path.as_str()), ("shapes", "region-a", "shape"));
+        let fetch = |index: &str, id: &str, _: &Option<String>| match (index, id) {
+            ("shapes", "region-a") => json!({"_index": "shapes", "_source": {"shape": {"type": "point", "coordinates": [1, 2]}}}),
+            _ => json!({"_index": "assets", "_source": {"shape": {"type": "point", "coordinates": [50, 50]}}}),
+        };
+        let (pointer, q) = &docs[0];
+        apply_doc(&mut body, pointer, q, &fetch);
+        assert_eq!(body["query"]["geo_shape"]["area"]["shape"], json!({"type": "point", "coordinates": [1, 2]}));
     }
 }

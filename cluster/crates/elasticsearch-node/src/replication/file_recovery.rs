@@ -12,7 +12,10 @@
 //! (`IndexShard::snapshot_files`: mapped files, a retention lock on the
 //! history above the commit's local checkpoint, checksums computed off the
 //! shard locks) and registers a [`RecoverySource::start_from`] whose
-//! translog phase starts above that local checkpoint. Chunks are read at
+//! translog phase starts above that local checkpoint. A shard that never
+//! committed an operation is not flushed while it holds few: its empty
+//! commit is shipped, which the target does not copy ([`holds_no_operations`]).
+//! Chunks are read at
 //! their offset from the pinned mappings, each request fenced by the
 //! source's allocation id and primary term, and paced by the node's
 //! limiter (`replication::throttle`, `indices.recovery.max_bytes_per_sec`:
@@ -280,11 +283,12 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn sync_dir(dir: Option<&Path>) {
-    if let Some(d) = dir {
-        if let Ok(f) = std::fs::File::open(d) {
-            let _ = f.sync_all();
-        }
+/// fsync a directory (see `replication::sync_dir`); a failure fails the
+/// step that needed it.
+fn sync_dir(dir: Option<&Path>) -> R<()> {
+    match dir.filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => super::sync_dir(d).map_err(|e| io("cannot fsync directory", d, e)),
+        None => Ok(()),
     }
 }
 
@@ -294,7 +298,7 @@ fn write_durable(path: &Path, bytes: &[u8]) -> R<()> {
     std::fs::write(&tmp, bytes).map_err(|e| io("cannot write", &tmp, e))?;
     elasticsearch_engine::rustic_core::platform::sync_file(&tmp).map_err(|e| io("cannot fsync", &tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| io("cannot rename", &tmp, e))?;
-    sync_dir(path.parent());
+    sync_dir(path.parent())?;
     Ok(())
 }
 
@@ -308,7 +312,7 @@ fn write_durable_json(path:&Path,value:&impl Serialize)->R<()> {
     serde_json::to_writer(&mut file,value).map_err(|e|e.to_string())?;
     file.sync_all().map_err(|e|io("cannot fsync",&tmp,e))?;
     std::fs::rename(&tmp,path).map_err(|e|io("cannot rename",&tmp,e))?;
-    sync_dir(path.parent());
+    sync_dir(path.parent())?;
     Ok(())
 }
 
@@ -474,7 +478,7 @@ impl ProgressBatch {
             return Ok(());
         }
         for d in std::mem::take(&mut self.dirs) {
-            sync_dir(Some(&d));
+            sync_dir(Some(&d))?;
         }
         self.progress.save(staging)?;
         self.pending = 0;
@@ -594,6 +598,25 @@ fn reuse_candidates(reuse: &Path) -> R<elasticsearch_engine::rustic_core::admiss
         paths.push(safe_join(reuse,rel)?);
     }
     Ok(Allocation::new(out,memory))
+}
+
+/// Operations a source that never committed one replays in phase 2 instead
+/// of flushing a commit to copy (see [`holds_no_operations`]).
+pub const EMPTY_COMMIT_REPLAY_OPS: i64 = 1000;
+
+/// Whether `manifest` is a commit no operation ever reached: a new shard's
+/// empty commit (`seq_no` -1, its metadata files only, no segment or vector
+/// file). ES phase 1 copies the files of the source's commit the target
+/// lacks; for such a commit that is its commit point (`segments_N`, a few
+/// hundred bytes), which the target's empty placeholder copy already
+/// equals. The target copies nothing and phase 2 replays every operation
+/// onto the placeholder.
+pub fn holds_no_operations(manifest: &IndexManifest) -> bool {
+    manifest.committed_seq_no < 0 && manifest.local_checkpoint < 0 && manifest.max_seq_no < 0
+        && manifest.files.iter().all(|f| match core_file_name(&f.path) {
+            Some(name) => name == elasticsearch_engine::rustic_core::transfer::COMMIT_FILE,
+            None => !f.path.contains('/'),
+        })
 }
 
 /// The core file name of a manifest path (`core-<g>/<name>`), if it is one.
@@ -871,7 +894,7 @@ pub fn link_reused(staging: &Path, entry: &IndexFileEntry, src: &Path, progress:
         }
         std::fs::rename(&tmp, &path).map_err(|e| io("cannot rename", &tmp, e))?;
     }
-    sync_dir(path.parent());
+    sync_dir(path.parent())?;
     progress.mark(staging, entry)
 }
 
@@ -987,7 +1010,7 @@ impl PartWriter {
     /// discards everything received for it.
     pub fn finish(self, staging: &Path, progress: &mut Progress) -> R<()> {
         let (entry, dir) = self.finish_deferred()?;
-        sync_dir(dir.as_deref());
+        sync_dir(dir.as_deref())?;
         progress.mark(staging, &entry)
     }
 
@@ -1175,7 +1198,7 @@ fn link_image(staging: &Path, image: &Path, manifest: &IndexManifest) -> R<()> {
             std::fs::copy(&from, &to).map_err(|e| io("cannot copy", &from, e))?;
         }
     }
-    sync_dir(image.parent());
+    sync_dir(image.parent())?;
     Ok(())
 }
 
@@ -1189,6 +1212,21 @@ pub fn activate(svc: &IndexService, prepared: &mut PreparedShard) -> R<Arc<Index
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A durable sidecar write whose directory fsync fails reports the
+    /// failure (the progress must not count as recorded).
+    #[test]
+    fn durable_writes_fail_when_the_directory_fsync_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("progress.json");
+        crate::replication::sync_dir_test_hook::fail_under(tmp.path(), true);
+        assert!(write_durable(&path, b"{}").is_err());
+        assert!(write_durable_json(&path, &serde_json::json!({"a": 1})).is_err());
+        assert!(sync_dir(Some(tmp.path())).is_err());
+        crate::replication::sync_dir_test_hook::fail_under(tmp.path(), false);
+        assert!(write_durable(&path, b"{}").is_ok());
+        assert!(sync_dir(Some(tmp.path())).is_ok());
+    }
 
     fn entry(path: &str, data: &[u8]) -> IndexFileEntry {
         IndexFileEntry { path: path.into(), len: data.len() as u64, crc32: crc32(data) }
@@ -1405,6 +1443,19 @@ mod tests {
         let p = plan(&staging, &reuse, &m).unwrap();
         assert_eq!(p.files[1].action, FileAction::Staged);
         assert!(!staging.join("core-9/stale.rvec").exists());
+    }
+
+    #[test]
+    fn only_a_commit_no_operation_reached_needs_no_file() {
+        let meta = entry("core-0/meta.json", b"{\"segments\":[]}");
+        let (state, terms) = (entry("shard_state.json", b"{}"), entry("primary_terms.json", b"{}"));
+        let empty = |files: Vec<IndexFileEntry>| IndexManifest { committed_seq_no: -1, local_checkpoint: -1, max_seq_no: -1, ..manifest(files) };
+        assert!(holds_no_operations(&empty(vec![state.clone(), terms.clone(), meta.clone()])));
+        assert!(!holds_no_operations(&manifest(vec![state.clone(), meta.clone()])), "a commit holding operations");
+        let checkpoint_only = IndexManifest { local_checkpoint: 0, ..empty(vec![state.clone(), meta.clone()]) };
+        assert!(!holds_no_operations(&checkpoint_only));
+        assert!(!holds_no_operations(&empty(vec![state.clone(), meta.clone(), entry("core-0/seg_00000001.rstc", b"x")])), "a segment");
+        assert!(!holds_no_operations(&empty(vec![state, meta, entry("translog/translog-1.tlog", b"x")])), "a nested file");
     }
 
     #[test]

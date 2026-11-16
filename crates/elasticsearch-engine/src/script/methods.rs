@@ -691,135 +691,301 @@ fn collector(rt: &mut Rt, items: Vec<Val>, c: &Val) -> SResult<Val> {
 }
 
 /// Stream operations (eager over a snapshot).
+/// Per-terminal state of a pipeline: elements counted by each `limit` /
+/// `skip`, values seen by each `distinct`, and whether pulling stopped.
+struct Pipe {
+    counts: Vec<u64>,
+    seen: Vec<Vec<Val>>,
+    allocation: super::allocation::Allocation,
+    stop: bool,
+}
+
+impl Pipe {
+    fn new(n: usize) -> Pipe {
+        Pipe { counts: vec![0; n], seen: vec![Vec::new(); n], allocation: super::allocation::Allocation::new(), stop: false }
+    }
+    /// A `limit` reached: no further element is pulled from upstream (Java
+    /// requests cancellation before the next element).
+    fn exhausted(&self, ops: &[super::value::StreamOp]) -> bool {
+        self.stop || ops.iter().enumerate().any(|(i, o)| matches!(o, super::value::StreamOp::Limit(n) if self.counts[i] >= *n))
+    }
+}
+
+type Sink<'a> = dyn FnMut(&mut Rt, Val) -> SResult<bool> + 'a;
+
+/// Pull `source` through `ops` into `sink` (which returns `false` to stop:
+/// short-circuiting terminals), one element at a time, as a Java
+/// sequential stream does: an element's callbacks all run before the next
+/// element is pulled, nothing past a reached `limit` or a satisfied
+/// short-circuit is evaluated, and `sorted` consumes its whole upstream
+/// first.
+fn drive(rt: &mut Rt, source: &[Val], ops: &[super::value::StreamOp], sink: &mut Sink<'_>) -> SResult<()> {
+    use super::value::StreamOp;
+    if let Some(k) = ops.iter().position(|o| matches!(o, StreamOp::Sorted(_))) {
+        let allocation = super::allocation::Allocation::new();
+        let mut buffer = Vec::new();
+        drive(rt, source, &ops[..k], &mut |_, v| {
+            allocation.push(&mut buffer, v)?;
+            Ok(true)
+        })?;
+        let StreamOp::Sorted(cmp) = &ops[k] else { unreachable!() };
+        sort_vals(rt, &mut buffer, cmp.as_ref())?;
+        return drive(rt, &buffer, &ops[k + 1..], sink);
+    }
+    let mut st = Pipe::new(ops.len());
+    for v in source {
+        if st.exhausted(ops) {
+            break;
+        }
+        rt.charge(1)?;
+        push(rt, ops, 0, v.clone(), &mut st, sink)?;
+    }
+    Ok(())
+}
+
+fn push(rt: &mut Rt, ops: &[super::value::StreamOp], i: usize, v: Val, st: &mut Pipe, sink: &mut Sink<'_>) -> SResult<()> {
+    use super::value::StreamOp;
+    if st.stop {
+        return Ok(());
+    }
+    let Some(op) = ops.get(i) else {
+        if !sink(rt, v)? {
+            st.stop = true;
+        }
+        return Ok(());
+    };
+    match op {
+        StreamOp::Filter(f) => {
+            if rt.call_fn(f, std::slice::from_ref(&v))?.as_bool()? {
+                push(rt, ops, i + 1, v, st, sink)?;
+            }
+        }
+        StreamOp::Map(f, ty) => {
+            let r = rt.call_fn(f, std::slice::from_ref(&v))?;
+            let r = match ty {
+                Some(t) => super::runtime::cast(t, r)?,
+                None => r,
+            };
+            push(rt, ops, i + 1, r, st, sink)?;
+        }
+        StreamOp::AsDouble => push(rt, ops, i + 1, Val::Double(v.to_f64()?), st, sink)?,
+        StreamOp::AsLong => push(rt, ops, i + 1, Val::Long(v.to_i64()?), st, sink)?,
+        StreamOp::Peek(f) => {
+            rt.call_fn(f, std::slice::from_ref(&v))?;
+            push(rt, ops, i + 1, v, st, sink)?;
+        }
+        StreamOp::FlatMap(f) => {
+            let r = rt.call_fn(f, std::slice::from_ref(&v))?;
+            match &r {
+                // An inner stream runs its own (lazy) pipeline into ours.
+                Val::Stream(inner) => {
+                    let inner = inner.clone();
+                    drive(rt, &inner.values, &inner.ops, &mut |rt, x| {
+                        push(rt, ops, i + 1, x, st, sink)?;
+                        Ok(!st.exhausted(ops))
+                    })?;
+                }
+                other => {
+                    let _copy = super::allocation::Allocation::iterable(other)?;
+                    for x in iter_values(other)? {
+                        if st.exhausted(ops) {
+                            break;
+                        }
+                        push(rt, ops, i + 1, x, st, sink)?;
+                    }
+                }
+            }
+        }
+        StreamOp::Limit(n) => {
+            if st.counts[i] < *n {
+                st.counts[i] += 1;
+                push(rt, ops, i + 1, v, st, sink)?;
+            }
+        }
+        StreamOp::Skip(n) => {
+            if st.counts[i] < *n {
+                st.counts[i] += 1;
+            } else {
+                push(rt, ops, i + 1, v, st, sink)?;
+            }
+        }
+        StreamOp::Distinct => {
+            rt.charge(st.seen[i].len() as u64)?;
+            if !st.seen[i].iter().any(|x| x.equals(&v)) {
+                let Pipe { allocation, seen, .. } = &mut *st;
+                allocation.push(&mut seen[i], v.clone())?;
+                push(rt, ops, i + 1, v, st, sink)?;
+            }
+        }
+        // `drive` splits pipelines at their first `sorted`.
+        StreamOp::Sorted(_) => unreachable!("sorted is a pipeline barrier"),
+    }
+    Ok(())
+}
+
+/// Every element a terminal operation receives, in order.
+fn materialize(rt: &mut Rt, items: &super::value::JStream) -> SResult<(Vec<Val>, super::allocation::Allocation)> {
+    let allocation = super::allocation::Allocation::new();
+    if items.ops.is_empty() {
+        let allocation = super::allocation::Allocation::values(items.len())?;
+        return Ok((items.values.clone(), allocation));
+    }
+    let mut out = Vec::new();
+    drive(rt, &items.values, &items.ops, &mut |_, v| {
+        allocation.push(&mut out, v)?;
+        Ok(true)
+    })?;
+    Ok((out, allocation))
+}
+
+/// The element count a terminal `count` gets without running the pipeline
+/// (JDK: a sized pipeline — only size-preserving or size-adjusting
+/// operations — counts its source, skipping `map` / `peek` callbacks).
+fn sized_count(items: &super::value::JStream) -> Option<u64> {
+    use super::value::StreamOp;
+    let mut n = items.len() as u64;
+    for op in &items.ops {
+        match op {
+            StreamOp::Map(..) | StreamOp::Peek(_) | StreamOp::Sorted(_) | StreamOp::AsDouble | StreamOp::AsLong => {}
+            StreamOp::Limit(k) => n = n.min(*k),
+            StreamOp::Skip(k) => n = n.saturating_sub(*k),
+            StreamOp::Filter(_) | StreamOp::FlatMap(_) | StreamOp::Distinct => return None,
+        }
+    }
+    Some(n)
+}
+
 fn stream_method(rt: &mut Rt, items: &Rc<super::value::JStream>, name: &str, args: Vec<Val>) -> SResult<Option<Val>> {
+    use super::value::StreamOp;
     let n = args.len();
+    // Intermediate operations only record themselves (Java streams are lazy).
+    let then = |op: StreamOp| -> SResult<Val> {
+        let allocation = super::allocation::Allocation::values(items.len())?;
+        let mut ops = items.ops.clone();
+        ops.push(op);
+        Ok(Val::Stream(Rc::new(super::value::JStream { values: items.values.clone(), allocation, ops })))
+    };
+    let count_arg = |v: &Val| -> SResult<u64> {
+        let k = v.to_i64()?;
+        if k < 0 {
+            return Err(illegal_arg(k.to_string()));
+        }
+        Ok(k as u64)
+    };
     Ok(Some(match (name, n) {
-        ("filter", 1) => {
-            let allocation = super::allocation::Allocation::new();
-            let mut out = Vec::new();
-            for v in items.iter() {
-                if rt.call_fn(&args[0], std::slice::from_ref(v))?.as_bool()? { allocation.push(&mut out, v.clone())?; }
-            }
-            Val::stream_from_values(out, allocation)
-        }
-        ("map" | "mapToObj", 1) => Val::stream_from_iter(items.iter().map(|v| rt.call_fn(&args[0], std::slice::from_ref(v))))?,
-        ("mapToInt", 1) => Val::stream_from_iter(items.iter().map(|v| rt.call_fn(&args[0], std::slice::from_ref(v)).and_then(|r| super::runtime::cast(&super::ast::Ty::Int, r))))?,
-        ("mapToLong", 1) => Val::stream_from_iter(items.iter().map(|v| rt.call_fn(&args[0], std::slice::from_ref(v)).and_then(|r| super::runtime::cast(&super::ast::Ty::Long, r))))?,
-        ("mapToDouble", 1) => Val::stream_from_iter(items.iter().map(|v| rt.call_fn(&args[0], std::slice::from_ref(v)).and_then(|r| super::runtime::cast(&super::ast::Ty::Double, r))))?,
-        ("asDoubleStream", 0) => Val::stream_from_iter(items.iter().map(|v| v.to_f64().map(Val::Double)))?,
-        ("asLongStream", 0) => Val::stream_from_iter(items.iter().map(|v| v.to_i64().map(Val::Long)))?,
+        ("filter", 1) => then(StreamOp::Filter(args[0].clone()))?,
+        ("map" | "mapToObj", 1) => then(StreamOp::Map(args[0].clone(), None))?,
+        ("mapToInt", 1) => then(StreamOp::Map(args[0].clone(), Some(super::ast::Ty::Int)))?,
+        ("mapToLong", 1) => then(StreamOp::Map(args[0].clone(), Some(super::ast::Ty::Long)))?,
+        ("mapToDouble", 1) => then(StreamOp::Map(args[0].clone(), Some(super::ast::Ty::Double)))?,
+        ("asDoubleStream", 0) => then(StreamOp::AsDouble)?,
+        ("asLongStream", 0) => then(StreamOp::AsLong)?,
         ("boxed" | "sequential" | "parallel" | "stream", 0) => Val::Stream(items.clone()),
-        ("flatMap", 1) => {
-            let allocation = super::allocation::Allocation::new();
-            let mut out = Vec::new();
-            for v in items.iter() {
-                let r = rt.call_fn(&args[0], std::slice::from_ref(v))?;
-                let _copy = super::allocation::Allocation::iterable(&r)?;
-                for value in iter_values(&r)? { allocation.push(&mut out, value)?; }
+        ("flatMap", 1) => then(StreamOp::FlatMap(args[0].clone()))?,
+        ("sorted", 0 | 1) => then(StreamOp::Sorted(args.first().cloned()))?,
+        ("distinct", 0) => then(StreamOp::Distinct)?,
+        ("limit", 1) => then(StreamOp::Limit(count_arg(&args[0])?))?,
+        ("skip", 1) => then(StreamOp::Skip(count_arg(&args[0])?))?,
+        ("peek", 1) => then(StreamOp::Peek(args[0].clone()))?,
+        ("count", 0) => match sized_count(items) {
+            Some(c) => Val::Long(c as i64),
+            None => {
+                let mut c = 0i64;
+                drive(rt, &items.values, &items.ops, &mut |_, _| {
+                    c += 1;
+                    Ok(true)
+                })?;
+                Val::Long(c)
             }
-            Val::stream_from_values(out, allocation)
-        }
-        ("sorted", 0 | 1) => {
-            let allocation = super::allocation::Allocation::values(items.len())?;
-            let mut v = items.values.clone();
-            sort_vals(rt, &mut v, args.first())?;
-            Val::stream_from_values(v, allocation)
-        }
-        ("distinct", 0) => {
-            let allocation = super::allocation::Allocation::new();
-            let mut out: Vec<Val> = Vec::new();
-            for v in items.iter() {
-                if !out.iter().any(|x| x.equals(v)) { allocation.push(&mut out, v.clone())?; }
-            }
-            Val::stream_from_values(out, allocation)
-        }
-        ("limit", 1) => Val::stream_from_iter(items.iter().take(args[0].to_i64()?.max(0) as usize).cloned().map(Ok))?,
-        ("skip", 1) => Val::stream_from_iter(items.iter().skip(args[0].to_i64()?.max(0) as usize).cloned().map(Ok))?,
-        ("peek", 1) => {
-            for v in items.iter() {
-                rt.call_fn(&args[0], std::slice::from_ref(v))?;
-            }
-            Val::Stream(items.clone())
-        }
-        ("count", 0) => Val::Long(items.len() as i64),
-        ("sum", 0) => sum_vals(items)?,
+        },
+        ("sum", 0) => sum_vals(&materialize(rt, items)?.0)?,
         ("average", 0) => {
-            if items.is_empty() {
+            let (vals, _allocation) = materialize(rt, items)?;
+            if vals.is_empty() {
                 opt(None)
             } else {
-                let s: f64 = items.iter().map(|v| v.to_f64()).sum::<SResult<f64>>()?;
-                opt(Some(Val::Double(s / items.len() as f64)))
+                let s: f64 = vals.iter().map(|v| v.to_f64()).sum::<SResult<f64>>()?;
+                opt(Some(Val::Double(s / vals.len() as f64)))
             }
         }
         ("max" | "min", 0 | 1) => {
             let mut best: Option<Val> = None;
-            for v in items.iter() {
-                best = Some(match best {
-                    None => v.clone(),
+            let cmp = args.first().cloned();
+            drive(rt, &items.values, &items.ops, &mut |rt, v| {
+                best = Some(match best.take() {
+                    None => v,
                     Some(b) => {
-                        let o = match args.first() {
+                        let o = match &cmp {
                             Some(f) => rt.call_fn(f, &[v.clone(), b.clone()])?.to_i64()?.cmp(&0),
                             None => v.compare(&b)?,
                         };
-                        if (name == "max" && o.is_gt()) || (name == "min" && o.is_lt()) { v.clone() } else { b }
+                        if (name == "max" && o.is_gt()) || (name == "min" && o.is_lt()) { v } else { b }
                     }
                 });
-            }
+                Ok(true)
+            })?;
             opt(best)
         }
-        ("anyMatch", 1) => {
-            for v in items.iter() {
-                if rt.call_fn(&args[0], std::slice::from_ref(v))?.as_bool()? {
-                    return Ok(Some(Val::Bool(true)));
+        ("anyMatch", 1) | ("allMatch", 1) | ("noneMatch", 1) => {
+            // anyMatch stops at the first match, allMatch / noneMatch at the
+            // first element deciding against them.
+            let stop_on = name == "anyMatch" || name == "noneMatch";
+            let mut hit = false;
+            drive(rt, &items.values, &items.ops, &mut |rt, v| {
+                if rt.call_fn(&args[0], std::slice::from_ref(&v))?.as_bool()? == stop_on {
+                    hit = true;
+                    return Ok(false);
                 }
-            }
-            Val::Bool(false)
+                Ok(true)
+            })?;
+            Val::Bool(match name {
+                "anyMatch" => hit,
+                _ => !hit,
+            })
         }
-        ("allMatch", 1) | ("noneMatch", 1) => {
-            let want = name == "allMatch";
-            for v in items.iter() {
-                if rt.call_fn(&args[0], std::slice::from_ref(v))?.as_bool()? != want {
-                    return Ok(Some(Val::Bool(false)));
-                }
-            }
-            Val::Bool(true)
+        ("findFirst" | "findAny", 0) => {
+            let mut first = None;
+            drive(rt, &items.values, &items.ops, &mut |_, v| {
+                first = Some(v);
+                Ok(false)
+            })?;
+            opt(first)
         }
-        ("findFirst" | "findAny", 0) => opt(items.first().cloned()),
-        ("forEach", 1) => {
-            for v in items.iter() {
-                rt.call_fn(&args[0], std::slice::from_ref(v))?;
-            }
+        ("forEach" | "forEachOrdered", 1) => {
+            drive(rt, &items.values, &items.ops, &mut |rt, v| {
+                rt.call_fn(&args[0], std::slice::from_ref(&v))?;
+                Ok(true)
+            })?;
             Val::Null
         }
         ("reduce", 2) => {
-            let mut acc = args[0].clone();
-            for v in items.iter() {
-                acc = rt.call_fn(&args[1], &[acc, v.clone()])?;
-            }
-            acc
+            let mut acc = Some(args[0].clone());
+            drive(rt, &items.values, &items.ops, &mut |rt, v| {
+                let a = acc.take().unwrap_or(Val::Null);
+                acc = Some(rt.call_fn(&args[1], &[a, v])?);
+                Ok(true)
+            })?;
+            acc.unwrap_or(Val::Null)
         }
         ("reduce", 1) => {
             let mut acc: Option<Val> = None;
-            for v in items.iter() {
-                acc = Some(match acc {
-                    None => v.clone(),
-                    Some(a) => rt.call_fn(&args[0], &[a, v.clone()])?,
+            drive(rt, &items.values, &items.ops, &mut |rt, v| {
+                acc = Some(match acc.take() {
+                    None => v,
+                    Some(a) => rt.call_fn(&args[0], &[a, v])?,
                 });
-            }
+                Ok(true)
+            })?;
             opt(acc)
         }
-        ("toList" | "toArray", 0) => {
-            let allocation = super::allocation::Allocation::values(items.len())?;
-            Val::new_list(items.values.clone()).allocated(allocation)
-        },
+        ("toList" | "toArray" | "iterator", 0) => {
+            let (vals, allocation) = materialize(rt, items)?;
+            Val::new_list(vals).allocated(allocation)
+        }
         ("collect", 1) => {
-            let _copy = super::allocation::Allocation::values(items.len())?;
-            collector(rt, items.values.clone(), &args[0])?
-        },
-        ("iterator", 0) => {
-            let allocation = super::allocation::Allocation::values(items.len())?;
-            Val::new_list(items.values.clone()).allocated(allocation)
-        },
+            let (vals, _allocation) = materialize(rt, items)?;
+            collector(rt, vals, &args[0])?
+        }
         _ => return Ok(None),
     }))
 }
@@ -834,7 +1000,8 @@ fn collection_method(rt: &mut Rt, recv: &Val, items: Vec<Val>, name: &str, args:
         ("containsAll", 1) => {
             let _copy = super::allocation::Allocation::iterable(&args[0])?;
             let other = iter_values(&args[0])?;
-            Val::Bool(other.iter().all(|o| items.iter().any(|v| v.equals(o))))
+            let member = member_of(&items);
+            Val::Bool(other.iter().all(|o| member(o)))
         }
         ("stream", 0) => {
             let allocation = super::allocation::Allocation::values(items.capacity())?;
@@ -1027,9 +1194,34 @@ pub fn string_length_fast(v: &Val) -> Option<i32> {
     }
 }
 
+/// Methods whose work grows with the receiver (and their arguments): charged
+/// to the execution fuel so cancellation and the deadline are polled
+/// through long built-in work, not only between loop iterations.
+fn linear_method(name: &str) -> bool {
+    matches!(name, "sort" | "addAll" | "removeAll" | "retainAll" | "containsAll" | "removeIf" | "replaceAll" | "contains" | "containsValue"
+        | "indexOf" | "lastIndexOf" | "equals" | "hashCode" | "toString" | "join" | "stream" | "toArray" | "putAll" | "values" | "keySet"
+        | "entrySet" | "split" | "splitOnToken" | "replace" | "repeat" | "toUpperCase" | "toLowerCase" | "matches" | "subList" | "reverse"
+        | "collect" | "sorted" | "distinct" | "count" | "sum" | "max" | "min" | "average" | "reduce" | "toList" | "getLength" | "chars" | "codePoints" | "intern")
+}
+
 pub fn call_method(rt: &mut Rt, recv: Val, name: &str, args: Vec<Val>) -> SResult<Val> {
+    if linear_method(name) {
+        let mut units = super::runtime::work_units(&recv);
+        for a in &args { units = units.saturating_add(super::runtime::work_units(a)); }
+        if name == "repeat" {
+            units = units.saturating_mul(args.first().and_then(|a| a.to_i64().ok()).unwrap_or(0).max(0) as u64);
+        }
+        rt.charge(units)?;
+    }
     let _output=if name=="toString" && args.is_empty() {Some(super::allocation::Allocation::scalar_text(&[&recv])?)} else {None};
-    let result=call_method_inner(rt,recv,name,args)?;
+    let result=call_method_inner(rt,recv,name,args);
+    // A native walk (hashCode / equals / toString of a collection) cut off
+    // at its bounds fails the call ([`super::walk`]).
+    if super::walk::take() {return Err(super::walk::overflow());}
+    // Regex scans are execution fuel (deadline / cancellation polling).
+    let regex_work=super::regex::take_work();
+    if regex_work>0 {rt.charge(regex_work)?;}
+    let result=result?;
     if matches!(result,Val::Str(_)|Val::Utf16(_)) {super::allocation::Scope::adopt(&result)?;}
     Ok(result)
 }
@@ -1404,7 +1596,8 @@ fn number_method(recv: &Val, name: &str, args: &[Val]) -> SResult<Option<Val>> {
 }
 
 fn string_method(recv: &Val, s: &Rc<str>, name: &str, args: &[Val]) -> SResult<Option<Val>> {
-    let _receiver_copy=super::allocation::Allocation::iterable(recv)?;
+    // Receiver copies are scalar accounting: scripted-metric scopes only.
+    let _receiver_copy=if super::allocation::Scope::active() {super::allocation::Allocation::iterable(recv)?} else {super::allocation::Allocation::disabled()};
     let n = args.len();
     if matches!((name,n),("chars"|"codePoints"|"toCharArray"|"decodeBase64",0)) {
         return super::source::string_method(recv,&s.encode_utf16().collect::<Vec<_>>(),name,args).map(Some);
@@ -1677,7 +1870,8 @@ fn list_method(rt: &mut Rt, l: &super::value::List, name: &str, args: &[Val]) ->
             let other = iter_values(&args[0])?;
             let mut b = l.borrow_mut();
             let before = b.len();
-            b.retain(|x| !other.iter().any(|o| o.equals(x)));
+            let member = member_of(&other);
+            b.retain(|x| !member(x));
             Val::Bool(b.len() != before)
         }
         ("retainAll", 1) => {
@@ -1685,7 +1879,8 @@ fn list_method(rt: &mut Rt, l: &super::value::List, name: &str, args: &[Val]) ->
             let other = iter_values(&args[0])?;
             let mut b = l.borrow_mut();
             let before = b.len();
-            b.retain(|x| other.iter().any(|o| o.equals(x)));
+            let member = member_of(&other);
+            b.retain(|x| member(x));
             Val::Bool(b.len() != before)
         }
         ("indexOf", 1) => Val::Int(l.borrow().iter().position(|x| x.equals(&args[0])).map(|p| p as i32).unwrap_or(-1)),
@@ -2205,6 +2400,14 @@ fn map_method_untree(rt: &mut Rt, recv: &Val, m: &mut Rc<JMap>, name: &str, args
 }
 
 /// Set `add` honoring the set kind; returns whether the set changed.
+/// Membership in `other` for the bulk `removeAll` / `retainAll`: a hash index
+/// of `other` under Java `equals` / `hashCode` ([`Key`]), so the operation is
+/// linear in both collections, never |a|·|b| comparisons.
+fn member_of(other: &[Val]) -> impl Fn(&Val) -> bool + '_ {
+    let index: std::collections::HashSet<Key> = other.iter().map(Key::from_val).collect();
+    move |x| index.contains(&Key::from_val(x))
+}
+
 pub fn set_add(rt: &mut Rt, l: &JList, v: Val) -> SResult<bool> {
     if l.kind == CollKind::TreeSet {
         let items = l.ordered().clone();
@@ -2224,12 +2427,9 @@ pub fn set_add(rt: &mut Rt, l: &JList, v: Val) -> SResult<bool> {
             }
         };
     }
-    if l.borrow().iter().any(|x| x.equals(&v)) {
-        return Ok(false);
-    }
-    l.reserve_growth(1)?;
-    l.borrow_mut().push(v);
-    Ok(true)
+    // `HashSet` / `LinkedHashSet`: O(1) through the element index (Java
+    // `equals` / `hashCode`).
+    l.set_insert(v)
 }
 
 fn tree_set_of(src: &JList, items: Vec<Val>) -> SResult<Val> {
@@ -2259,6 +2459,8 @@ fn set_method(rt: &mut Rt, recv: &Val, l: &Rc<JList>, name: &str, args: &[Val]) 
             let it = items();
             Val::Bool(tree_search(rt, &l.cmp, &it, &args[0])?.is_ok())
         }
+        ("remove", 1) if !tree => Val::Bool(l.set_remove(&args[0])),
+        ("contains", 1) if !tree => Val::Bool(l.set_contains(&args[0])),
         ("remove", 1) => {
             let mut b = l.borrow_mut();
             match b.iter().position(|x| x.equals(&args[0])) {
@@ -2274,7 +2476,8 @@ fn set_method(rt: &mut Rt, recv: &Val, l: &Rc<JList>, name: &str, args: &[Val]) 
             let other = iter_values(&args[0])?;
             let mut b = l.borrow_mut();
             let before = b.len();
-            b.retain(|x| !other.iter().any(|o| o.equals(x)));
+            let member = member_of(&other);
+            b.retain(|x| !member(x));
             Val::Bool(b.len() != before)
         }
         ("clear", 0) => {
@@ -2298,7 +2501,8 @@ fn set_method(rt: &mut Rt, recv: &Val, l: &Rc<JList>, name: &str, args: &[Val]) 
             let other = iter_values(&args[0])?;
             let mut b = l.borrow_mut();
             let before = b.len();
-            b.retain(|x| other.iter().any(|o| o.equals(x)));
+            let member = member_of(&other);
+            b.retain(|x| member(x));
             Val::Bool(b.len() != before)
         }
         ("iterator", 0) => super::jmisc::new_iter(l.ordered().iter().cloned(), Some(l.clone()))?,

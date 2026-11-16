@@ -522,6 +522,15 @@ impl GeoValues {
         }
     }
 
+    /// Append an encoded point (docs must arrive in ascending order): a
+    /// sorted seal moves points between memtables without re-encoding.
+    pub fn push_entry(&mut self, entry: GeoPointEntry) {
+        match &mut self.points {
+            PointBuf::Owned(v) if self.dense.is_none() => v.push(entry),
+            _ => unreachable!("points pushed to a sealed segment"),
+        }
+    }
+
     /// Number of points.
     #[inline]
     pub fn len(&self) -> usize {

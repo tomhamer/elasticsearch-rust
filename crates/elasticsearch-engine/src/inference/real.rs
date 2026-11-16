@@ -2,10 +2,11 @@
 //! `intfloat/multilingual-e5-small` (BERT architecture, XLM-R tokenizer)
 //! with `candle`, from files under `<path.data>/ml-models/<model>/`
 //! (`config.json`, `tokenizer.json`, `model.safetensors`) or the directory
-//! named by `ES_ML_MODEL_DIR_<NORMALISED_ID>`.
+//! named by `ES_ML_MODEL_DIR_MULTILINGUAL_E5_SMALL` ([`super::backend::model_dir`]).
 //!
-//! Without the feature (or without the files) callers use the hashing
-//! fallbacks in [`super::local`].
+//! Without the feature, or without loadable files, the model cannot run:
+//! callers report it as not deployed (see [`super::backend`]); the built-in
+//! stand-ins are used only when the node explicitly enables them.
 
 #[cfg(feature = "candle-models")]
 mod imp {
@@ -23,39 +24,56 @@ mod imp {
         dev: Device,
     }
 
-    fn cache() -> &'static Mutex<HashMap<PathBuf, Option<Arc<Embedder>>>> {
-        static C: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<Embedder>>>>> = OnceLock::new();
+    /// Loaded models, and load failures keyed by the weights' mtime (a
+    /// broken install is not reloaded on every call; replacing the files
+    /// retries).
+    enum Slot {
+        Ready(Arc<Embedder>),
+        Failed(Option<std::time::SystemTime>, String),
+    }
+
+    fn cache() -> &'static Mutex<HashMap<PathBuf, Slot>> {
+        static C: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
         C.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     fn load(dir: &Path) -> Result<Embedder, String> {
         let dev = Device::Cpu;
-        let cfg: Config = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let mut tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| e.to_string())?;
+        let cfg: Config = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("config.json: {e}"))?).map_err(|e| format!("config.json: {e}"))?;
+        let mut tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
         tok.with_padding(Some(PaddingParams::default()));
         tok.with_truncation(Some(TruncationParams { max_length: 512, ..Default::default() })).map_err(|e| e.to_string())?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &dev) }.map_err(|e| e.to_string())?;
-        let model = BertModel::load(vb, &cfg).map_err(|e| e.to_string())?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &dev) }.map_err(|e| format!("model.safetensors: {e}"))?;
+        let model = BertModel::load(vb, &cfg).map_err(|e| format!("model.safetensors: {e}"))?;
         Ok(Embedder { model, tok, dev })
     }
 
-    /// Lazily load the model in `dir` (None when files are missing/broken).
-    pub fn get(dir: &Path) -> Option<Arc<Embedder>> {
+    /// The model in `dir`, loaded on first use; why it cannot be loaded otherwise.
+    pub fn get(dir: &Path) -> Result<Arc<Embedder>, String> {
+        let missing: Vec<&str> = super::FILES.iter().copied().filter(|f| !dir.join(f).is_file()).collect();
+        if !missing.is_empty() {
+            return Err(format!("model files [{}] not found in [{}]", missing.join(", "), dir.display()));
+        }
+        let mtime = std::fs::metadata(dir.join("model.safetensors")).and_then(|m| m.modified()).ok();
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-        c.entry(dir.to_path_buf())
-            .or_insert_with(|| {
-                if !dir.join("model.safetensors").exists() {
-                    return None;
-                }
-                match load(dir) {
-                    Ok(e) => Some(Arc::new(e)),
-                    Err(err) => {
-                        tracing::error!("failed to load model at {}: {err}", dir.display());
-                        None
-                    }
-                }
-            })
-            .clone()
+        match c.get(dir) {
+            Some(Slot::Ready(e)) => return Ok(e.clone()),
+            Some(Slot::Failed(t, err)) if *t == mtime => return Err(err.clone()),
+            _ => {}
+        }
+        match load(dir) {
+            Ok(e) => {
+                let e = Arc::new(e);
+                c.insert(dir.to_path_buf(), Slot::Ready(e.clone()));
+                Ok(e)
+            }
+            Err(err) => {
+                let err = format!("failed to load the model from [{}]: {err}", dir.display());
+                tracing::error!("{err}");
+                c.insert(dir.to_path_buf(), Slot::Failed(mtime, err.clone()));
+                Err(err)
+            }
+        }
     }
 
     impl Embedder {
@@ -86,11 +104,28 @@ mod imp {
 }
 
 #[cfg(feature = "candle-models")]
-pub use imp::*;
+pub use imp::Embedder;
 
-/// Embed with the real model for `model_id` if available.
-/// `kind`: "ingest" -> `passage: ` prefix, "search" -> `query: ` prefix.
-pub fn try_embed(model_dir: &std::path::Path, texts: &[String], kind: &str) -> Option<Vec<Vec<f32>>> {
+/// The files a model directory must hold.
+pub const FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
+
+/// Can the model in `model_dir` run (loading it on first use)? `Err` says why not.
+pub fn ready(model_dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(feature = "candle-models")]
+    {
+        imp::get(model_dir).map(|_| ())
+    }
+    #[cfg(not(feature = "candle-models"))]
+    {
+        let _ = model_dir;
+        Err("this build does not include the [candle-models] feature that runs the model".to_string())
+    }
+}
+
+/// Embed `texts` with the real model in `model_dir`. `kind`: "ingest" ->
+/// `passage: ` prefix, "search" -> `query: ` prefix. Never substitutes:
+/// a missing model or a failed inference is an error.
+pub fn embed(model_dir: &std::path::Path, texts: &[String], kind: &str) -> Result<Vec<Vec<f32>>, String> {
     #[cfg(feature = "candle-models")]
     {
         let e = imp::get(model_dir)?;
@@ -102,13 +137,18 @@ pub fn try_embed(model_dir: &std::path::Path, texts: &[String], kind: &str) -> O
                 _ => t.clone(),
             })
             .collect();
-        return e.embed(&prefixed).ok();
+        e.embed(&prefixed)
     }
     #[cfg(not(feature = "candle-models"))]
     {
-        let _ = (model_dir, texts, kind);
-        None
+        let _ = (texts, kind);
+        ready(model_dir).map(|_| Vec::new())
     }
+}
+
+/// [`embed`], `None` on any failure (kept for callers that probe).
+pub fn try_embed(model_dir: &std::path::Path, texts: &[String], kind: &str) -> Option<Vec<Vec<f32>>> {
+    embed(model_dir, texts, kind).ok()
 }
 
 pub const ACTIVE: bool = cfg!(feature = "candle-models");

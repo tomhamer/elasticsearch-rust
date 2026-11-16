@@ -90,6 +90,10 @@ pub struct SimNode {
     disk_busy: bool,
     /// Applied (version, uuid) sequence of this incarnation.
     pub applied_seq: Vec<(u64, String)>,
+    /// Each restart gets a new IP (a Kubernetes pod): the previous
+    /// address goes dark (a request to it fails after the driver's 2s
+    /// connect bound, as a dial to a vanished pod IP does).
+    pub new_address_on_restart: bool,
 }
 
 impl SimNode {
@@ -140,8 +144,13 @@ pub struct Cluster {
     pub dup_prob: f64,
     /// Max fsync latency (0 = synchronous disk).
     pub max_disk_delay: u64,
+    /// Extra one-way delay range for publish requests (large full states
+    /// on a fresh, TLS-handshaking connection), on top of the link delay.
+    pub publish_extra_delay: (u64, u64),
     pub trace: Option<VecDeque<String>>,
     blackholed: BTreeSet<(usize, usize)>,
+    /// Addresses of previous incarnations that moved.
+    dead_addresses: BTreeSet<String>,
     disconnected: BTreeSet<(usize, usize)>,
     // Invariant bookkeeping.
     leaders_by_term: BTreeMap<u64, String>,
@@ -183,8 +192,10 @@ impl Cluster {
             crash_mid_output_prob: 0.0,
             dup_prob: 0.0,
             max_disk_delay: 0,
+            publish_extra_delay: (0, 0),
             trace: None,
             blackholed: BTreeSet::new(),
+            dead_addresses: BTreeSet::new(),
             disconnected: BTreeSet::new(),
             leaders_by_term: BTreeMap::new(),
             accepted: BTreeMap::new(),
@@ -248,15 +259,37 @@ impl Cluster {
             queue: VecDeque::new(),
             disk_busy: false,
             applied_seq: Vec::new(),
+            new_address_on_restart: false,
         });
         idx
+    }
+
+    /// Resolve `name` (a seed host name, e.g. a headless service) to node
+    /// `idx`, whatever its current address.
+    pub fn alias(&mut self, name: &str, idx: usize) {
+        self.addr_index.insert(name.to_string(), idx);
     }
 
     pub fn start(&mut self, idx: usize) {
         assert!(!self.nodes[idx].alive());
         let n = &mut self.nodes[idx];
         n.incarnation += 1;
+        let old_address = n.node.transport_address.clone();
         n.node = mk_node(&n.prefix, n.index_in_prefix, n.node.is_master_eligible(), n.incarnation);
+        if n.new_address_on_restart && n.incarnation > 1 {
+            let ip = format!("{}10.{}.0.{}", n.prefix, n.incarnation, n.index_in_prefix);
+            n.node.transport_address = format!("{ip}:9300");
+            n.node.http_address = format!("{ip}:9200");
+            n.node.host = ip.clone();
+            n.node.ip = ip;
+        }
+        if n.node.transport_address != old_address {
+            let new_address = n.node.transport_address.clone();
+            self.addr_index.remove(&old_address);
+            self.dead_addresses.insert(old_address);
+            self.addr_index.insert(new_address, idx);
+        }
+        let n = &mut self.nodes[idx];
         n.applied_version = 0;
         n.applied_seq.clear();
         n.queue.clear();
@@ -353,6 +386,15 @@ impl Cluster {
         if let Message::PublishRequest { state, .. } = &msg {
             self.check_config_committed(state, "published");
         }
+        if self.dead_addresses.contains(to_addr) && !self.addr_index.contains_key(to_addr) {
+            // The driver bounds a dial to an unconnected peer by
+            // `CONNECT_GRACE` (2s), then reports the send as failed.
+            if let Some(request_id) = msg.request_id() {
+                let incarnation = self.nodes[from].incarnation;
+                self.schedule(self.now + 2_000, Event::SendFailure { node: from, incarnation, request_id });
+            }
+            return;
+        }
         let Some(&to) = self.addr_index.get(to_addr) else {
             return self.fail_request(from, &msg);
         };
@@ -370,7 +412,11 @@ impl Cluster {
             let at = self.now + self.delay();
             self.schedule(at, Event::Deliver { from, to, msg: msg.clone() });
         }
-        let at = self.now + self.delay();
+        let mut at = self.now + self.delay();
+        if matches!(msg, Message::PublishRequest { .. }) && self.publish_extra_delay.1 > 0 {
+            let (lo, hi) = self.publish_extra_delay;
+            at += self.rng.gen_range(lo..=hi);
+        }
         self.schedule(at, Event::Deliver { from, to, msg });
     }
 

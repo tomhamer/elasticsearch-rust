@@ -253,13 +253,14 @@ for suite, module, _ in jobs:
 # Licensing is hardwired to enterprise/trial (AGENTS.md "Licensing: always
 # enterprise"), so suites asserting basic/expired/licence-transition behaviour
 # are skipped, not failed. Do not change these skips without asking Tom Hamer.
-# The suites below are classified the same way (CCR is not supported).
+# CCR (`plug/ccr/`) and CCS (`oss cluster.stats/30_ccs_stats.yml`) now run
+# for real: ES's own suites alias the fixture cluster as its remote through
+# a real remote-cluster connection. The separate-cluster CCS suite
+# (x-pack/qa/multi-cluster-search-security) runs in `ccs_ccr_yaml.py`.
 KNOWN_SKIPS = (
     ('main', ('license/',), 'licence hardwired to trial'),
     ('plug', ('rank-rrf/license/',), 'licence hardwired to trial'),
-    ('plug', ('ccr/',), 'CCR out of scope for PR3'),
     ('plug', ('gpu/',), 'GPU suite deferred until the GPU test round'),
-    ('oss', ('cluster.stats/30_ccs_stats.yml',), 'remote cross-cluster search out of scope for PR3'),
     ('oss', ('tasks.list/10_basic.yml',), 'known gap: tasks.list node roles'),
 )
 reclassified = set()

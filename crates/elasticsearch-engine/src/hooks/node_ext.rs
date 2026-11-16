@@ -67,7 +67,7 @@ impl Node {
         if let Some(other) = self.all_indices().into_iter().find(|s| s.uuid == uuid) {
             return Err(EsError::illegal_argument(format!("index uuid [{uuid}] is already used by index [{}]", other.name)));
         }
-        self.create_index_impl(name, body, Some(uuid), true)
+        self.create_index_impl(name, body, Some(uuid), true, true)
     }
 
     /// Register an index whose metadata the cluster already resolved,

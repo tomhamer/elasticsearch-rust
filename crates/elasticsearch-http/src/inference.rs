@@ -49,6 +49,15 @@ fn fix_root(r: R) -> R {
     }
 }
 
+/// A response of an endpoint served by a built-in stand-in carries a
+/// warning naming it (`xpack.inference.builtin_fallback`).
+fn with_fallback_warning(svc: &InferenceService, id: &str, mut r: Resp) -> Resp {
+    if let Some(w) = svc.fallback_warning(id) {
+        r.headers.push(crate::search_api::warning_header(&w));
+    }
+    r
+}
+
 pub async fn handle(node: Arc<Node>, req: Req) -> R {
     let segs = req.segs.clone();
     let n = segs.len();
@@ -104,7 +113,7 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
         let body = body_obj(&req)?;
         return blocking(move || {
             let res = svc.infer(task.as_deref(), &id, &body)?;
-            Ok(sse(&res))
+            Ok(with_fallback_warning(&svc, &id, sse(&res)))
         })
         .await;
     }
@@ -135,6 +144,9 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
                     // that already use this id must keep compatible settings.
                     let ms = svc.get_endpoint(&id).and_then(|ep| elasticsearch_engine::inference::model_settings(&ep));
                     let mut bad: Vec<String> = Vec::new();
+                    // Does indexed data reference this id (a semantic_text
+                    // field whose model settings are set)?
+                    let mut in_use = false;
                     for ix in node.all_indices() {
                         let lk = ix.lookup();
                         let clash = lk.fields.values().any(|f| {
@@ -144,6 +156,9 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
                             let Some(p) = f.ext.as_ref().map(|e| e.params.clone()) else { return false };
                             if p.get("inference_id").and_then(Value::as_str) != Some(id.as_str()) {
                                 return false;
+                            }
+                            if p.get("model_settings").is_some_and(|v| !v.is_null()) {
+                                in_use = true;
                             }
                             match (p.get("model_settings").filter(|v| !v.is_null()), &ms) {
                                 (Some(a), Some(b)) => ["task_type", "dimensions", "similarity", "element_type"].iter().any(|k| a.get(*k) != b.get(*k)),
@@ -163,6 +178,12 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
                             bad.join(", ")
                         )));
                     }
+                    // A new endpoint under an id no data uses starts without
+                    // a recorded implementation; one whose id still has
+                    // embedded data keeps it, so it cannot mix implementations.
+                    if !in_use {
+                        elasticsearch_engine::inference::backend::clear_pin(svc.state_dir(), &id);
+                    }
                     Ok(Resp::ok(out))
                 })
                 .await,
@@ -175,7 +196,11 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
         }
         Method::POST => {
             let body = body_obj(&req)?;
-            blocking(move || Ok(Resp::ok(svc.infer(task.as_deref(), &id, &body)?))).await
+            blocking(move || {
+                let res = svc.infer(task.as_deref(), &id, &body)?;
+                Ok(with_fallback_warning(&svc, &id, Resp::ok(res)))
+            })
+            .await
         }
         _ => method_not_allowed(&req, &["GET", "PUT", "POST", "DELETE"]),
     }

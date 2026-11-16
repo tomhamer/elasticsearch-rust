@@ -81,18 +81,45 @@ fn cbor(v:&Value,o:&mut Out<'_>)->io::Result<()> {
 fn vint(mut n:u64,o:&mut Out<'_>)->io::Result<()> {let last=(n&63) as u8|128;n>>=6;let mut groups=[0u8;9];let mut used=0;while n>0{groups[used]=(n&127) as u8;used+=1;n>>=7;}for b in groups[..used].iter().rev(){o.byte(*b)?;}o.byte(last)}
 fn smile_str(s:&str,o:&mut Out<'_>)->io::Result<()> {
     let b=s.as_bytes();if b.is_empty(){return o.byte(0x20);}let ascii=b.is_ascii();
-    if ascii&&b.len()<=32{o.byte(0x40+(b.len()-1) as u8)?;}else if ascii&&b.len()<=64{o.byte(0x60+(b.len()-33) as u8)?;}else if !ascii&&b.len()<=33{o.byte(0xc0+(b.len()-2) as u8)?;}else if !ascii&&b.len()<=65{o.byte(0xe0+(b.len()-34) as u8)?;}else{o.byte(if ascii{0xe0}else{0xe4})?;o.bytes(b)?;return o.byte(0xfc);}o.bytes(b)
+    if ascii&&b.len()<=32{o.byte(0x40+(b.len()-1) as u8)?;}else if ascii&&b.len()<=64{o.byte(0x60+(b.len()-33) as u8)?;}else if !ascii&&b.len()<=33{o.byte(0x80+(b.len()-2) as u8)?;}else if !ascii&&b.len()<=65{o.byte(0xa0+(b.len()-34) as u8)?;}else{o.byte(if ascii{0xe0}else{0xe4})?;o.bytes(b)?;return o.byte(0xfc);}o.bytes(b)
+}
+/// Smile BigInteger (`0x26`) of a value above `i64::MAX`: the length of its
+/// big-endian two's-complement bytes (a leading zero keeps it positive),
+/// then those bytes in 7-bit groups (Jackson `SmileGenerator.writeNumber(BigInteger)`).
+fn big_integer(u:u64,o:&mut Out<'_>)->io::Result<()> {
+    let mut raw=[0u8;9];raw[1..].copy_from_slice(&u.to_be_bytes());
+    o.byte(0x26)?;vint(raw.len() as u64,o)?;seven_bit(&raw,o)
+}
+/// Raw bytes as 7-bit groups (`SmileGenerator._write7BitBinaryWithLength`'s body).
+fn seven_bit(data:&[u8],o:&mut Out<'_>)->io::Result<()> {
+    let mut chunks=data.chunks_exact(7);
+    for c in &mut chunks {
+        let mut acc:u64=0;for b in c{acc=(acc<<8)|*b as u64;}
+        for shift in (0..8).rev(){o.byte(((acc>>(shift*7))&0x7f) as u8)?;}
+    }
+    let rest=chunks.remainder();
+    if !rest.is_empty() {
+        // The last `n` bytes: `n` full 7-bit groups, then the remaining
+        // `n` low bits right-aligned in a final byte.
+        let mut acc:u64=0;for b in rest{acc=(acc<<8)|*b as u64;}
+        let n=rest.len();
+        for j in 0..n{o.byte(((acc>>(8*n-7*(j+1)))&0x7f) as u8)?;}
+        o.byte((acc&((1u64<<n)-1)) as u8)?;
+    }
+    Ok(())
 }
 struct Names<'a>{values:[Option<&'a str>;1024],len:usize}
+/// A field name: a shared reference to an earlier literal name, else the
+/// literal (registered in the dictionary whatever its length, as every
+/// Smile reader registers it: Jackson `SmileGenerator._writeNonShortFieldName`).
 fn name<'a>(k:&'a str,o:&mut Out<'_>,names:&mut Names<'a>)->io::Result<()> {
-    let b=k.as_bytes();if b.is_empty(){return o.byte(0x20);}if b.len()<=64 {
-        if let Some(i)=names.values[..names.len].iter().position(|v|*v==Some(k)){if i<64{return o.byte(0x40+i as u8);}o.byte(0x30+(i>>8) as u8)?;return o.byte((i&255)as u8);}
-        if names.len==1024{names.len=0;}names.values[names.len]=Some(k);names.len+=1;
-        if b.is_ascii(){o.byte(0x80+(b.len()-1)as u8)?;}else if b.len()>=2&&b.len()<=57{o.byte(0xc0+(b.len()-2)as u8)?;}else{o.byte(0x34)?;o.bytes(b)?;return o.byte(0xfc);}o.bytes(b)
-    }else{o.byte(0x34)?;o.bytes(b)?;o.byte(0xfc)}
+    let b=k.as_bytes();if b.is_empty(){return o.byte(0x20);}
+    if let Some(i)=names.values[..names.len].iter().position(|v|*v==Some(k)){if i<64{return o.byte(0x40+i as u8);}o.byte(0x30+(i>>8) as u8)?;return o.byte((i&255)as u8);}
+    if names.len==1024{names.len=0;}names.values[names.len]=Some(k);names.len+=1;
+    if b.is_ascii()&&b.len()<=64{o.byte(0x80+(b.len()-1)as u8)?;}else if !b.is_ascii()&&b.len()>=2&&b.len()<=57{o.byte(0xc0+(b.len()-2)as u8)?;}else{o.byte(0x34)?;o.bytes(b)?;return o.byte(0xfc);}o.bytes(b)
 }
 fn smile<'a>(v:&'a Value,o:&mut Out<'_>,names:&mut Names<'a>)->io::Result<()> {
-    match v {Value::Null=>o.byte(0x21),Value::Bool(b)=>o.byte(if *b{0x23}else{0x22}),Value::Number(n)=>{if let Some(i)=n.as_i64(){let z=((i<<1)^(i>>63)) as u64;if(-16..=15).contains(&i){o.byte(0xc0+z as u8)}else{o.byte(if i>=i32::MIN as i64&&i<=i32::MAX as i64{0x24}else{0x25})?;vint(z,o)}}else if let Some(u)=n.as_u64(){o.byte(0x25)?;vint(u,o)}else{let bits=n.as_f64().unwrap_or(0.).to_bits();o.byte(0x29)?;o.byte((bits>>63) as u8)?;for shift in (0..9).rev(){o.byte(((bits>>(shift*7))&127)as u8)?;}Ok(())}},Value::String(s)=>smile_str(s,o),Value::Array(a)=>{o.byte(0xf8)?;for v in a{smile(v,o,names)?;}o.byte(0xf9)},Value::Object(m)=>{o.byte(0xfa)?;for(k,v)in m{name(k,o,names)?;smile(v,o,names)?;}o.byte(0xfb)}}
+    match v {Value::Null=>o.byte(0x21),Value::Bool(b)=>o.byte(if *b{0x23}else{0x22}),Value::Number(n)=>{if let Some(i)=n.as_i64(){let z=((i<<1)^(i>>63)) as u64;if(-16..=15).contains(&i){o.byte(0xc0+z as u8)}else{o.byte(if i>=i32::MIN as i64&&i<=i32::MAX as i64{0x24}else{0x25})?;vint(z,o)}}else if let Some(u)=n.as_u64(){big_integer(u,o)}else{let bits=n.as_f64().unwrap_or(0.).to_bits();o.byte(0x29)?;o.byte((bits>>63) as u8)?;for shift in (0..9).rev(){o.byte(((bits>>(shift*7))&127)as u8)?;}Ok(())}},Value::String(s)=>smile_str(s,o),Value::Array(a)=>{o.byte(0xf8)?;for v in a{smile(v,o,names)?;}o.byte(0xf9)},Value::Object(m)=>{o.byte(0xfa)?;for(k,v)in m{name(k,o,names)?;smile(v,o,names)?;}o.byte(0xfb)}}
 }
 pub(super) fn encode(w:Wire,v:&Value,sink:&mut dyn Write)->io::Result<()> {
     let mut out=Out{w:sink,column:0};

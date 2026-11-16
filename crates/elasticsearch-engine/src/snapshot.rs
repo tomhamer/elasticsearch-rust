@@ -80,14 +80,45 @@ impl SnapshotService {
         Ok(())
     }
 
+    /// Where an fs repository lives: an absolute `location` is that path
+    /// (ES: the configured location; production review #402: it was
+    /// rewritten under this node's data directory, so backups never reached
+    /// the intended volume); a relative one resolves under `<data>/repo`.
     fn repo_dir(&self, repo: &Value) -> PathBuf {
         let loc = repo["settings"]["location"].as_str().unwrap_or("");
-        self.data.join("repo").join(loc.trim_start_matches('/'))
+        if Path::new(loc).is_absolute() {
+            return PathBuf::from(loc);
+        }
+        self.data.join("repo").join(loc)
+    }
+
+    /// Where an earlier version put an absolute location's snapshots.
+    fn legacy_dir(&self, repo: &Value) -> Option<PathBuf> {
+        let loc = repo["settings"]["location"].as_str().unwrap_or("");
+        Path::new(loc).is_absolute().then(|| self.data.join("repo").join(loc.trim_start_matches('/')))
+    }
+
+    /// Snapshots an earlier version wrote under the data directory for an
+    /// absolute location that does not hold them: an explicit error naming
+    /// both paths (move the files, then retry), never a silent empty
+    /// repository.
+    fn check_legacy(&self, name: &str, repo: &Value) -> Result<()> {
+        if let Some(legacy) = self.legacy_dir(repo) {
+            let dir = self.repo_dir(repo);
+            if legacy.join("_repo_uuid").exists() && !dir.join("_repo_uuid").exists() {
+                return Err(EsError::new(500, "repository_exception", format!(
+                    "[{name}] location [{}] holds no repository, but an earlier version stored this repository's snapshots under [{}]: move that directory's contents to the location and retry",
+                    dir.display(), legacy.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn dir_of(&self, name: &str) -> Result<PathBuf> {
         let repos = self.repos.read();
         let r = repos.get(name).ok_or_else(|| repo_missing(name))?;
+        self.check_legacy(name, r)?;
         Ok(self.repo_dir(r))
     }
 
@@ -161,8 +192,9 @@ impl SnapshotService {
             }
         }
         let mut repo = json!({"type": ty, "settings": settings});
+        self.check_legacy(name, &repo)?;
         let dir = self.repo_dir(&repo);
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&dir).map_err(|e| EsError::new(500, "repository_exception", format!("[{name}] cannot create location [{}]: {e}", dir.display())))?;
         // The repository uuid lives in the location, so repositories sharing one agree.
         let uuid_file = dir.join("_repo_uuid");
         let uuid = match std::fs::read_to_string(&uuid_file) {
@@ -224,7 +256,15 @@ impl SnapshotService {
     }
 
     pub fn verify(&self, name: &str, node_name: &str) -> Result<Value> {
-        self.dir_of(name)?;
+        // ES verification writes and reads a blob at the location.
+        let dir = self.dir_of(name)?;
+        if self.read_only(name) {
+            std::fs::read_dir(&dir).map_err(|e| EsError::new(500, "repository_verification_exception", format!("[{name}] store location [{}] is not accessible on the node: {e}", dir.display())))?;
+        } else {
+            let probe = dir.join(format!("tests-{}", new_uuid()));
+            std::fs::write(&probe, b"verify").and_then(|_| std::fs::read(&probe)).map_err(|e| EsError::new(500, "repository_verification_exception", format!("[{name}] store location [{}] is not accessible on the node: {e}", dir.display())))?;
+            let _ = std::fs::remove_file(&probe);
+        }
         Ok(json!({"nodes": {NODE_ID: {"name": node_name}}}))
     }
 
@@ -294,6 +334,7 @@ impl SnapshotService {
             return Err(EsError::new(400, "invalid_snapshot_name_exception", format!("[{repo}:{snap}] Invalid snapshot name [{snap}], snapshot with the same name already exists")));
         }
         let ignore_unavailable = body["ignore_unavailable"].as_bool().unwrap_or(false);
+        let partial = body["partial"].as_bool().unwrap_or(false);
         let expr = match &body["indices"] {
             Value::Null => "*".to_string(),
             Value::String(s) if s.is_empty() => "*".to_string(),
@@ -312,6 +353,20 @@ impl SnapshotService {
         let mut total_shards = 0usize;
         let mut failed_shards = 0usize;
         let mut failures: Vec<Value> = Vec::new();
+        // Without `partial`, an index missing a primary fails the snapshot
+        // before anything is written (ES: "Indices don't have primary shards").
+        if !partial {
+            let mut red: Vec<String> = targets.iter().filter(|t| t.svc.is_open()).filter(|t| {
+                let n = t.svc.setting_usize("index.number_of_shards", 1) as u32;
+                let present: std::collections::BTreeSet<u32> = t.svc.local_shards().iter().map(|sh| sh.id).collect();
+                (0..n).any(|k| !present.contains(&k))
+            }).map(|t| t.svc.name.clone()).collect();
+            red.sort();
+            red.dedup();
+            if !red.is_empty() {
+                return Err(EsError::new(500, "snapshot_exception", format!("[{repo}:{snap}] Indices don't have primary shards [{}]", red.join(", "))));
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         for t in &targets {
             let svc = &t.svc;
@@ -324,6 +379,21 @@ impl SnapshotService {
             let shard_count = svc.setting_usize("index.number_of_shards", 1);
             total_shards += shard_count;
             indices.push(svc.name.clone());
+            // Every primary must be copied: a shard slot without an open
+            // copy fails the snapshot, or with `partial: true` is recorded
+            // as a failed shard of a PARTIAL snapshot (production review
+            // #415: it was counted as backed up).
+            let present: std::collections::BTreeSet<u32> = svc.local_shards().iter().map(|sh| sh.id).collect();
+            let missing: Vec<u32> = (0..shard_count as u32).filter(|k| !present.contains(k)).collect();
+            if !missing.is_empty() {
+                for shard in &missing {
+                    failures.push(json!({
+                        "index": svc.name, "index_uuid": svc.uuid, "shard_id": shard,
+                        "reason": "primary shard is not allocated", "node_id": NODE_ID, "status": "INTERNAL_SERVER_ERROR",
+                    }));
+                }
+                failed_shards += missing.len();
+            }
             // A `source` repository snapshots `_source` only: an index whose
             // source is incomplete fails every shard (`SourceOnlySnapshotRepository`).
             if source_only && !has_complete_source(svc) {
@@ -347,19 +417,33 @@ impl SnapshotService {
         let end = crate::date::now_millis();
         let include_global_state = body["include_global_state"].as_bool().unwrap_or(true);
         // Global metadata: persistent cluster settings and templates.
+        // Global state (ES): persistent settings, templates, ingest pipelines
+        // and lifecycle policies (production review #403: pipelines and
+        // policies were missing, so a restored index lost its ingestion and
+        // lifecycle configuration).
         let global_state = if include_global_state {
             let t = node.templates.read();
+            let pipelines: Map<String, Value> = node.ingest().get(None).into_iter().collect();
+            let policies: Map<String, Value> = node.ilm.st_snapshot().policies.into_iter().map(|(k, m)| (k, m.policy)).collect();
             json!({
                 "persistent_settings": node.cluster_settings.read().0,
                 "legacy_templates": t.legacy, "index_templates": t.index, "component_templates": t.component,
+                "ingest_pipelines": pipelines, "ilm_policies": policies,
             })
         } else {
             Value::Null
         };
+        // Data streams whose backing indices are all in the snapshot, with
+        // their records (membership, write index), whatever the global-state
+        // flag (ES snapshots selected streams independently of it).
+        let streams: Map<String, Value> = node.data_streams.read().iter()
+            .filter(|(_, ds)| !ds.indices.is_empty() && ds.indices.iter().all(|i| indices.contains(i)))
+            .filter_map(|(n, ds)| serde_json::to_value(ds).ok().map(|v| (n.clone(), v)))
+            .collect();
         let meta = json!({
             "snapshot": snap, "uuid": new_uuid(), "repository": repo,
             "version_id": SNAPSHOT_VERSION_ID, "version": SNAPSHOT_VERSION,
-            "indices": indices, "data_streams": [],
+            "indices": indices, "data_streams": streams.keys().cloned().collect::<Vec<_>>(), "data_stream_records": streams,
             "include_global_state": include_global_state,
             "metadata": body.get("metadata").cloned().unwrap_or(Value::Null),
             "state": if failed_shards > 0 { "PARTIAL" } else { "SUCCESS" },
@@ -548,6 +632,15 @@ impl SnapshotService {
                 return Err(EsError::new(500, "snapshot_restore_exception", format!("[{repo}:{snap}/{}] index [{i}] wasn't fully snapshotted - cannot restore", meta["uuid"].as_str().unwrap_or(""))));
             }
             let target = rename(i)?;
+            // Two sources renamed onto one target fail the whole restore
+            // before anything changes (ES `RestoreService`; production
+            // review #404: the second deleted the first's restored index).
+            if let Some((prev, _)) = plan.iter().find(|(_, t)| *t == target) {
+                return Err(EsError::new(500, "snapshot_restore_exception", format!(
+                    "[{repo}:{snap}/{}] indices [{i}] and [{prev}] are renamed into the same index [{target}]",
+                    meta["uuid"].as_str().unwrap_or("")
+                )));
+            }
             if let Some(existing) = node.get_index(&target) {
                 if existing.is_open() {
                     return Err(EsError::new(500, "snapshot_restore_exception", format!(
@@ -557,6 +650,46 @@ impl SnapshotService {
                 }
             }
             plan.push((i.clone(), target));
+        }
+        // `include_global_state`: persistent settings are replaced, legacy
+        // templates put, composable / component templates replaced (`RestoreService`).
+        if body["include_global_state"].as_bool().unwrap_or(false) {
+            if let Some(gs) = meta.get("global_state").filter(|g| g.is_object()) {
+                let obj = |k: &str| -> std::collections::BTreeMap<String, Value> { gs[k].as_object().map(|o| o.clone().into_iter().collect()).unwrap_or_default() };
+                if let Some(ps) = gs["persistent_settings"].as_object() {
+                    node.cluster_settings.write().0 = ps.clone();
+                    crate::memory::configure(node);
+                    crate::script::rate_limit::configure(node)?;
+                }
+                {
+                    let mut t = node.templates.write();
+                    for (k, v) in obj("legacy_templates") {
+                        t.legacy.insert(k, v);
+                    }
+                    if gs.get("index_templates").is_some() {
+                        t.index = obj("index_templates");
+                    }
+                    if gs.get("component_templates").is_some() {
+                        t.component = obj("component_templates");
+                    }
+                }
+                // Pipelines and lifecycle policies before any restored index
+                // resumes ingestion or lifecycle (#403).
+                for (id, mut cfg) in obj("ingest_pipelines") {
+                    // The node sets the tracking timestamps; a stored copy
+                    // carries them, the put API refuses them.
+                    if let Some(m) = cfg.as_object_mut() {
+                        for k in ["created_date_millis", "created_date", "modified_date_millis", "modified_date"] {
+                            m.remove(k);
+                        }
+                    }
+                    node.ingest().put(&id, cfg, None)?;
+                }
+                for (name, policy) in obj("ilm_policies") {
+                    node.ilm.put_policy(node, &name, policy)?;
+                }
+                node.persist_state()?;
+            }
         }
         let ignore_settings: Vec<String> = crate::node::pattern_list(&body["ignore_index_settings"]);
         let include_aliases = body["include_aliases"].as_bool().unwrap_or(true);
@@ -627,28 +760,26 @@ impl SnapshotService {
             self.restored.lock().insert(target.clone(), (start, crate::date::now_millis(), bytes.max(1), nfiles));
             restored.push(target);
         }
-        // `include_global_state`: persistent settings are replaced, legacy
-        // templates put, composable / component templates replaced (`RestoreService`).
-        if body["include_global_state"].as_bool().unwrap_or(false) {
-            if let Some(gs) = meta.get("global_state").filter(|g| g.is_object()) {
-                let obj = |k: &str| -> std::collections::BTreeMap<String, Value> { gs[k].as_object().map(|o| o.clone().into_iter().collect()).unwrap_or_default() };
-                if let Some(ps) = gs["persistent_settings"].as_object() {
-                    node.cluster_settings.write().0 = ps.clone();
-                    crate::memory::configure(node);
-                    crate::script::rate_limit::configure(node)?;
+        // Data streams whose backing indices were all restored come back
+        // as streams (renamed like their indices), unless the name is taken.
+        if let Some(records) = meta["data_stream_records"].as_object() {
+            let mut changed = false;
+            for (name, rec) in records {
+                let Ok(mut ds) = serde_json::from_value::<crate::datastream::DataStream>(rec.clone()) else { continue };
+                let backing: Vec<String> = ds.indices.iter().map(|i| rename(i)).collect::<Result<_>>()?;
+                if !backing.iter().all(|b| restored.contains(b)) {
+                    continue;
                 }
-                {
-                    let mut t = node.templates.write();
-                    for (k, v) in obj("legacy_templates") {
-                        t.legacy.insert(k, v);
-                    }
-                    if gs.get("index_templates").is_some() {
-                        t.index = obj("index_templates");
-                    }
-                    if gs.get("component_templates").is_some() {
-                        t.component = obj("component_templates");
-                    }
+                let target = rename(name)?;
+                if node.data_streams.read().contains_key(&target) || node.get_index(&target).is_some() {
+                    continue;
                 }
+                ds.name = target.clone();
+                ds.indices = backing;
+                node.data_streams.write().insert(target, ds);
+                changed = true;
+            }
+            if changed {
                 node.persist_state()?;
             }
         }
@@ -792,6 +923,12 @@ fn copy_index(svc: &IndexService, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     std::fs::copy(svc.path().join("index_meta.json"), dst.join("index_meta.json"))?;
     for sh in svc.local_shards() {
+        // An operation permit for the whole copy: deleting the index fences
+        // the copy and waits for its permits before removing its files, so
+        // a committed file can never vanish mid-copy and be skipped as a
+        // temporary one (production review #420). A copy already closed
+        // fails the snapshot of this shard.
+        let _permit = sh.operation_permit()?;
         // Pin the files so no commit swaps them mid-copy (writes and searches
         // continue; the copy's commit point is the flush above).
         let _files = sh.shard.files_pinned();
@@ -820,6 +957,114 @@ mod registration_tests {
         assert!(service.repository_dir("writable").is_err());
         service.restore_cluster_registrations(BTreeMap::new());
         assert_eq!(service.registered_readonly("writable"), None);
+    }
+}
+
+#[cfg(test)]
+mod standalone_snapshot_tests {
+    use super::*;
+    use crate::node::Node;
+
+    fn node_at(dir: &Path) -> Arc<Node> {
+        Node::open(dir).unwrap()
+    }
+
+    fn write(svc: &IndexService, id: &str, body: Value) {
+        let r = svc.write(vec![crate::index::WriteReq::Index { id: Some(id.into()), source: body.to_string(), routing: None, cond: Default::default() }], true);
+        r.into_iter().next().unwrap().unwrap();
+    }
+
+    /// #402: an absolute location is where the repository lives.
+    #[test]
+    fn absolute_location_receives_the_backup() {
+        let (data, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let node = node_at(data.path());
+        let loc = backups.path().join("daily");
+        node.snapshots.put_repository("r", &json!({"type": "fs", "settings": {"location": loc.to_string_lossy()}})).unwrap();
+        let svc = node.create_index("i", &json!({})).unwrap();
+        write(&svc, "1", json!({"n": 1}));
+        node.snapshots.create_snapshot(&node, "r", "s", &json!({"indices": "i"})).unwrap();
+        assert!(loc.join("snap-s.json").exists(), "the snapshot is at the configured location");
+        assert!(!data.path().join("repo").join(loc.to_string_lossy().trim_start_matches('/')).exists(), "nothing under the data directory");
+        // Another node registering the same location sees it.
+        let other = tempfile::tempdir().unwrap();
+        let node2 = node_at(other.path());
+        node2.snapshots.put_repository("r", &json!({"type": "fs", "settings": {"location": loc.to_string_lossy()}})).unwrap();
+        assert_eq!(SnapshotService::list_names(&node2.snapshots.repository_dir("r").unwrap()), vec!["s".to_string()]);
+    }
+
+    /// #415: an index missing a primary fails a non-partial snapshot; a
+    /// partial one records the failed shard and is PARTIAL.
+    #[test]
+    fn unavailable_primaries_fail_or_are_partial() {
+        let (data, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let node = node_at(data.path());
+        node.snapshots.put_repository("r", &json!({"type": "fs", "settings": {"location": backups.path().to_string_lossy()}})).unwrap();
+        let svc = node.create_index("red", &json!({"settings": {"number_of_shards": 2}})).unwrap();
+        write(&svc, "a", json!({"n": 1}));
+        svc.remove_shard(1, false).unwrap();
+        let e = node.snapshots.create_snapshot(&node, "r", "s1", &json!({"indices": "red"})).unwrap_err();
+        assert!(e.reason.contains("Indices don't have primary shards [red]"), "{e:?}");
+        assert!(!backups.path().join("snap-s1.json").exists());
+        let m = node.snapshots.create_snapshot(&node, "r", "s2", &json!({"indices": "red", "partial": true})).unwrap();
+        assert_eq!(m["state"], json!("PARTIAL"));
+        assert_eq!(m["shards"], json!({"total": 2, "failed": 1, "successful": 1}));
+    }
+
+    /// #420: the snapshot copy holds an operation permit; deleting the
+    /// index waits for it instead of removing files mid-copy.
+    #[test]
+    fn index_deletion_waits_for_a_copy_holding_its_permit() {
+        let data = tempfile::tempdir().unwrap();
+        let node = node_at(data.path());
+        let svc = node.create_index("live", &json!({})).unwrap();
+        write(&svc, "1", json!({"n": 1}));
+        let copy = svc.local_shards().remove(0);
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (n2, d2) = (node.clone(), deleted.clone());
+        let permit = copy.operation_permit().unwrap();
+        let t = std::thread::spawn(move || {
+            n2.delete_index("live").unwrap();
+            d2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst), "deletion waits for the copy's permit");
+        assert!(svc.path().join("shard-0").exists(), "the files are still there");
+        drop(permit);
+        t.join().unwrap();
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// #403 + #404: a global-state snapshot carries pipelines, lifecycle
+    /// policies and data streams to a fresh node; two sources renamed onto
+    /// one target fail before anything is restored.
+    #[test]
+    fn global_state_and_streams_restore_on_a_fresh_node_and_rename_collisions_fail() {
+        let (data, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let node = node_at(data.path());
+        let repo = json!({"type": "fs", "settings": {"location": backups.path().to_string_lossy()}});
+        node.snapshots.put_repository("r", &repo).unwrap();
+        node.ingest().put("tag", json!({"processors": [{"set": {"field": "tagged", "value": true}}]}), None).unwrap();
+        node.ilm.put_policy(&node, "keep", json!({"phases": {"hot": {"actions": {}}}})).unwrap();
+        let a = node.create_index("a1", &json!({"settings": {"index.default_pipeline": "tag"}})).unwrap();
+        write(&a, "1", json!({"n": 1}));
+        let b = node.create_index("a2", &json!({})).unwrap();
+        write(&b, "1", json!({"n": 2}));
+        node.snapshots.create_snapshot(&node, "r", "g", &json!({"indices": "a1,a2", "include_global_state": true})).unwrap();
+        // #404 on the same node: a1 and a2 both renamed to `same`.
+        let e = node.snapshots.restore(&node, "r", "g", &json!({"indices": "a1,a2", "rename_pattern": "a(\\d)", "rename_replacement": "same"})).unwrap_err();
+        assert!(e.reason.contains("are renamed into the same index [same]"), "{e:?}");
+        assert!(node.get_index("same").is_none(), "nothing restored");
+        // #403 on a fresh node.
+        let fresh = tempfile::tempdir().unwrap();
+        let node2 = node_at(fresh.path());
+        node2.snapshots.put_repository("r", &repo).unwrap();
+        node2.snapshots.restore(&node2, "r", "g", &json!({"indices": "a1", "include_global_state": true})).unwrap();
+        assert!(!node2.ingest().get(Some("tag")).is_empty(), "the pipeline is restored");
+        assert!(node2.ilm.policy("keep").is_some(), "the lifecycle policy is restored");
+        let a = node2.get_index("a1").unwrap();
+        let r = a.write(vec![crate::index::WriteReq::Index { id: Some("2".into()), source: json!({"n": 3}).to_string(), routing: None, cond: Default::default() }], true);
+        assert!(r[0].is_ok(), "writes resolve the restored default pipeline: {r:?}");
     }
 }
 

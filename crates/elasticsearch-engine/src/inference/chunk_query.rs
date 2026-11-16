@@ -18,13 +18,62 @@ use std::sync::Arc;
 /// What a chunk is scored against.
 #[derive(Clone, Debug)]
 pub enum ChunkVec {
-    /// kNN: the query vector, the field's similarity and an optional
-    /// `similarity` threshold in ES score space.
-    Dense { v: Arc<Vec<f32>>, sim: Similarity, threshold: Option<f32> },
+    /// kNN: the query vector, the field's similarity, the model's element
+    /// type and an optional `similarity` threshold in ES score space.
+    Dense { v: Arc<Vec<f32>>, sim: Similarity, elem: ChunkElem, threshold: Option<f32> },
     /// `sparse_vector`: weighted tokens (Lucene `FeatureField` linear scoring).
     Sparse(Arc<Vec<(String, f32)>>),
     /// Every chunk matches with score 1 (`match_all` in a nested query).
     All,
+}
+
+/// The element type of a dense model's embeddings (its `model_settings`
+/// `element_type`): `byte` and `bit` embeddings are stored as their byte
+/// values and score with ES's byte / Hamming formulas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkElem {
+    Float,
+    Byte,
+    /// Packed bits, one stored value (a signed byte) per 8 dimensions.
+    Bit,
+}
+
+impl ChunkElem {
+    pub fn of(element_type: Option<&str>) -> Self {
+        match element_type {
+            Some("byte") => ChunkElem::Byte,
+            Some("bit") => ChunkElem::Bit,
+            _ => ChunkElem::Float,
+        }
+    }
+
+    /// The `ElementType` the ES score conversions take.
+    pub fn es(self) -> crate::vectors::ElementType {
+        match self {
+            ChunkElem::Float => crate::vectors::ElementType::Float,
+            ChunkElem::Byte => crate::vectors::ElementType::Byte,
+            ChunkElem::Bit => crate::vectors::ElementType::Bit,
+        }
+    }
+
+    /// ES's score of a chunk `d` against query `v` (same lengths): `byte`
+    /// `dot_product` is `0.5 + dot / (dims * 2^15)`, `bit` is
+    /// `(bits - hamming) / bits`; the others are the float formulas.
+    pub fn score(self, sim: Similarity, v: &[f32], d: &[f32]) -> f32 {
+        match self {
+            ChunkElem::Bit => {
+                let byte = |x: f32| x as i32 as u8;
+                let h: u32 = v.iter().zip(d).map(|(a, b)| (byte(*a) ^ byte(*b)).count_ones()).sum();
+                let bits = (v.len() * 8) as f32;
+                (bits - h as f32) / bits
+            }
+            ChunkElem::Byte if sim == Similarity::DotProduct => {
+                let dot: f32 = v.iter().zip(d).map(|(a, b)| a * b).sum();
+                0.5 + dot / (v.len() as f32 * 32768.0)
+            }
+            _ => sim.score(v, d),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -43,6 +92,46 @@ pub struct ChunkQuery {
     pub fixed: Option<std::collections::HashMap<usize, Vec<(DocId, f32)>>>,
 }
 
+/// A probe called with each root document the scan scores (tests count
+/// the documents a stopped scan still visits).
+static SCAN_PROBE: parking_lot::RwLock<Option<Arc<dyn Fn() + Send + Sync>>> = parking_lot::RwLock::new(None);
+static PROBE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_scan_probe(probe: Option<Arc<dyn Fn() + Send + Sync>>) {
+    PROBE_ON.store(probe.is_some(), std::sync::atomic::Ordering::Relaxed);
+    *SCAN_PROBE.write() = probe;
+}
+
+/// Chunks scored between deadline / cancellation checks within one doc.
+const CHUNK_POLL: usize = 256;
+
+/// One candidate of the shard-wide top `k`, ordered worst first (a lower
+/// score, then a later leaf, then a later doc is worse), so a max-heap of
+/// them keeps the `k` best at the cost of `k` entries.
+struct Candidate {
+    score: f32,
+    leaf: usize,
+    doc: DocId,
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Candidate {}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.score.total_cmp(&self.score).then(self.leaf.cmp(&other.leaf)).then(self.doc.cmp(&other.doc))
+    }
+}
+
 /// Lucene `FeatureField`: a stored weight keeps 9 significant bits.
 fn feature_value(w: f64) -> f32 {
     f32::from_bits(((w as f32).to_bits() >> 15) << 15)
@@ -56,11 +145,30 @@ impl ChunkQuery {
     }
 
     fn blob_scores(&self, b: &Value) -> Vec<Option<f32>> {
+        self.blob_scores_until(b, &|| false).unwrap_or_default()
+    }
+
+    /// [`Self::blob_scores`], checking `stopped` every [`CHUNK_POLL`]
+    /// chunks (`None`: stopped before the doc was scored).
+    fn blob_scores_until(&self, b: &Value, stopped: &dyn Fn() -> bool) -> Option<Vec<Option<f32>>> {
         let vecs = b["v"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let mut out = Vec::with_capacity(vecs.len());
+        for (i, part) in vecs.chunks(CHUNK_POLL).enumerate() {
+            if i > 0 && stopped() {
+                return None;
+            }
+            out.extend(self.scores_of(&b["k"], part));
+        }
+        Some(out)
+    }
+
+    /// Scores of chunk embeddings `vecs` of blob kind `kind` (`d` / `s`).
+    fn scores_of(&self, kind: &Value, vecs: &[Value]) -> Vec<Option<f32>> {
+        let b = kind;
         match &self.vec {
             ChunkVec::All => vecs.iter().map(|_| Some(1.0)).collect(),
-            ChunkVec::Dense { v, sim, threshold } => {
-                if b["k"] != "d" {
+            ChunkVec::Dense { v, sim, elem, threshold } => {
+                if *b != "d" {
                     return vecs.iter().map(|_| None).collect();
                 }
                 vecs.iter()
@@ -69,13 +177,13 @@ impl ChunkQuery {
                         if d.len() != v.len() {
                             return None;
                         }
-                        let s = sim.score(v, &d);
+                        let s = elem.score(*sim, v, &d);
                         threshold.is_none_or(|t| s >= t).then_some(s)
                     })
                     .collect()
             }
             ChunkVec::Sparse(q) => {
-                if b["k"] != "s" {
+                if *b != "s" {
                     return vecs.iter().map(|_| None).collect();
                 }
                 vecs.iter()
@@ -151,54 +259,97 @@ impl CustomQuery for ChunkQuery {
 }
 
 impl ChunkQuery {
-    /// Matching docs of one leaf (pre-filter applied, before any top `k`).
+    /// Matching docs of one leaf (pre-filter applied, before any top `k`);
+    /// a stopped search (deadline, cancellation) keeps what it scored.
     fn leaf_hits(&self, leaf: &LeafReader<'_>, ctx: &SearchContext) -> Vec<(DocId, f32)> {
-        let live = leaf.live_docs();
-        let allowed: Option<std::collections::HashSet<DocId>> = self.filter.as_ref().map(|f| {
-            let mut set = std::collections::HashSet::new();
-            if let Some(mut s) = f.scorer(leaf, ctx) {
-                loop {
-                    let d = s.advance();
-                    if d == rustic_core::query::TERMINATED {
-                        break;
-                    }
-                    set.insert(d);
-                }
-            }
-            set
-        });
         let mut hits: Vec<(DocId, f32)> = Vec::new();
+        self.scan_leaf(leaf, ctx, &mut |d, s| hits.push((d, s)));
+        hits
+    }
+
+    /// Score the matching docs of one leaf into `emit`, polling the search's
+    /// deadline and cancellation while filtering, before every document and
+    /// within a document's chunks. `false`: stopped before the end.
+    fn scan_leaf(&self, leaf: &LeafReader<'_>, ctx: &SearchContext, emit: &mut dyn FnMut(DocId, f32)) -> bool {
+        if ctx.stopped() {
+            return false;
+        }
+        let live = leaf.live_docs();
+        let allowed: Option<std::collections::HashSet<DocId>> = match self.filter.as_ref() {
+            None => None,
+            Some(f) => {
+                let mut set = std::collections::HashSet::new();
+                if let Some(mut s) = f.scorer(leaf, ctx) {
+                    loop {
+                        let d = s.advance();
+                        if d == rustic_core::query::TERMINATED {
+                            break;
+                        }
+                        set.insert(d);
+                        if set.len() % 1024 == 0 && ctx.stopped() {
+                            return false;
+                        }
+                    }
+                }
+                Some(set)
+            }
+        };
+        let stopped = || ctx.stopped();
         for d in 0..leaf.num_docs() {
             if !leaf.is_root(d) || !live(d) || allowed.as_ref().is_some_and(|a| !a.contains(&d)) {
                 continue;
             }
-            if let Some(s) = self.doc_score(leaf, d) {
-                hits.push((d, s));
+            if ctx.stopped() {
+                return false;
+            }
+            if PROBE_ON.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(p) = SCAN_PROBE.read().clone() {
+                    p();
+                }
+            }
+            let Some(b) = super::semantic::blob_of(leaf, self.aux, d) else { continue };
+            let Some(scores) = self.blob_scores_until(&b, &stopped) else { return false };
+            if let Some(s) = self.combine(&scores) {
+                emit(d, s);
             }
         }
-        hits
+        true
     }
 
-    /// Resolve the shard-wide top `k` over `leaves` (kNN semantics).
-    pub fn with_top_k(mut self, leaves: &[LeafReader<'_>]) -> crate::error::Result<Self> {
+    /// Resolve the shard-wide top `k` over `leaves` (kNN semantics), within
+    /// the search's `deadline` and cancellation (finding 123): the scan
+    /// polls both and keeps only the `k` best candidates. A cancelled search
+    /// fails with ES's `task_cancelled_exception`; at the deadline the scan
+    /// stops with the candidates found so far (the search times out).
+    pub fn with_top_k(mut self, leaves: &[LeafReader<'_>], deadline: Option<std::time::Instant>) -> crate::error::Result<Self> {
         let Some(k) = self.k else { return Ok(self) };
         let ctx = match &self.filter {
-            Some(f) => SearchContext::for_query(f, leaves, rustic_core::query::Bm25Params::default()),
-            None => SearchContext::for_query(&rustic_core::query::Query::MatchAll, leaves, rustic_core::query::Bm25Params::default()),
+            Some(f) => SearchContext::for_query_deadline(f, leaves, rustic_core::query::Bm25Params::default(), deadline),
+            None => SearchContext::for_query_deadline(&rustic_core::query::Query::MatchAll, leaves, rustic_core::query::Bm25Params::default(), deadline),
         };
         ctx.execution_result()?;
-        let mut all: Vec<(usize, DocId, f32)> = Vec::new();
+        let mut best: std::collections::BinaryHeap<Candidate> = std::collections::BinaryHeap::with_capacity(k.min(1 << 16) + 1);
         for (li, leaf) in leaves.iter().enumerate() {
-            for (d, s) in self.leaf_hits(leaf, &ctx) {
-                all.push((li, d, s));
+            let complete = self.scan_leaf(leaf, &ctx, &mut |doc, score| {
+                best.push(Candidate { score, leaf: li, doc });
+                if best.len() > k {
+                    best.pop();
+                }
+            });
+            if !complete {
+                break;
             }
         }
+        if ctx.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            let reason = ctx.cancel.as_ref().and_then(|c| c.reason()).unwrap_or_else(|| "by user request".to_string());
+            return Err(crate::error::EsError::new(400, "task_cancelled_exception", format!("task cancelled [{reason}]")));
+        }
         ctx.execution_result()?;
-        all.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
-        all.truncate(k);
+        // Best first: the order a full sort truncated to `k` gives.
+        let all = best.into_sorted_vec();
         let mut fixed: std::collections::HashMap<usize, Vec<(DocId, f32)>> = std::collections::HashMap::new();
-        for (li, d, s) in all {
-            fixed.entry(leaves[li].id()).or_default().push((d, s));
+        for Candidate { score, leaf, doc } in all {
+            fixed.entry(leaves[leaf].id()).or_default().push((doc, score));
         }
         for v in fixed.values_mut() {
             v.sort_by_key(|h| h.0);
@@ -291,4 +442,25 @@ pub fn prune_tokens(leaves: &[LeafReader<'_>], aux: u16, tokens: Vec<(String, f3
             .cloned()
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod element_type_tests {
+    use super::*;
+
+    /// #545: byte `dot_product` chunks score `0.5 + dot / (dims * 2^15)`;
+    /// bit chunks by Hamming similarity, so query byte 0 ranks byte -128 (one
+    /// bit away) above byte 3 (two bits away); floats keep their formula.
+    #[test]
+    fn chunk_scores_follow_the_element_type() {
+        let byte = ChunkElem::Byte.score(Similarity::DotProduct, &[100.0, 0.0], &[100.0, 0.0]);
+        assert_eq!(byte, 0.652587890625);
+        let bit = |d: f32| ChunkElem::Bit.score(Similarity::L2, &[0.0], &[d]);
+        assert_eq!(bit(-128.0), 7.0 / 8.0);
+        assert_eq!(bit(3.0), 6.0 / 8.0);
+        assert!(bit(-128.0) > bit(3.0));
+        assert_eq!(ChunkElem::Float.score(Similarity::DotProduct, &[0.6, 0.8], &[0.6, 0.8]), Similarity::DotProduct.score(&[0.6, 0.8], &[0.6, 0.8]));
+        assert_eq!(ChunkElem::of(Some("bit")), ChunkElem::Bit);
+        assert_eq!(ChunkElem::of(None), ChunkElem::Float);
+    }
 }

@@ -127,6 +127,18 @@ fn id_of(order: u8, v: u128, len: usize, out: &mut Vec<u8>) {
     }
 }
 
+/// The delta entry of `id` after `p` (`(zigzag(delta) + 1) << 1`), when
+/// both are the same length of at most 16 bytes and the tag holds the
+/// delta exactly; `None`: the id is written raw (a 128-bit delta whose
+/// zigzag needs the top bit does not fit the tag).
+fn delta_tag(order: u8, id: &[u8], p: &[u8]) -> Option<u128> {
+    if p.len() != id.len() || id.len() > 16 {
+        return None;
+    }
+    let delta = int_of(order, id).wrapping_sub(int_of(order, p)) as i128;
+    zigzag(delta).checked_add(1)?.checked_mul(2)
+}
+
 /// The entries of `ids` under `order`, appended to `out` (with the block
 /// offsets in `offsets`); returns the entries' size.
 fn encode_with(order: u8, ids: &[Option<&[u8]>], offsets: &mut Vec<u32>, out: &mut Vec<u8>) -> usize {
@@ -138,9 +150,8 @@ fn encode_with(order: u8, ids: &[Option<&[u8]>], offsets: &mut Vec<u32>, out: &m
         for id in block {
             match (id, prev) {
                 (None, _) => out.push(0),
-                (Some(id), Some(p)) if p.len() == id.len() && id.len() <= 16 => {
-                    let delta = int_of(order, id).wrapping_sub(int_of(order, p)) as i128;
-                    write_vint128((zigzag(delta) + 1) << 1, out);
+                (Some(id), Some(p)) if delta_tag(order, id, p).is_some() => {
+                    write_vint128(delta_tag(order, id, p).expect("checked"), out);
                     prev = Some(id);
                 }
                 (Some(id), _) => {
@@ -163,10 +174,7 @@ fn size_with(order: u8, ids: &[Option<&[u8]>]) -> usize {
         for id in block {
             n += match (id, prev) {
                 (None, _) => 1,
-                (Some(id), Some(p)) if p.len() == id.len() && id.len() <= 16 => {
-                    let delta = int_of(order, id).wrapping_sub(int_of(order, p)) as i128;
-                    vint128_len((zigzag(delta) + 1) << 1)
-                }
+                (Some(id), Some(p)) if delta_tag(order, id, p).is_some() => vint128_len(delta_tag(order, id, p).expect("checked")),
                 (Some(id), _) => vint128_len(((id.len() as u128) << 1) | 1) + id.len(),
             };
             if id.is_some() {
@@ -182,7 +190,8 @@ fn size_with(order: u8, ids: &[Option<&[u8]>]) -> usize {
 #[derive(Default)]
 pub struct IdList {
     bytes: Vec<u8>,
-    ends: Vec<u32>,
+    /// Cumulative byte ends (64-bit: a merge's ids may exceed 4 GiB).
+    ends: Vec<u64>,
     has: Vec<bool>,
 }
 
@@ -191,8 +200,36 @@ impl IdList {
         if let Some(id) = id {
             self.bytes.extend_from_slice(id);
         }
-        self.ends.push(self.bytes.len() as u32);
+        self.ends.push(self.bytes.len() as u64);
         self.has.push(id.is_some());
+    }
+    /// [`Self::push`], the list's growth charged to `memory` before it
+    /// allocates (refused past the budget).
+    pub fn push_admitted(&mut self, id: Option<&[u8]>, memory: &mut crate::admission::Reservation, label: &str) -> Result<()> {
+        let next = |cap: usize, need: usize| if need > cap { need.max(cap.saturating_mul(2)).max(1024) } else { cap };
+        let nb = next(self.bytes.capacity(), self.bytes.len() + id.map_or(0, <[u8]>::len));
+        let ne = next(self.ends.capacity(), self.ends.len() + 1);
+        let nh = next(self.has.capacity(), self.has.len() + 1);
+        let want = (nb + ne * 8 + nh) as u64;
+        if want > memory.bytes() {
+            memory.grow(want - memory.bytes(), label)?;
+        }
+        self.bytes.reserve_exact(nb - self.bytes.len());
+        self.ends.reserve_exact(ne - self.ends.len());
+        self.has.reserve_exact(nh - self.has.len());
+        self.push(id);
+        Ok(())
+    }
+    /// Append `other`'s ids, charged to `memory` ([`Self::push_admitted`]).
+    pub fn extend_admitted(&mut self, other: &IdList, memory: &mut crate::admission::Reservation, label: &str) -> Result<()> {
+        for i in 0..other.len() {
+            self.push_admitted(other.get(i), memory, label)?;
+        }
+        Ok(())
+    }
+    /// Bytes of the ids themselves.
+    pub fn id_bytes(&self) -> usize {
+        self.bytes.len()
     }
     pub fn len(&self) -> usize {
         self.ends.len()
@@ -206,7 +243,7 @@ impl IdList {
     }
     /// Bytes the list holds.
     pub fn heap_bytes(&self) -> usize {
-        self.bytes.capacity() + self.ends.capacity() * 4 + self.has.capacity()
+        self.bytes.capacity() + self.ends.capacity() * 8 + self.has.capacity()
     }
     /// Doc `i`'s id.
     pub fn get(&self, i: usize) -> Option<&[u8]> {
@@ -474,6 +511,25 @@ mod tests {
         roundtrip(&[]);
         roundtrip(&[None, None]);
         roundtrip(&[Some(vec![]), Some(vec![1]), Some(vec![0xff; 16]), Some(vec![0; 16]), Some(vec![0xff; 16])]);
+    }
+
+    /// #281: 16-byte ids whose delta's zigzag needs the top bit (2^126
+    /// and around the tag boundary) are written raw, not as a truncated
+    /// delta: every id reads back exactly, and the size estimate agrees.
+    #[test]
+    fn full_width_deltas_round_trip() {
+        let id = |v: u128| v.to_be_bytes().to_vec();
+        let mut values = vec![0u128, 1u128 << 126, 0, (1u128 << 126) - 1, u128::MAX, 0, 1u128 << 127, (1u128 << 127) + (1u128 << 126), 5, (1u128 << 126) + 5, u128::MAX - 1, 3];
+        for k in 0..40u128 {
+            values.push((1u128 << 125) * (k % 7) + k);
+        }
+        let ids: Vec<Option<Vec<u8>>> = values.iter().map(|&v| Some(id(v))).collect();
+        let bytes = roundtrip(&ids);
+        let refs: Vec<Option<&[u8]>> = ids.iter().map(|x| x.as_deref()).collect();
+        assert_eq!(size_with(ORDER_IDENTITY, &refs) + 9 + 4 * (refs.len().div_ceil(BLOCK) + 1), bytes.len());
+        // The witness: two ids 2^126 apart are different ids.
+        let col = UidColumn::open(&bytes).unwrap();
+        assert_ne!(col.get(0), col.get(1));
     }
 
     #[test]

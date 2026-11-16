@@ -191,3 +191,59 @@ async fn an_upgraded_node_follows_a_legacy_master() {
     assert_eq!(old.diffs.load(Ordering::Relaxed), 0, "a legacy master sends no diffs");
     assert!(old.full_states.load(Ordering::Relaxed) > 0);
 }
+
+/// A publication naming a member at an unreachable address (a restored
+/// state after a full-cluster restart names the old pod IPs) is applied by
+/// a follower at once. ES applies a publication without connecting to every
+/// member first (`NodeConnectionsService` connects asynchronously); here a
+/// follower used to probe each member's capabilities before accepting, and
+/// waited out the 2 s connect bound on every dead address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_with_an_unreachable_member_applies_promptly() {
+    use elasticsearch_cluster::state::Role;
+    let master = spawn_node(settings_for("stale-member", "n0", &[], "n0")).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !master.is_master() {
+        assert!(Instant::now() < deadline, "n0 did not become master");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let follower = spawn_node(settings_for("stale-member", "n1", &[ports::transport_port(&master)], "n0")).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while follower.state().nodes.len() < 2 || master.state().nodes.len() < 2 {
+        assert!(Instant::now() < deadline, "n1 did not join");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(converged(&master, &follower).await);
+    // The member advertises capabilities (so the follower would probe it)
+    // at an address whose connects black-hole (TEST-NET-1).
+    let mut stale = master.local.clone();
+    assert!(stale.attributes.keys().any(|k| k.starts_with("rustic.internal.")), "nodes advertise capability claims: {:?}", stale.attributes);
+    stale.id = "stale-member-id".into();
+    stale.name = "stale-member".into();
+    stale.ephemeral_id = "stale-member-ephemeral".into();
+    stale.transport_address = "192.0.2.1:9300".into();
+    stale.roles = [Role::Ingest].into_iter().collect();
+    let started = Instant::now();
+    let coord = master.coord().clone();
+    let added = stale.clone();
+    tokio::spawn(async move {
+        let result = coord.submit(Box::new(move |s| {
+            let mut next = s.clone();
+            next.nodes.insert(added.id.clone(), added);
+            Ok(next)
+        })).await;
+        if let Err(e) = result {
+            eprintln!("adding the unreachable member failed: {e}");
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !follower.state().nodes.contains_key(&stale.id) {
+        assert!(Instant::now() < deadline, "the follower never applied the publication");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let took = started.elapsed();
+    eprintln!("follower applied the publication naming an unreachable member after {took:?}");
+    assert!(took < Duration::from_millis(1_000), "applying waited on the unreachable member: {took:?}");
+    // And the follower stays a working member.
+    assert!(follower.state().master_node_id.is_some());
+}

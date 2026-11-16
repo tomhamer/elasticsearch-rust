@@ -32,6 +32,7 @@ pub mod parser;
 pub mod regex;
 mod regex_text;
 pub mod runtime;
+pub mod sql_utils;
 pub mod search;
 mod source;
 pub(crate) use source::{from_source as source_from_json, to_source as source_to_json, partial_ctx, merge_partial};
@@ -48,12 +49,17 @@ pub mod stored;
 pub mod timefmt;
 pub mod update;
 pub mod value;
+pub(crate) mod walk;
 pub mod whitelist;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_loop_fast;
+#[cfg(test)]
+mod tests_containment;
+#[cfg(test)]
+mod tests_c33;
 
 pub use error::ScriptErr;
 pub use runtime::{Executor, Program};
@@ -642,6 +648,18 @@ pub fn terms_lookup_ptr() -> TermsLookupPtr {
     TermsLookupPtr(TERMS_LOOKUP.with(|c| c.get()))
 }
 
+/// Call this thread's terms-lookup callback ([`with_terms_lookup`]);
+/// `None` without one.
+pub fn call_terms_lookup(index: &str, id: &str, path: &str, routing: Option<&str>) -> Option<Result<Vec<Value>>> {
+    // SAFETY: see `with_terms_lookup`.
+    TERMS_LOOKUP.with(|c| c.get()).map(|p| unsafe { (*p)(index, id, path, routing) })
+}
+
+/// Whether this thread has a terms-lookup callback.
+pub fn has_terms_lookup() -> bool {
+    TERMS_LOOKUP.with(|c| c.get()).is_some()
+}
+
 /// Run `f` with a captured terms-lookup callback ([`terms_lookup_ptr`]).
 pub fn with_terms_lookup_ptr<R>(ptr: TermsLookupPtr, f: impl FnOnce() -> R) -> R {
     let prev = TERMS_LOOKUP.with(|c| c.replace(ptr.0));
@@ -653,6 +671,33 @@ pub fn with_terms_lookup_ptr<R>(ptr: TermsLookupPtr, f: impl FnOnce() -> R) -> R
     }
     let _r = Restore(prev);
     f()
+}
+
+/// Marks a term lookup ([`lookup_term`]) in the `path` argument of the
+/// request's lookup callback (a source path never starts with a NUL).
+const TERM_LOOKUP_MARK: &str = "\u{0}lookup_term\u{0}";
+
+/// A `lookup` runtime field whose `target_field` is not `_id`: the fetch
+/// fields of the docs of `index` whose `target_field` holds `value` (ES
+/// `LookupField`: a `term` search, size 1, fields API values), one object
+/// per matching doc with any of them. Runs through the request's lookup
+/// callback ([`with_terms_lookup`]), as the caller; nothing without one.
+pub fn lookup_term(index: &str, target_field: &str, value: &str, fetch_fields: &[String]) -> Result<Vec<Value>> {
+    let path = format!("{TERM_LOOKUP_MARK}{}", serde_json::json!({ "field": target_field, "fetch_fields": fetch_fields }));
+    match TERMS_LOOKUP.with(|c| c.get()) {
+        // SAFETY: see `with_terms_lookup`.
+        Some(p) => unsafe { (*p)(index, value, &path, None) },
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The `(target_field, fetch_fields)` of a [`lookup_term`] call seen by a
+/// lookup callback (`None`: an ordinary source-path lookup).
+pub fn decode_term_lookup(path: &str) -> Option<(String, Vec<String>)> {
+    let v: Value = serde_json::from_str(path.strip_prefix(TERM_LOOKUP_MARK)?).ok()?;
+    let field = v.get("field")?.as_str()?.to_string();
+    let fetch = v.get("fetch_fields")?.as_array()?.iter().filter_map(|f| f.as_str().map(str::to_string)).collect();
+    Some((field, fetch))
 }
 
 /// Source values at `path` of doc `id` of `index` (the request's realtime-get lookup).

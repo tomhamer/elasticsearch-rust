@@ -22,6 +22,10 @@ fn queue_bytes(index: &str, aid: &str, size: usize) -> Result<u64> {
             )
         })
 }
+// A decoded control envelope owns its request-breaker charge for as long
+// as it lives (`DecodeMemory::new(memory.into_result_owner())`): a shard
+// report is queued on the master past the transport request it was decoded
+// in, so the charge must not count as left behind by that request's scope.
 fn copy(value: &str) -> Result<String> {
     crate::mapping_update::copy_wire_text(value)
 }
@@ -77,7 +81,7 @@ impl<'de> Deserialize<'de> for ShardStartedReq {
                     index,
                     shard,
                     allocation_id,
-                    memory: DecodeMemory::new(memory),
+                    memory: DecodeMemory::new(memory.into_result_owner()),
                 })
             }
             fn visit_map<A: MapAccess<'de>>(
@@ -128,7 +132,7 @@ impl<'de> Deserialize<'de> for ShardStartedReq {
                     index,
                     shard,
                     allocation_id,
-                    memory: DecodeMemory::new(memory),
+                    memory: DecodeMemory::new(memory.into_result_owner()),
                 })
             }
         }
@@ -227,7 +231,7 @@ impl<'de> Deserialize<'de> for ShardFailedReq {
                     reporter_term,
                     message,
                     mark_as_stale,
-                    memory: DecodeMemory::new(memory),
+                    memory: DecodeMemory::new(memory.into_result_owner()),
                 })
             }
             fn visit_map<A: MapAccess<'de>>(
@@ -306,7 +310,7 @@ impl<'de> Deserialize<'de> for ShardFailedReq {
                     reporter_term,
                     message,
                     mark_as_stale,
-                    memory: DecodeMemory::new(memory),
+                    memory: DecodeMemory::new(memory.into_result_owner()),
                 })
             }
         }
@@ -417,7 +421,7 @@ impl<'de> Deserialize<'de> for FollowerMetadataReq {
                     settings_json,
                     reopen,
                     aliases_json,
-                    memory: DecodeMemory::new(memory),
+                    memory: DecodeMemory::new(memory.into_result_owner()),
                 })
             }
             fn visit_map<A: MapAccess<'de>>(
@@ -486,7 +490,7 @@ impl<'de> Deserialize<'de> for FollowerMetadataReq {
                     settings_json,
                     reopen,
                     aliases_json,
-                    memory: DecodeMemory::new(memory),
+                    memory: DecodeMemory::new(memory.into_result_owner()),
                 })
             }
         }
@@ -553,7 +557,7 @@ impl FollowerMetadataReq {
                 .as_ref()
                 .map(|v| encoded(&mut memory, v))
                 .transpose()?,
-            memory: DecodeMemory::new(memory),
+            memory: DecodeMemory::new(memory.into_result_owner()),
         })
     }
 }

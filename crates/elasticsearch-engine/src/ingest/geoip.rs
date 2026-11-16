@@ -109,7 +109,14 @@ pub struct Mmdb {
     pub build_epoch: u64,
     ipv4_start: u32,
     ipv4_depth: u32,
+    /// Process-unique identity of this loaded database: lookup cache
+    /// entries are keyed by it, so a reloaded file (or an allocation at a
+    /// freed database's address) never answers from an older generation's
+    /// entries (finding 455).
+    generation: u64,
 }
+
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
 
 const META_MARKER: &[u8] = b"\xAB\xCD\xEFMaxMind.com";
 
@@ -144,7 +151,7 @@ impl Mmdb {
         if tree_size + 16 > buf.len() {
             return Err(bad("The MaxMind DB file's search tree is corrupt"));
         }
-        let mut db = Mmdb { buf, node_count, record_size, ip_version, tree_size, database_type, build_epoch, ipv4_start: 0, ipv4_depth: 0 };
+        let mut db = Mmdb { buf, node_count, record_size, ip_version, tree_size, database_type, build_epoch, ipv4_start: 0, ipv4_depth: 0, generation: GENERATIONS.fetch_add(1, Ordering::Relaxed) };
         if ip_version == 6 {
             let mut node = 0u32;
             let mut depth = 0;
@@ -326,11 +333,26 @@ pub struct CacheStats {
 
 const CACHE_SIZE: usize = 1000;
 
-type CacheKey = (usize, String);
+/// (database generation, IP text).
+type CacheKey = (u64, String);
 
 fn cache() -> &'static (Mutex<lru::LruCache<CacheKey, Option<(MmVal, u32)>>>, CacheStats) {
     static C: OnceLock<(Mutex<lru::LruCache<CacheKey, Option<(MmVal, u32)>>>, CacheStats)> = OnceLock::new();
     C.get_or_init(|| (Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(CACHE_SIZE).unwrap())), CacheStats::default()))
+}
+
+fn extra_dirs() -> &'static Mutex<Vec<PathBuf>> {
+    static D: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    D.get_or_init(Default::default)
+}
+
+/// Also search `dir` (a cluster node installs the databases it pulled from
+/// `.geoip_databases` there, for every engine of the process).
+pub fn add_search_dir(dir: PathBuf) {
+    let mut d = extra_dirs().lock();
+    if !d.contains(&dir) {
+        d.push(dir);
+    }
 }
 
 /// Directories searched for databases (`data` = the node's data dir).
@@ -344,6 +366,11 @@ pub fn search_dirs(data: Option<&Path>) -> Vec<PathBuf> {
     }
     if let Some(d) = data {
         v.push(d.join("ingest-geoip"));
+    }
+    for d in extra_dirs().lock().iter() {
+        if !v.contains(d) {
+            v.push(d.clone());
+        }
     }
     v
 }
@@ -439,7 +466,7 @@ pub fn stats_json(data: Option<&Path>, node_id: &str) -> Value {
 
 /// Cached lookup.
 fn cached_lookup(db: &Arc<Mmdb>, ip: IpAddr, ip_str: &str) -> Result<Option<(MmVal, u32)>> {
-    let key = (Arc::as_ptr(db) as usize, ip_str.to_string());
+    let key = (db.generation, ip_str.to_string());
     let (c, st) = cache();
     let t = Instant::now();
     if let Some(v) = c.lock().get(&key) {
@@ -822,6 +849,11 @@ impl Processor for GeoIpP {
         let db = database(&self.database_file, data.as_deref());
         let tag = format!("_{}_database_unavailable_{}", self.kind, self.database_file);
         let Some(db) = db else {
+            // Unavailable until downloaded (ES tags the document the same
+            // way while its downloader runs, finding 446).
+            if let Some(d) = &data {
+                super::geoip_download::trigger(d);
+            }
             doc.append("tags", Value::String(tag), true)?;
             return Ok(());
         };
@@ -911,6 +943,26 @@ pub fn build(cfg: &mut Cfg, kind: &str) -> Result<Box<dyn Processor>> {
 mod tests {
     use super::*;
 
+    /// Finding 455: cached lookups belong to one loaded database: a
+    /// replacement (even at a reused address) answers from its own data.
+    #[test]
+    fn cache_entries_do_not_outlive_their_database() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../elasticsearch-http/tests/data/geoip/");
+        let city = std::fs::read(format!("{dir}GeoLite2-City.mmdb")).unwrap();
+        let asn = std::fs::read(format!("{dir}GeoLite2-ASN.mmdb")).unwrap();
+        let ip_s = "89.160.20.128";
+        let ip: IpAddr = ip_s.parse().unwrap();
+        for _ in 0..20 {
+            let a = Arc::new(Mmdb::from_bytes(city.clone()).unwrap());
+            let first = cached_lookup(&a, ip, ip_s).unwrap();
+            assert_eq!(first, a.lookup(ip).unwrap());
+            drop(a);
+            let b = Arc::new(Mmdb::from_bytes(asn.clone()).unwrap());
+            assert_eq!(cached_lookup(&b, ip, ip_s).unwrap(), b.lookup(ip).unwrap());
+            assert_ne!(cached_lookup(&b, ip, ip_s).unwrap(), first);
+        }
+    }
+
     #[test]
     fn network_and_format() {
         assert_eq!(network("89.160.20.128".parse().unwrap(), 17), "89.160.0.0/17");
@@ -935,6 +987,44 @@ mod tests {
 fn configs() -> &'static Mutex<std::collections::BTreeMap<(PathBuf, String), (Value, i64, i64)>> {
     static C: OnceLock<Mutex<std::collections::BTreeMap<(PathBuf, String), (Value, i64, i64)>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Database configurations of the node at `data` are kept in
+/// `<data>/_state/geoip_database_configs.json` (ES keeps them in cluster
+/// metadata), so a restart keeps downloading them.
+fn configs_file(data: &Path) -> PathBuf {
+    data.join("_state").join("geoip_database_configs.json")
+}
+
+fn load_configs(data: &Path) {
+    static LOADED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    if !LOADED.get_or_init(Default::default).lock().insert(data.to_path_buf()) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(configs_file(data)) else { return };
+    let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&text) else { return };
+    let mut c = configs().lock();
+    for (id, v) in m {
+        if let (Some(db), Some(modified), Some(version)) = (v.get("database"), v["modified"].as_i64(), v["version"].as_i64()) {
+            c.entry((data.to_path_buf(), id)).or_insert((db.clone(), modified, version));
+        }
+    }
+}
+
+fn save_configs(data: &Path, c: &std::collections::BTreeMap<(PathBuf, String), (Value, i64, i64)>) {
+    let m: Map<String, Value> = c.iter().filter(|((d, _), _)| d == data).map(|((_, id), (db, modified, version))| (id.clone(), json!({"database": db, "modified": modified, "version": version}))).collect();
+    let path = configs_file(data);
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, Value::Object(m).to_string()).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        tracing::warn!("failed to persist geoip database configurations to [{}]", path.display());
+    }
+}
+
+/// The configured databases (`_ingest/geoip/database`, `_ingest/ip_location/database`)
+/// of the node at `data`: `(id, database)`.
+pub fn configured(data: &Path) -> Vec<(String, Value)> {
+    load_configs(data);
+    configs().lock().iter().filter(|((d, _), _)| d == data).map(|((_, id), (db, _, _))| (id.clone(), db.clone())).collect()
 }
 
 const MAXMIND_NAMES: &[&str] = &["GeoIP2-Enterprise", "GeoIP2-ISP", "GeoIP2-Domain", "GeoIP2-Connection-Type", "GeoIP2-City", "GeoIP2-Anonymous-IP", "GeoIP2-Country"];
@@ -1071,6 +1161,7 @@ pub fn put_config(data: &Path, id: &str, body: &Value, raw: &str, _ip_location: 
         return Err(EsError::action_validation(&refs));
     }
     let now = crate::date::now_millis();
+    load_configs(data);
     let mut c = configs().lock();
     let key = (data.to_path_buf(), id.to_string());
     if let Some(existing) = c.get(&key) {
@@ -1080,10 +1171,15 @@ pub fn put_config(data: &Path, id: &str, body: &Value, raw: &str, _ip_location: 
     }
     let version = c.get(&key).map(|x| x.2 + 1).unwrap_or(1);
     c.insert(key, (body.clone(), now, version));
+    save_configs(data, &c);
+    drop(c);
+    // Configured accounts download (`EnterpriseGeoIpDownloader`).
+    super::geoip_download::trigger(data);
     Ok(())
 }
 
 pub fn get_configs(data: &Path, ids: Option<&str>) -> Result<Value> {
+    load_configs(data);
     let c = configs().lock();
     let render = |id: &str, v: &(Value, i64, i64)| json!({"id": id, "version": v.2, "modified_date_millis": v.1, "database": v.0});
     let pats: Vec<&str> = ids.map(|l| l.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
@@ -1097,8 +1193,13 @@ pub fn get_configs(data: &Path, ids: Option<&str>) -> Result<Value> {
 }
 
 pub fn delete_config(data: &Path, id: &str) -> Result<()> {
-    match configs().lock().remove(&(data.to_path_buf(), id.to_string())) {
-        Some(_) => Ok(()),
+    load_configs(data);
+    let mut c = configs().lock();
+    match c.remove(&(data.to_path_buf(), id.to_string())) {
+        Some(_) => {
+            save_configs(data, &c);
+            Ok(())
+        }
         None => Err(EsError::resource_not_found(format!("Database configuration not found: {id}"))),
     }
 }

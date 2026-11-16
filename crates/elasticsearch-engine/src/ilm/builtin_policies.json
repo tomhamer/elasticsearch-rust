@@ -1136,6 +1136,22 @@
       }
     }
   },
+  "ml-size-based-ilm-policy": {
+    "_meta": {
+      "description": "default policy for machine learning state and stats indices",
+      "managed": true
+    },
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb"
+          }
+        },
+        "min_age": "0ms"
+      }
+    }
+  },
   "slm-history-ilm-policy": {
     "_meta": {
       "description": "default policy for the SLM history indices",

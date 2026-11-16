@@ -19,6 +19,8 @@ pub enum Target {
     Reindex,
     /// `POST /_aliases`: indices and aliases from the body.
     AliasesBody,
+    /// `POST /_data_stream/_modify`: data streams and indices from the body.
+    DataStreamModifyBody,
     /// Index names only known to the engine (ES|QL, SQL, templates):
     /// require the action on some index.
     AnyIndex,
@@ -154,6 +156,10 @@ pub fn classify(req: &Req) -> Act {
     }
     match first {
         "_search" | "_count" => match g(1) {
+            // ES: clearing every scroll needs the cluster privilege; a named
+            // scroll is its owner's.
+            "scroll" if *m == Method::DELETE && g(2) == "_all" => cluster("cluster:admin/indices/scroll/clear_all"),
+            "scroll" if *m == Method::DELETE => act("indices:data/read/scroll/clear", Target::Authenticated),
             "scroll" => act("indices:data/read/scroll", Target::Authenticated),
             "template" => act("indices:data/read/search/template", Target::Seg(0)),
             _ => act("indices:data/read/search", Target::Seg(0)),
@@ -192,7 +198,8 @@ pub fn classify(req: &Req) -> Act {
             if *m == Method::POST && g(1).is_empty() {
                 act("indices:data/read/async_search/submit", Target::Seg(0))
             } else if g(1) == "status" {
-                cluster("cluster:monitor/async_search/status")
+                // The submitter, or `monitor` (checked by the handler with the result's owner).
+                act("cluster:monitor/async_search/status", Target::Authenticated)
             } else {
                 act("indices:data/read/async_search/get", Target::Authenticated)
             }
@@ -210,8 +217,23 @@ pub fn classify(req: &Req) -> Act {
         }
         "_update_by_query" | "_delete_by_query" => cluster("cluster:admin/reindex/rethrottle"),
         "_query" => {
-            if g(1) == "async" {
-                act("indices:data/read/esql/async/get", Target::Authenticated)
+            // `POST /_query/async` submits a query (ES runs `EsqlQueryAction`);
+            // the other async endpoints address a stored result.
+            // The stored-result endpoints are index actions without indices
+            // (ES: the caller needs the action on some index); the result is
+            // returned only to its owner.
+            // Running queries: a cluster monitor action (`monitor_esql`).
+            if g(1) == "queries" {
+                return cluster(if g(2).is_empty() { "cluster:monitor/xpack/esql/list_queries" } else { "cluster:monitor/xpack/esql/get_query" });
+            }
+            if g(1) == "async" && !(*m == Method::POST && g(2).is_empty()) {
+                if *m == Method::DELETE {
+                    act("indices:data/read/async_search/delete", Target::AnyIndex)
+                } else if g(3) == "stop" {
+                    act("indices:data/read/esql/async/stop", Target::AnyIndex)
+                } else {
+                    act("indices:data/read/esql/async/get", Target::AnyIndex)
+                }
             } else {
                 act("indices:data/read/esql", Target::AnyIndex)
             }
@@ -288,7 +310,7 @@ pub fn classify(req: &Req) -> Act {
             "_stats" => act("indices:monitor/data_stream/stats", Target::Seg(1)),
             "_migrate" => act("indices:admin/data_stream/migrate", Target::Seg(2)),
             "_promote" => act("indices:admin/data_stream/promote", Target::Seg(2)),
-            "_modify" => act("indices:admin/data_stream/modify", Target::AnyIndex),
+            "_modify" => act("indices:admin/data_stream/modify", Target::DataStreamModifyBody),
             _ => match g(2) {
                 "_stats" => act("indices:monitor/data_stream/stats", Target::Seg(1)),
                 "_lifecycle" => act(by_method(m, "indices:admin/data_stream/lifecycle/get", "indices:admin/data_stream/lifecycle/delete", "indices:admin/data_stream/lifecycle/put"), Target::Seg(1)),
@@ -396,6 +418,9 @@ pub fn classify(req: &Req) -> Act {
                 cluster("cluster:admin/transform/put")
             }
         }
+        // A datafeed preview searches the datafeed's indices (ES
+        // `PreviewDatafeedAction`, not granted by `monitor_ml`).
+        "_ml" if g(1) == "datafeeds" && (g(2) == "_preview" || g(3) == "_preview") => cluster("cluster:admin/xpack/ml/datafeeds/preview"),
         "_ml" => cluster(if is_read(m) { format!("cluster:monitor/xpack/ml/{}/get", g(1)) } else { format!("cluster:admin/xpack/ml/{}", g(1)) }),
         "_watcher" => cluster(if is_read(m) { format!("cluster:monitor/xpack/watcher/{}", g(1)) } else { format!("cluster:admin/xpack/watcher/{}", g(1)) }),
         "_rollup" => cluster(if is_read(m) { "cluster:monitor/xpack/rollup/get".to_string() } else { format!("cluster:admin/xpack/rollup/{}", g(1)) }),

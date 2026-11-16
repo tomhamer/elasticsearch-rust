@@ -48,6 +48,9 @@ pub struct Settings {
     pub deduce_mappings: bool,
     pub num_failure_retries: Option<i64>,
     pub unattended: bool,
+    /// `settings.use_point_in_time` (default true): each checkpoint's source
+    /// searches read one point in time (#567).
+    pub use_point_in_time: bool,
 }
 
 /// A parsed config (the raw normalized JSON is kept alongside).
@@ -356,7 +359,7 @@ pub fn parse(id: Option<&str>, body: &Value, for_put: bool, require_dest: bool) 
         }
     };
     // settings
-    let mut settings = Settings { align_checkpoints: true, deduce_mappings: true, ..Default::default() };
+    let mut settings = Settings { align_checkpoints: true, deduce_mappings: true, use_point_in_time: true, ..Default::default() };
     if let Some(s) = o.get("settings") {
         let sm = obj(s, "transform_config_settings")?;
         check_keys(
@@ -384,6 +387,7 @@ pub fn parse(id: Option<&str>, body: &Value, for_put: bool, require_dest: bool) 
         settings.align_checkpoints = b("align_checkpoints", true);
         settings.deduce_mappings = b("deduce_mappings", true);
         settings.unattended = b("unattended", false);
+        settings.use_point_in_time = b("use_point_in_time", true);
     }
     // function
     let function = match (o.get("pivot"), o.get("latest")) {
@@ -513,7 +517,7 @@ pub fn normalize(body: &Value, cfg: &Config, version: &str, create_time: Option<
 pub fn strip_generated(stored: &Value) -> Value {
     let mut v = stored.clone();
     if let Some(o) = v.as_object_mut() {
-        for k in ["version", "create_time", "authorization"] {
+        for k in ["version", "create_time", "authorization", "headers"] {
             o.remove(k);
         }
     }

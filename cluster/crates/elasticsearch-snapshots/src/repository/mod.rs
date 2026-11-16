@@ -75,8 +75,23 @@ pub struct Repository {
     /// Index ids that running snapshots are writing into (refcounted); their
     /// directories must not be removed by deletes.
     pub(crate) active_index_ids: Mutex<HashMap<String, usize>>,
+    /// A repository cleanup is running. Set and checked under the
+    /// `in_progress` lock, so cleanup admission and snapshot / clone
+    /// registration exclude each other (ES rejects new snapshots and clones
+    /// while a cleanup runs).
+    pub(crate) cleanup_running: Mutex<bool>,
+    /// Snapshots being cloned (name → number of clones reading them):
+    /// deleting them is rejected until the clones finish (ES
+    /// `cannot delete snapshot while it is being cloned`).
+    pub(crate) clone_sources: Mutex<HashMap<String, usize>>,
+    /// Pause points for concurrency tests ([`Repository::set_test_hook`]).
+    test_hooks: Mutex<HashMap<&'static str, TestHook>>,
     _input_owner: Option<Box<dyn Send + Sync>>,
 }
+
+/// Awaited at a named point of a repository operation (tests only pause
+/// operations with it; no hook is installed otherwise).
+pub type TestHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 impl std::fmt::Debug for Repository {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,6 +132,9 @@ impl Repository {
             in_progress: Mutex::new(HashMap::new()),
             reserved_index_ids: Mutex::new(HashMap::new()),
             active_index_ids: Mutex::new(HashMap::new()),
+            cleanup_running: Mutex::new(false),
+            clone_sources: Mutex::new(HashMap::new()),
+            test_hooks: Mutex::new(HashMap::new()),
             _input_owner: None,
         })
     }
@@ -171,6 +189,29 @@ impl Repository {
 
     pub fn shard_container(&self, index_id: &str, shard: u32) -> BlobContainer {
         self.index_container(index_id).child(&shard.to_string())
+    }
+
+    /// Install (or with `None` remove) the hook awaited at `point`:
+    /// `cleanup_admitted` (cleanup has passed its idle check) and
+    /// `clone_metadata_read` (a clone has written its shard references and
+    /// not yet finalized).
+    pub fn set_test_hook(&self, point: &'static str, hook: Option<TestHook>) {
+        let mut h = self.test_hooks.lock();
+        match hook {
+            Some(f) => {
+                h.insert(point, f);
+            }
+            None => {
+                h.remove(point);
+            }
+        }
+    }
+
+    pub(crate) async fn test_hook(&self, point: &'static str) {
+        let hook = self.test_hooks.lock().get(point).cloned();
+        if let Some(f) = hook {
+            f().await;
+        }
     }
 
     pub(crate) fn acquire_index_ids(&self, ids: &[String]) {

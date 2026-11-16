@@ -63,7 +63,7 @@ impl Pool {
     }
 }
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
 
 thread_local! {
     /// Set on executor worker threads.
@@ -198,7 +198,9 @@ impl Executor {
         }
         for i in 0..threads {
             let (queue, queued, active, completed, service_ns) = (queue.clone(), queued.clone(), active.clone(), completed.clone(), service_ns.clone());
-            let spawned = std::thread::Builder::new().name(format!("es-{}-{i}", pool.name())).spawn(move || {
+            let spawned = std::thread::Builder::new().name(format!("es-{}-{i}", pool.name())).stack_size(REQUEST_STACK).spawn(move || {
+                // Guarded parses run on this thread while it has room.
+                elasticsearch_engine::parse_depth::register_thread_stack(REQUEST_STACK);
                 ON_EXECUTOR.with(|on| on.set(pool.waits_nested()));
                 CURRENT.with(|c| c.set(Some(pool)));
                 let mut seen = queue.generation();
@@ -248,7 +250,8 @@ impl Executor {
                 break;
             }
         }
-        let spawned = std::thread::Builder::new().name(format!("es-{}-spare", self.pool.name())).spawn(move || {
+        let spawned = std::thread::Builder::new().name(format!("es-{}-spare", self.pool.name())).stack_size(REQUEST_STACK).spawn(move || {
+            elasticsearch_engine::parse_depth::register_thread_stack(REQUEST_STACK);
             ON_EXECUTOR.with(|on| on.set(self.pool.waits_nested()));
             CURRENT.with(|c| c.set(Some(self.pool)));
             let mut idle_since = std::time::Instant::now();
@@ -369,6 +372,13 @@ fn record_service(cell: &AtomicU64, elapsed: std::time::Duration) {
 /// without taking a worker from the executor this thread belongs to: a
 /// spare worker drains its queue meanwhile (Java's managed blocking). Off
 /// an executor, `f` just runs.
+/// Native stack of the threads that run requests (engine pools; the tokio
+/// runtime uses the same): reserved address space, committed as used.
+/// Request bodies and documents may nest 1000 levels (ES's limit), and the
+/// handlers that walk them recurse per level, so request threads get room
+/// for that beyond the 2 MiB default.
+pub const REQUEST_STACK: usize = 16 << 20;
+
 pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
     let Some(pool) = CURRENT.with(|c| c.get()) else { return f() };
     struct Parked(&'static Executor);
@@ -562,6 +572,113 @@ impl Drop for ExecutorMark {
     }
 }
 
+/// Admission of long-running background jobs (`wait_for_completion=false`
+/// reindex / update-by-query / delete-by-query): each runs on the
+/// `management` executor (ES runs them as tasks on its `generic` pool),
+/// never on a thread of its own. A job holds a permit for its whole
+/// lifetime, throttle pauses included, and at most `limit` run at once, so
+/// throttled jobs never hold every `management` worker (`_tasks`,
+/// `_cancel` and cluster work still find one). Further jobs wait in a
+/// bounded FIFO and start, in order, on the worker a finishing job frees;
+/// a full FIFO rejects the job (429) before it starts.
+pub struct JobGate {
+    limit: usize,
+    capacity: usize,
+    state: Mutex<GateState>,
+    /// Hands a started job to its executor; `Err` = it could not start.
+    start: fn(Job) -> Result<(), EsError>,
+}
+
+#[derive(Default)]
+struct GateState {
+    running: usize,
+    pending: std::collections::VecDeque<Job>,
+}
+
+/// Point-in-time figures of a [`JobGate`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobGateStats {
+    pub running: usize,
+    pub queued: usize,
+}
+
+impl JobGate {
+    pub fn new(limit: usize, capacity: usize, start: fn(Job) -> Result<(), EsError>) -> JobGate {
+        JobGate { limit: limit.max(1), capacity, state: Mutex::new(GateState::default()), start }
+    }
+
+    /// Admit `job`: start it now (a free permit), queue it, or reject it
+    /// (429, `es_rejected_execution_exception`) when the queue is full or
+    /// the executor refused it. A rejected job never runs; its caller
+    /// rolls back whatever it registered for it.
+    pub fn submit(&'static self, job: Job) -> Result<(), EsError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.running >= self.limit {
+            if state.pending.len() >= self.capacity {
+                return Err(rejected(Pool::Management, self.capacity));
+            }
+            state.pending.push_back(job);
+            return Ok(());
+        }
+        state.running += 1;
+        drop(state);
+        let run = Box::new(move || self.drain(job));
+        if let Err(e) = (self.start)(run) {
+            // Never started: give the permit back. Jobs queued meanwhile
+            // behind this permit with no running job left to drain them are
+            // dropped unrun (a job's owner finishes its task when it drops
+            // unrun, see `tasks::run`), never stranded.
+            let stranded = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.running -= 1;
+                if state.running == 0 { std::mem::take(&mut state.pending) } else { Default::default() }
+            };
+            drop(stranded);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Run `job`, then each queued job in turn on this worker under the
+    /// same permit; the permit is returned once the queue is empty.
+    fn drain(&'static self, job: Job) {
+        let mut job = Some(job);
+        while let Some(current) = job.take() {
+            // A panicking job must not leak its permit.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(current));
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match state.pending.pop_front() {
+                Some(next) => job = Some(next),
+                None => state.running -= 1,
+            }
+        }
+    }
+
+    /// The most jobs that run at once.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn stats(&self) -> JobGateStats {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        JobGateStats { running: state.running, queued: state.pending.len() }
+    }
+}
+
+/// The background-job gate ([`JobGate`]) of this process: at most half the
+/// `management` workers run jobs at once, and up to 10,000 more wait.
+/// `ES_BACKGROUND_TASKS_MAX_RUNNING` / `ES_BACKGROUND_TASKS_QUEUE_SIZE`
+/// override both (read once).
+pub fn background_jobs() -> &'static JobGate {
+    static GATE: OnceLock<JobGate> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let limit = env("ES_BACKGROUND_TASKS_MAX_RUNNING").unwrap_or_else(|| executor(Pool::Management).threads / 2);
+        let capacity = env("ES_BACKGROUND_TASKS_QUEUE_SIZE").unwrap_or(10_000);
+        JobGate::new(limit, capacity, |job| executor(Pool::Management).submit(job))
+    })
+}
+
 /// The executor a REST request's engine work runs on (ES's per-action
 /// thread pools): searches and reads on `search`, document writes on
 /// `write`, refresh / flush / force merge on `flush`, the rest on
@@ -596,6 +713,69 @@ pub fn pool_for(method: &axum::http::Method, segs: &[String]) -> Pool {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// Review #106: background jobs run under a bounded permit count and a
+    /// bounded queue; overflow is rejected with 429 before the job starts,
+    /// queued jobs start in order as permits free, and every permit comes
+    /// back (also after a panicking job).
+    #[test]
+    fn job_gate_bounds_running_and_queued_jobs() {
+        fn start(job: Job) -> Result<(), EsError> {
+            std::thread::spawn(job);
+            Ok(())
+        }
+        let gate: &'static JobGate = Box::leak(Box::new(JobGate::new(2, 2, start)));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (done_tx, done_rx) = mpsc::channel::<usize>();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+        for i in 0..4 {
+            let (release_rx, done_tx, peak, live) = (release_rx.clone(), done_tx.clone(), peak.clone(), live.clone());
+            gate.submit(Box::new(move || {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let _ = release_rx.lock().unwrap().recv();
+                live.fetch_sub(1, Ordering::SeqCst);
+                if i == 1 {
+                    panic!("a panicking job keeps no permit");
+                }
+                let _ = done_tx.send(i);
+            }))
+            .unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(gate.stats(), JobGateStats { running: 2, queued: 2 });
+        let e = gate.submit(Box::new(|| unreachable!("rejected jobs never run"))).unwrap_err();
+        assert_eq!((e.status, e.kind.as_str()), (429, "es_rejected_execution_exception"));
+        for _ in 0..4 {
+            release_tx.send(()).unwrap();
+        }
+        let mut done: Vec<usize> = (0..3).map(|_| done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()).collect();
+        done.sort();
+        assert_eq!(done, vec![0, 2, 3]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gate.stats() != JobGateStats::default() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(gate.stats(), JobGateStats::default());
+        assert!(peak.load(Ordering::SeqCst) <= 2, "at most `limit` jobs ran at once");
+    }
+
+    /// Review #106: a job the executor refuses to start returns its permit
+    /// and an error to the caller (who rolls back its task).
+    #[test]
+    fn job_gate_start_failure_returns_the_permit() {
+        fn refuse(_job: Job) -> Result<(), EsError> {
+            Err(EsError::internal("cannot start"))
+        }
+        let gate: &'static JobGate = Box::leak(Box::new(JobGate::new(1, 1, refuse)));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        assert!(gate.submit(Box::new(move || { r.fetch_add(1, Ordering::SeqCst); })).is_err());
+        assert_eq!(gate.stats(), JobGateStats::default());
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
 
     /// Combined review M29: one wake reaches every idle worker of a queue
     /// (not one per notify, nor drained by the first woken), each exactly

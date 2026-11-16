@@ -33,6 +33,21 @@ impl<V> Registry<V> {
         self.memory=Some(memory);
         Ok(())
     }
+    /// After entries were removed: give the table's spare room back down
+    /// to `required` entries (with headroom), shrinking its reservation to
+    /// what the smaller table holds.
+    pub(super) fn shrink_for(&mut self,required:usize) {
+        let floor=required.max(256);
+        if self.entries.capacity()<=floor.saturating_mul(4){return}
+        self.entries.shrink_to(floor);
+        let Some(memory)=self.memory.as_mut() else {return};
+        let bytes=self.entries.capacity().checked_next_power_of_two().and_then(|n|n.checked_mul(2))
+            .and_then(|b|b.checked_mul(std::mem::size_of::<(String,Entry<V>)>()+1)).and_then(|n|n.checked_add(32));
+        if let Some(bytes)=bytes.map(|b|b as u64).filter(|b|*b<memory.bytes()) {memory.shrink(memory.bytes()-bytes);}
+    }
+    /// Bytes the table's reservation holds.
+    #[cfg(test)]
+    pub(super) fn table_bytes(&self)->u64 {self.memory.as_ref().map_or(0,|m|m.bytes())}
     pub(super) fn insert(&mut self,key:Key,value:V)->Option<V> {
         if let Some(existing)=self.entries.get_mut(key.text.as_str()) {
             // HashMap preserves its original key allocation on replacement;

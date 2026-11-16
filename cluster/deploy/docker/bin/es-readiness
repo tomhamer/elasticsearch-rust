@@ -13,17 +13,21 @@
 # shutdown record left by es-prestop (`DELETE /_nodes/{id}/shutdown`), which
 # re-enables normal allocation for it.
 #
-# Env: ES_URL (default http://127.0.0.1:9200), ES_HEALTH_PARAMS,
-#      ES_DRAIN_ON_SHUTDOWN, ES_PROBE_TIMEOUT (seconds, default 3).
+# Env: ES_HEALTH_PARAMS, ES_DRAIN_ON_SHUTDOWN, ES_PROBE_TIMEOUT (seconds,
+#      default 3), and the connection settings of es-http-lib (ES_URL,
+#      ES_CA_CERT, ES_CONNECT_TO, ES_USERNAME, ES_PASSWORD[_FILE]): with
+#      security on, the probe speaks HTTPS, verifies the node's certificate
+#      and authenticates.
 set -uo pipefail
+# shellcheck source=es-http-lib
+. "$(dirname "$0")/es-http-lib"
 
-ES_URL="${ES_URL:-http://127.0.0.1:9200}"
 PARAMS="${ES_HEALTH_PARAMS:-wait_for_status=yellow&timeout=1s}"
 T="${ES_PROBE_TIMEOUT:-3}"
 START_FILE=/tmp/.es_start_file
 
 code() {
-  curl -s -o /dev/null --max-time "$T" -w '%{http_code}' "${ES_URL}$1"
+  es_curl -s -o /dev/null --max-time "$T" -w '%{http_code}' "${ES_URL}$1"
 }
 
 if [[ -f "$START_FILE" ]]; then
@@ -40,9 +44,9 @@ fi
 touch "$START_FILE"
 
 if [[ "${ES_DRAIN_ON_SHUTDOWN:-false}" == "true" ]]; then
-  id="$(curl -s --max-time "$T" "${ES_URL}/_nodes/_local" | jq -r '.nodes | keys[0] // empty' 2>/dev/null || true)"
+  id="$(es_curl -s --max-time "$T" "${ES_URL}/_nodes/_local" | jq -r '.nodes | keys[0] // empty' 2>/dev/null || true)"
   if [[ -n "$id" ]]; then
-    curl -s -o /dev/null --max-time "$T" -X DELETE "${ES_URL}/_nodes/${id}/shutdown" || true
+    es_curl -s -o /dev/null --max-time "$T" -X DELETE "${ES_URL}/_nodes/${id}/shutdown" || true
   fi
 fi
 exit 0

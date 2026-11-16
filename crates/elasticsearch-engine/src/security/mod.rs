@@ -8,6 +8,7 @@
 //! [`Security::permission`]; with security disabled nothing here runs.
 
 pub mod hash;
+pub mod owner;
 pub mod privilege;
 pub mod roles;
 
@@ -127,8 +128,17 @@ fn setting(yml: &BTreeMap<String, String>, key: &str) -> Option<String> {
     yml.get(key).cloned()
 }
 
-fn parse_bool(s: &str) -> bool {
-    matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+/// ES `Booleans.parseBoolean`: `true` / `false` only (`tru`, `TRUE`,
+/// `yes`, `1` are errors, never false).
+fn parse_bool(s: &str) -> Result<bool, String> {
+    crate::settings::parse_bool(s).map_err(|e| e.reason)
+}
+
+/// For the pre-start environment read ([`SecConfig::from_env`], which
+/// cannot fail): an invalid value keeps `default`. The node settings read
+/// ([`SecConfig::from_node_settings`]) and the start's validation reject it.
+fn parse_bool_or(s: &str, default: bool) -> bool {
+    parse_bool(s).unwrap_or(default)
 }
 
 fn read_flat_yml(path: &Path) -> BTreeMap<String, String> {
@@ -167,15 +177,18 @@ impl SecConfig {
         // overrides the default (never an explicit setting). In-process
         // embedders that use `SecConfig::default()` keep security off.
         c.enabled = match value("xpack.security.enabled") {
-            Some(v) => parse_bool(&v),
-            None => std::env::var("ES_SECURITY_ENABLED").ok().map(|v| parse_bool(&v)).unwrap_or(NODE_SECURITY_ENABLED_DEFAULT),
+            Some(v) => parse_bool(&v)?,
+            None => match std::env::var("ES_SECURITY_ENABLED") {
+                Ok(v) => parse_bool(&v)?,
+                Err(_) => NODE_SECURITY_ENABLED_DEFAULT,
+            },
         };
         if let Some(v) = value("xpack.security.http.ssl.enabled") {
-            c.http_ssl = parse_bool(&v);
+            c.http_ssl = parse_bool(&v)?;
             if !settings.contains_key("xpack.security.authc.token.enabled") { c.token_enabled = c.http_ssl; }
         }
-        if let Some(v) = value("xpack.security.authc.token.enabled") { c.token_enabled = parse_bool(&v); }
-        if let Some(v) = value("xpack.security.authc.api_key.enabled") { c.api_key_enabled = parse_bool(&v); }
+        if let Some(v) = value("xpack.security.authc.token.enabled") { c.token_enabled = parse_bool(&v)?; }
+        if let Some(v) = value("xpack.security.authc.api_key.enabled") { c.api_key_enabled = parse_bool(&v)?; }
         if let Some(v) = value("xpack.security.authc.token.timeout") { c.token_timeout_ms = parse_time_ms(&v, "xpack.security.authc.token.timeout").map_err(|e| e.reason)?; }
         if let Some(v) = value("xpack.security.authc.anonymous.username") { c.anonymous_username = v; }
         if let Some(v) = settings.get("xpack.security.authc.anonymous.roles") {
@@ -185,12 +198,15 @@ impl SecConfig {
                 _ => return Err("xpack.security.authc.anonymous.roles must be a list of roles".into()),
             };
         }
-        if let Some(v) = value("xpack.security.authc.anonymous.authz_exception") { c.anonymous_authz_exception = parse_bool(&v); }
+        if let Some(v) = value("xpack.security.authc.anonymous.authz_exception") { c.anonymous_authz_exception = parse_bool(&v)?; }
         if let Some(v) = value("xpack.security.authc.password_hashing.algorithm") { c.password_hashing = Hasher::resolve(&v)?; }
         if let Some(v) = value("bootstrap.password") { c.bootstrap_password = Some(v); }
-        if let Some(v) = value("xpack.security.authc.reserved_realm.enabled") { c.reserved_realm_enabled = parse_bool(&v); }
+        if let Some(v) = value("xpack.security.authc.reserved_realm.enabled") { c.reserved_realm_enabled = parse_bool(&v)?; }
         for key in settings.keys() {
             if let Some(rest) = key.strip_prefix("xpack.security.authc.realms.") {
+                if rest.split('.').count() == 3 && rest.ends_with(".enabled") {
+                    if let Some(v) = value(key) { parse_bool(&v)?; }
+                }
                 match rest.split('.').collect::<Vec<_>>().as_slice() {
                     ["file", name, _, ..] => c.file_realm_name = name.to_string(),
                     ["native", name, _, ..] => c.native_realm_name = name.to_string(),
@@ -207,7 +223,8 @@ impl SecConfig {
         let conf = PathBuf::from(std::env::var("ES_PATH_CONF").unwrap_or_else(|_| "config".into()));
         let yml = read_flat_yml(&conf.join("elasticsearch.yml"));
         let mut c = SecConfig::default();
-        c.enabled = std::env::var("ES_SECURITY_ENABLED").ok().map(|v| parse_bool(&v)).or_else(|| setting(&yml, "xpack.security.enabled").map(|v| parse_bool(&v))).unwrap_or(false);
+        // An invalid value reads as enabled (fail closed); the start rejects it.
+        c.enabled = std::env::var("ES_SECURITY_ENABLED").ok().or_else(|| setting(&yml, "xpack.security.enabled")).map(|v| parse_bool_or(&v, true)).unwrap_or(false);
         if let Some(u) = setting(&yml, "xpack.security.authc.anonymous.username") {
             c.anonymous_username = u;
         }
@@ -215,17 +232,17 @@ impl SecConfig {
             c.anonymous_roles = r.trim_matches(|ch| ch == '[' || ch == ']').split(',').map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty()).collect();
         }
         if let Some(v) = setting(&yml, "xpack.security.authc.anonymous.authz_exception") {
-            c.anonymous_authz_exception = parse_bool(&v);
+            c.anonymous_authz_exception = parse_bool_or(&v, c.anonymous_authz_exception);
         }
         if let Some(v) = setting(&yml, "xpack.security.authc.password_hashing.algorithm") {
             if let Ok(h) = Hasher::resolve(&v) {
                 c.password_hashing = h;
             }
         }
-        c.http_ssl = setting(&yml, "xpack.security.http.ssl.enabled").map(|v| parse_bool(&v)).unwrap_or(false);
-        c.token_enabled = setting(&yml, "xpack.security.authc.token.enabled").map(|v| parse_bool(&v)).unwrap_or(c.http_ssl);
+        c.http_ssl = setting(&yml, "xpack.security.http.ssl.enabled").map(|v| parse_bool_or(&v, false)).unwrap_or(false);
+        c.token_enabled = setting(&yml, "xpack.security.authc.token.enabled").map(|v| parse_bool_or(&v, c.http_ssl)).unwrap_or(c.http_ssl);
         if let Some(v) = setting(&yml, "xpack.security.authc.api_key.enabled") {
-            c.api_key_enabled = parse_bool(&v);
+            c.api_key_enabled = parse_bool_or(&v, c.api_key_enabled);
         }
         if let Some(v) = setting(&yml, "xpack.security.authc.token.timeout") {
             if let Ok(ms) = parse_time_ms(&v, "xpack.security.authc.token.timeout") {
@@ -234,7 +251,7 @@ impl SecConfig {
         }
         c.bootstrap_password = std::env::var("ELASTIC_PASSWORD").ok().or_else(|| std::env::var("ES_BOOTSTRAP_PASSWORD").ok()).or_else(|| setting(&yml, "bootstrap.password"));
         if let Some(v) = setting(&yml, "xpack.security.authc.reserved_realm.enabled") {
-            c.reserved_realm_enabled = parse_bool(&v);
+            c.reserved_realm_enabled = parse_bool_or(&v, c.reserved_realm_enabled);
         }
         c.load_files(&conf);
         c
@@ -381,11 +398,26 @@ fn rest_type() -> String {
     "rest".into()
 }
 
+/// An OAuth2 token pair as the token store keeps it: only the SHA-256 of
+/// the access and refresh tokens is stored (ES keeps hashed token ids), so
+/// the security state on disk or in a snapshot yields no usable bearer
+/// token. [`Security::create_token`] hands the raw values back once.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenDoc {
+    /// Hex SHA-256 of the access token (the raw value only in the copy
+    /// `create_token` returns).
     pub access_token: String,
+    /// Hex SHA-256 of the refresh token (raw in `create_token`'s copy).
     #[serde(default)]
     pub refresh_token: Option<String>,
+    /// Token ids are hashed (state written by this version). Documents
+    /// from before (plaintext ids) are never accepted and are purged.
+    #[serde(default)]
+    pub hashed: bool,
+    /// The client that obtained the token (ES `checkClientCanRefresh`:
+    /// only it may refresh).
+    #[serde(default)]
+    pub client: Option<owner::ResourceOwner>,
     pub creation: i64,
     pub expires: i64,
     #[serde(default)]
@@ -398,6 +430,8 @@ pub struct TokenDoc {
     pub authn: AuthnSnapshot,
 }
 
+/// The authentication a token carries (ES stores the whole `Authentication`
+/// in the token document: authenticating subject, run-as target and type).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthnSnapshot {
     pub username: String,
@@ -407,6 +441,21 @@ pub struct AuthnSnapshot {
     pub metadata: Value,
     pub realm_name: String,
     pub realm_type: String,
+    /// Set when the authenticating subject is an API key: the token keeps
+    /// the key's role descriptors and its owner's `limited_by` ceiling
+    /// (ES `Authentication.token()` keeps the `API_KEY` subject).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<TokenApiKey>,
+    /// The run-as target (effective subject) when the token was issued for a
+    /// run-as authentication; the run-as privilege is checked again on use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<Box<AuthnSnapshot>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenApiKey {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -451,6 +500,12 @@ pub enum Principal {
     ApiKey { id: String, name: String, metadata: Value },
     ServiceAccount { token_name: String, source: &'static str },
     Anonymous,
+    /// A remote cluster's user, over API key based remote cluster security
+    /// (ES RCS 2.0, `cross_cluster_access`): `descriptors` are the role
+    /// descriptors the querying cluster grants the user for this cluster
+    /// (its roles' `remote_indices` / `remote_cluster`), limited by the
+    /// cross-cluster API key `key_id`'s access.
+    CrossCluster { key_id: String, descriptors: Arc<Vec<Value>> },
 }
 
 #[derive(Clone, Debug)]
@@ -489,16 +544,22 @@ impl Authn {
         self.run_as.as_deref().unwrap_or(self)
     }
 
+    /// The token snapshot: the authenticating subject (an API key stays an
+    /// API key) plus the run-as target, never the effective user alone.
     fn snapshot(&self) -> AuthnSnapshot {
-        let e = self.effective();
         AuthnSnapshot {
-            username: e.username.clone(),
-            roles: e.roles.clone(),
-            full_name: e.full_name.clone(),
-            email: e.email.clone(),
-            metadata: e.metadata.clone(),
-            realm_name: e.realm_name.clone(),
-            realm_type: e.realm_type.clone(),
+            username: self.username.clone(),
+            roles: self.roles.clone(),
+            full_name: self.full_name.clone(),
+            email: self.email.clone(),
+            metadata: self.metadata.clone(),
+            realm_name: self.realm_name.clone(),
+            realm_type: self.realm_type.clone(),
+            api_key: match &self.principal {
+                Principal::ApiKey { id, name, .. } => Some(TokenApiKey { id: id.clone(), name: name.clone() }),
+                _ => None,
+            },
+            run_as: self.run_as.as_ref().map(|target| Box::new(target.snapshot())),
         }
     }
 
@@ -526,6 +587,7 @@ impl Authn {
 }
 
 /// Credentials extracted from the `Authorization` header.
+#[derive(Clone)]
 pub enum Credentials {
     None,
     Basic(String, String),
@@ -567,13 +629,22 @@ impl Permission {
         self.role.check_index_action(action) && self.limit.as_ref().map(|l| l.check_index_action(action)).unwrap_or(true)
     }
     pub fn check_index(&self, action: &str, name: &str) -> bool {
-        self.role.check_index(action, name) && self.limit.as_ref().map(|l| l.check_index(action, name)).unwrap_or(true)
+        self.check_index_component(action, name, false)
+    }
+    /// `action` on `name`'s `::failures` component (`failures`) or its data.
+    pub fn check_index_component(&self, action: &str, name: &str, failures: bool) -> bool {
+        self.role.check_index_component(action, name, failures) && self.limit.as_ref().map(|l| l.check_index_component(action, name, failures)).unwrap_or(true)
     }
     pub fn has_cluster_privilege(&self, name: &str) -> bool {
         self.role.has_cluster_privilege(name) && self.limit.as_ref().map(|l| l.has_cluster_privilege(name)).unwrap_or(true)
     }
     pub fn has_index_privilege(&self, index: &str, name: &str) -> bool {
         self.role.has_index_privilege(index, name) && self.limit.as_ref().map(|l| l.has_index_privilege(index, name)).unwrap_or(true)
+    }
+    /// Run-as: an API key's own `run_as` is bounded by its owner's
+    /// (`limited_by`) role, as ES's `LimitedRole.checkRunAs`.
+    pub fn can_run_as(&self, user: &str) -> bool {
+        self.role.can_run_as(user) && self.limit.as_ref().map(|l| l.can_run_as(user)).unwrap_or(true)
     }
 
     /// Does the role (or an API key's limiting role) carry any DLS/FLS group?
@@ -607,6 +678,19 @@ impl Permission {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Defer {
+    Off,
+    Armed,
+    Deferred,
+}
+
+thread_local! {
+    /// [`Security::authenticate_nonblocking`] on this thread: skip (and
+    /// report) uncached expensive verification.
+    static DEFER_EXPENSIVE: std::cell::Cell<Defer> = const { std::cell::Cell::new(Defer::Off) };
+}
+
 pub struct Security {
     enabled: AtomicBool,
     pub cfg: RwLock<SecConfig>,
@@ -616,10 +700,16 @@ pub struct Security {
     native_snapshot_seen: AtomicBool,
     /// Bumped on every change; invalidates caches.
     generation: AtomicU64,
-    /// sha256(scheme:principal:secret) -> generation at verification time.
-    verified: Mutex<HashMap<[u8; 32], u64>>,
-    /// role-set key -> compiled role.
+    /// sha256(scheme:principal:secret) -> (generation at verification time,
+    /// `scheme\0principal` for targeted invalidation by `_clear_cache`).
+    verified: Mutex<HashMap<[u8; 32], (u64, String)>>,
+    /// role-set key -> compiled role, tagged with the generation the
+    /// descriptors were read under.
     role_cache: Mutex<HashMap<String, (u64, Arc<Role>)>>,
+    /// Tests: runs after a permission lookup read its descriptors and before
+    /// it compiles and caches them (interleaves a concurrent role change).
+    #[cfg(test)]
+    after_descriptors_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Security {
@@ -627,7 +717,10 @@ impl Security {
     pub fn open(data: &Path) -> Security {
         let cfg = SecConfig::from_env();
         let path = data.join("_state/security.json");
-        let state: SecState = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut state: SecState = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // Tokens stored before ids were hashed are invalid (clients
+        // re-authenticate); their plaintext ids leave the state.
+        state.tokens.retain(|_, t| t.hashed);
         Security {
             enabled: AtomicBool::new(cfg.enabled),
             cfg: RwLock::new(cfg),
@@ -638,6 +731,8 @@ impl Security {
             generation: AtomicU64::new(1),
             verified: Mutex::new(HashMap::new()),
             role_cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            after_descriptors_hook: Mutex::new(None),
         }
     }
 
@@ -655,7 +750,7 @@ impl Security {
     }
 
     pub fn bump(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Re-read the file realm (`users`, `users_roles`), `service_tokens`
@@ -703,7 +798,7 @@ impl Security {
     }
 
     fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Persist the state after a change.
@@ -720,7 +815,7 @@ impl Security {
             let _ = std::fs::create_dir_all(dir);
         }
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, bytes)?;
+        write_private(&tmp, &bytes)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -745,7 +840,9 @@ impl Security {
         if current == *value { return Ok(false); }
         if let Some(parent) = self.path.parent() { std::fs::create_dir_all(parent)?; }
         let temporary = self.path.with_extension("cluster.tmp");
-        std::fs::write(&temporary, serde_json::to_vec(&restored)?)?;
+        let mut restored = restored;
+        restored.tokens.retain(|_, t| t.hashed);
+        write_private(&temporary, &serde_json::to_vec(&restored)?)?;
         std::fs::rename(&temporary, &self.path)?;
         *state = restored;
         self.bump();
@@ -767,28 +864,109 @@ impl Security {
 
     fn check_cached(&self, key: &[u8; 32]) -> bool {
         let g = self.generation();
-        self.verified.lock().get(key).map(|v| *v == g).unwrap_or(false)
+        self.verified.lock().get(key).map(|v| v.0 == g).unwrap_or(false)
     }
 
-    fn remember(&self, key: [u8; 32]) {
+    /// Cache a verified credential under the generation read before the
+    /// verification (`g`); refused when the generation moved meanwhile.
+    fn remember(&self, key: [u8; 32], g: u64, tag: String) {
         let mut v = self.verified.lock();
+        if self.generation() != g {
+            return;
+        }
         if v.len() > 10_000 {
             v.clear();
         }
-        v.insert(key, self.generation());
+        v.insert(key, (g, tag));
     }
 
     fn verify_cached(&self, scheme: &str, principal: &str, secret: &str, hash: &str) -> bool {
+        let g = self.generation();
         let key = hash::sha256(format!("{scheme}\u{0}{principal}\u{0}{secret}\u{0}{hash}").as_bytes());
         if self.check_cached(&key) {
             return true;
         }
+        // On a networking thread ([`Self::authenticate_nonblocking`]), an
+        // uncached bcrypt / PBKDF2 verification is not run: the caller
+        // repeats the whole authentication on the crypto pool.
+        if hash::is_expensive(hash) && DEFER_EXPENSIVE.with(|d| d.get() != Defer::Off) {
+            DEFER_EXPENSIVE.with(|d| d.set(Defer::Deferred));
+            return false;
+        }
         if hash::verify(secret, hash) {
-            self.remember(key);
+            self.remember(key, g, format!("{scheme}\u{0}{principal}"));
             true
         } else {
             false
         }
+    }
+
+    /// Cache contents: the role-cache keys and the verified-credential tags
+    /// (`scheme\0principal`), for tests and diagnostics.
+    #[doc(hidden)]
+    pub fn cache_keys(&self) -> (Vec<String>, Vec<String>) {
+        let mut roles: Vec<String> = self.role_cache.lock().keys().cloned().collect();
+        let mut verified: Vec<String> = self.verified.lock().values().map(|(_, tag)| tag.clone()).collect();
+        roles.sort();
+        verified.sort();
+        (roles, verified)
+    }
+
+    /// The `_clear_cache` security APIs on this node (the REST layer fans
+    /// them out to every node). `kind`: `roles` (role names; none = all),
+    /// `api_keys` (key ids), `realms` (realm names, `usernames`),
+    /// `privileges` (application names: ES also clears the role cache) and
+    /// `service_tokens` (`ns/service/token` names, `*` for every token).
+    /// Clearing only drops cache entries: nothing is ever cached past a
+    /// security change (the generation check), so a clear never loosens.
+    pub fn clear_cache(&self, kind: &str, names: &[String], usernames: &[String]) -> Result<(), EsError> {
+        let all = names.is_empty() || names.iter().any(|n| n == "*" || n == "_all");
+        let tag_principal = |tag: &str, scheme: &str| tag.strip_prefix(scheme).and_then(|t| t.strip_prefix('\u{0}')).map(str::to_owned);
+        match kind {
+            "roles" => {
+                let mut cache = self.role_cache.lock();
+                if all {
+                    cache.clear();
+                } else {
+                    cache.retain(|key, _| match key.strip_prefix("roles:") {
+                        Some(set) => !set.split('\u{0}').any(|r| names.iter().any(|n| n == r)),
+                        None => true,
+                    });
+                }
+            }
+            "privileges" => self.role_cache.lock().clear(),
+            "api_keys" => {
+                self.role_cache.lock().retain(|key, _| {
+                    let id = key.strip_prefix("apikey-limit:").or_else(|| key.strip_prefix("apikey:"));
+                    match id {
+                        Some(id) => !(all || names.iter().any(|n| n == id)),
+                        None => true,
+                    }
+                });
+                self.verified.lock().retain(|_, (_, tag)| match tag_principal(tag, "apikey") {
+                    Some(id) => !(all || names.iter().any(|n| *n == id)),
+                    None => true,
+                });
+            }
+            "realms" => {
+                // One verified-credential cache serves every realm here, so a
+                // named realm clears it for those users across realms (more,
+                // never less, than ES clears).
+                let every_user = usernames.is_empty() || usernames.iter().any(|u| u == "*");
+                self.verified.lock().retain(|_, (_, tag)| match tag_principal(tag, "basic") {
+                    Some(user) => !(every_user || usernames.iter().any(|u| *u == user)),
+                    None => true,
+                });
+            }
+            "service_tokens" => {
+                self.verified.lock().retain(|_, (_, tag)| match tag_principal(tag, "svc") {
+                    Some(token) => !names.iter().any(|n| privilege::glob(n, &token)),
+                    None => true,
+                });
+            }
+            other => return Err(EsError::illegal_argument(format!("unknown security cache [{other}]"))),
+        }
+        Ok(())
     }
 
     /// Look up a user (no password check) as the realms would: reserved, file, native.
@@ -817,7 +995,7 @@ impl Security {
             drop(st);
             let ok = match &rs.password_hash {
                 Some(h) => self.verify_cached("basic", user, pass, h),
-                None => user == "elastic" && self.cfg.read().bootstrap_password.as_deref().map(|b| !b.is_empty() && b == pass).unwrap_or(false),
+                None => user == "elastic" && self.cfg.read().bootstrap_password.as_deref().map(|b| !b.is_empty() && hash::ct_eq(b.as_bytes(), pass.as_bytes())).unwrap_or(false),
             };
             if !ok || !rs.enabled {
                 return Err(AuthFail::User(user.to_string()));
@@ -861,6 +1039,28 @@ impl Security {
         a
     }
 
+    /// [`Self::authenticate`] when it needs no expensive (bcrypt / PBKDF2)
+    /// password verification: a cached success, a cheap hash, an unknown
+    /// principal, missing or malformed credentials. `None`: deciding needs
+    /// expensive verification, which must run on the bounded crypto pool
+    /// (`elasticsearch_http::security::edge`), not on this (networking)
+    /// thread. Only successes are cached (ES `CachingUsernamePasswordRealm`).
+    pub fn authenticate_nonblocking(&self, creds: &Credentials) -> Option<Result<Authn, AuthFail>> {
+        let previous = DEFER_EXPENSIVE.with(|d| d.replace(Defer::Armed));
+        let result = self.authenticate(creds.clone());
+        let deferred = DEFER_EXPENSIVE.with(|d| d.replace(previous)) == Defer::Deferred;
+        if deferred { None } else { Some(result) }
+    }
+
+    /// The principal whose password an expensive verification of `creds`
+    /// would check (failed-authentication rate limiting key).
+    pub fn credential_principal(creds: &Credentials) -> Option<&str> {
+        match creds {
+            Credentials::Basic(user, _) => Some(user),
+            _ => None,
+        }
+    }
+
     /// Authenticate the request credentials.
     pub fn authenticate(&self, creds: Credentials) -> Result<Authn, AuthFail> {
         match creds {
@@ -879,6 +1079,43 @@ impl Security {
     }
 
     // -------------------------------------------------------------- api keys
+
+    /// Authenticate a remote cluster's request over API key based remote
+    /// cluster security: `raw` must be an active cross-cluster API key
+    /// (`POST /_security/cross_cluster/api_key`); the request then runs as
+    /// `user` (the querying cluster's user) with `descriptors` limited by
+    /// the key's access.
+    pub fn authenticate_cross_cluster(&self, raw: &str, user: &str, descriptors: Vec<Value>) -> Result<Authn, String> {
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(raw.trim()).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(|| "invalid cross-cluster API key value".to_string())?;
+        let (id, secret) = decoded.split_once(':').ok_or_else(|| "invalid cross-cluster API key value".to_string())?;
+        let key = self.state.read().api_keys.get(id).cloned().ok_or_else(|| format!("unable to find apikey with id {id}"))?;
+        if !self.verify_cached("apikey", id, secret, &key.hash) {
+            return Err(format!("invalid credentials for API key [{id}]"));
+        }
+        if key.invalidated {
+            return Err("api key has been invalidated".into());
+        }
+        if key.expiration.map(|e| e <= now_ms()).unwrap_or(false) {
+            return Err("api key is expired".into());
+        }
+        if key.key_type != "cross_cluster" {
+            return Err(format!("authentication expected API key type of [cross_cluster], but API key [{id}] has type [{}]", key.key_type));
+        }
+        Ok(Authn {
+            username: user.to_string(),
+            roles: vec![],
+            full_name: None,
+            email: None,
+            metadata: json!({}),
+            enabled: true,
+            realm_name: "_es_cross_cluster".into(),
+            realm_type: "_es_cross_cluster".into(),
+            auth_type: "api_key",
+            principal: Principal::CrossCluster { key_id: key.id.clone(), descriptors: Arc::new(descriptors) },
+            run_as: None,
+        })
+    }
 
     pub fn authenticate_api_key(&self, raw: &str) -> Result<Authn, String> {
         use base64::Engine;
@@ -1004,7 +1241,8 @@ impl Security {
         if !enabled {
             return Err(AuthFail::Other(vec![]));
         }
-        let doc = self.state.read().tokens.get(tok).cloned();
+        // Looked up by hash; documents from before hashing never match.
+        let doc = self.state.read().tokens.get(&token_hash(tok)).filter(|d| d.hashed).cloned();
         let Some(doc) = doc else { return Err(AuthFail::Other(vec!["OAuth2 token: token malformed".into()])) };
         if doc.invalidated {
             return Err(AuthFail::Other(vec!["OAuth2 token: token expired".into()]));
@@ -1012,19 +1250,67 @@ impl Security {
         if doc.expires <= now_ms() {
             return Err(AuthFail::TokenExpired);
         }
-        let s = doc.authn;
-        let mut a = user_authn(&s.username, s.roles, s.full_name, s.email, s.metadata, true, &s.realm_name, &s.realm_type);
+        self.authn_from_snapshot(&doc.authn).map_err(|m| AuthFail::Other(vec![format!("OAuth2 token: {m}")]))
+    }
+
+    /// Rebuild a token's authentication. An API-key subject stays an API key
+    /// (its descriptors and `limited_by` ceiling keep applying, and an
+    /// invalidated, expired or deleted key ends the token); a run-as target
+    /// is honoured only while the authenticating subject may still run as it
+    /// (ES re-authorizes run-as on every request).
+    pub fn authn_from_snapshot(&self, s: &AuthnSnapshot) -> Result<Authn, String> {
+        let mut a = match &s.api_key {
+            Some(k) => {
+                let key = self.state.read().api_keys.get(&k.id).cloned().ok_or_else(|| format!("unable to find apikey with id {}", k.id))?;
+                if key.invalidated {
+                    return Err("api key has been invalidated".into());
+                }
+                if key.expiration.map(|e| e <= now_ms()).unwrap_or(false) {
+                    return Err("api key is expired".into());
+                }
+                if key.key_type != "rest" {
+                    return Err(format!("authentication expected API key type of [rest], but API key [{}] has type [{}]", key.id, key.key_type));
+                }
+                Authn {
+                    username: key.username.clone(),
+                    roles: vec![],
+                    full_name: key.full_name.clone(),
+                    email: key.email.clone(),
+                    metadata: if key.user_metadata.is_null() { json!({}) } else { key.user_metadata.clone() },
+                    enabled: true,
+                    realm_name: "_es_api_key".into(),
+                    realm_type: "_es_api_key".into(),
+                    auth_type: "token",
+                    principal: Principal::ApiKey { id: key.id.clone(), name: key.name.clone(), metadata: key.metadata.clone() },
+                    run_as: None,
+                }
+            }
+            None => user_authn(&s.username, s.roles.clone(), s.full_name.clone(), s.email.clone(), s.metadata.clone(), true, &s.realm_name, &s.realm_type),
+        };
         a.auth_type = "token";
+        if let Some(target) = &s.run_as {
+            if !self.permission(&a).can_run_as(&target.username) {
+                return Err(format!("[{}] is unauthorized to run as [{}]", a.username, target.username));
+            }
+            let mut t = user_authn(&target.username, target.roles.clone(), target.full_name.clone(), target.email.clone(), target.metadata.clone(), true, &target.realm_name, &target.realm_type);
+            t.auth_type = "token";
+            a.run_as = Some(Box::new(t));
+        }
         Ok(a)
     }
 
-    /// Issue an access (+ optional refresh) token for `authn`.
-    pub fn create_token(&self, authn: &Authn, with_refresh: bool) -> Result<TokenDoc, EsError> {
+    /// Issue an access (+ optional refresh) token for `authn`, obtained by
+    /// `client` (the authenticated caller of the token API). The store keeps
+    /// only the tokens' hashes; the returned copy carries the raw values.
+    pub fn create_token(&self, authn: &Authn, with_refresh: bool, client: &Authn) -> Result<TokenDoc, EsError> {
         let timeout = self.cfg.read().token_timeout_ms;
         let now = now_ms();
-        let doc = TokenDoc {
-            access_token: format!("{}", hash::random_b64url(48)),
-            refresh_token: if with_refresh { Some(hash::random_b64url(32)) } else { None },
+        let (access, refresh) = (hash::random_b64url(48), with_refresh.then(|| hash::random_b64url(32)));
+        let stored = TokenDoc {
+            access_token: token_hash(&access),
+            refresh_token: refresh.as_deref().map(token_hash),
+            hashed: true,
+            client: Some(owner::ResourceOwner::of(client)),
             creation: now,
             expires: now + timeout,
             invalidated: false,
@@ -1033,13 +1319,24 @@ impl Security {
             authn: authn.snapshot(),
         };
         let mut st = self.state.write();
-        // Drop long-dead tokens.
+        // Drop long-dead tokens, and any stored before ids were hashed.
         let horizon = now - 24 * 3600 * 1000;
-        st.tokens.retain(|_, t| t.creation > horizon);
-        st.tokens.insert(doc.access_token.clone(), doc.clone());
+        st.tokens.retain(|_, t| t.hashed && t.creation > horizon);
+        st.tokens.insert(stored.access_token.clone(), stored.clone());
         drop(st);
         self.save()?;
-        Ok(doc)
+        let mut out = stored;
+        out.access_token = access;
+        out.refresh_token = refresh;
+        Ok(out)
+    }
+
+    /// The stored token documents matching a raw access and/or refresh
+    /// token (`_security/oauth2/token` invalidation).
+    pub fn token_matches(doc: &TokenDoc, access: Option<&str>, refresh: Option<&str>) -> bool {
+        doc.hashed
+            && (access.is_some_and(|a| hash::ct_eq(token_hash(a).as_bytes(), doc.access_token.as_bytes()))
+                || refresh.is_some_and(|r| doc.refresh_token.as_deref().is_some_and(|h| hash::ct_eq(token_hash(r).as_bytes(), h.as_bytes()))))
     }
 
     // ------------------------------------------------------ service accounts
@@ -1088,8 +1385,13 @@ impl Security {
         self.state.read().roles.get(name).cloned()
     }
 
-    fn compiled(&self, key: String, descs: impl FnOnce() -> Vec<Value>) -> Arc<Role> {
-        let g = self.generation();
+    /// The compiled role for `key`. `g` is the generation read *before*
+    /// the descriptors `descs` returns were read: an entry is reused only
+    /// at that generation, and a freshly compiled role is cached only if the
+    /// generation has not moved since, so descriptors read before a
+    /// concurrent role change (every change bumps the generation after
+    /// writing) are never cached as current.
+    fn compiled(&self, key: String, g: u64, descs: impl FnOnce() -> Vec<Value>) -> Arc<Role> {
         if let Some((cg, r)) = self.role_cache.lock().get(&key) {
             if *cg == g {
                 return r.clone();
@@ -1098,11 +1400,25 @@ impl Security {
         let d = descs();
         let r = Arc::new(Role::compile(&d.iter().collect::<Vec<_>>()));
         let mut c = self.role_cache.lock();
+        if self.generation() != g {
+            return r;
+        }
         if c.len() > 1000 {
             c.clear();
         }
         c.insert(key, (g, r.clone()));
         r
+    }
+
+    #[inline]
+    fn descriptors_read(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.after_descriptors_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
     }
 
     /// Role names assigned to the effective user, plus anonymous roles when enabled.
@@ -1131,6 +1447,28 @@ impl Security {
         m
     }
 
+    /// The `limited_by` descriptors of an API key created (or granted) for
+    /// `owner` (ES `ApiKeyUserRoleDescriptorResolver`): the owner's role
+    /// descriptors, a service account's own descriptor, and none for an
+    /// API key subject. A key derived from an API key holds no privileges
+    /// (ES retains "the user of an API key authentication has no roles"):
+    /// the parent's descriptors alone are not its effective permissions,
+    /// which are also bounded by the parent's own `limited_by`.
+    pub fn api_key_owner_descriptors(&self, owner: &Authn) -> Map<String, Value> {
+        let effective = owner.effective();
+        if effective.is_api_key() {
+            return Map::new();
+        }
+        if effective.is_service_account() {
+            let mut m = Map::new();
+            if let Some(d) = service_account(&effective.username) {
+                m.insert(effective.username.clone(), d);
+            }
+            return m;
+        }
+        self.user_descriptors(owner)
+    }
+
     /// Workflows an API key's role descriptors restrict it to
     /// (`restriction.workflows`); `None` when unrestricted.
     pub fn workflow_restriction(&self, a: &Authn) -> Option<Vec<String>> {
@@ -1147,25 +1485,43 @@ impl Security {
         (!out.is_empty()).then_some(out)
     }
 
+    /// The permissions of the effective subject (the run-as target when
+    /// run-as was honoured, as ES authorizes the effective subject).
     pub fn permission(&self, a: &Authn) -> Permission {
+        let a = a.effective();
+        // Read before any descriptor: see `compiled`.
+        let g = self.generation();
         match &a.principal {
             Principal::ApiKey { id, .. } => {
                 let key = self.state.read().api_keys.get(id).cloned();
                 let Some(key) = key else {
                     return Permission { role: Arc::new(Role::default()), limit: None, effective_roles: vec![], missing_roles: vec![], is_superuser: false };
                 };
-                let limit = self.compiled(format!("apikey-limit:{id}"), || key.limited_by.values().cloned().collect());
+                self.descriptors_read();
+                let limit = self.compiled(format!("apikey-limit:{id}"), g, || key.limited_by.values().cloned().collect());
                 let role = if key.role_descriptors.is_empty() {
                     limit.clone()
                 } else {
-                    self.compiled(format!("apikey:{id}"), || key.role_descriptors.values().cloned().collect())
+                    self.compiled(format!("apikey:{id}"), g, || key.role_descriptors.values().cloned().collect())
                 };
                 let is_superuser = key.role_descriptors.is_empty() && key.limited_by.contains_key("superuser");
                 Permission { role, limit: Some(limit), effective_roles: vec![], missing_roles: vec![], is_superuser }
             }
+            Principal::CrossCluster { key_id, descriptors } => {
+                let key = self.state.read().api_keys.get(key_id).cloned();
+                let Some(key) = key else {
+                    return Permission { role: Arc::new(Role::default()), limit: None, effective_roles: vec![], missing_roles: vec![], is_superuser: false };
+                };
+                self.descriptors_read();
+                let limit = self.compiled(format!("ccx-key:{key_id}"), g, || key.role_descriptors.values().cloned().collect());
+                let fingerprint = serde_json::to_string(&**descriptors).unwrap_or_default();
+                let descs = descriptors.clone();
+                let role = self.compiled(format!("ccx-user:{fingerprint}"), g, || (*descs).clone());
+                Permission { role, limit: Some(limit), effective_roles: vec![], missing_roles: vec![], is_superuser: false }
+            }
             Principal::ServiceAccount { .. } => {
                 let name = a.username.clone();
-                let role = self.compiled(format!("svc:{name}"), || service_account(&name).into_iter().collect());
+                let role = self.compiled(format!("svc:{name}"), g, || service_account(&name).into_iter().collect());
                 Permission { role, limit: None, effective_roles: vec![], missing_roles: vec![], is_superuser: false }
             }
             _ => {
@@ -1182,27 +1538,110 @@ impl Security {
                         None => missing.push(n.clone()),
                     }
                 }
+                self.descriptors_read();
                 let is_superuser = found.iter().any(|n| n == "superuser");
-                let role = self.compiled(format!("roles:{}", found.join("\u{0}")), || descs);
+                let role = self.compiled(format!("roles:{}", found.join("\u{0}")), g, || descs);
                 Permission { role, limit: None, effective_roles: found, missing_roles: missing, is_superuser }
             }
         }
     }
 
     /// Run-as: swap in the effective user named by `es-security-runas-user`.
+    /// The authenticating subject's permission decides, an API key's
+    /// bounded by its owner's `limited_by` role. ES `supportsRunAs`: no
+    /// chained run-as, and service accounts never run as.
     pub fn run_as(&self, mut a: Authn, target: &str) -> Result<Authn, ()> {
+        if a.run_as.is_some() || a.is_service_account() {
+            return Err(());
+        }
         let perm = self.permission(&a);
-        if !perm.role.can_run_as(target) {
+        if !perm.can_run_as(target) {
             return Err(());
         }
         match self.lookup_user(target) {
-            Some(u) => {
+            // ES `AuthenticatorChain.finishAuthentication`: a disabled
+            // effective user fails the authentication.
+            Some(u) if u.enabled => {
                 a.run_as = Some(Box::new(u));
                 Ok(a)
             }
-            None => Err(()),
+            _ => Err(()),
         }
     }
+
+    /// Whether `authenticating` could run as `target` but `target` is a
+    /// disabled user: ES answers that request with an authentication
+    /// failure (401) rather than a run-as denial.
+    pub fn run_as_target_disabled(&self, authenticating: &Authn, target: &str) -> bool {
+        authenticating.run_as.is_none()
+            && !authenticating.is_service_account()
+            && self.permission(authenticating).can_run_as(target)
+            && self.lookup_user(target).is_some_and(|u| !u.enabled)
+    }
+
+    /// ES `TokenService.refreshToken`: take the refresh token `rt` (once),
+    /// under one write of the token store, and rebuild the original
+    /// token's authentication for the new pair. `Err`: the
+    /// `error_description` of the `invalid_grant` answer.
+    pub fn take_refresh(&self, rt: &str, client: &Authn) -> Result<Authn, String> {
+        let wanted = token_hash(rt);
+        let snapshot = {
+            let mut st = self.state.write();
+            let Some(t) = st.tokens.values_mut().find(|t| t.hashed && t.refresh_token.as_deref() == Some(wanted.as_str())) else {
+                return Err("could not refresh the requested token".into());
+            };
+            if t.refresh_invalidated {
+                return Err("token has been invalidated".into());
+            }
+            // ES `checkClientCanRefresh`: the client that obtained the
+            // token (same principal and realm, or the same API key).
+            let caller = owner::ResourceOwner::of(client);
+            let same = t.client.as_ref().is_some_and(|c| c.username == caller.username && c.realm_name == caller.realm_name && c.api_key_id == caller.api_key_id);
+            if !same {
+                return Err("tokens must be refreshed by the creating client".into());
+            }
+            if t.refreshed {
+                return Err("token has already been refreshed".into());
+            }
+            if t.creation + 24 * 3600 * 1000 < now_ms() {
+                return Err("refresh token is expired".into());
+            }
+            t.refreshed = true;
+            t.authn.clone()
+        };
+        // The new token carries the original authentication (its subject,
+        // realm and roles), never the refreshing client's or a same-named
+        // user's of another realm.
+        let mut a = self.authn_from_snapshot(&snapshot)?;
+        if snapshot.api_key.is_none() {
+            a.auth_type = "realm";
+            if let Some(t) = a.run_as.as_deref_mut() {
+                t.auth_type = "realm";
+            }
+        }
+        Ok(a)
+    }
+}
+
+/// Write the security state (password hashes, key and token hashes) readable
+/// by the node's user only (mode 0600), as ES protects its data directory.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 fn user_authn(username: &str, roles: Vec<String>, full_name: Option<String>, email: Option<String>, metadata: Value, enabled: bool, realm: &str, realm_type: &str) -> Authn {
@@ -1219,6 +1658,11 @@ fn user_authn(username: &str, roles: Vec<String>, full_name: Option<String>, ema
         principal: Principal::User,
         run_as: None,
     }
+}
+
+/// Hex SHA-256 of a raw OAuth2 token: its id in the token store.
+pub fn token_hash(token: &str) -> String {
+    hash::sha256(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Decode a service account bearer token: `base64("\0\1\0\1" + "ns/svc/name:secret")`.
@@ -1373,5 +1817,383 @@ mod cluster_security_tests {
         assert!(peer.restore_cluster_state(&source.cluster_state()).unwrap());
         assert!(peer.state.read().api_keys.is_empty());
         assert!(!peer.restore_cluster_state(&old_snapshot).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod api_key_ceiling_and_role_cache_tests {
+    use super::*;
+    use base64::Engine;
+    use std::sync::Barrier;
+
+    const PUT_USER: &str = "cluster:admin/xpack/security/user/put";
+    const HEALTH: &str = "cluster:monitor/health";
+
+    fn secured() -> (tempfile::TempDir, Arc<Security>) {
+        let dir = tempfile::tempdir().unwrap();
+        let security = Arc::new(Security::open(dir.path()));
+        security.configure(SecConfig { enabled: true, token_enabled: true, ..Default::default() });
+        (dir, security)
+    }
+
+    fn put_role(security: &Security, name: &str, descriptor: Value) {
+        let role = roles::parse_role(name, &descriptor, false).unwrap();
+        security.state.write().roles.insert(name.into(), role);
+        security.save().unwrap();
+    }
+
+    fn put_user(security: &Security, name: &str, roles: &[&str]) {
+        let user = NativeUser { password_hash: Hasher::Ssha256.hash("pw"), roles: roles.iter().map(|r| r.to_string()).collect(), full_name: None, email: None, metadata: json!({}), enabled: true };
+        security.state.write().users.insert(name.into(), user);
+        security.save().unwrap();
+    }
+
+    /// Create a key owned by `owner` with `descriptors` (limited by the
+    /// owner's roles, as `do_create_key`); its authentication.
+    fn key(security: &Security, owner: &str, descriptors: Value) -> Authn {
+        let owner = security.authenticate_password(owner, "pw").unwrap_or_else(|_| panic!("owner authenticates"));
+        let mut rds = Map::new();
+        for (name, d) in descriptors.as_object().unwrap() {
+            rds.insert(name.clone(), roles::parse_role(name, d, true).unwrap());
+        }
+        let limited = security.user_descriptors(&owner);
+        let key = security.create_api_key(&owner, limited, "k".into(), None, rds, json!({})).unwrap();
+        let credential = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", key.id, key.hash));
+        security.authenticate_api_key(&credential).unwrap()
+    }
+
+    fn setup(security: &Security) {
+        put_role(security, "owner", json!({"cluster": ["monitor", "manage_own_api_key", "manage_token"]}));
+        put_role(security, "runner", json!({"run_as": ["target"]}));
+        put_role(security, "everything", json!({"cluster": ["all"], "indices": [{"names": ["*"], "privileges": ["all"]}]}));
+        put_user(security, "owner", &["owner"]);
+        put_user(security, "runner", &["owner", "runner"]);
+        put_user(security, "target", &["everything"]);
+    }
+
+    #[test]
+    fn api_key_run_as_is_bounded_by_the_owner_role() {
+        let (_dir, security) = secured();
+        setup(&security);
+        // The key asks for run_as, its owner has none: denied.
+        let limited = key(&security, "owner", json!({"r": {"run_as": ["target"], "cluster": ["all"]}}));
+        assert!(security.run_as(limited.clone(), "target").is_err(), "an API key ran as a user its owner cannot run as");
+        assert!(!security.permission(&limited).check_cluster(PUT_USER));
+        // Owner and key both allow it: the target's permissions apply.
+        let allowed = key(&security, "runner", json!({"r": {"run_as": ["target"]}}));
+        let ran = security.run_as(allowed.clone(), "target").unwrap_or_else(|_| panic!("run-as within the owner ceiling"));
+        assert_eq!(ran.effective().username, "target");
+        assert!(security.permission(&ran).check_cluster(PUT_USER));
+        // The owner allows it but the key's own descriptors do not.
+        let narrowed = key(&security, "runner", json!({"r": {"cluster": ["monitor"]}}));
+        assert!(security.run_as(narrowed, "target").is_err());
+        // No chained run-as.
+        assert!(security.run_as(ran, "target").is_err());
+    }
+
+    #[test]
+    fn tokens_issued_to_an_api_key_keep_its_limits() {
+        let (_dir, security) = secured();
+        setup(&security);
+        // Key descriptors broader than the owner: the owner bounds them.
+        let limited = key(&security, "owner", json!({"r": {"cluster": ["all"], "run_as": ["target"]}}));
+        assert!(!security.permission(&limited).check_cluster(PUT_USER));
+        let doc = security.create_token(&limited, false, &limited).unwrap();
+        assert_eq!(doc.authn.api_key.as_ref().map(|k| k.id.as_str()), limited.api_key_id());
+        let bearer = security.authenticate(Credentials::Bearer(doc.access_token.clone())).unwrap_or_else(|_| panic!("token authenticates"));
+        assert!(bearer.is_api_key(), "the token lost the API key subject");
+        assert_eq!(bearer.auth_type, "token");
+        assert_eq!(bearer.api_key_id(), limited.api_key_id());
+        let perm = security.permission(&bearer);
+        assert!(perm.limit.is_some(), "the token lost the owner's limited_by ceiling");
+        assert!(!perm.check_cluster(PUT_USER), "the token gained a privilege its owner lacks");
+        assert!(perm.check_cluster(HEALTH));
+        assert!(security.run_as(bearer, "target").is_err(), "the token ran as a user the owner cannot run as");
+
+        // A run-as token keeps the API key as the authenticating subject and
+        // is re-checked on use.
+        let allowed = key(&security, "runner", json!({"r": {"run_as": ["target"]}}));
+        let ran = security.run_as(allowed.clone(), "target").unwrap_or_else(|_| panic!("run-as"));
+        let doc = security.create_token(&ran, false, &ran).unwrap();
+        let bearer = security.authenticate(Credentials::Bearer(doc.access_token.clone())).unwrap_or_else(|_| panic!("run-as token authenticates"));
+        assert!(bearer.is_api_key());
+        assert_eq!(bearer.effective().username, "target");
+        // The owner loses run_as (the key's limited_by changes): the token stops working.
+        let id = allowed.api_key_id().unwrap().to_string();
+        security.state.write().api_keys.get_mut(&id).unwrap().limited_by.remove("runner");
+        security.save().unwrap();
+        assert!(security.authenticate(Credentials::Bearer(doc.access_token.clone())).is_err(), "run-as token survived the loss of the run_as privilege");
+        // An invalidated key ends its tokens.
+        let other = key(&security, "owner", json!({"r": {"cluster": ["monitor"]}}));
+        let doc = security.create_token(&other, false, &other).unwrap();
+        assert!(security.authenticate(Credentials::Bearer(doc.access_token.clone())).is_ok());
+        security.state.write().api_keys.get_mut(other.api_key_id().unwrap()).unwrap().invalidated = true;
+        security.save().unwrap();
+        assert!(security.authenticate(Credentials::Bearer(doc.access_token)).is_err());
+        // Tokens without the new fields (written before) still read as users.
+        let legacy: AuthnSnapshot = serde_json::from_value(json!({"username": "owner", "roles": ["owner"], "full_name": null, "email": null, "metadata": {}, "realm_name": "default_native", "realm_type": "native"})).unwrap();
+        assert!(legacy.api_key.is_none() && legacy.run_as.is_none());
+    }
+
+    #[test]
+    fn a_key_derived_from_an_api_key_has_no_privileges() {
+        let (_dir, security) = secured();
+        setup(&security);
+        // A parent key whose descriptors ask for more than its owner holds:
+        // its effective permissions stay under the owner.
+        let parent = key(&security, "owner", json!({"r": {"cluster": ["all"], "run_as": ["*"], "indices": [{"names": ["*"], "privileges": ["all"]}]}}));
+        assert!(security.run_as(parent.clone(), "target").is_err());
+        assert!(!security.permission(&parent).check_cluster(PUT_USER));
+        // A key created by that key (empty descriptors, as derived keys
+        // must be) is limited by what the parent's authentication resolves
+        // to: no roles, as ES's ApiKeyUserRoleDescriptorResolver.
+        let limited = security.api_key_owner_descriptors(&parent);
+        assert!(limited.is_empty(), "a derived key inherited descriptors: {limited:?}");
+        let mut rds = Map::new();
+        rds.insert("d".into(), roles::parse_role("d", &json!({"run_as": ["target"]}), true).unwrap());
+        let derived = security.create_api_key(&parent, limited, "derived".into(), None, rds, json!({})).unwrap();
+        let credential = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", derived.id, derived.hash));
+        let derived = security.authenticate_api_key(&credential).unwrap();
+        let perm = security.permission(&derived);
+        assert!(!perm.check_cluster(PUT_USER), "a derived key escaped its parent's owner ceiling");
+        assert!(!perm.check_cluster(HEALTH), "a derived key holds privileges");
+        assert!(!perm.check_index("indices:data/read/search", "anything"));
+        assert!(!perm.is_superuser);
+        assert!(security.run_as(derived, "target").is_err(), "a derived key ran as a user its parent's owner cannot run as");
+        // Users and service accounts keep their own descriptors.
+        let owner = security.authenticate_password("owner", "pw").unwrap_or_else(|_| panic!("owner"));
+        assert!(security.api_key_owner_descriptors(&owner).contains_key("owner"));
+    }
+
+    #[test]
+    fn run_as_a_disabled_user_fails() {
+        let (_dir, security) = secured();
+        setup(&security);
+        let runner = security.authenticate_password("runner", "pw").unwrap_or_else(|_| panic!("runner"));
+        assert!(security.run_as(runner.clone(), "target").is_ok());
+        assert!(!security.run_as_target_disabled(&runner, "target"));
+        security.state.write().users.get_mut("target").unwrap().enabled = false;
+        security.save().unwrap();
+        assert!(security.run_as(runner.clone(), "target").is_err(), "ran as a disabled user");
+        assert!(security.run_as_target_disabled(&runner, "target"));
+        // A subject that may not run as the user gets the run-as denial instead.
+        let owner = security.authenticate_password("owner", "pw").unwrap_or_else(|_| panic!("owner"));
+        assert!(!security.run_as_target_disabled(&owner, "target"));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_original_authentication_and_happens_once() {
+        let (_dir, security) = secured();
+        setup(&security);
+        let owner = security.authenticate_password("owner", "pw").unwrap_or_else(|_| panic!("owner"));
+        // Obtained by a client (Kibana-style) on the user's behalf.
+        let client = security.authenticate_password("runner", "pw").unwrap_or_else(|_| panic!("client"));
+        let doc = security.create_token(&owner, true, &client).unwrap();
+        let rt = doc.refresh_token.clone().unwrap();
+        // Only the stored hashes are kept.
+        assert!(security.state.read().tokens.values().all(|t| t.hashed && t.access_token != doc.access_token && t.refresh_token.as_deref() != Some(rt.as_str())));
+        // Another client may not refresh it.
+        let other_client = security.authenticate_password("target", "pw").unwrap_or_else(|_| panic!("other"));
+        assert_eq!(security.take_refresh(&rt, &other_client).err().as_deref(), Some("tokens must be refreshed by the creating client"));
+        // The user is deleted and a same-named file user appears with more
+        // roles: the refreshed token keeps the original subject and roles.
+        security.state.write().users.remove("owner");
+        security.save().unwrap();
+        let mut cfg = security.cfg.read().clone();
+        cfg.file_users.insert("owner".into(), Hasher::Ssha256.hash("pw"));
+        cfg.file_user_roles.insert("owner".into(), vec!["everything".into()]);
+        security.configure(cfg);
+        let refreshed = security.take_refresh(&rt, &client).unwrap_or_else(|why| panic!("refresh: {why}"));
+        assert_eq!(refreshed.username, "owner");
+        assert_eq!(refreshed.realm_type, "native");
+        assert_eq!(refreshed.roles, vec!["owner".to_string()]);
+        assert!(!security.permission(&refreshed).check_cluster(PUT_USER), "the refresh picked up another realm's user");
+        assert_eq!(security.take_refresh(&rt, &client).err().as_deref(), Some("token has already been refreshed"));
+        assert!(security.take_refresh("no-such-refresh-token", &client).is_err());
+    }
+
+    #[test]
+    fn token_ids_are_hashed_at_rest_and_the_state_file_is_private() {
+        let (dir, security) = secured();
+        setup(&security);
+        let owner = security.authenticate_password("owner", "pw").unwrap_or_else(|_| panic!("owner"));
+        let doc = security.create_token(&owner, true, &owner).unwrap();
+        let path = dir.path().join("_state/security.json");
+        let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_string();
+        assert!(!text.contains(&doc.access_token), "the access token is stored in plaintext");
+        assert!(!text.contains(doc.refresh_token.as_deref().unwrap()), "the refresh token is stored in plaintext");
+        assert!(security.authenticate(Credentials::Bearer(doc.access_token.clone())).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // A document from before hashing (plaintext id) never authenticates
+        // and is purged when the state is next loaded.
+        let mut legacy = security.state.read().tokens.values().next().unwrap().clone();
+        legacy.access_token = "legacy-plain".into();
+        legacy.hashed = false;
+        security.state.write().tokens.insert("legacy-plain".into(), legacy);
+        security.save().unwrap();
+        assert!(security.authenticate(Credentials::Bearer("legacy-plain".into())).is_err());
+        let reopened = Security::open(dir.path());
+        assert!(reopened.state.read().tokens.values().all(|t| t.hashed));
+        assert_eq!(reopened.state.read().tokens.len(), 1);
+    }
+
+    /// Interleave a permission lookup (paused after it read the descriptors)
+    /// with a downgrade; `downgrade` runs while the lookup is paused.
+    fn race(security: &Arc<Security>, subject: &Authn, downgrade: impl FnOnce()) -> bool {
+        let barrier = Arc::new(Barrier::new(2));
+        let armed = Arc::new(AtomicBool::new(true));
+        let (b, a) = (barrier.clone(), armed.clone());
+        *security.after_descriptors_hook.lock() = Some(Arc::new(move || {
+            if a.swap(false, Ordering::SeqCst) {
+                b.wait();
+                b.wait();
+            }
+        }));
+        let (s, who) = (security.clone(), subject.clone());
+        let lookup = std::thread::spawn(move || s.permission(&who).check_cluster(PUT_USER));
+        barrier.wait(); // the lookup holds the old descriptors
+        downgrade();
+        barrier.wait(); // let it compile and try to cache them
+        let in_flight = lookup.join().unwrap();
+        *security.after_descriptors_hook.lock() = None;
+        in_flight
+    }
+
+    #[test]
+    fn a_role_downgrade_racing_a_lookup_is_not_cached() {
+        let (_dir, security) = secured();
+        put_role(&security, "r", json!({"cluster": ["all"]}));
+        put_user(&security, "u", &["r"]);
+        let user = security.lookup_user("u").unwrap();
+        assert!(security.permission(&user).check_cluster(PUT_USER));
+        // Start from a cold cache so the lookup has to compile and insert.
+        security.clear_cache("roles", &[], &[]).unwrap();
+        let in_flight = race(&security, &user, || put_role(&security, "r", json!({"cluster": ["monitor"]})));
+        assert!(in_flight, "the in-flight lookup read the old descriptors (interleaving happened)");
+        for _ in 0..3 {
+            let perm = security.permission(&user);
+            assert!(!perm.check_cluster(PUT_USER), "the downgraded role's old permissions were cached");
+            assert!(perm.check_cluster(HEALTH));
+        }
+    }
+
+    #[test]
+    fn an_api_key_downgrade_racing_a_lookup_is_not_cached() {
+        let (_dir, security) = secured();
+        put_role(&security, "boss", json!({"cluster": ["all"]}));
+        put_user(&security, "boss", &["boss"]);
+        let k = key(&security, "boss", json!({"r": {"cluster": ["all"]}}));
+        assert!(security.permission(&k).check_cluster(PUT_USER));
+        security.clear_cache("api_keys", &[], &[]).unwrap();
+        let id = k.api_key_id().unwrap().to_string();
+        let in_flight = race(&security, &k, || {
+            let narrowed = roles::parse_role("r", &json!({"cluster": ["monitor"]}), true).unwrap();
+            security.state.write().api_keys.get_mut(&id).unwrap().role_descriptors = Map::from_iter([("r".to_string(), narrowed)]);
+            security.save().unwrap();
+        });
+        assert!(in_flight);
+        let perm = security.permission(&k);
+        assert!(!perm.check_cluster(PUT_USER), "the narrowed key's old descriptors were cached");
+        assert!(perm.check_cluster(HEALTH));
+    }
+
+    #[test]
+    fn clear_cache_invalidates_each_cache() {
+        let (_dir, security) = secured();
+        setup(&security);
+        put_role(&security, "r", json!({"cluster": ["monitor"]}));
+        put_user(&security, "u", &["r"]);
+        let u = security.authenticate_password("u", "pw").unwrap_or_else(|_| panic!("u"));
+        security.permission(&u);
+        let owner = security.authenticate_password("owner", "pw").unwrap_or_else(|_| panic!("owner"));
+        security.permission(&owner);
+        let k = key(&security, "owner", json!({"r": {"cluster": ["monitor"]}}));
+        let id = k.api_key_id().unwrap().to_string();
+        security.permission(&k);
+        let has = |roles: bool, entry: &str| {
+            let (r, v) = security.cache_keys();
+            (if roles { r } else { v }).iter().any(|x| x == entry)
+        };
+        assert!(has(true, "roles:r") && has(true, "roles:owner") && has(true, &format!("apikey:{id}")) && has(true, &format!("apikey-limit:{id}")));
+        assert!(has(false, "basic\u{0}u") && has(false, &format!("apikey\u{0}{id}")));
+
+        security.clear_cache("roles", &["other".into()], &[]).unwrap();
+        assert!(has(true, "roles:r"));
+        security.clear_cache("roles", &["r".into()], &[]).unwrap();
+        assert!(!has(true, "roles:r") && has(true, "roles:owner"));
+
+        security.clear_cache("api_keys", &[id.clone()], &[]).unwrap();
+        assert!(!has(true, &format!("apikey:{id}")) && !has(true, &format!("apikey-limit:{id}")) && !has(false, &format!("apikey\u{0}{id}")));
+        assert!(has(true, "roles:owner") && has(false, "basic\u{0}u"));
+
+        security.clear_cache("realms", &["default_native".into()], &["owner".into()]).unwrap();
+        assert!(has(false, "basic\u{0}u") && !has(false, "basic\u{0}owner"));
+        security.clear_cache("realms", &["default_native".into()], &[]).unwrap();
+        assert!(!has(false, "basic\u{0}u"));
+
+        security.clear_cache("privileges", &["app".into()], &[]).unwrap();
+        assert!(security.cache_keys().0.is_empty());
+
+        let tokens = BTreeMap::from([("t1".to_string(), ServiceToken { hash: Hasher::Ssha256.hash("s1"), creation: 0 }), ("t2".to_string(), ServiceToken { hash: Hasher::Ssha256.hash("s2"), creation: 0 })]);
+        security.state.write().service_tokens.insert("elastic/fleet-server".into(), tokens);
+        security.save().unwrap();
+        for (name, secret) in [("t1", "s1"), ("t2", "s2")] {
+            assert!(security.authenticate(Credentials::Bearer(service_token_value("elastic/fleet-server", name, secret))).is_ok());
+        }
+        security.clear_cache("service_tokens", &["elastic/fleet-server/t1".into()], &[]).unwrap();
+        assert!(!has(false, "svc\u{0}elastic/fleet-server/t1") && has(false, "svc\u{0}elastic/fleet-server/t2"));
+        security.clear_cache("service_tokens", &["elastic/fleet-server/*".into()], &[]).unwrap();
+        assert!(!has(false, "svc\u{0}elastic/fleet-server/t2"));
+        assert!(security.clear_cache("bogus", &[], &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod nonblocking_authentication_tests {
+    use super::*;
+
+    /// Production review #17: the networking thread never runs uncached
+    /// bcrypt / PBKDF2 verification; it learns that the verdict needs the
+    /// crypto pool. Only successes are cached, so a failed password is never
+    /// decided (or cached) on the networking thread.
+    #[test]
+    fn expensive_verification_is_deferred_and_only_successes_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let bcrypt = Hasher::Bcrypt(10).hash("bcrypt-pw");
+        let pbkdf2 = Hasher::Pbkdf2(10000).hash("pbkdf2-pw");
+        let cheap = Hasher::Ssha256.hash("cheap-pw");
+        std::fs::write(dir.path().join("users"), format!("b:{bcrypt}\np:{pbkdf2}\nc:{cheap}\n")).unwrap();
+        std::fs::write(dir.path().join("users_roles"), "superuser:b,p,c\n").unwrap();
+        let security = Security::open(dir.path());
+        let mut cfg = SecConfig { enabled: true, bootstrap_password: Some("bootstrap".into()), ..Default::default() };
+        cfg.load_files(dir.path());
+        security.configure(cfg);
+        let basic = |u: &str, p: &str| Credentials::Basic(u.into(), p.into());
+        for (user, pw) in [("b", "bcrypt-pw"), ("p", "pbkdf2-pw")] {
+            let started = std::time::Instant::now();
+            assert!(security.authenticate_nonblocking(&basic(user, pw)).is_none(), "{user}: uncached expensive success deferred");
+            assert!(security.authenticate_nonblocking(&basic(user, "wrong")).is_none(), "{user}: expensive failure deferred");
+            assert!(started.elapsed() < std::time::Duration::from_millis(20), "{user}: no hashing on the networking thread");
+            // On the crypto pool: the real verdicts.
+            assert!(security.authenticate(basic(user, pw)).is_ok());
+            assert!(security.authenticate(basic(user, "wrong")).is_err());
+            // A success is cached and then decided without the pool...
+            assert!(matches!(security.authenticate_nonblocking(&basic(user, pw)), Some(Ok(_))), "{user}: cached success");
+            // ... a failure never is.
+            assert!(security.authenticate_nonblocking(&basic(user, "wrong")).is_none(), "{user}: failures are not cached");
+        }
+        // Cheap cases are decided inline.
+        assert!(matches!(security.authenticate_nonblocking(&basic("c", "cheap-pw")), Some(Ok(_))));
+        assert!(matches!(security.authenticate_nonblocking(&basic("c", "nope")), Some(Err(_))));
+        assert!(matches!(security.authenticate_nonblocking(&basic("nobody", "x")), Some(Err(_))));
+        assert!(matches!(security.authenticate_nonblocking(&basic("elastic", "bootstrap")), Some(Ok(_))));
+        assert!(matches!(security.authenticate_nonblocking(&Credentials::None), Some(Err(AuthFail::Missing))));
+        // Deferral is scoped to the call: plain authentication still verifies.
+        assert!(security.authenticate(basic("b", "wrong")).is_err());
+        assert!(security.authenticate(basic("p", "pbkdf2-pw")).is_ok());
     }
 }

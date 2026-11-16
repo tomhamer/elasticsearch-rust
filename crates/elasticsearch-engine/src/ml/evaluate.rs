@@ -435,16 +435,18 @@ impl Metric {
                     Some(names) => {
                         // Precision: by predicted class, share of docs whose actual class is equal;
                         // recall: by actual class, share whose predicted class is equal.
+                        // One class filter with its own equality filter each
+                        // (2 buckets per class, as ES's one metric per class
+                        // bucket): not every class's filter under every class,
+                        // which needs N + N² buckets (90,300 for 300 classes,
+                        // past the default search.max_buckets).
                         let (outer, inner) = if matches!(self, Metric::ClassPrecision { .. }) { (predicted, actual.as_str()) } else { (actual.as_str(), predicted) };
-                        let mut filters = Map::new();
-                        for c in names {
-                            filters.insert(c.clone(), json!({"match": {outer: {"query": c, "lenient": true}}}));
+                        for (ci, c) in names.iter().enumerate() {
+                            out.insert(
+                                format!("{p}_by_class_{ci}"),
+                                json!({"filter": {"match": {outer: {"query": c, "lenient": true}}}, "aggs": {"equal": {"filter": {"match": {inner: {"query": c, "lenient": true}}}}}}),
+                            );
                         }
-                        let mut equal = Map::new();
-                        for c in names {
-                            equal.insert(c.clone(), json!({"match": {inner: {"query": c, "lenient": true}}}));
-                        }
-                        out.insert(format!("{p}_by_class"), json!({"filters": {"filters": filters}, "aggs": {"equal": {"filters": {"filters": equal}}}}));
                     }
                 }
             }
@@ -562,14 +564,13 @@ impl Metric {
                         return Ok(());
                     }
                 }
-                if let (Some(names), Some(by)) = (top.as_ref(), get("_by_class")) {
-                    let buckets = &by["buckets"];
+                if let Some(names) = top.as_ref().filter(|n| !n.is_empty() && get("_by_class_0").is_some()) {
                     let mut classes = Vec::new();
                     let (mut sum, mut n) = (0.0f64, 0u64);
-                    for c in names {
-                        let b = &buckets[c.as_str()];
-                        let total = doc_count(b);
-                        let equal = doc_count(&b["equal"]["buckets"][c.as_str()]);
+                    for (ci, c) in names.iter().enumerate() {
+                        let b = get(&format!("_by_class_{ci}")).cloned().unwrap_or(Value::Null);
+                        let total = doc_count(&b);
+                        let equal = doc_count(&b["equal"]);
                         let v = equal as f64 / total as f64;
                         if v.is_finite() {
                             sum += v;
@@ -1231,6 +1232,31 @@ mod tests {
         assert_eq!(message_format_number(0.25), "0.25");
         assert_eq!(message_format_number(1234.5), "1,234.5");
         assert_eq!(message_format_number(-0.5), "-0.5");
+    }
+
+    /// #531: precision / recall over 300 classes stay within the default
+    /// bucket limit (ES: one metric per class bucket), and are perfect when
+    /// every prediction is right.
+    #[test]
+    fn class_precision_and_recall_fit_the_default_bucket_limit() {
+        use crate::index::WriteReq;
+        use crate::shard::WriteCond;
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        node.create_index("cls", &json!({"mappings": {"properties": {"a": {"type": "keyword"}, "p": {"type": "keyword"}}}})).unwrap();
+        let svc = node.get_index("cls").unwrap();
+        let reqs = (0..300).map(|i| WriteReq::Index { id: Some(i.to_string()), source: json!({"a": format!("c{i:03}"), "p": format!("c{i:03}")}).to_string(), routing: None, cond: WriteCond::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        for metric in ["precision", "recall"] {
+            let body = json!({"index": "cls", "evaluation": {"classification": {"actual_field": "a", "predicted_field": "p", "metrics": {metric: {}}}}});
+            let out = evaluate(&node, &body).unwrap();
+            let m = &out["classification"][metric];
+            assert_eq!(m[format!("avg_{metric}")].as_f64(), Some(1.0), "{out}");
+            assert_eq!(m["classes"].as_array().unwrap().len(), 300);
+        }
     }
 
     #[test]

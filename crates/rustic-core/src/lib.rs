@@ -233,12 +233,6 @@ pub fn on_encode_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     on_pool(encode_pool(), f)
 }
 
-/// The pool background merges encode on (ES / Lucene
-/// `ConcurrentMergeScheduler`: dedicated merge threads, throttled by sleeping
-/// on themselves): a throttled merge never occupies an [`encode_pool`]
-/// thread that seals (which indexing and refresh wait on) need. As many
-/// threads as ES's `index.merge.scheduler.max_thread_count` default
-/// (`max(1, min(4, cores / 2))`).
 /// Lower the calling thread's CPU priority (Linux `nice`, per thread): the
 /// background encode and merge threads yield the cores to searches and
 /// indexing when the node is busy, and use them fully when it is not.
@@ -260,14 +254,20 @@ pub fn lower_thread_priority(default_nice: i32) {
     let _ = default_nice;
 }
 
+/// The pool background merges encode on (ES 9's `merge` thread pool,
+/// `allocatedProcessors` threads, which every shard's merge scheduler
+/// submits to): a throttled merge never occupies an [`encode_pool`] thread
+/// that seals (which indexing and refresh wait on) need.
 pub fn merge_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         // Every copy runs its own merges (ES: a merge scheduler per shard,
-        // `max_thread_count` each), the node at most half its cores at
-        // once (the engine's node-wide merge permits), niced.
+        // `max_thread_count` = half the cores each), the node at most as
+        // many as it has cores at once (the engine's node-wide merge
+        // permits), niced. With half the cores, one copy's merges filled
+        // the pool and none had a thread for its parallel stages.
         let n = std::env::var("RUSTIC_MERGE_POOL_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
-            .unwrap_or_else(|| (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1));
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()).max(1));
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .thread_name(|i| format!("rustic-merge-{i}"))

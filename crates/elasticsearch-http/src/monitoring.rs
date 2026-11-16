@@ -115,9 +115,21 @@ fn bulk(node: &Node, req: &Req) -> R {
     let ts = elasticsearch_engine::watcher::iso(now);
     let index = format!(".monitoring-{system}-{TEMPLATE_VERSION}-{}", ts[..10].replace('-', "."));
     let source_node = json!({"uuid": NODE_ID, "host": "127.0.0.1", "transport_address": TRANSPORT_ADDRESS, "ip": "127.0.0.1", "name": node.name, "timestamp": ts});
+    // On a cluster the envelope carries the cluster's UUID (from cluster
+    // state, as the cluster root reports it), not this engine's own
+    // (finding 391).
+    let rest = req.internal_cluster_rest();
+    let cluster_uuid = match &rest {
+        Some(rest) => match (rest.0)("GET", "/", None) {
+            Ok(v) if v["cluster_uuid"].is_string() => v["cluster_uuid"].as_str().unwrap_or_default().to_string(),
+            Ok(_) => node.cluster_uuid.clone(),
+            Err(e) => return Ok(export_error(start, vec![export_exception(&index, &e.reason, e.error_object(false))])),
+        },
+        None => node.cluster_uuid.clone(),
+    };
     let envelope = |d: Doc| {
         let mut src = serde_json::Map::new();
-        src.insert("cluster_uuid".into(), json!(node.cluster_uuid));
+        src.insert("cluster_uuid".into(), json!(cluster_uuid));
         src.insert("timestamp".into(), json!(ts));
         src.insert("interval_ms".into(), json!(interval_ms));
         src.insert("type".into(), json!(d.ty));
@@ -127,8 +139,8 @@ fn bulk(node: &Node, req: &Req) -> R {
     };
     // On a cluster the exporter writes through the coordinator (as the
     // monitoring origin): the index and its documents reach every copy.
-    if let Some(rest) = req.internal_cluster_rest() {
-        if let Err(e) = (rest.0)("PUT", &format!("/{index}"), Some(monitoring_index_body())) {
+    if let Some(rest) = rest {
+        if let Err(e) = (rest.0)("PUT", &format!("/{index}"), Some(monitoring_index_body(&system)?)) {
             if e.kind != "resource_already_exists_exception" {
                 return Ok(export_error(start, vec![export_exception(&index, &e.reason, e.error_object(false))]));
             }
@@ -147,21 +159,15 @@ fn bulk(node: &Node, req: &Req) -> R {
             }
         });
     }
-    let svc = monitoring_index(node, &index)?;
+    let svc = monitoring_index(node, &system, &index)?;
     if !svc.is_open() {
         return Ok(export_failure(start, &svc));
     }
     let reqs: Vec<WriteReq> = docs
         .into_iter()
         .map(|d| {
-            let mut src = serde_json::Map::new();
-            src.insert("cluster_uuid".into(), json!(node.cluster_uuid));
-            src.insert("timestamp".into(), json!(ts));
-            src.insert("interval_ms".into(), json!(interval_ms));
-            src.insert("type".into(), json!(d.ty));
-            src.insert("source_node".into(), source_node.clone());
-            src.insert(d.ty.clone(), d.source);
-            WriteReq::Index { id: d.id, source: Value::Object(src).to_string(), routing: None, cond: WriteCond::default() }
+            let (id, src) = envelope(d);
+            WriteReq::Index { id, source: src.to_string(), routing: None, cond: WriteCond::default() }
         })
         .collect();
     let failed: Vec<EsError> = svc.write(reqs, false).into_iter().filter_map(Result::err).collect();
@@ -174,28 +180,34 @@ fn bulk(node: &Node, req: &Req) -> R {
 
 /// The monitoring index of today, created with the envelope mappings of
 /// ES's `.monitoring-*` templates on first use.
-fn monitoring_index(node: &Node, name: &str) -> Result<Arc<IndexService>, EsError> {
+fn monitoring_index(node: &Node, system: &str, name: &str) -> Result<Arc<IndexService>, EsError> {
     if let Some(s) = node.get_index(name) {
         return Ok(s);
     }
-    match node.create_index(name, &monitoring_index_body()) {
+    match node.create_index(name, &monitoring_index_body(system)?) {
         Ok(s) => Ok(s),
         Err(e) if e.kind == "resource_already_exists_exception" => node.get_index(name).ok_or(e),
         Err(e) => Err(e),
     }
 }
 
-/// Settings and envelope mappings of a `.monitoring-*` index.
-fn monitoring_index_body() -> Value {
-    let kw = json!({"type": "keyword"});
-    let date = json!({"type": "date", "format": "date_time"});
-    json!({
-        "settings": {"index": {"number_of_shards": 1, "auto_expand_replicas": "0-1", "format": TEMPLATE_VERSION}},
-        "mappings": {"dynamic": false, "properties": {
-            "cluster_uuid": kw, "timestamp": date, "interval_ms": {"type": "long"}, "type": kw,
-            "source_node": {"properties": {"uuid": kw, "host": kw, "transport_address": kw, "ip": kw, "name": kw, "timestamp": date}},
-        }},
-    })
+/// ES's `monitoring-{system}` index templates (x-pack core template
+/// resources, as shipped with 9.5.5).
+const TEMPLATES: &[(&str, &str)] = &[
+    ("kibana", include_str!("data/monitoring-kibana.json")),
+    ("logstash", include_str!("data/monitoring-logstash.json")),
+    ("beats", include_str!("data/monitoring-beats.json")),
+];
+
+/// Settings and mappings of a `.monitoring-{system}-*` index: those of ES's
+/// template for the system, so payload fields are indexed with ES's types
+/// and fields it leaves unmapped stay unmapped (finding 388).
+fn monitoring_index_body(system: &str) -> Result<Value, EsError> {
+    let text = TEMPLATES.iter().find(|(s, _)| *s == system).map(|(_, t)| *t).ok_or_else(|| EsError::illegal_argument(format!("no monitoring template for [{system}]")))?;
+    let text = text.replace("${xpack.monitoring.template.version}", TEMPLATE_VERSION).replace("${xpack.monitoring.template.release.version}", "0");
+    let t: Value = serde_json::from_str(&text).map_err(|e| EsError::internal(format!("monitoring-{system} template: {e}")))?;
+    let mappings = t["mappings"].get("_doc").cloned().unwrap_or_else(|| t["mappings"].clone());
+    Ok(json!({"settings": t["settings"], "mappings": mappings}))
 }
 
 /// The NDJSON `_bulk` body of exported documents (the index is in the path).

@@ -60,6 +60,8 @@ spec:
       annotations:
         # roll the group when its elasticsearch.yml changes
         checksum/config: {{ $esConfig | sha256sum | trunc 16 }}
+        # ... or when the security mode / certificate sources change
+        checksum/security: {{ toJson $root.Values.security | sha256sum | trunc 16 }}
         {{- with $g.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -195,6 +197,8 @@ spec:
               value: {{ $root.Values.drainOnShutdown.timeoutSeconds | quote }}
             - name: ES_VOTING_EXCLUSIONS
               value: {{ $root.Values.masterScaleDown.votingConfigExclusions | quote }}
+            # Security: settings + how the probe/hook scripts reach the node.
+            {{- include "es.securityEnv" $root | trim | nindent 12 }}
             {{- with $g.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -227,6 +231,16 @@ spec:
               mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
               subPath: elasticsearch.yml
               readOnly: true
+            {{- if $root.Values.security.enabled }}
+            - name: transport-certs
+              mountPath: /usr/share/elasticsearch/config/certs/transport
+              readOnly: true
+            {{- if $root.Values.security.tls.http.enabled }}
+            - name: http-certs
+              mountPath: /usr/share/elasticsearch/config/certs/http
+              readOnly: true
+            {{- end }}
+            {{- end }}
             {{- if $isMaster }}
             - name: bootstrap
               mountPath: /usr/share/elasticsearch/settings.d/bootstrap
@@ -244,12 +258,33 @@ spec:
         - name: exporter
           image: {{ $root.Values.metrics.exporter.image }}
           args:
+            {{- if include "es.httpsEnabled" $root }}
+            - --es.uri=https://127.0.0.1:9200
+            - --es.ca=/certs/http/ca.crt
+            {{- else }}
             - --es.uri=http://127.0.0.1:9200
+            {{- end }}
             - --es.timeout=10s
             - --web.listen-address=:{{ $root.Values.metrics.exporter.port }}
             {{- with $root.Values.metrics.exporter.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if $root.Values.security.enabled }}
+          env:
+            - name: ES_USERNAME
+              value: elastic
+            - name: ES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "es.credentialsSecret" $root }}
+                  key: {{ include "es.credentialsKey" $root }}
+          {{- end }}
+          {{- if include "es.httpsEnabled" $root }}
+          volumeMounts:
+            - name: http-certs
+              mountPath: /certs/http
+              readOnly: true
+          {{- end }}
           ports:
             - name: metrics
               containerPort: {{ $root.Values.metrics.exporter.port }}
@@ -265,6 +300,14 @@ spec:
         - name: config
           configMap:
             name: {{ $name }}-config
+        {{- if $root.Values.security.enabled }}
+        - name: transport-certs
+          {{- include "es.certVolume" (dict "root" $root "kind" "transport") | trim | nindent 10 }}
+        {{- if $root.Values.security.tls.http.enabled }}
+        - name: http-certs
+          {{- include "es.certVolume" (dict "root" $root "kind" "http") | trim | nindent 10 }}
+        {{- end }}
+        {{- end }}
         - name: elasticsearch-logs
           emptyDir: {}
         {{- if not $g.persistence.enabled }}

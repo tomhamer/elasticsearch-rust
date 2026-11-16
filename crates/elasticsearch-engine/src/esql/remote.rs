@@ -251,6 +251,37 @@ pub trait ShardSource: Send + Sync {
     /// occur. The caller holds this guard until it consumes this fetched page
     /// or transfers its values into separately accounted output ownership.
     fn fetch(&self, spec: &FetchSpec, memory: &mut crate::memory::Reservation) -> Result<Vec<ShardResult>>;
+    /// The targets (schemas only: no local shard) of `indices` on remote
+    /// cluster `alias`, named `alias:index` ([`remote_shell`]); their shards
+    /// are read on that cluster through [`ShardSource::fetch`]. Empty when an
+    /// unavailable remote is skipped (`skip_unavailable`).
+    fn remote_targets(&self, alias: &str, indices: &[String]) -> Result<Vec<Target>> {
+        Err(EsError::illegal_argument(format!(
+            "Cross-cluster calls are not supported in this context but remote indices were requested: [{}]",
+            indices.iter().map(|i| format!("{alias}:{i}")).collect::<Vec<_>>().join(", ")
+        )))
+    }
+}
+
+/// A schema-only target for index `name` (`alias:index`) of a remote
+/// cluster, from that cluster's metadata (`{"settings", "mappings"}`): a
+/// sparse index service with no shard here, registered nowhere.
+pub fn remote_shell(name: &str, metadata: &Value) -> Result<Target> {
+    use crate::settings;
+    let mut flat = settings::normalize_index_settings(metadata.get("settings").unwrap_or(&Value::Null));
+    let uuid = flat.get("index.uuid").and_then(Value::as_str).map(str::to_string).unwrap_or_else(crate::index::new_uuid);
+    flat.insert("index.uuid".into(), serde_json::json!(uuid));
+    let registry = crate::index::registry_for(&flat)?;
+    let mut mappings = crate::mapping::Mappings::parse(metadata.get("mappings").filter(|m| !m.is_null()).unwrap_or(&serde_json::json!({})), &registry)?;
+    crate::tsdb::prepare_mappings(&flat, &mut mappings, &registry)?;
+    mappings.assign_core_ids();
+    let lookup = crate::mapping::FieldLookup::build(&mappings, &registry);
+    let dir = std::env::temp_dir().join("rustic-ccs-remote-shells").join(&uuid);
+    let core = crate::index::IndexCore::new_sparse(name, &uuid, crate::date::now_millis(), &dir, flat, mappings, lookup, registry, Default::default());
+    let svc = std::sync::Arc::new(crate::index::IndexService::sparse_from(core));
+    let mut t = Target::new(svc);
+    t.remote_index = Some(name.to_string());
+    Ok(t)
 }
 
 pub type SharedShardSource = Arc<dyn ShardSource>;
@@ -291,16 +322,66 @@ pub(crate) fn search_hits(node: &Node, targets: &[Target], body: &Value) -> Resu
     let req = crate::search::parse_request(body, &HashMap::new())?;
     let out = crate::search::execute(targets, &req, &exec_opts(node)).map_err(fetch_error)?;
     let mut v: Value = serde_json::from_str(&out.json).map_err(|e| EsError::internal(format!("bad search output: {e}")))?;
+    super::note_shard_failures(&v["_shards"])?;
     Ok(match v["hits"]["hits"].take() {
         Value::Array(hits) => hits,
         _ => Vec::new(),
     })
 }
 
+/// Name prefix of the full-text probes evaluated as named queries.
+const PROBE_NAME: &str = "__esql_probe_";
+
+/// The hits search with each full-text probe as a named, zero-scoring
+/// optional clause: every hit then says which probes it matches
+/// ([`annotate_probes`]), from the same reader and the same document
+/// revision as the row (review findings 542, 543: never matched by
+/// `(index, _id)` across shards, never from another search's view).
+pub(crate) fn with_probes(body: &mut Value, probes: &[Value]) {
+    if probes.is_empty() {
+        return;
+    }
+    let q = body.get("query").cloned().filter(|q| !q.is_null()).unwrap_or_else(|| json!({"match_all": {}}));
+    let should: Vec<Value> = probes.iter().enumerate().map(|(k, pq)| json!({"constant_score": {"filter": pq, "boost": 0.0, "_name": format!("{PROBE_NAME}{k}")}})).collect();
+    body["query"] = json!({"bool": {"must": [q], "should": should}});
+}
+
+/// Each hit's probe matches (`__probes`: one boolean per probe), from its
+/// `matched_queries`.
+pub(crate) fn annotate_probes(hits: &mut [Value], probes: usize) {
+    if probes == 0 {
+        return;
+    }
+    for h in hits.iter_mut() {
+        let matched: Vec<String> = match h.get("matched_queries") {
+            Some(Value::Array(a)) => a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect(),
+            Some(Value::Object(o)) => o.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        let flags: Vec<Value> = (0..probes).map(|k| json!(matched.iter().any(|n| *n == format!("{PROBE_NAME}{k}")))).collect();
+        if let Some(o) = h.as_object_mut() {
+            o.remove("matched_queries");
+            o.insert("__probes".into(), Value::Array(flags));
+        }
+    }
+}
+
+/// [`crate::search::count`] for a query: shard failures are reported or
+/// refused as the query's `allow_partial_results` says
+/// ([`super::note_shard_failures`]), never dropped.
+pub(crate) fn checked_count(targets: &[Target], query: Option<&Value>, terms_lookup: Option<crate::query::dsl::TermsLookupFn>) -> Result<u64> {
+    let out = crate::search::count_output(targets, query, terms_lookup)?;
+    if out.json.contains("\"failures\"") {
+        let v: Value = serde_json::from_str(&out.json).map_err(|e| EsError::internal(format!("bad search output: {e}")))?;
+        super::note_shard_failures(&v["_shards"])?;
+    }
+    Ok(out.total)
+}
+
 /// `(index, id)` of the documents of `targets` matching probe `pq` within `query`.
 pub(crate) fn probe_set(node: &Node, targets: &[Target], pq: &Value, query: &Value) -> Result<Vec<(String, String)>> {
     let q = json!({"bool": {"filter": [pq, query]}});
-    let n = crate::search::count(targets, Some(&q), None)? as usize;
+    let n = checked_count(targets, Some(&q), None)? as usize;
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -312,18 +393,19 @@ pub(crate) fn probe_set(node: &Node, targets: &[Target], pq: &Value, query: &Val
 /// on a node serving a fetch).
 pub fn shard_result(node: &Node, t: &Target, query: &Value, body: &Value, size: Option<usize>, probes: &[Value]) -> Result<ShardResult> {
     let targets = std::slice::from_ref(t);
-    let count = crate::search::count(targets, Some(query), None)?;
+    let count = checked_count(targets, Some(query), None)?;
     let n = size.map_or(count as usize, |s| s.min(count as usize));
     let mut hits = Vec::new();
     let mut sets = Vec::with_capacity(probes.len());
     if n > 0 {
         let mut b = body.clone();
         b["size"] = json!(n);
+        with_probes(&mut b, probes);
         hits = search_hits(node, targets, &b)?;
+        annotate_probes(&mut hits, probes.len());
     }
-    for pq in probes {
-        sets.push(if count > 0 { probe_set(node, targets, pq, query)? } else { Vec::new() });
-    }
+    // Probe matches travel on the hits (`__probes`).
+    let _ = &mut sets;
     Ok(ShardResult { index: t.svc.name.clone(), shard: t.shard.as_ref().map(|s| s.id).unwrap_or(0), count, hits, probes: sets, groups: None, loaded: 0, pit: false, fast: None, warnings: Vec::new() })
 }
 
@@ -386,6 +468,13 @@ where
 
 /// Serve a fetch: read the requested shards from this node's started copies.
 pub fn serve(node: &Node, spec: &FetchSpec, source: Option<&SharedShardSource>, restrict: Option<&super::exec::Restrict>) -> Result<Vec<ShardResult>> {
+    // The pushed-down queries were built by the coordinating node: their
+    // internal `esql_single_value` predicates carry its token, re-stamped
+    // with this node's before they are parsed here.
+    let mut stamped = serde_json::to_value(spec).map_err(|e| EsError::internal(format!("fetch spec: {e}")))?;
+    crate::query::single_value::restamp(&mut stamped);
+    let stamped: FetchSpec = serde_json::from_value(stamped).map_err(|e| EsError::internal(format!("fetch spec: {e}")))?;
+    let spec = &stamped;
     if let Some(pit) = &spec.pit {
         if spec.agg.is_some() || spec.group_limit.is_some() || spec.fast.is_some() {
             return Err(EsError::internal("a point-in-time fetch reads hits only"));

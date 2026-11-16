@@ -198,7 +198,7 @@ fn check_nested(index: &Index, live: &BTreeMap<String, Parent>) {
     }
 
     // Nested sort: min of the children's n ascending, missing last.
-    let sort = vec![SortField::Nested { path: "c".into(), filter: None, sort: Box::new(SortField::field(N, SortKind::I64)) }];
+    let sort = vec![SortField::Nested { max_children: None, path: "c".into(), filter: None, sort: Box::new(SortField::field(N, SortKind::I64)) }];
     let hits = run(index, &Query::MatchAll, sort);
     let mut got = Vec::new();
     for h in &hits {
@@ -216,7 +216,7 @@ fn check_nested(index: &Index, live: &BTreeMap<String, Parent>) {
     // including a filter that leaves some parents with no eligible children.
     for mode in [SortMode::Min, SortMode::Max, SortMode::Sum, SortMode::Avg, SortMode::Median] {
         for descending in [false, true] {
-            let sort = vec![SortField::Nested {
+            let sort = vec![SortField::Nested { max_children: None,
                 path: "c".into(), filter: Some(Box::new(Query::term(COLOR, "red"))),
                 sort: Box::new(SortField::Field { field: N, kind: SortKind::I64,
                     descending, missing: SortMissing::Value(SortValue::I64(-999)), mode: Some(mode) }),
@@ -243,7 +243,7 @@ fn check_nested(index: &Index, live: &BTreeMap<String, Parent>) {
         }
     }
     // Filtered nested sort: max n among red children, descending.
-    let sort = vec![SortField::Nested { path: "c".into(), filter: Some(Box::new(Query::term(COLOR, "red"))), sort: Box::new(SortField::field(N, SortKind::I64).desc()) }];
+    let sort = vec![SortField::Nested { max_children: None, path: "c".into(), filter: Some(Box::new(Query::term(COLOR, "red"))), sort: Box::new(SortField::field(N, SortKind::I64).desc()) }];
     for h in run(index, &Query::MatchAll, sort) {
         let want = live[&h.0].kids.iter().filter(|c| c.0 == "red").map(|c| c.1).max();
         match (&h.4[0], want) {
@@ -414,7 +414,7 @@ fn nested_negative_average_rounds_towards_positive_infinity() {
     for sealed in [false, true] {
         if sealed { index.refresh().unwrap(); index.force_merge().unwrap(); }
         for mode in [SortMode::Avg, SortMode::Median] {
-            let sort = vec![SortField::Nested { path: "c".into(), filter: None,
+            let sort = vec![SortField::Nested { max_children: None, path: "c".into(), filter: None,
                 sort: Box::new(SortField::Field { field: N, kind: SortKind::I64,
                     descending: false, missing: SortMissing::Last, mode: Some(mode) }) }];
             let hits = run(&index, &Query::MatchAll, sort);
@@ -491,7 +491,7 @@ fn geo_queries_and_sort_match_oracle() {
         }
         // Distance sort ascending; docs without points last (+inf).
         let (lat, lon) = (50.0, 7.0);
-        let hits = run(index, &Query::MatchAll, vec![SortField::GeoDistance { field: LOC, lat, lon, descending: false, mode: None, plane: false }]);
+        let hits = run(index, &Query::MatchAll, vec![SortField::GeoDistance { field: LOC, lat, lon, descending: false, mode: None, plane: false, more: Vec::new() }]);
         assert_eq!(hits.len(), live.len());
         let mut prev = f64::NEG_INFINITY;
         for h in &hits {

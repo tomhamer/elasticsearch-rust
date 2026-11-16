@@ -106,6 +106,17 @@ impl ShardSource for EsqlShards {
         let mut pinned = false;
         let mut wanted_all: Vec<(String, u32)> = Vec::new();
         for target in targets {
+            // A remote cluster's index (`alias:index`): every shard is read
+            // on that cluster ([`EsqlShards::fetch`]).
+            if target.remote_index.is_some() {
+                all_local = false;
+                let n = target.svc.number_of_shards();
+                for shard in 0..n {
+                    slots.push(Slot::Remote(RemoteShard { index: target.svc.name.clone(), shard, alias_filter: target.alias_filter.clone() }));
+                }
+                out.push(target);
+                continue;
+            }
             if target.shard.is_some() || target.snapshot.is_some() {
                 pinned = true;
                 slots.push(Slot::Local(out.len()));
@@ -156,7 +167,37 @@ impl ShardSource for EsqlShards {
         Ok(Split { targets: out, slots: if all_local { None } else { Some(slots) } })
     }
 
+    fn remote_targets(&self, alias: &str, indices: &[String]) -> Result<Vec<Target>> {
+        let node = self.node.clone();
+        let template = self.template.clone();
+        let (alias, indices) = (alias.to_string(), indices.to_vec());
+        self.runtime.block_on(async move { super::ccs::esql_remote_targets(&node, &template, &alias, &indices).await })
+    }
+
     fn fetch(&self, spec: &FetchSpec, memory: &mut elasticsearch_engine::memory::Reservation) -> Result<Vec<ShardResult>> {
+        // Shards of remote clusters' indices (`alias:index`): read there.
+        let (remote, local): (Vec<RemoteShard>, Vec<RemoteShard>) = spec.shards.iter().cloned().partition(|s| elasticsearch_engine::ccr::remote::is_remote_part(&s.index));
+        let mut out = Vec::new();
+        if !remote.is_empty() {
+            let node = self.node.clone();
+            let template = self.template.clone();
+            let spec_remote = FetchSpec { shards: remote, ..spec.clone() };
+            out.extend(self.runtime.block_on(async move { super::ccs::esql_remote_fetch(&node, &template, &spec_remote).await })?);
+            if local.is_empty() {
+                return Ok(out);
+            }
+        }
+        let local_spec;
+        let spec = if out.is_empty() { spec } else { local_spec = FetchSpec { shards: local, ..spec.clone() }; &local_spec };
+        let mut local_out = self.fetch_cluster(spec, memory)?;
+        local_out.extend(out);
+        Ok(local_out)
+    }
+}
+
+impl EsqlShards {
+    /// [`ShardSource::fetch`] of this cluster's shards.
+    pub(super) fn fetch_cluster(&self, spec: &FetchSpec, memory: &mut elasticsearch_engine::memory::Reservation) -> Result<Vec<ShardResult>> {
         let state = self.node.state();
         use elasticsearch_engine::esql::remote::PitPhase;
         let pinned = spec.pit.as_ref().filter(|p| p.phase != PitPhase::Open)

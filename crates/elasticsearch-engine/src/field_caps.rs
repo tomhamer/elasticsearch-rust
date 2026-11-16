@@ -159,12 +159,14 @@ fn index_caps(t: &Target, opts: &FieldCapsOpts) -> BTreeMap<String, Cap> {
         }
     }
     for rf in &rt.fields {
-        if out.contains_key(&rf.name) || fls.is_some_and(|fa| !fa.allows(&rf.name)) {
+        // A runtime field takes precedence over a mapped field of the same
+        // name (as search binds it), metadata fields aside.
+        if out.get(&rf.name).is_some_and(|c| c.metadata) || fls.is_some_and(|fa| !fa.allows(&rf.name)) {
             continue;
         }
         let (searchable, aggregatable) = match rf.ty {
-            RtType::Long | RtType::Double | RtType::Boolean | RtType::Date | RtType::Ip => (true, true),
-            RtType::Keyword => (true, false),
+            // A keyword runtime field is a terms (and other) aggregation input.
+            RtType::Long | RtType::Double | RtType::Boolean | RtType::Date | RtType::Ip | RtType::Keyword => (true, true),
             RtType::Lookup => (false, false),
             RtType::GeoShape => (true, true),
         };
@@ -321,4 +323,31 @@ pub fn field_caps(targets: &[Target], opts: &FieldCapsOpts) -> Result<Value> {
         fields.insert(name, Value::Object(tm));
     }
     Ok(json!({ "indices": index_names, "fields": fields }))
+}
+
+#[cfg(test)]
+mod runtime_caps_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Review findings 405 / 406: a runtime field overrides a same-name
+    /// mapped field in field caps (its type and flags, as search binds it),
+    /// and a keyword runtime field is aggregatable.
+    #[test]
+    fn runtime_fields_take_precedence_and_keywords_aggregate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        node.create_index("fc", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {
+            "runtime": {"tag": {"type": "keyword", "script": {"source": "emit('x')"}}},
+            "properties": {"n": {"type": "text"}, "k": {"type": "keyword"}}}})).unwrap();
+        let rt = json!({"n": {"type": "long", "script": {"source": "emit(1)"}}});
+        let fields = vec!["*".to_string()];
+        let opts = FieldCapsOpts { fields: &fields, include_unmapped: false, filters: &[], types: &[], runtime_mappings: Some(&rt), include_empty_fields: true };
+        let out = field_caps(&[crate::search::Target::new(node.get_index("fc").unwrap())], &opts).unwrap();
+        assert!(out["fields"]["n"].get("long").is_some(), "{out}");
+        assert!(out["fields"]["n"].get("text").is_none(), "{out}");
+        assert_eq!(out["fields"]["n"]["long"]["aggregatable"], true, "{out}");
+        assert_eq!(out["fields"]["tag"]["keyword"]["aggregatable"], true, "{out}");
+        assert_eq!(out["fields"]["k"]["keyword"]["aggregatable"], true, "{out}");
+    }
 }

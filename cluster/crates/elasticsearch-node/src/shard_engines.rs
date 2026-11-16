@@ -41,11 +41,25 @@ pub struct ShardEngines {
     map: RwLock<BTreeMap<u32, Arc<ShardEngine>>>,
     /// The node's dynamic-mapping hook, installed on every shard engine.
     mapping_hook: RwLock<Option<Arc<dyn elasticsearch_engine::index::MappingUpdateHook>>>,
+    /// The node's BulkByScroll write acknowledgement, installed on every
+    /// shard engine.
+    replication_barrier: RwLock<Option<Arc<dyn elasticsearch_engine::reindex::ReplicationBarrier>>>,
+    /// Builds shard engine `k`'s task result sink (results stored in the
+    /// cluster's `.tasks`).
+    task_sinks: RwLock<Option<TaskSinks>>,
 }
+
+/// Shard engine `k` → its task result sink.
+pub type TaskSinks = Arc<dyn Fn(u32) -> elasticsearch_engine::node::TaskResultSink + Send + Sync>;
 
 fn engine_dir(data_path: &Path, k: u32) -> PathBuf {
     data_path.join(format!("engine-shard-{k}"))
 }
+
+/// The [`mirror::ApplyReport::errors`] key of a shard engine whose stored
+/// script catalog failed to apply (required metadata: see
+/// `ClusterNode::required_metadata_failed`).
+pub const STORED_SCRIPTS_FAILURE: &str = "stored scripts";
 
 fn uuids_path(data_path: &Path, k: u32) -> PathBuf {
     data_path.join(format!("_cluster/uuids-shard-{k}.json"))
@@ -54,7 +68,7 @@ fn uuids_path(data_path: &Path, k: u32) -> PathBuf {
 impl ShardEngines {
     /// Open the shard engines already on disk.
     pub fn open(data_path: &Path, node_settings: serde_json::Map<String, Value>, primary_engine: Arc<Engine>) -> ShardEngines {
-        let se = ShardEngines { data_path: data_path.to_path_buf(), primary_engine, node_settings, map: RwLock::new(BTreeMap::new()), mapping_hook: RwLock::new(None) };
+        let se = ShardEngines { data_path: data_path.to_path_buf(), primary_engine, node_settings, map: RwLock::new(BTreeMap::new()), mapping_hook: RwLock::new(None), replication_barrier: RwLock::new(None), task_sinks: RwLock::new(None) };
         if let Ok(rd) = std::fs::read_dir(data_path) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
@@ -81,6 +95,12 @@ impl ShardEngines {
         if let Some(e) = m.get(&k) {
             return Ok(e.clone());
         }
+        // Test seam: while the file `RUSTIC_TEST_FAIL_SHARD_ENGINE_OPEN`
+        // names exists, opening a shard engine fails (a transient storage
+        // failure, production review SIDE 003).
+        if std::env::var("RUSTIC_TEST_FAIL_SHARD_ENGINE_OPEN").ok().is_some_and(|f| std::path::Path::new(&f).exists()) {
+            return Err(format!("injected failure opening shard engine [{k}]"));
+        }
         let engine = Engine::open_with_security_named(&engine_dir(&self.data_path, k), self.primary_engine.security.clone(), &self.primary_engine.name).map_err(|e| e.to_string())?;
         *engine.transport_address.write() = self.primary_engine.transport_address.read().clone();
         *engine.cluster_transport_addresses.write() = self.primary_engine.cluster_transport_addresses.read().clone();
@@ -88,10 +108,18 @@ impl ShardEngines {
         if let Some(hook) = self.mapping_hook.read().clone() {
             engine.set_mapping_update_hook(Some(hook));
         }
+        if let Some(barrier) = self.replication_barrier.read().clone() {
+            engine.set_replication_barrier(Some(barrier));
+        }
+        if let Some(sinks) = self.task_sinks.read().clone() {
+            *engine.task_result_sink.write() = Some(sinks(k));
+        }
         // query_then_fetch contexts are capped per node, over every engine.
         *engine.fetch_budget.lock() = self.primary_engine.fetch_budget.lock().clone();
+        // So are open scroll contexts (`search.max_open_scroll_context`).
+        *engine.scroll_budget.lock() = self.primary_engine.scroll_budget.lock().clone();
         let router = elasticsearch_http::router(engine.clone());
-        let uuids = UuidMap::load(&uuids_path(&self.data_path, k));
+        let uuids = UuidMap::load_at_start(&uuids_path(&self.data_path, k)).map_err(|e| e.to_string())?;
         let se = Arc::new(ShardEngine { engine, router, uuids: Mutex::new(uuids) });
         m.insert(k, se.clone());
         Ok(se)
@@ -103,6 +131,24 @@ impl ShardEngines {
         *self.mapping_hook.write() = Some(hook.clone());
         for (_, se) in self.all() {
             se.engine.set_mapping_update_hook(Some(hook.clone()));
+        }
+    }
+
+    /// Install the node's BulkByScroll write acknowledgement on every shard
+    /// engine, open now or later.
+    pub fn set_replication_barrier(&self, barrier: Arc<dyn elasticsearch_engine::reindex::ReplicationBarrier>) {
+        *self.replication_barrier.write() = Some(barrier.clone());
+        for (_, se) in self.all() {
+            se.engine.set_replication_barrier(Some(barrier.clone()));
+        }
+    }
+
+    /// Install the node's task result sinks on every shard engine, open
+    /// now or later.
+    pub fn set_task_result_sinks(&self, sinks: TaskSinks) {
+        *self.task_sinks.write() = Some(sinks.clone());
+        for (k, se) in self.all() {
+            *se.engine.task_result_sink.write() = Some(sinks(k));
         }
     }
 
@@ -224,8 +270,9 @@ impl TsdbRoutingCache {
         }
         let entry = &self.entries[index];
         let Some((mapping, fields)) = &entry.mapping else { return 0 };
-        fields.build_ids(mapping, &entry.settings, source).ok()
-            .and_then(|ids| elasticsearch_engine::tsdb::routing_hash_of_id(&ids.id))
+        // The routing path values of the source, mapped or not yet mapped
+        // (a dynamic dimension is learned only on the shard).
+        fields.routing_hash(mapping, &entry.settings, source).ok()
             .map_or(0, |hash| elasticsearch_cluster::routing::index_routing(im).hash_to_shard(hash))
     }
 }
@@ -326,11 +373,27 @@ impl ClusterNode {
     pub fn apply_shard_engines(&self, prev: Option<&Metadata>, md: &Metadata) -> Vec<(u32, ApplyReport)> {
         let max = max_shards(md);
         let mut out = Vec::new();
+        let mut opened = std::collections::BTreeSet::new();
         for k in 1..max {
+            let existed = self.shard_engines.get(k).is_some();
             match self.shard_engines.get_or_open(k) {
-                Ok(_) => {}
+                Ok(_) => {
+                    if !existed {
+                        opened.insert(k);
+                    }
+                }
                 Err(e) => {
+                    // A required engine that did not open is a failed
+                    // application of every index holding shard `k`: the
+                    // retry timer re-applies until it opens (SIDE 003).
                     tracing::error!(shard = k, "failed to open shard engine: {e}");
+                    let mut rep = ApplyReport::default();
+                    for (name, im) in &md.indices {
+                        if im.number_of_shards > k {
+                            rep.errors.push((name.clone(), format!("failed to open shard engine [{k}]: {e}")));
+                        }
+                    }
+                    out.push((k, rep));
                 }
             }
         }
@@ -340,14 +403,19 @@ impl ClusterNode {
             // (applied before the indices whose copies resolve them).
             let scripts = crate::meta_extra::apply_stored_scripts(&se.engine, md);
             let inference = crate::meta_extra::apply_inference(&se.engine, md);
+            // Deployments: a shard copy's semantic / inference queries run them.
+            if let Some(e) = crate::meta_extra::apply_trained_models(&se.engine, md) {
+                tracing::error!(shard = k, "failed to apply trained model deployments: {e}");
+            }
             // Incremental when the engine already mirrors `prev` (an engine
             // opened by this application starts with a full pass).
-            let mut rep = match prev.filter(|p| max_shards(p) > k) {
+            // An engine opened by this application starts with a full pass.
+            let mut rep = match prev.filter(|p| max_shards(p) > k && !opened.contains(&k)) {
                 Some(p) => mirror::apply_changes(&se.engine, &shard_metadata(p, k), &smd, &mut se.uuids.lock(), true, &Default::default()),
                 None => mirror::apply(&se.engine, &smd, &mut se.uuids.lock()),
             };
             if let Some(e) = scripts {
-                rep.errors.push(("stored scripts".into(), e));
+                rep.errors.push((STORED_SCRIPTS_FAILURE.into(), e));
             }
             if let Some(e) = inference {
                 rep.errors.push(("inference endpoints".into(), e));
@@ -434,7 +502,7 @@ mod tests {
         let engine = Engine::open(&tmp.path().join("e")).unwrap();
         engine.create_index("three", &serde_json::json!({"settings": {"number_of_shards": 3, "number_of_replicas": 1}})).unwrap();
         engine.create_index("one", &serde_json::json!({})).unwrap();
-        let mut uuids = UuidMap::load(&tmp.path().join("u.json"));
+        let mut uuids = UuidMap::load(&tmp.path().join("u.json")).unwrap();
         let md = mirror::extract(&engine, &Metadata::default(), &mut uuids);
         let three = &md.indices["three"];
         assert_eq!(three.number_of_shards, 3);

@@ -81,6 +81,94 @@ pub fn run(q: &Query, leaves: &[LeafReader<'_>]) -> Result<Vec<(usize, DocId, f3
     Ok(out)
 }
 
+/// Matches polled between deadline / cancellation checks.
+const POLL_EVERY: u64 = 1024;
+
+/// Whether a join's inner traversal must stop: a cancelled task fails as
+/// cancelled; a search past its `timeout` stops (`Ok(true)`) and the join
+/// is built from the inner matches read so far, as ES's collection stops at
+/// the deadline: the search itself, already past its deadline, then stops
+/// at its first check and answers `timed_out: true` with partial results.
+fn check_stopped(sctx: &SearchContext) -> Result<bool> {
+    crate::search::check_cancelled()?;
+    Ok(sctx.stopped())
+}
+
+/// [`run`] for a join query being built: `f` sees each live match of `q`
+/// over the context's leaves. The search's deadline and its task's
+/// cancellation are polled every [`POLL_EVERY`] matches.
+/// `Ok(true)`: the search's deadline stopped it (partial matches).
+fn each_match(q: &Query, ctx: &QueryContext, mut f: impl FnMut(usize, DocId, f32) -> Result<()>) -> Result<bool> {
+    let sctx = SearchContext::for_query_deadline(q, ctx.leaves, Bm25Params::default(), ctx.deadline);
+    sctx.execution_result()?;
+    let mut seen = 0u64;
+    for (li, leaf) in ctx.leaves.iter().enumerate() {
+        let Some(mut s) = q.scorer(leaf, &sctx) else { continue };
+        let live = leaf.live_docs();
+        loop {
+            let d = s.advance();
+            if d == TERMINATED {
+                break;
+            }
+            seen += 1;
+            if seen % POLL_EVERY == 0 && check_stopped(&sctx)? {
+                return Ok(true);
+            }
+            if live(d) {
+                f(li, d, s.score())?;
+            }
+        }
+    }
+    // A cancellation that stopped the scorer early still fails the search.
+    let stopped = check_stopped(&sctx)?;
+    sctx.execution_result()?;
+    Ok(stopped)
+}
+
+/// A join built from the partial matches of a search past its deadline:
+/// the search that runs it reports `timed_out: true` (its context's
+/// timeout flag), however few documents it then collects.
+#[derive(Debug)]
+struct PartialJoin(Query);
+
+impl rustic_core::query::CustomQuery for PartialJoin {
+    fn scorer(&self, leaf: &LeafReader<'_>, ctx: &SearchContext) -> Option<Box<dyn rustic_core::query::Scorer>> {
+        ctx.vector_timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.0.scorer(leaf, ctx)
+    }
+    fn children(&self) -> Vec<&Query> {
+        vec![&self.0]
+    }
+}
+
+fn mark_partial(q: Query, partial: bool) -> Query {
+    if partial { Query::Custom(Arc::new(PartialJoin(q))) } else { q }
+}
+
+/// Request-breaker bytes of one retained join map entry keyed by `id`.
+fn entry_bytes(id: &str) -> u64 {
+    // The key's heap bytes, the map slot (key, value, control) and the
+    // copied candidate `_id` term.
+    2 * id.len() as u64 + 96
+}
+
+/// ES rejects every joining query when expensive queries are disallowed.
+fn check_expensive(ctx: &QueryContext) -> Result<()> {
+    if !ctx.allow_expensive_queries {
+        return Err(shard_err(ctx, "[joining] queries cannot be executed when 'search.allow_expensive_queries' is set to false."));
+    }
+    Ok(())
+}
+
+/// Child scores of one parent, combined as they arrive (no per-child list).
+#[derive(Clone, Copy)]
+struct ChildScores {
+    n: usize,
+    sum: f32,
+    min: f32,
+    max: f32,
+}
+
 fn term(field: u16, s: &str) -> Query {
     Query::Term(Term::new_text(field, s))
 }
@@ -132,6 +220,7 @@ pub fn has_child(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     if min_children > max_children {
         return Err(EsError::illegal_argument("[has_child] 'max_children' is less than 'min_children'"));
     }
+    check_expensive(ctx)?;
     let Some(jf) = join_field(ctx.lookup) else {
         if ignore_unmapped {
             return Ok(Query::MatchNone);
@@ -147,35 +236,53 @@ pub fn has_child(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     };
     let (Some(jid), Some(pid)) = (jf.core_id, jf.aux_id("parent")) else { return Ok(Query::MatchNone) };
     let inner_q = parse_query(inner, ctx)?;
-    let child_q = Query::Bool { must: vec![inner_q], should: vec![], must_not: vec![], filter: vec![term(jid, ty)], minimum_should_match: MinShouldMatch::Count(0) };
-    let mut per_parent: HashMap<String, Vec<f32>> = HashMap::new();
-    for (li, d, s) in run(&child_q, ctx.leaves)? {
+    // Document-level security: children the caller cannot see do not count.
+    let mut filter = vec![term(jid, ty)];
+    filter.extend(ctx.dls_query()?);
+    let child_q = Query::Bool { must: vec![inner_q], should: vec![], must_not: vec![], filter, minimum_should_match: MinShouldMatch::Count(0) };
+    // Every parent with a matching child, charged to the request breaker
+    // as the map grows (child scores are combined, not kept).
+    let mem = crate::memory::RequestMemory::new();
+    let mut per_parent: HashMap<String, ChildScores> = HashMap::new();
+    let partial = each_match(&child_q, ctx, |li, d, s| {
         for p in ctx.leaves[li].keyword_values(pid, d) {
-            per_parent.entry(p).or_default().push(s);
+            match per_parent.get_mut(&p) {
+                Some(c) => {
+                    c.n += 1;
+                    c.sum += s;
+                    c.min = c.min.min(s);
+                    c.max = c.max.max(s);
+                }
+                None => {
+                    mem.add(entry_bytes(&p), "[has_child] matching parents")?;
+                    per_parent.insert(p, ChildScores { n: 1, sum: s, min: f32::MAX.min(s), max: f32::MIN.max(s) });
+                }
+            }
         }
-    }
+        Ok(())
+    })?;
     let scores: HashMap<String, f32> = per_parent
         .into_iter()
-        .filter(|(_, v)| v.len() >= min_children && v.len() <= max_children)
-        .map(|(k, v)| {
+        .filter(|(_, c)| c.n >= min_children && c.n <= max_children)
+        .map(|(k, c)| {
             let s = match mode {
                 ScoreMode::None => 1.0,
-                ScoreMode::Avg => v.iter().sum::<f32>() / v.len() as f32,
-                ScoreMode::Sum => v.iter().sum(),
-                ScoreMode::Max => v.iter().copied().fold(f32::MIN, f32::max),
-                ScoreMode::Min => v.iter().copied().fold(f32::MAX, f32::min),
+                ScoreMode::Avg => c.sum / c.n as f32,
+                ScoreMode::Sum => c.sum,
+                ScoreMode::Max => c.max,
+                ScoreMode::Min => c.min,
             };
             (k, s)
         })
         .collect();
     if scores.is_empty() {
-        return Ok(Query::MatchNone);
+        return Ok(mark_partial(Query::MatchNone, partial));
     }
     let ids: Vec<Vec<u8>> = scores.keys().map(|k| k.clone().into_bytes()).collect();
     let cand = filter2(Query::TermSet { field: ID_FIELD, terms: ids, boost: 1.0 }, term(jid, &parent_ty));
     let scores = Arc::new(scores);
     let q = FilterQuery::new("has_child", Some(cand), Arc::new(move |leaf: &LeafReader<'_>, d: DocId| leaf.keyword_value(ID_FIELD, d).and_then(|id| scores.get(&id).copied())));
-    Ok(with_boost(q.into_query(), boost_of(o)))
+    Ok(mark_partial(with_boost(q.into_query(), boost_of(o)), partial))
 }
 
 pub fn has_parent(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
@@ -188,6 +295,7 @@ pub fn has_parent(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     let inner = o.get("query").ok_or_else(|| EsError::parsing("[has_parent] requires 'query' field"))?;
     let ignore_unmapped = o.get("ignore_unmapped").and_then(Value::as_bool).unwrap_or(false);
     let score = o.get("score").and_then(Value::as_bool).unwrap_or(false);
+    check_expensive(ctx)?;
     let Some(jf) = join_field(ctx.lookup) else {
         if ignore_unmapped {
             return Ok(Query::MatchNone);
@@ -203,22 +311,30 @@ pub fn has_parent(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
         return Err(shard_err(ctx, format!("[has_parent] join field [{}] doesn't hold [{pty}] as a parent", jf.name)));
     }
     let (Some(jid), Some(pid)) = (jf.core_id, jf.aux_id("parent")) else { return Ok(Query::MatchNone) };
-    let parent_q = Query::Bool { must: vec![parse_query(inner, ctx)?], should: vec![], must_not: vec![], filter: vec![term(jid, pty)], minimum_should_match: MinShouldMatch::Count(0) };
+    // Document-level security: a parent the caller cannot see does not match.
+    let mut filter = vec![term(jid, pty)];
+    filter.extend(ctx.dls_query()?);
+    let parent_q = Query::Bool { must: vec![parse_query(inner, ctx)?], should: vec![], must_not: vec![], filter, minimum_should_match: MinShouldMatch::Count(0) };
+    let mem = crate::memory::RequestMemory::new();
     let mut scores: HashMap<String, f32> = HashMap::new();
-    for (li, d, s) in run(&parent_q, ctx.leaves)? {
+    let partial = each_match(&parent_q, ctx, |li, d, s| {
         if let Some(id) = ctx.leaves[li].keyword_value(ID_FIELD, d) {
+            if !scores.contains_key(&id) {
+                mem.add(entry_bytes(&id), "[has_parent] matching parents")?;
+            }
             scores.insert(id, if score { s } else { 1.0 });
         }
-    }
+        Ok(())
+    })?;
     if scores.is_empty() {
-        return Ok(Query::MatchNone);
+        return Ok(mark_partial(Query::MatchNone, partial));
     }
     let ids: Vec<Vec<u8>> = scores.keys().map(|k| k.clone().into_bytes()).collect();
     let types = Query::TermSet { field: jid, terms: children.iter().map(|c| c.clone().into_bytes()).collect(), boost: 1.0 };
     let cand = filter2(Query::TermSet { field: pid, terms: ids, boost: 1.0 }, types);
     let scores = Arc::new(scores);
     let q = FilterQuery::new("has_parent", Some(cand), Arc::new(move |leaf: &LeafReader<'_>, d: DocId| leaf.keyword_values(pid, d).iter().find_map(|p| scores.get(p).copied())));
-    Ok(with_boost(q.into_query(), boost_of(o)))
+    Ok(mark_partial(with_boost(q.into_query(), boost_of(o)), partial))
 }
 
 /// The other side of a `has_child` / `has_parent` query that asks for
@@ -260,7 +376,11 @@ pub fn inner_hits_side(kind: &str, o: &Map<String, Value>, ctx: &QueryContext) -
         (ty.to_string(), ch)
     };
     let Some(inner) = o.get("query") else { return Ok(None) };
-    let query = Query::Bool { must: vec![parse_query(inner, ctx)?], should: vec![], must_not: vec![], filter: vec![term(jid, &ty)], minimum_should_match: MinShouldMatch::Count(0) };
+    // Document-level security: inner hits never include a document the
+    // caller cannot see (whether or not the request has aggregations).
+    let mut filter = vec![term(jid, &ty)];
+    filter.extend(ctx.dls_query()?);
+    let query = Query::Bool { must: vec![parse_query(inner, ctx)?], should: vec![], must_not: vec![], filter, minimum_should_match: MinShouldMatch::Count(0) };
     Ok(Some(InnerSide { query, ty, children, hit_types, join_field: jid, parent_field: pid }))
 }
 
@@ -292,6 +412,7 @@ pub fn parent_id(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     });
     let id = id.ok_or_else(|| EsError::parsing("[parent_id] requires 'id' field"))?;
     let ignore_unmapped = o.get("ignore_unmapped").and_then(Value::as_bool).unwrap_or(false);
+    check_expensive(ctx)?;
     let Some(jf) = join_field(ctx.lookup) else {
         if ignore_unmapped {
             return Ok(Query::MatchNone);
@@ -309,63 +430,102 @@ pub fn parent_id(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     Ok(with_boost(q, boost_of(o)))
 }
 
-/// `children` aggregation: the child docs (of `type`) of the parent docs in
-/// `docs`, over all docs of the searched leaves.
+/// The segments of `host` per physical shard (index and shard): a
+/// parent and its children live on one shard, and `_id`s are only unique
+/// within one index (#603).
+fn shard_groups(host: &super::aggs::Host) -> Vec<Vec<usize>> {
+    let mut groups: Vec<((&str, usize), Vec<usize>)> = Vec::new();
+    for (i, s) in host.segs.iter().enumerate() {
+        match groups.iter_mut().find(|(k, _)| *k == (s.index, s.shard)) {
+            Some((_, v)) => v.push(i),
+            None => groups.push(((s.index, s.shard), vec![i])),
+        }
+    }
+    groups.into_iter().map(|(_, v)| v).collect()
+}
+
+/// `children` aggregation: the child docs (of `type`) of the parent docs,
+/// joined within each shard with that shard's join field.
 pub fn children_docs(o: &Map<String, Value>, docs: &Docs, host: &super::aggs::Host) -> Result<Docs> {
     let ty = o.get("type").and_then(Value::as_str).ok_or_else(|| EsError::parsing_at("Missing [type] field for children aggregation", 1, 1))?;
     let mut out: Docs = vec![Vec::new(); docs.len()];
-    let Some(jf) = host.segs.first().and_then(|s| join_field(s.lookup)) else { return Ok(out) };
-    let rel = Relations::of(&jf);
-    let Some(parent_ty) = rel.parent_of(ty) else {
-        return Err(EsError::illegal_argument(format!("[children] no join field with parent/child relation was found for child type [{ty}]")));
-    };
-    let (Some(jid), Some(pid)) = (jf.core_id, jf.aux_id("parent")) else { return Ok(out) };
-    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (s, v) in docs.iter().enumerate() {
-        let leaf = &host.segs[s].leaf;
-        for &(d, _) in v {
-            if leaf.keyword_value(jid, d).as_deref() == Some(parent_ty) {
-                if let Some(id) = leaf.keyword_value(ID_FIELD, d) {
-                    ids.insert(id);
+    if host.segs.first().and_then(|s| join_field(s.lookup)).is_none() {
+        return Ok(out);
+    }
+    let mut related = false;
+    for group in shard_groups(host) {
+        let Some(jf) = join_field(host.segs[group[0]].lookup) else { continue };
+        let rel = Relations::of(&jf);
+        let Some(parent_ty) = rel.parent_of(ty) else { continue };
+        related = true;
+        let (Some(jid), Some(pid)) = (jf.core_id, jf.aux_id("parent")) else { continue };
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for &s in &group {
+            let leaf = &host.segs[s].leaf;
+            for &(d, _) in &docs[s] {
+                if leaf.keyword_value(jid, d).as_deref() == Some(parent_ty) {
+                    if let Some(id) = leaf.keyword_value(ID_FIELD, d) {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+        if ids.is_empty() {
+            continue;
+        }
+        for &s in &group {
+            let seg = &host.segs[s];
+            for d in (host.all_docs)(s) {
+                if seg.leaf.keyword_value(jid, d).as_deref() == Some(ty) && seg.leaf.keyword_values(pid, d).iter().any(|p| ids.contains(p)) {
+                    out[s].push((d, 0.0));
                 }
             }
         }
     }
-    for (s, seg) in host.segs.iter().enumerate() {
-        for d in (host.all_docs)(s) {
-            if seg.leaf.keyword_value(jid, d).as_deref() == Some(ty) && seg.leaf.keyword_values(pid, d).iter().any(|p| ids.contains(p)) {
-                out[s].push((d, 0.0));
-            }
-        }
+    if !related {
+        return Err(EsError::illegal_argument(format!("[children] no join field with parent/child relation was found for child type [{ty}]")));
     }
     Ok(out)
 }
 
-/// `parent` aggregation: the parent docs of the child docs (of `type`).
+/// `parent` aggregation: the parent docs of the child docs (of `type`),
+/// joined within each shard with that shard's join field.
 pub fn parent_docs(o: &Map<String, Value>, docs: &Docs, host: &super::aggs::Host) -> Result<Docs> {
     let ty = o.get("type").and_then(Value::as_str).ok_or_else(|| EsError::parsing_at("Missing [type] field for parent aggregation", 1, 1))?;
     let mut out: Docs = vec![Vec::new(); docs.len()];
-    let Some(jf) = host.segs.first().and_then(|s| join_field(s.lookup)) else { return Ok(out) };
-    let rel = Relations::of(&jf);
-    let Some(parent_ty) = rel.parent_of(ty).map(str::to_string) else {
-        return Err(EsError::illegal_argument(format!("[parent] no join field with parent/child relation was found for child type [{ty}]")));
-    };
-    let (Some(jid), Some(pid)) = (jf.core_id, jf.aux_id("parent")) else { return Ok(out) };
-    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (s, v) in docs.iter().enumerate() {
-        let leaf = &host.segs[s].leaf;
-        for &(d, _) in v {
-            if leaf.keyword_value(jid, d).as_deref() == Some(ty) {
-                ids.extend(leaf.keyword_values(pid, d));
+    if host.segs.first().and_then(|s| join_field(s.lookup)).is_none() {
+        return Ok(out);
+    }
+    let mut related = false;
+    for group in shard_groups(host) {
+        let Some(jf) = join_field(host.segs[group[0]].lookup) else { continue };
+        let rel = Relations::of(&jf);
+        let Some(parent_ty) = rel.parent_of(ty).map(str::to_string) else { continue };
+        related = true;
+        let (Some(jid), Some(pid)) = (jf.core_id, jf.aux_id("parent")) else { continue };
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for &s in &group {
+            let leaf = &host.segs[s].leaf;
+            for &(d, _) in &docs[s] {
+                if leaf.keyword_value(jid, d).as_deref() == Some(ty) {
+                    ids.extend(leaf.keyword_values(pid, d));
+                }
+            }
+        }
+        if ids.is_empty() {
+            continue;
+        }
+        for &s in &group {
+            let seg = &host.segs[s];
+            for d in (host.all_docs)(s) {
+                if seg.leaf.keyword_value(jid, d).as_deref() == Some(parent_ty.as_str()) && seg.leaf.keyword_value(ID_FIELD, d).map(|i| ids.contains(&i)).unwrap_or(false) {
+                    out[s].push((d, 0.0));
+                }
             }
         }
     }
-    for (s, seg) in host.segs.iter().enumerate() {
-        for d in (host.all_docs)(s) {
-            if seg.leaf.keyword_value(jid, d).as_deref() == Some(parent_ty.as_str()) && seg.leaf.keyword_value(ID_FIELD, d).map(|i| ids.contains(&i)).unwrap_or(false) {
-                out[s].push((d, 0.0));
-            }
-        }
+    if !related {
+        return Err(EsError::illegal_argument(format!("[parent] no join field with parent/child relation was found for child type [{ty}]")));
     }
     Ok(out)
 }

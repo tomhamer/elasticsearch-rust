@@ -120,6 +120,10 @@ fn held_locks() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
     H.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
+/// How long a starting shard waits for its lock (ES `IndicesService
+/// .createShard`: five seconds).
+const SHARD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The exclusive lock of one shard directory (`<index>/shard-<n>.lock`,
 /// beside `shard-<n>/` so it can be held before that directory exists).
 pub(crate) struct ShardLock {
@@ -130,6 +134,24 @@ pub(crate) struct ShardLock {
 impl ShardLock {
     fn path_of(index_dir: &Path, n: u32) -> PathBuf {
         index_dir.join(format!("shard-{n}.lock"))
+    }
+
+    /// [`Self::try_acquire`], retrying for up to `wait` (ES
+    /// `NodeEnvironment.shardLock(shardId, reason, 5s)` when a shard
+    /// starts): a copy being closed releases its lock once its last
+    /// reference drops, which a background refresh / seal pass holding it
+    /// for a moment delays.
+    fn acquire_for(index_dir: &Path, n: u32, wait: std::time::Duration) -> Result<Option<ShardLock>> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if let Some(lock) = Self::try_acquire(index_dir, n)? {
+                return Ok(Some(lock));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// `None` when another copy holds it.
@@ -189,6 +211,10 @@ pub struct IndexShard {
     /// In-flight operations (op permits).
     inflight: Mutex<usize>,
     drained: Condvar,
+    /// Writes past their entry into the write path (their block check
+    /// included): [`IndexShard::drain_writes`] waits for them.
+    writes: Mutex<usize>,
+    writes_drained: Condvar,
     lock: Mutex<Option<ShardLock>>,
     /// [`IndexCore::schema_generation`] this copy's core schema matches.
     synced_schema: AtomicU64,
@@ -295,7 +321,7 @@ impl IndexShard {
     /// Open (create / recover) copy `n` of the index at `core` (see
     /// [`IndexService::open_shard`]).
     pub(crate) fn open(core: &Arc<IndexCore>, n: u32, spec: ShardOpenSpec) -> Result<Arc<IndexShard>> {
-        let lock = ShardLock::try_acquire(&core.path, n)?.ok_or_else(|| EsError::shard_lock_failed(&core.name, &core.uuid, n, "starting shard"))?;
+        let lock = ShardLock::acquire_for(&core.path, n, SHARD_LOCK_WAIT)?.ok_or_else(|| EsError::shard_lock_failed(&core.name, &core.uuid, n, "starting shard"))?;
         let dir = core.path.join(format!("shard-{n}"));
         // The generation is read before the schema: a mapping update landing
         // in between leaves the copy behind the generation it records, so its
@@ -312,8 +338,13 @@ impl IndexShard {
         // them searchable): a [`crate::memory::Replay`], never refused or
         // delayed by a circuit breaker (ES `recoverFromTranslog`).
         let replay = crate::memory::Replay::new(format!("local recovery of [{}][{n}]", core.name));
+        // `index.shard.check_on_startup`: `checksum` / `true` verify every
+        // segment file's whole-file checksum while the copy opens (ES
+        // `Store.checkIndex` before the engine starts); `false` checks only
+        // the footers and commit counts.
+        let verify = matches!(core.setting("index.shard.check_on_startup").as_deref(), Some("true" | "checksum"));
         let opened = replay.run(|| -> Result<(Shard, crate::translog::TranslogReplay)> {
-            match &spec.recovery {
+            rustic_core::segment::with_verified_open(verify, || match &spec.recovery {
                 RecoverySource::Empty => {
                     if dir.join("shard_state.json").exists() {
                         return Err(EsError::new(500, "illegal_state_exception", format!("shard [{}][{n}] already has data at [{}]; remove it first", core.name, dir.display())));
@@ -327,7 +358,7 @@ impl IndexShard {
                     gcp_from_manifest = Some(manifest.local_checkpoint);
                     Shard::open_for_replay(&dir, schema)
                 }
-            }
+            })
         });
         let (shard, ops) = match opened {
             Ok(x) => x,
@@ -348,6 +379,8 @@ impl IndexShard {
             closed: AtomicBool::new(false),
             inflight: Mutex::new(0),
             drained: Condvar::new(),
+            writes: Mutex::new(0),
+            writes_drained: Condvar::new(),
             lock: Mutex::new(Some(lock)),
             synced_schema: AtomicU64::new(schema_generation),
             global_checkpoint: AtomicI64::new(-1),
@@ -356,6 +389,7 @@ impl IndexShard {
         });
         s.sync_index_sort(&core.lookup());
         s.sync_merge_config();
+        s.sync_gc_deletes();
         s.sync_stored_compression();
         {
             // Gets load the vectors kept out of the stored `_source`.
@@ -482,6 +516,27 @@ impl IndexShard {
         Ok(true)
     }
 
+    /// Put a store set aside earlier (`from`, see [`Self::move_store`])
+    /// back as `shard-<n>/`, replacing whatever is there (an empty
+    /// recovery placeholder), under the shard lock. `false` when `from`
+    /// does not exist.
+    pub(crate) fn restore_store(core: &IndexCore, n: u32, from: &Path) -> Result<bool> {
+        let lock = ShardLock::try_acquire(&core.path, n)?.ok_or_else(|| EsError::shard_lock_failed(&core.name, &core.uuid, n, "restoring shard data"))?;
+        if !from.exists() {
+            return Ok(false);
+        }
+        let dir = core.path.join(format!("shard-{n}"));
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        std::fs::rename(from, &dir)?;
+        crate::hooks::sync_dir(Some(&core.path));
+        drop(lock);
+        Ok(true)
+    }
+
     /// The shared index core (mapping, settings, analysis).
     pub fn core(&self) -> &Arc<IndexCore> {
         &self.core
@@ -507,6 +562,22 @@ impl IndexShard {
     /// waits; acquire it for each local operation instead.
     pub fn operation_permit(&self) -> Result<impl Drop + '_> {
         self.permit()
+    }
+
+    /// Wait (up to `timeout`) until every write that entered the write path
+    /// before now has finished: with a write block published, none can
+    /// still apply afterwards (ES `TransportVerifyShardIndexBlockAction`:
+    /// the add-block API acknowledges shards only once in-flight writes
+    /// completed; production review #231). `false` on timeout.
+    pub fn drain_writes(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut n = self.writes.lock();
+        while *n > 0 {
+            if self.writes_drained.wait_until(&mut n, deadline).timed_out() {
+                return *n == 0;
+            }
+        }
+        true
     }
 
     /// Fails with the typed closed error once the copy is closed.
@@ -556,6 +627,26 @@ impl IndexShard {
         self.shard.close_files();
         self.lock.lock().take();
         r
+    }
+
+    /// Stop new operation permits and wait for the in-flight ones, keeping
+    /// the store lock and the files: the copy is quiescent until
+    /// [`Self::unfence`] or [`Self::close`] (field-id adoption).
+    pub(crate) fn fence_and_drain(&self) {
+        let mut n = self.inflight.lock();
+        self.closed.store(true, Ordering::Release);
+        while *n > 0 {
+            self.drained.wait(&mut n);
+        }
+    }
+
+    /// Accept operations again after [`Self::fence_and_drain`] (never after
+    /// a close released the store lock).
+    pub(crate) fn unfence(&self) {
+        let _n = self.inflight.lock();
+        if self.lock.lock().is_some() {
+            self.closed.store(false, Ordering::Release);
+        }
     }
 
     /// Fence the copy and wait for in-flight operations without
@@ -665,6 +756,16 @@ impl IndexShard {
         }
     }
 
+    /// Push the dynamic `index.gc_deletes` into the shard (at open, then
+    /// with the merge settings about once a second) and prune the delete
+    /// tombstones it expired (ES prunes them on refresh and from its
+    /// maintenance; production review #124).
+    pub(crate) fn sync_gc_deletes(&self) {
+        let millis = self.core.setting("index.gc_deletes").as_deref().and_then(crate::date::parse_time_value).unwrap_or(crate::shard::GC_DELETES_DEFAULT_MS as i64);
+        self.shard.set_gc_deletes(millis);
+        self.shard.maybe_prune_tombstones();
+    }
+
     /// Push `index.codec` into the shard's memtables: `best_compression`
     /// (and `legacy_best_compression`) stores fields in ES's large zstd
     /// blocks, anything else in the default small LZ4 chunks. A static
@@ -709,36 +810,17 @@ impl IndexShard {
     /// The write path of this copy (blocks, parsing, dynamic mapping,
     /// concurrency checks, translog), for already routed requests.
     fn write_inner(&self, reqs: Vec<WriteReq>, sync: bool) -> Vec<Result<WriteResult>> {
+        let _write = WriteInFlight::enter(self);
         let profile = tracing::enabled!(target: "primary_profile", tracing::Level::DEBUG).then(std::time::Instant::now);
         let profile_rows = reqs.len();
         if let Err(e) = self.check_open() {
             return reqs.iter().map(|_| Err(e.clone())).collect();
         }
-        let (idx_block, del_block) = (self.blocked_writes(false).err(), self.blocked_writes(true).err());
-        if idx_block.is_some() || del_block.is_some() {
-            let blocked: Vec<Option<EsError>> = reqs.iter().map(|r| if matches!(r, WriteReq::Delete { .. }) { del_block.clone() } else { idx_block.clone() }).collect();
-            if blocked.iter().all(|b| b.is_some()) {
-                return blocked.into_iter().map(|b| Err(b.unwrap())).collect();
-            }
-            if blocked.iter().any(|b| b.is_some()) {
-                // Mixed batch: run the allowed ops, fail the blocked ones in place.
-                let mut allowed = Vec::new();
-                let mut slots = Vec::new();
-                for (r, b) in reqs.into_iter().zip(blocked) {
-                    match b {
-                        Some(e) => slots.push(Err(e)),
-                        None => {
-                            slots.push(Ok(allowed.len()));
-                            allowed.push(r);
-                        }
-                    }
-                }
-                let mut res: Vec<Option<Result<WriteResult>>> = self.write_inner(allowed, sync).into_iter().map(Some).collect();
-                return slots.into_iter().map(|s| match s {
-                    Ok(i) => res[i].take().unwrap(),
-                    Err(e) => Err(e),
-                }).collect();
-            }
+        // Every document write, deletes included (ES checks
+        // `ClusterBlockLevel.WRITE` for the whole bulk shard request;
+        // `read_only_allow_delete` only lets the index itself be deleted).
+        if let Err(e) = self.blocked_writes() {
+            return reqs.iter().map(|_| Err(e.clone())).collect();
         }
         let (routing_required, source_enabled) = {
             let m = self.meta.read();
@@ -835,6 +917,25 @@ impl IndexShard {
                             if !auto && id != ids.id {
                                 return Err(EsError::illegal_argument(format!("_id must be unset or set to [{}] but was [{id}] because [{}] is in time_series mode", ids.id, self.name)));
                             }
+                            // The final id (computed once the mapping knows
+                            // every dimension) must route to this shard: a
+                            // document acknowledged here under an id that
+                            // routes elsewhere could never be read, updated
+                            // or deleted by that id.
+                            {
+                                let routing = crate::index::index_routing_of(&self.meta.read().settings);
+                                if routing.number_of_shards > 1 {
+                                    if let Some(want) = crate::tsdb::routing_hash_of_id(&ids.id).map(|h| routing.hash_to_shard(h)) {
+                                        if want != self.id {
+                                            return Err(EsError::new(
+                                                500,
+                                                "illegal_state_exception",
+                                                format!("time series document [{}] of [{}] routes to shard [{want}] but was sent to shard [{}]", ids.id, self.name, self.id),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                             id = ids.id.clone();
                             auto = false;
                             // The parsed document does not depend on its
@@ -859,6 +960,12 @@ impl IndexShard {
                     WriteReq::Delete { id, cond, routing } => {
                         if routing.is_some() && ts_bounds.is_some() {
                             return Err(crate::tsdb::mode_error("specifying routing", &self.name));
+                        }
+                        // ES `TransportBulkAction` (every op type): a required
+                        // routing is checked before the delete is sequenced
+                        // (production review #135).
+                        if routing_required && routing.is_none() {
+                            return Err(EsError::new(400, "routing_missing_exception", format!("routing is required for [{}]/[{id}]", self.name)).with("index_uuid", "_na_").with("index", self.name.clone()));
                         }
                         cond.validate(true)?;
                         if ts_bounds.is_some() && !crate::tsdb::valid_id(&id) {
@@ -1064,6 +1171,11 @@ impl IndexShard {
                 return self.core.attached_or(Ok((orig, src)));
             }
         }
+        // ES `TransportUpdateAction.resolveRequest`: a required routing is
+        // the request's, never taken from the stored document.
+        if routing.is_none() && self.meta.read().mappings.routing_required() {
+            return Err(EsError::new(400, "routing_missing_exception", format!("routing is required for [{}]/[{id}]", self.name)).with("index_uuid", "_na_").with("index", self.name.clone()));
+        }
         let marker = cond.coordinator_id.clone();
         let r = self.update_inner(id, o, body, raw, routing, retry_on_conflict, cond);
         if let (Ok((w, _)), Some(m)) = (&r, marker) {
@@ -1072,6 +1184,20 @@ impl IndexShard {
             }
         }
         self.core.attached_or(r)
+    }
+
+    /// An update's `if_seq_no`/`if_primary_term` against the document it
+    /// read (`seq_no`, `primary_term`): a mismatch is a version conflict
+    /// whatever the update would do, a no-op included (production review
+    /// #36; ES's `UpdateHelper` reads with `getForUpdate`, which throws).
+    pub(crate) fn check_update_cond(&self, id: &str, seq_no: i64, primary_term: u64, cond: &WriteCond) -> Result<()> {
+        if let (Some(sq), Some(pt)) = (cond.if_seq_no, cond.if_primary_term) {
+            if seq_no != sq || primary_term != pt {
+                return Err(EsError::version_conflict(&self.name, &self.uuid, id, format!(
+                    "version conflict, required seqNo [{sq}], primary term [{pt}]. current document has seqNo [{seq_no}] and primary term [{primary_term}]")));
+            }
+        }
+        Ok(())
     }
 
     fn update_inner(&self, id: &str, o: &serde_json::Map<String, Value>, _body: &Value, raw:Option<&crate::source_json::Source>, routing: Option<String>, retry_on_conflict: usize, cond: WriteCond) -> Result<(WriteResult, Option<String>)> {
@@ -1088,8 +1214,15 @@ impl IndexShard {
         let mut attempt = 0;
         loop {
             let cur = self.shard.get(id)?;
+            // ES `UpdateHelper.calculateRouting`: the request's routing, else
+            // the routing the existing document was stored with (a partial
+            // update without `routing` must not erase it).
+            let doc_routing = routing.clone().or_else(|| cur.as_ref().and_then(|g| g.routing.clone()));
             let (new_src, c, created) = match &cur {
                 Some(g) => {
+                    // Before any result, a no-op included (ES's
+                    // `getForUpdate` with `if_seq_no`/`if_primary_term`).
+                    self.check_update_cond(id, g.seq_no, g.primary_term, &cond)?;
                     let stored = g.source.as_deref().unwrap_or("{}");
                     let parsed=serde_json::from_str::<Value>(stored);
                     let (src, unchanged) = match parsed {
@@ -1143,7 +1276,7 @@ impl IndexShard {
                 }
             };
             let s = new_src.clone();
-            let r = self.write(vec![WriteReq::Index { id: Some(id.to_string()), source: s, routing: routing.clone(), cond: c }], true).remove(0);
+            let r = self.write(vec![WriteReq::Index { id: Some(id.to_string()), source: s, routing: doc_routing, cond: c }], true).remove(0);
             match r {
                 Ok(mut w) => {
                     if created {
@@ -1469,7 +1602,22 @@ impl IndexShard {
                 let addr = rustic_core::types::DocAddress::new(li as u32, d);
                 let doc = core.get_doc(&addr)?;
                 let Some(id) = doc.get(ID_FIELD).and_then(|v| v.as_text()).map(str::to_string) else { continue };
-                let source = doc.get(SOURCE_FIELD).and_then(|v| v.as_text()).map(|raw| crate::vector_source::load(raw, &self.core.lookup(), leaf, d).into_owned()).unwrap_or_default();
+                // `_recovery_source` (disabled or filtered stored source):
+                // the original input, so a copy rebuilt from these documents
+                // indexes every field.
+                let lookup = self.core.lookup();
+                let recovery = lookup.recovery_source_id.and_then(|f| doc.get(f)).and_then(|v| v.as_text()).map(str::to_string);
+                let mut source = match recovery {
+                    Some(original) => original,
+                    None => doc.get(SOURCE_FIELD).and_then(|v| v.as_text()).map(|raw| crate::vector_source::load(raw, &lookup, leaf, d).into_owned()).unwrap_or_default(),
+                };
+                // Disabled / filtered source: the indexed dense vectors come
+                // back from the vector store (never kept twice).
+                if lookup.recovery_source_id.is_some() {
+                    if let Some(rebuilt) = crate::vector_source::with_rebuilt_vectors(&source, &lookup, &|f| leaf.vector(f, d)) {
+                        source = rebuilt;
+                    }
+                }
                 let routing = doc.get(ROUTING_FIELD).and_then(|v| v.as_text()).map(str::to_string);
                 let version = leaf.i64_value(VERSION_FIELD, d).unwrap_or(1).max(1) as u64;
                 out.push((id, routing, source, seq, version, addr));
@@ -1562,3 +1710,23 @@ mod replay_source_tests {
 #[cfg(test)]
 #[path = "index_shard_tests.rs"]
 mod tests;
+
+/// One write in [`IndexShard::write_inner`] (see [`IndexShard::drain_writes`]).
+struct WriteInFlight<'a>(&'a IndexShard);
+
+impl<'a> WriteInFlight<'a> {
+    fn enter(shard: &'a IndexShard) -> Self {
+        *shard.writes.lock() += 1;
+        WriteInFlight(shard)
+    }
+}
+
+impl Drop for WriteInFlight<'_> {
+    fn drop(&mut self) {
+        let mut n = self.0.writes.lock();
+        *n -= 1;
+        if *n == 0 {
+            self.0.writes_drained.notify_all();
+        }
+    }
+}

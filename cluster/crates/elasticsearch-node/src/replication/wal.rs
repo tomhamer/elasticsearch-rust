@@ -5,8 +5,13 @@
 //! replica would lose every op applied since its last flush on a crash.
 //!
 //! Files `wal-<gen:08>.log`, records `[len u32 LE][crc32 u32 LE][bincode
-//! WalRecord]`; one `write(2)` + `fsync` per appended batch. A torn tail on
-//! the newest generation is truncated on open. `state.json` holds the
+//! WalRecord]`; one `write(2)` + `fsync` per appended batch. `wal.ckp`
+//! durably records how far the current generation was fsynced, once per
+//! group sync (as the engine's translog checkpoint). A bad tail of the
+//! newest generation past that offset was never acknowledged and is
+//! truncated on replay; any other bad record is corruption of acknowledged data and
+//! fails the replay (`translog_corrupted_exception`: the copy is failed
+//! and recovered from another copy). `state.json` holds the
 //! durable checkpoint floor (everything `<=` it is committed in the engine)
 //! and the highest primary term seen.
 //!
@@ -27,13 +32,15 @@ use serde::{Deserialize, Serialize};
 use serde::de::DeserializeSeed;
 use elasticsearch_engine::translog::AdmittedBatch;
 use elasticsearch_engine::memory::breakers;
+use elasticsearch_engine::translog::{classify_tail, file_identity, Checkpoint, SyncedOffset};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-pub const WAL_DIR: &str = "cluster-replica-wal";
+pub const WAL_DIR: &str = elasticsearch_engine::shard::REPLICA_WAL_DIR;
 const STATE_FILE: &str = "state.json";
+const CHECKPOINT_FILE: &str = "wal.ckp";
 const COMPRESSED_MAGIC: &[u8; 4] = b"RWZ\x01";
 const MAX_COMPRESSED_BODY: usize = 256 * 1024 * 1024;
 
@@ -208,6 +215,7 @@ pub struct ReplicaWal {
     /// Replayed since open: a torn tail is cut off and the generations'
     /// seq_no ranges are known. Appends wait for it.
     replayed: bool,
+    checkpoint: std::sync::Arc<Checkpoint>,
 }
 
 fn file_name(g: u64) -> String {
@@ -235,6 +243,15 @@ impl SyncFailure {
         }
     }
 
+    /// Record a failure for good (the first one wins).
+    fn fail(&self, error: String) {
+        let mut sticky = self.error.lock();
+        if sticky.is_none() {
+            tracing::error!("replica WAL failed, failing the copy: {error}");
+            *sticky = Some(error);
+        }
+    }
+
     /// `file.sync_data()`, recording a failure for good.
     fn sync(&self, file: &File) -> Result<()> {
         self.check()?;
@@ -255,17 +272,34 @@ impl SyncFailure {
     }
 }
 
-/// The current generation's file and the mark of its last append.
+/// The current generation's file, the mark of its last append and the
+/// bytes its appends have written (what a sync records in the checkpoint).
 #[derive(Clone)]
 struct WalFile {
     file: std::sync::Arc<File>,
     last: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+    id: u64,
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    checkpoint: std::sync::Arc<Checkpoint>,
 }
 
 impl WalFile {
-    fn open(path: &Path) -> Result<WalFile> {
-        Ok(WalFile { file: std::sync::Arc::new(OpenOptions::new().create(true).append(true).open(path)?),
-            last: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) })
+    fn open(path: &Path, generation: u64, checkpoint: &std::sync::Arc<Checkpoint>) -> Result<WalFile> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let (id, len) = (file_identity(&file), file.metadata()?.len());
+        Ok(WalFile { file: std::sync::Arc::new(file),
+            last: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            generation, id, written: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(len)), checkpoint: checkpoint.clone() })
+    }
+
+    /// Durably record that every byte appended before `offset` is durable
+    /// (once per group sync). A failure fails the WAL for good.
+    fn synced(&self, offset: u64, failure: &SyncFailure) -> Result<()> {
+        self.checkpoint.advance(SyncedOffset { generation: self.generation, file_id: self.id, offset }).map_err(|error| {
+            failure.fail(format!("checkpoint write failed: {error}"));
+            error.into()
+        })
     }
 }
 
@@ -292,7 +326,9 @@ impl WalSync {
         }
         // Everything appended to this file so far is covered by its fsync.
         let target = self.file.last.load(std::sync::atomic::Ordering::Acquire);
+        let offset = self.file.written.load(std::sync::atomic::Ordering::Acquire);
         self.failure.sync(&self.file.file)?;
+        self.file.synced(offset, &self.failure)?;
         *synced = (*synced).max(target);
         Ok(())
     }
@@ -339,6 +375,8 @@ fn scan_records(path: &Path, f: &mut dyn FnMut(WalRecord) -> Result<()>) -> Resu
 /// of the WAL so the caller can apply records to state that owns it.
 pub struct ReplayPlan {
     generations: Vec<(u64, PathBuf)>,
+    /// How far the newest generation was fsynced ([`CHECKPOINT_FILE`]).
+    synced: Option<SyncedOffset>,
 }
 
 /// What a replay learned ([`ReplicaWal::replayed`]).
@@ -349,7 +387,10 @@ pub struct ReplayOutcome {
 
 impl ReplayPlan {
     /// Stream every record to `f`; a torn tail on the newest generation is
-    /// cut off (a crash mid-append), a corrupt older one fails the replay.
+    /// cut off (past its checkpointed offset nothing was acknowledged); a
+    /// corrupt record anywhere else (an older generation, or below the
+    /// newest one's fsynced offset) fails the replay and leaves the files as
+    /// they are.
     /// Reading and `f` run as a replay of acknowledged ops: no circuit
     /// breaker refuses or delays them (module docs).
     pub fn run(&self, f: impl FnMut(WalRecord) -> Result<()>) -> Result<ReplayOutcome> {
@@ -366,13 +407,23 @@ impl ReplayPlan {
                 outcome.records += 1;
                 f(record)
             })?;
-            if good != total {
-                if Some(*g) == last {
+            if good != total && Some(*g) != last {
+                return Err(ReplicationError::Corrupt { what: "replica wal".into(), detail: format!("generation {g} is corrupt at offset {good}") });
+            }
+            if Some(*g) == last {
+                let synced = match self.synced {
+                    Some(at) if at.generation == *g && at.file_id == File::open(path).map(|f| file_identity(&f)).unwrap_or(0) => at.offset,
+                    _ => 0,
+                };
+                let prefix = elasticsearch_engine::translog::Prefix { good: good as u64, len: total as u64 };
+                if let Err(e) = classify_tail("replica WAL generation", path, prefix, synced) {
+                    return Err(ReplicationError::Corrupt { what: "replica wal".into(), detail: e.reason });
+                }
+                if good != total {
+                    tracing::warn!("replica WAL generation [{g}] at {}: cutting off a torn tail at byte [{good}] of [{total}]", path.display());
                     let file = OpenOptions::new().write(true).open(path)?;
                     file.set_len(good as u64)?;
                     file.sync_all()?;
-                } else {
-                    return Err(ReplicationError::Corrupt { what: "replica wal".into(), detail: format!("generation {g} is corrupt at offset {good}") });
                 }
             }
             outcome.maxes.push((*g, max));
@@ -388,7 +439,7 @@ pub fn remove(shard_path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    super::sync_dir(shard_path);
+    super::sync_dir(shard_path)?;
     Ok(())
 }
 
@@ -416,14 +467,16 @@ impl ReplicaWal {
         persist_state(&dir, &state)?;
         let generation = gens.keys().next_back().copied().unwrap_or(1);
         gens.entry(generation).or_insert(-1);
-        let file = WalFile::open(&dir.join(file_name(generation)))?;
-        super::sync_dir(&dir);
-        Ok(ReplicaWal { dir, generation, file, appended: 0, synced: std::sync::Arc::new(parking_lot::Mutex::new(0)), failure: SyncFailure::default(), gens, state, replayed: false })
+        let checkpoint = Checkpoint::new(&dir, CHECKPOINT_FILE);
+        let file = WalFile::open(&dir.join(file_name(generation)), generation, &checkpoint)?;
+        super::sync_dir(&dir)?;
+        Ok(ReplicaWal { dir, generation, file, appended: 0, synced: std::sync::Arc::new(parking_lot::Mutex::new(0)), failure: SyncFailure::default(), gens, state, replayed: false, checkpoint })
     }
 
     /// The generations to replay, oldest first.
     pub fn replay_plan(&self) -> ReplayPlan {
-        ReplayPlan { generations: self.gens.keys().map(|g| (*g, self.dir.join(file_name(*g)))).filter(|(_, path)| path.exists()).collect() }
+        ReplayPlan { generations: self.gens.keys().map(|g| (*g, self.dir.join(file_name(*g)))).filter(|(_, path)| path.exists()).collect(),
+            synced: Checkpoint::read(&self.dir, CHECKPOINT_FILE) }
     }
 
     /// Record what a replay of [`replay_plan`](Self::replay_plan) found;
@@ -434,6 +487,10 @@ impl ReplicaWal {
         }
         for known in self.gens.values_mut() {
             if *known == i64::MAX { *known = -1; }
+        }
+        // A torn tail was cut off: appends continue from the file's end.
+        if let Ok(meta) = self.file.file.metadata() {
+            self.file.written.store(meta.len(), std::sync::atomic::Ordering::Release);
         }
         self.replayed = true;
     }
@@ -465,7 +522,15 @@ impl ReplicaWal {
         let body = encode_record(rec)?;
         let mut buf = buffer(body.len().checked_add(frame::HEADER_LEN).ok_or_else(|| corrupt("WAL frame size overflow"))?, "replica WAL encoded output")?;
         frame::encode(&body, &mut buf.bytes);
-        (&*self.file.file).write_all(&buf)?;
+        if let Err(error) = (&*self.file.file).write_all(&buf) {
+            // A partial record is cut back (best effort) and nothing is
+            // ever appended after it: records behind a partial one would
+            // read as corruption of acknowledged data.
+            let _ = self.file.file.set_len(self.file.written.load(std::sync::atomic::Ordering::Acquire));
+            self.failure.fail(format!("write failed: {error}"));
+            return Err(error.into());
+        }
+        self.file.written.fetch_add(buf.len() as u64, std::sync::atomic::Ordering::AcqRel);
         self.appended += 1;
         self.file.last.store(self.appended, std::sync::atomic::Ordering::Release);
         let m = self.gens.entry(self.generation).or_insert(-1);
@@ -527,13 +592,15 @@ impl ReplicaWal {
             let next = self.generation + 1;
             // Appends to the generation being left are durable from here on
             // (their pending waits find the mark synced).
+            let offset = self.file.written.load(std::sync::atomic::Ordering::Acquire);
             self.failure.sync(&self.file.file)?;
+            self.file.synced(offset, &self.failure)?;
             {
                 let mut synced = self.synced.lock();
                 *synced = (*synced).max(self.appended);
             }
-            self.file = WalFile::open(&self.dir.join(file_name(next)))?;
-            super::sync_dir(&self.dir);
+            self.file = WalFile::open(&self.dir.join(file_name(next)), next, &self.checkpoint)?;
+            super::sync_dir(&self.dir)?;
             self.generation = next;
             self.gens.insert(next, -1);
         }
@@ -711,5 +778,44 @@ mod tests {
         }
         let (_, recs) = open_all(tmp.path()).unwrap();
         assert!(recs.is_empty());
+    }
+
+    fn ops_record(seq: i64) -> WalRecord {
+        WalRecord::Ops { ops: super::super::ops::admitted_ops_for_test(vec![idx(seq)]), global_checkpoint: -1 }
+    }
+
+    /// Flip a byte in the body of record `n` (0-based) of `path`.
+    fn corrupt_record(path: &Path, n: usize) -> Vec<u8> {
+        let mut data = fs::read(path).unwrap();
+        let mut pos = 0;
+        for _ in 0..n {
+            pos += frame::HEADER_LEN + u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        }
+        data[pos + frame::HEADER_LEN + 1] ^= 0xFF;
+        fs::write(path, &data).unwrap();
+        data
+    }
+
+    /// Records A/B/C (each fsynced and acknowledged) with B corrupted: the
+    /// replay fails as corruption and the file is left as it is; it never
+    /// recovers "A only". The same for C corrupted (the last record, below
+    /// the checkpointed offset).
+    #[test]
+    fn a_corrupted_acknowledged_record_fails_the_replay_instead_of_truncating() {
+        for victim in [1, 2] {
+            let tmp = tempfile::tempdir().unwrap();
+            {
+                let (mut w, _) = open_all(tmp.path()).unwrap();
+                for seq in 0..3 { w.append(&ops_record(seq)).unwrap(); }
+            }
+            let path = tmp.path().join(WAL_DIR).join(file_name(1));
+            let data = corrupt_record(&path, victim);
+            for _ in 0..2 {
+                let error = open_all(tmp.path()).err().expect("corrupted acknowledged WAL records were cut back");
+                assert!(matches!(error, ReplicationError::Corrupt { .. }), "{error}");
+                assert_eq!(error.es_type(), "translog_corrupted_exception");
+                assert_eq!(fs::read(&path).unwrap(), data, "victim {victim}: the WAL was changed");
+            }
+        }
     }
 }

@@ -362,6 +362,64 @@ async fn sql_cursor_deadline_renewal_expiry_and_close() {
     assert!(state.sql_cursors.lock().is_empty());
 }
 
+/// `time_zone` is SQL's session zone: extraction, truncation and date
+/// strings use it (across a DST change), later cursor pages keep it, and an
+/// unknown zone is rejected.
+#[tokio::test]
+async fn sql_time_zone_applies_to_calendar_functions_literals_and_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let (status, body) = es.put("/tz", json!({"mappings":{"properties":{"id":{"type":"keyword"},"ts":{"type":"date"}}}})).await;
+    assert_eq!(status, 200, "{body}");
+    es.bulk(&[
+        json!({"index":{"_index":"tz","_id":"a"}}), json!({"id":"a","ts":"2026-01-01T01:00:00Z"}),
+        // 05:00 PDT, the day DST starts (local midnight was still PST).
+        json!({"index":{"_index":"tz","_id":"b"}}), json!({"id":"b","ts":"2026-03-08T12:00:00Z"}),
+        json!({"index":{"_index":"tz","_id":"c"}}), json!({"id":"c","ts":"2026-03-07T12:00:00Z"}),
+    ]).await;
+    let la = "America/Los_Angeles";
+    let q = "SELECT id, DAY_OF_MONTH(ts) AS d, HOUR(ts) AS h, DATE_TRUNC('day', ts) AS t FROM tz ORDER BY id";
+    let (status, body) = es.post("/_sql", json!({"query": q, "time_zone": la})).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{body}");
+    let want = [("a", 31, 17, "2025-12-31T00:00:00.000-08:00"), ("b", 8, 5, "2026-03-08T00:00:00.000-08:00"), ("c", 7, 4, "2026-03-07T00:00:00.000-08:00")];
+    for (row, (id, d, h, t)) in rows.iter().zip(want) {
+        assert_eq!(row[0], id, "{body}");
+        assert_eq!(row[1], d, "{id}: {body}");
+        assert_eq!(row[2], h, "{id}: {body}");
+        assert_eq!(row[3], t, "{id}: {body}");
+    }
+    // UTC (the default) for contrast.
+    let (status, body) = es.post("/_sql", json!({"query": q})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"][0][1], 1, "{body}");
+    assert_eq!(body["rows"][0][3], "2026-01-01T00:00:00.000Z", "{body}");
+    // A date string without an offset is local time: 2026-01-01T08:00Z.
+    let literal = "SELECT id FROM tz WHERE ts >= '2026-01-01' ORDER BY id";
+    let (status, body) = es.post("/_sql", json!({"query": literal, "time_zone": la})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"], json!([["b"], ["c"]]));
+    let (status, body) = es.post("/_sql", json!({"query": literal})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"], json!([["a"], ["b"], ["c"]]));
+    // Every cursor page evaluates in the request's zone.
+    let (status, first) = es.post("/_sql", json!({"query": q, "time_zone": la, "fetch_size": 1})).await;
+    assert_eq!(status, 200, "{first}");
+    let mut paged = vec![(first["rows"][0][2].clone(), first["rows"][0][3].clone())];
+    let mut cursor = first["cursor"].clone();
+    while cursor.is_string() {
+        let (status, next) = es.post("/_sql", json!({"cursor": cursor})).await;
+        assert_eq!(status, 200, "{next}");
+        paged.extend(next["rows"].as_array().unwrap().iter().map(|r| (r[2].clone(), r[3].clone())));
+        cursor = next["cursor"].clone();
+    }
+    let want: Vec<(Value, Value)> = want.iter().map(|(_, _, h, t)| (json!(h), json!(t))).collect();
+    assert_eq!(paged, want);
+    let (status, body) = es.post("/_sql", json!({"query": "SELECT 1", "time_zone": "Not/AZone"})).await;
+    assert_eq!(status, 400, "{body}");
+}
+
 #[tokio::test]
 async fn sql_page_timeout_parser_matches_es9_types() {
     let tmp = tempfile::tempdir().unwrap();

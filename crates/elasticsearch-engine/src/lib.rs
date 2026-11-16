@@ -1,5 +1,6 @@
 pub mod aggs;
 pub mod h3;
+pub mod locale_names;
 pub mod slice;
 pub mod analysis;
 pub mod date;
@@ -8,6 +9,7 @@ pub mod synthetic;
 pub mod stored;
 pub mod error;
 pub mod memory;
+pub mod boxed_future;
 pub mod indexing_pressure;
 pub mod jsonpos;
 pub mod source_json;
@@ -25,7 +27,7 @@ pub mod collapse;
 pub mod segsort;
 pub mod explain_fmt;
 pub mod similarity;
-pub(crate) mod parse_depth;
+pub mod parse_depth;
 pub use rustic_core::sloppy_math;
 pub mod warnings;
 pub mod settings;
@@ -46,6 +48,7 @@ pub mod tasks;
 pub mod datastream;
 pub mod migrate;
 pub mod async_search;
+pub mod autoscaling;
 pub mod reindex;
 pub mod remote;
 pub mod field_caps;
@@ -84,6 +87,8 @@ pub mod profiling;
 pub mod registry;
 
 #[cfg(test)]
+mod function_score_diff_tests;
+#[cfg(test)]
 mod geo_count_aggs_tests;
 #[cfg(test)]
 mod geo_suite_microbench;
@@ -99,6 +104,8 @@ mod noaa_store_microbench;
 mod par_count_microbench;
 #[cfg(test)]
 mod text_fielddata_tests;
+#[cfg(test)]
+mod query_semantics_b6_tests;
 
 /// Runs last when the suite runs on one thread (tests run in name order):
 /// every reservation on the process's breakers has been released by then,

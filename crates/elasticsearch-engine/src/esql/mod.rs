@@ -25,6 +25,7 @@ pub mod remote;
 pub(crate) mod regex_memory;
 pub mod settings;
 pub mod spatial;
+pub mod sqltime;
 pub mod telemetry;
 pub mod ts;
 pub mod typecheck;
@@ -35,7 +36,7 @@ use crate::error::EsError;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 
-pub use exec::{run, EsqlOptions, EsqlResult, Table};
+pub use exec::{run, EsqlCluster, EsqlOptions, EsqlResult, Table};
 pub use parse::{parse_query, Cmd, Expr};
 
 /// A runtime value.
@@ -54,7 +55,15 @@ pub enum Val {
     /// `date_period`: months, days.
     Period(i64, i64),
     Multi(Vec<Val>),
+    /// An `unsigned_long` beyond `i64::MAX` (smaller ones are `Long`):
+    /// exact, never a rounded double.
+    ULong(u64),
+    /// A `date_nanos`: epoch nanoseconds.
+    Nanos(i64),
 }
+
+/// Nanoseconds per millisecond.
+pub const NANOS_PER_MILLI: i64 = 1_000_000;
 
 impl Val {
     /// Heap bytes beyond the value itself.
@@ -75,6 +84,9 @@ impl Val {
             Val::Int(i) | Val::Long(i) => Some(*i as f64),
             Val::Double(d) => Some(*d),
             Val::Date(d) => Some(*d as f64),
+            Val::ULong(u) => Some(*u as f64),
+            // The millisecond view of a nanosecond date (as a `Date` reads).
+            Val::Nanos(n) => Some(n.div_euclid(NANOS_PER_MILLI) as f64),
             _ => None,
         }
     }
@@ -82,6 +94,7 @@ impl Val {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Val::Int(i) | Val::Long(i) | Val::Date(i) => Some(*i),
+            Val::Nanos(n) => Some(n.div_euclid(NANOS_PER_MILLI)),
             Val::Double(d) if d.is_finite() => Some(*d as i64),
             _ => None,
         }
@@ -95,7 +108,7 @@ impl Val {
     }
 
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Val::Int(_) | Val::Long(_) | Val::Double(_))
+        matches!(self, Val::Int(_) | Val::Long(_) | Val::Double(_) | Val::ULong(_))
     }
 
     /// Values of a (possibly multi-valued) value, nulls skipped.
@@ -129,6 +142,8 @@ impl Val {
             Val::Dur(ms) => fmt_duration(*ms),
             Val::Period(m, d) => fmt_period(*m, *d),
             Val::Multi(v) => format!("[{}]", v.iter().map(Val::to_text).collect::<Vec<_>>().join(", ")),
+            Val::ULong(u) => u.to_string(),
+            Val::Nanos(n) => fmt_date_nanos(*n),
         }
     }
 
@@ -148,6 +163,8 @@ impl Val {
             Val::Date(d) => json!(fmt_date(*d)),
             Val::Dur(_) | Val::Period(..) => json!(self.to_text()),
             Val::Multi(v) => Value::Array(v.iter().map(Val::to_json).collect()),
+            Val::ULong(u) => json!(u),
+            Val::Nanos(n) => json!(fmt_date_nanos(*n)),
         }
     }
 
@@ -168,6 +185,9 @@ impl Val {
             Val::Date(d) => format!("t{d}"),
             Val::Dur(d) => format!("u{d}"),
             Val::Period(m, d) => format!("p{m}/{d}"),
+            // Every `ULong` is beyond `i64`: never equal to a `Long` key.
+            Val::ULong(u) => format!("i{u}"),
+            Val::Nanos(n) => format!("n{n}"),
             Val::Multi(v) => {
                 use std::fmt::Write;
                 let mut key = String::from("m");
@@ -193,6 +213,8 @@ impl Val {
             Val::Date(_) => "date",
             Val::Dur(_) => "time_duration",
             Val::Period(..) => "date_period",
+            Val::ULong(_) => "unsigned_long",
+            Val::Nanos(_) => "date_nanos",
             Val::Multi(v) => v.first().map(Val::type_name).unwrap_or("null"),
         }
     }
@@ -221,6 +243,52 @@ pub fn fmt_double(d: f64) -> String {
 }
 
 thread_local! {
+    /// The running query's `allow_partial_results` and whether a search it
+    /// ran lost shards: `None` outside an ES|QL / SQL query.
+    static PARTIAL: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous partial-results scope when dropped.
+pub struct PartialGuard(Option<(bool, bool)>);
+
+impl Drop for PartialGuard {
+    fn drop(&mut self) {
+        PARTIAL.with(|p| p.set(self.0));
+    }
+}
+
+/// Run the query on this thread under `allow_partial_results = allow`
+/// until the guard drops (see [`note_shard_failures`]).
+pub fn partial_scope(allow: bool) -> PartialGuard {
+    PartialGuard(PARTIAL.with(|p| p.replace(Some((allow, false)))))
+}
+
+/// Whether a search of the running query lost shards (its result is then
+/// partial: `is_partial`).
+pub fn partial_seen() -> bool {
+    PARTIAL.with(|p| p.get().is_some_and(|(_, seen)| seen))
+}
+
+/// An internal search's `_shards` section (review finding 544): with shard
+/// failures, a query that does not allow partial results fails with the
+/// first one; one that does is marked partial. Outside a query: nothing.
+pub(crate) fn note_shard_failures(shards: &Value) -> crate::error::Result<()> {
+    let failed = shards["failed"].as_u64().unwrap_or(0);
+    if failed == 0 {
+        return Ok(());
+    }
+    let Some((allow, _)) = PARTIAL.with(|p| p.get()) else { return Ok(()) };
+    if allow {
+        PARTIAL.with(|p| p.set(Some((true, true))));
+        return Ok(());
+    }
+    let first = &shards["failures"][0];
+    let reason = &first["reason"];
+    let status = first["status"].as_u64().unwrap_or(400) as u16;
+    Err(EsError::new(status, reason["type"].as_str().unwrap_or("exception"), reason["reason"].as_str().unwrap_or("shard failure").to_string()))
+}
+
+thread_local! {
     /// The query's `time_zone`: dates render (and calendar functions run) in it.
     static ZONE: std::cell::Cell<crate::date::Tz> = const { std::cell::Cell::new(crate::date::Tz::Fixed(0)) };
 }
@@ -242,6 +310,35 @@ impl Drop for ZoneGuard {
 /// Make `tz` the zone of this thread until the guard drops.
 pub fn set_zone(tz: crate::date::Tz) -> ZoneGuard {
     ZoneGuard(ZONE.with(|z| z.replace(tz)))
+}
+
+thread_local! {
+    /// SQL's `time_zone`, in which date strings without an offset (date
+    /// literals compared to or cast to dates) are read; `None` (ES|QL, or
+    /// no SQL request) reads them in UTC.
+    static LITERAL_ZONE: std::cell::Cell<Option<crate::date::Tz>> = const { std::cell::Cell::new(None) };
+}
+
+/// The zone date strings without an offset are read in (see [`set_sql_zone`]).
+pub fn literal_zone() -> Option<crate::date::Tz> {
+    LITERAL_ZONE.with(|z| z.get())
+}
+
+/// Restores the previous zones when dropped.
+pub struct SqlZoneGuard(#[allow(dead_code)] ZoneGuard, Option<crate::date::Tz>);
+
+impl Drop for SqlZoneGuard {
+    fn drop(&mut self) {
+        LITERAL_ZONE.with(|z| z.set(self.1));
+    }
+}
+
+/// A SQL request's `time_zone` (ES SQL's session zone) on this thread until
+/// the guard drops: calendar functions, extraction and truncation run in it,
+/// dates render in it, and date strings without an offset are read in it.
+pub fn set_sql_zone(tz: crate::date::Tz) -> SqlZoneGuard {
+    let prev = LITERAL_ZONE.with(|z| z.replace(Some(tz)));
+    SqlZoneGuard(set_zone(tz), prev)
 }
 
 /// A date as ES|QL prints it: ISO-8601 millis in the query's zone (`Z` for UTC).
@@ -283,10 +380,48 @@ fn fmt_period(m: i64, d: i64) -> String {
     s
 }
 
+/// A date as ES|QL prints a `date_nanos`: ISO-8601 with nine fractional
+/// digits in the query's zone (`Z` for UTC).
+pub fn fmt_date_nanos(ns: i64) -> String {
+    let ms = ns.div_euclid(NANOS_PER_MILLI);
+    let tz = zone();
+    let off = tz.offset_at(ms);
+    let secs = ns.div_euclid(1_000_000_000) + off as i64;
+    let sub = ns.rem_euclid(1_000_000_000) as u32;
+    // ES `strict_date_optional_time_nanos` prints the fraction with 3 to 9
+    // digits (`appendFraction(NANO_OF_SECOND, 3, 9, true)`): trailing zeros
+    // dropped, at least milliseconds.
+    let fraction = || {
+        let mut f = format!("{sub:09}");
+        while f.len() > 3 && f.ends_with('0') { f.pop(); }
+        f
+    };
+    match chrono::DateTime::from_timestamp(secs, sub) {
+        Some(dt) if off == 0 && matches!(tz, crate::date::Tz::Fixed(0)) => format!("{}.{}Z", dt.format("%Y-%m-%dT%H:%M:%S"), fraction()),
+        Some(dt) => format!("{}.{}{}", dt.format("%Y-%m-%dT%H:%M:%S"), fraction(), tz.offset_string(ms)),
+        None => ns.to_string(),
+    }
+}
+
+/// A `date_nanos` as ISO-8601 UTC with nine fractional digits (query DSL bounds).
+pub fn fmt_date_nanos_utc(ns: i64) -> String {
+    match chrono::DateTime::from_timestamp(ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000) as u32) {
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string(),
+        None => ns.to_string(),
+    }
+}
+
 /// Total order used by SORT/MIN/MAX (same-typed values; numbers mixed).
 pub fn cmp_vals(a: &Val, b: &Val) -> Ordering {
     match (a, b) {
         (Val::Int(x) | Val::Long(x), Val::Int(y) | Val::Long(y)) => x.cmp(y),
+        (Val::ULong(x), Val::ULong(y)) => x.cmp(y),
+        // A `ULong` is beyond every `i64`.
+        (Val::ULong(_), Val::Int(_) | Val::Long(_)) => Ordering::Greater,
+        (Val::Int(_) | Val::Long(_), Val::ULong(_)) => Ordering::Less,
+        (Val::Nanos(x), Val::Nanos(y)) => x.cmp(y),
+        (Val::Nanos(x), Val::Date(y)) => (*x as i128).cmp(&(*y as i128 * NANOS_PER_MILLI as i128)),
+        (Val::Date(x), Val::Nanos(y)) => (*x as i128 * NANOS_PER_MILLI as i128).cmp(&(*y as i128)),
         (Val::Date(x), Val::Date(y)) => x.cmp(y),
         (Val::Str(x), Val::Str(y)) => x.cmp(y),
         (Val::Bool(x), Val::Bool(y)) => x.cmp(y),
@@ -366,3 +501,6 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod qlang_semantics_tests;

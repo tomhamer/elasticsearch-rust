@@ -214,7 +214,7 @@ impl CustomQuery for DocValuesQuery {
             }
             let hit = match self.kind {
                 Kind::Keyword => leaf.keyword_values(self.field, d).iter().any(|v| self.pred.test(v.as_bytes())),
-                Kind::Bool => leaf.bool_value(self.field, d).map(|b| self.pred.test(&[b as u8])).unwrap_or(false),
+                Kind::Bool => leaf.bool_values(self.field, d).into_iter().any(|b| self.pred.test(&[b as u8])),
             };
             if hit {
                 docs.push((d, self.score));

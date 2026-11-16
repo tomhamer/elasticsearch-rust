@@ -16,24 +16,80 @@
 //! See `cluster/docs/CROSS_NODE_SEARCH.md`.
 
 use super::fanout::{cmp_values, hit_order, sort_keys};
-use elasticsearch_engine::aggs::expr as eexpr;
 use elasticsearch_engine::date as edate;
-use elasticsearch_engine::script::{ScriptContext, Val};
 use serde_json::{json, Map, Value};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 
-/// Helper-aggregation name prefixes (never returned to the client).
-const AVG_HELPER: &str = "__fanout_avg__";
-/// `terms` over the same values as a `rare_terms` (global per-key counts).
+thread_local! {
+    /// The helper-name prefix of the request being rewritten or reduced
+    /// ([`helper_prefix`]).
+    static PREFIX: RefCell<String> = RefCell::new(DEFAULT_PREFIX.to_string());
+}
+
+const DEFAULT_PREFIX: &str = "__fanout_";
+
+/// The prefix of the helper aggregations (and bucket tags) of a request
+/// with aggregations `aggs`: `__fanout_`, or `__fanout{n}_` with the first
+/// `n` that begins none of the request's own aggregation names, so a valid
+/// user aggregation named like a helper (`__fanout_avg__a`) is never
+/// replaced by one, nor read as one (#569). The rewrite and the reduce of a
+/// request compute the same prefix from the same tree.
+fn helper_prefix(aggs: &Value) -> String {
+    fn names(v: &Value, out: &mut Vec<String>) {
+        for (k, e) in v.as_object().into_iter().flatten() {
+            out.push(k.clone());
+            for key in ["aggs", "aggregations"] {
+                if let Some(sub) = e.get(key) {
+                    names(sub, out);
+                }
+            }
+        }
+    }
+    let mut all = Vec::new();
+    names(aggs, &mut all);
+    let mut n = 0u32;
+    loop {
+        let p = if n == 0 { DEFAULT_PREFIX.to_string() } else { format!("__fanout{n}_") };
+        if !all.iter().any(|a| a.starts_with(&p)) {
+            return p;
+        }
+        n += 1;
+    }
+}
+
+/// Run `f` with the helper prefix of `aggs`.
+fn with_prefix<R>(aggs: &Value, f: impl FnOnce() -> R) -> R {
+    struct Restore(String);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = std::mem::take(&mut self.0);
+            PREFIX.with(|p| *p.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(PREFIX.with(|p| std::mem::replace(&mut *p.borrow_mut(), helper_prefix(aggs))));
+    f()
+}
+
+fn prefix() -> String {
+    PREFIX.with(|p| p.borrow().clone())
+}
+
+/// Helper-aggregation name prefixes (never returned to the client): an
+/// average's sum and count.
+fn avg_helper() -> String {
+    format!("{}avg__", prefix())
+}
 /// Root-level `global > filter > terms` giving a `significant_terms`'s
 /// background counts per key.
-const SIG_BG_HELPER: &str = "__fanout_sigbg__";
+fn sig_bg_helper() -> String {
+    format!("{}sigbg__", prefix())
+}
 /// Per-level exact subset counts of a `significant_terms` field.
-const SIG_SUB_HELPER: &str = "__fanout_sigsub__";
-/// `filter > sum` of a `weighted_avg`'s weights over the docs it averages.
-const WAVG_HELPER: &str = "__fanout_wavg__";
+fn sig_sub_helper() -> String {
+    format!("{}sigsub__", prefix())
+}
 /// Buckets a node is asked for when every bucket is needed for exactness.
 const ALL_LIMIT: u64 = 10_000;
 const PARENT_PIPELINES: &[&str] = &["bucket_sort", "bucket_selector", "bucket_script", "cumulative_sum", "derivative"];
@@ -48,9 +104,37 @@ thread_local! {
     /// `bytes_limit`, `durability` included).
     static BREAKING: RefCell<Option<elasticsearch_engine::error::EsError>> = const { RefCell::new(None) };
     static REDUCE_MEMORY: RefCell<Vec<elasticsearch_engine::memory::Reservation>> = const { RefCell::new(Vec::new()) };
-    /// Merged background counts of each `significant_terms`, by agg name:
-    /// (`key` JSON -> count, complete).
-    static SIG_BG: RefCell<HashMap<String, (HashMap<String, u64>, bool)>> = RefCell::new(HashMap::new());
+    /// Merged background counts of each `significant_terms`, by its full
+    /// aggregation path (names from the root): (`key` JSON -> count, complete).
+    static SIG_BG: RefCell<HashMap<Vec<String>, (HashMap<String, u64>, bool)>> = RefCell::new(HashMap::new());
+    /// Names of the aggregations [`reduce`] is inside, from the root.
+    static PATH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps an aggregation's name on [`PATH`] while it is reduced (only when
+/// the request has `significant_terms` state to look up by path).
+struct PathGuard(bool);
+impl PathGuard {
+    fn push(name: &str) -> Self {
+        let on = SIG_BG.with(|s| !s.borrow().is_empty());
+        if on {
+            PATH.with(|p| p.borrow_mut().push(name.to_string()));
+        }
+        PathGuard(on)
+    }
+}
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            PATH.with(|p| {
+                p.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+fn current_path() -> Vec<String> {
+    PATH.with(|p| p.borrow().clone())
 }
 
 /// Keep growth charges attached to the active reduction, including unwind.
@@ -225,9 +309,12 @@ pub fn rewrite(aggs: &Value) -> Value {
                     o.insert("size".into(), json!(total));
                 }
                 "avg" => {
+                    // The shards' sum and value count, from the aggregations
+                    // every avg-capable field supports (`stats` is refused on
+                    // `aggregate_metric_double` and histogram fields).
                     let mut s = o.clone();
                     s.shift_remove("format");
-                    helper = Some((format!("{AVG_HELPER}{name}"), json!({ "stats": s })));
+                    helper = Some((format!("{}{name}", avg_helper()), json!({ "filter": {"match_all": {}}, "aggs": {"s": {"sum": s.clone()}, "c": {"value_count": s}} })));
                 }
                 // `cardinality` / percentiles / `geo_bounds`: the shards attach
                 // their mergeable sketch state (`SHARD_STATE_AGGS`), no helper.
@@ -245,18 +332,8 @@ pub fn rewrite(aggs: &Value) -> Value {
                     // coordinator runs the request's reduce_script over all.
                     o.insert("reduce_script".into(), json!({"source": "return states;"}));
                 }
-                "weighted_avg" => {
-                    let weight = conf.get("weight").and_then(Value::as_object).map(|w| pick(w, &["field", "script", "missing"], 0)).unwrap_or_default();
-                    let mut weight = weight;
-                    weight.shift_remove("size");
-                    // Only docs with a value (or a `missing` for it) are averaged.
-                    let value = &conf["value"];
-                    let filter = match (value.get("field").and_then(Value::as_str), value.get("missing")) {
-                        (Some(f), None) => json!({"exists": {"field": f}}),
-                        _ => json!({"match_all": {}}),
-                    };
-                    helper = Some((format!("{WAVG_HELPER}{name}"), json!({"filter": filter, "aggs": {"w": {"sum": weight}}})));
-                }
+                // `weighted_avg`: shards attach their weighted sum and summed
+                // weights (`SHARD_STATE_AGGS`), no helper.
                 // `rare_terms`: shards attach a filter of their frequent terms.
                 "counted_terms" => {
                     let (_, shard) = terms_sizes(conf);
@@ -299,7 +376,7 @@ pub fn rewrite(aggs: &Value) -> Value {
                     o.shift_remove("shard_min_doc_count");
                     // Exact subset counts while the field has few terms.
                     let t = pick(conf.as_object().unwrap_or(&Map::new()), &["field", "include", "exclude"], ALL_LIMIT);
-                    helper = Some((format!("{SIG_SUB_HELPER}{name}"), json!({ "terms": t })));
+                    helper = Some((format!("{}{name}", sig_sub_helper()), json!({ "terms": t })));
                 }
                 _ => {}
             }
@@ -325,17 +402,20 @@ pub fn rewrite(aggs: &Value) -> Value {
 }
 
 /// [`rewrite`] for the request's top level: also adds the root-level
-/// background-count helpers of every `significant_terms` in the tree.
+/// background-count helpers of every `significant_terms` in the tree, one
+/// per aggregation (by its position in [`collect_sig`]'s walk: two
+/// same-named `significant_terms` under different parents are distinct).
 pub fn rewrite_root(aggs: &Value) -> Value {
+    with_prefix(aggs, || rewrite_root_in(aggs))
+}
+
+fn rewrite_root_in(aggs: &Value) -> Value {
     let mut out = rewrite(aggs);
     let mut sigs = Vec::new();
-    collect_sig(aggs, &mut sigs);
+    collect_sig(aggs, &mut Vec::new(), &mut sigs);
     if let Some(m) = out.as_object_mut() {
-        for (name, conf) in sigs {
-            let key = format!("{SIG_BG_HELPER}{name}");
-            if m.contains_key(&key) {
-                continue;
-            }
+        for (i, (_, conf)) in sigs.into_iter().enumerate() {
+            let key = format!("{}{i}", sig_bg_helper());
             let t = pick(conf.as_object().unwrap_or(&Map::new()), &["field", "include", "exclude"], ALL_LIMIT);
             let filter = conf.get("background_filter").cloned().unwrap_or_else(|| json!({"match_all": {}}));
             m.insert(key, json!({"global": {}, "aggs": {"f": {"filter": filter, "aggs": {"t": {"terms": t}}}}}));
@@ -344,16 +424,20 @@ pub fn rewrite_root(aggs: &Value) -> Value {
     out
 }
 
-fn collect_sig(aggs: &Value, out: &mut Vec<(String, Value)>) {
+/// Every `significant_terms` of the tree with its full aggregation path
+/// (names from the root), depth first in request order.
+fn collect_sig(aggs: &Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, Value)>) {
     let Some(m) = aggs.as_object() else { return };
     for (name, e) in m {
         let Some((ty, conf, subs)) = parse(e) else { continue };
+        path.push(name.clone());
         if ty == "significant_terms" {
-            out.push((name.clone(), conf.clone()));
+            out.push((path.clone(), conf.clone()));
         }
         if let Some(s) = subs {
-            collect_sig(s, out);
+            collect_sig(s, path, out);
         }
+        path.pop();
     }
 }
 
@@ -410,12 +494,13 @@ pub fn reduce(spec: &Value, parts: &[&Value], typed: bool) -> Value {
             continue;
         }
         let vals: Vec<&Value> = found.iter().map(|f| f.1).collect();
+        let _path = PathGuard::push(name);
         let helper = |prefix: &str| -> Vec<Option<&Value>> {
             let h = format!("{prefix}{name}");
             parts.iter().filter(|p| find(p, name).is_some()).map(|p| find(p, &h).map(|f| f.1)).collect()
         };
         let v = match ty {
-            "avg" => reduce_avg(conf, &vals, &helper(AVG_HELPER)),
+            "avg" => reduce_avg(conf, &vals, &helper(&avg_helper())),
             "rare_terms" => reduce_rare(name, conf, subs, &vals, typed),
             "variable_width_histogram" => reduce_variable_width(conf, subs, &vals, typed),
             "categorize_text" => reduce_categorize(name, conf, subs, &vals, typed),
@@ -432,7 +517,7 @@ pub fn reduce(spec: &Value, parts: &[&Value], typed: bool) -> Value {
                 }
             }
 
-            "significant_terms" => reduce_sig(name, conf, subs, &vals, &helper(SIG_SUB_HELPER), typed),
+            "significant_terms" => reduce_sig(name, conf, subs, &vals, &helper(&sig_sub_helper()), typed),
             // The coordinator checks the complete output tree using the
             // configured limit after all sibling/child reducers finish.
             "significant_text" => match elasticsearch_engine::aggs::significant_text::reduce(conf.as_object().unwrap_or(&Map::new()), &vals, usize::MAX, true) {
@@ -445,7 +530,6 @@ pub fn reduce(spec: &Value, parts: &[&Value], typed: bool) -> Value {
             },
             "multi_terms" => reduce_multi_terms(conf, subs, &vals, typed),
             "composite" => reduce_composite(conf, subs, &vals, typed),
-            "weighted_avg" => reduce_weighted_avg(&vals, &helper(WAVG_HELPER)),
             "scripted_metric" => reduce_scripted_metric(name, conf, &vals),
             _ => reduce_one(ty, conf, subs, &vals, typed),
         };
@@ -510,6 +594,10 @@ pub fn reduce_root(spec: &Value, parts: &[&Value], typed: bool) -> Value {
 }
 
 pub fn reduce_root_with_limit(spec: &Value, parts: &[&Value], typed: bool, max_buckets: usize) -> Value {
+    with_prefix(spec, || reduce_root_in(spec, parts, typed, max_buckets))
+}
+
+fn reduce_root_in(spec: &Value, parts: &[&Value], typed: bool, max_buckets: usize) -> Value {
     ERR.with(|e| *e.borrow_mut() = None);
     BREAKING.with(|e| *e.borrow_mut() = None);
     // ES `QueryPhaseResultConsumer`: the nodes' partials are held on the
@@ -524,12 +612,12 @@ pub fn reduce_root_with_limit(spec: &Value, parts: &[&Value], typed: bool, max_b
     };
     let memory=ReduceMemory::enter(mem);
     MAX_BUCKETS.with(|m| m.set(max_buckets));
-    let mut bg: HashMap<String, (HashMap<String, u64>, bool)> = HashMap::new();
+    let mut bg: HashMap<Vec<String>, (HashMap<String, u64>, bool)> = HashMap::new();
     let mut sigs = Vec::new();
-    collect_sig(spec, &mut sigs);
-    for (name, _) in sigs {
-        let h = format!("{SIG_BG_HELPER}{name}");
-        let entry = bg.entry(name).or_insert_with(|| (HashMap::new(), true));
+    collect_sig(spec, &mut Vec::new(), &mut sigs);
+    for (i, (path, _)) in sigs.into_iter().enumerate() {
+        let h = format!("{}{i}", sig_bg_helper());
+        let entry = bg.entry(path).or_insert_with(|| (HashMap::new(), true));
         for p in parts {
             let terms = find(p, &h).and_then(|(_, g)| find(g, "f")).and_then(|(_, f)| find(f, "t")).map(|(_, t)| t);
             let Some(t) = terms else {
@@ -544,9 +632,12 @@ pub fn reduce_root_with_limit(spec: &Value, parts: &[&Value], typed: bool, max_b
             }
         }
     }
-    SIG_BG.with(|s| *s.borrow_mut() = bg);
+    // A nested root reduce keeps the enclosing one's state.
+    let outer_bg = SIG_BG.with(|s| std::mem::replace(&mut *s.borrow_mut(), bg));
+    let outer_path = PATH.with(|p| std::mem::take(&mut *p.borrow_mut()));
     let mut out = reduce(spec, parts, typed);
-    SIG_BG.with(|s| s.borrow_mut().clear());
+    SIG_BG.with(|s| *s.borrow_mut() = outer_bg);
+    PATH.with(|p| *p.borrow_mut() = outer_path);
     if let Some(results)=out.as_object_mut(){for result in results.values_mut(){strip_shard_state(result);}}
     // ES's final reduce counts every bucket against `search.max_buckets`.
     if let Err(e) = elasticsearch_engine::aggs::significant_text::check_final_bucket_limit(spec, &out, max_buckets) { fail_es(e); }
@@ -630,31 +721,21 @@ fn reduce_rate(vals: &[&Value]) -> Value {
     if vals.len() == 1 {
         return vals[0].clone();
     }
+    // A counter rate in a `time_series` bucket: its series may span backing
+    // indices on several shards, merged before normalising (not added).
+    if let Some(v) = elasticsearch_engine::aggs::reduce_counter_rates(vals) {
+        return v;
+    }
     json!({"value": fnum(vals.iter().filter_map(|v| num(v, "value")).sum::<f64>())})
-}
-
-/// `weighted_avg`: each node's average weighted by the summed weights of
-/// the docs it averaged (the helper).
-fn reduce_weighted_avg(vals: &[&Value], helpers: &[Option<&Value>]) -> Value {
-    let (mut num_sum, mut weights) = (0f64, 0f64);
-    let mut live = Vec::new();
-    for (i, v) in vals.iter().enumerate() {
-        let w = helpers.get(i).copied().flatten().and_then(|h| find(h, "w")).and_then(|(_, w)| num(w, "value")).unwrap_or(0.0);
-        if let (Some(x), true) = (num(v, "value"), w != 0.0) {
-            num_sum += x * w;
-            weights += w;
-            live.push(i);
-        }
-    }
-    match live.len() {
-        0 => vals.first().map(|v| (*v).clone()).unwrap_or_else(|| json!({"value": null})),
-        1 => vals[live[0]].clone(),
-        _ => json!({"value": fnum(num_sum / weights)}),
-    }
 }
 
 /// `geo_centroid` / `cartesian_centroid`: node centroids weighted by count.
 fn reduce_centroid(ty: &str, vals: &[&Value]) -> Value {
+    // Shape centroids: the shards' weighted sums, weights and dimensions.
+    let state = if ty == "geo_centroid" { elasticsearch_engine::aggs::reduce_centroid_states(vals) } else { elasticsearch_engine::aggs::reduce_cartesian_centroid_states(vals) };
+    if let Some(v) = state {
+        return v;
+    }
     let live: Vec<&Value> = vals.iter().copied().filter(|v| count_of(v, "count") > 0).collect();
     if live.len() <= 1 {
         return live.first().or(vals.first()).map(|v| (*v).clone()).unwrap_or_else(|| json!({"count": 0}));
@@ -696,10 +777,26 @@ fn reduce_top_metrics(conf: &Value, vals: &[&Value]) -> Value {
         Value::String(k) => k == "_score",
         _ => false,
     };
+    // A document without a sort value sorts last in either direction
+    // unless the sort's `missing` is `_first`, as on one shard (#576).
+    let field_opts = match &conf["sort"] {
+        Value::Object(o) => o.values().next().and_then(Value::as_object),
+        Value::Array(a) => a.first().and_then(Value::as_object).and_then(|o| o.values().next()).and_then(Value::as_object),
+        _ => None,
+    };
+    let missing_first = field_opts.and_then(|m| m.get("missing")).and_then(Value::as_str) == Some("_first");
     let mut top: Vec<Value> = vals.iter().flat_map(|v| v["top"].as_array().cloned().unwrap_or_default()).collect();
     top.sort_by(|a, b| {
-        let o = cmp_key(&a["sort"][0], &b["sort"][0]);
-        if desc { o.reverse() } else { o }
+        let (x, y) = (&a["sort"][0], &b["sort"][0]);
+        match (x.is_null(), y.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => if missing_first { Ordering::Less } else { Ordering::Greater },
+            (false, true) => if missing_first { Ordering::Greater } else { Ordering::Less },
+            (false, false) => {
+                let o = cmp_key(x, y);
+                if desc { o.reverse() } else { o }
+            }
+        }
     });
     top.truncate(size);
     json!({"top": top})
@@ -799,8 +896,17 @@ fn reduce_adjacency(subs: Option<&Value>, vals: &[&Value], typed: bool) -> Value
     json!({"buckets": buckets})
 }
 
+/// An avg helper's (value count, sum): the `filter` helper's `c` / `s`
+/// children, or an older node's `stats` helper.
+fn avg_parts(h: &Value) -> (u64, f64) {
+    match (h.get("c"), h.get("s")) {
+        (Some(c), Some(s)) => (count_of(c, "value"), num(s, "value").unwrap_or(0.0)),
+        _ => (count_of(h, "count"), num(h, "sum").unwrap_or(0.0)),
+    }
+}
+
 fn reduce_avg(conf: &Value, vals: &[&Value], helpers: &[Option<&Value>]) -> Value {
-    let live: Vec<usize> = (0..vals.len()).filter(|i| helpers.get(*i).copied().flatten().map(|h| count_of(h, "count") > 0).unwrap_or(false)).collect();
+    let live: Vec<usize> = (0..vals.len()).filter(|i| helpers.get(*i).copied().flatten().map(|h| avg_parts(h).0 > 0).unwrap_or(false)).collect();
     match live.len() {
         0 => vals.first().map(|v| (*v).clone()).unwrap_or_else(|| json!({"value": null})),
         // One node has all the values: its rendering is exact.
@@ -808,9 +914,9 @@ fn reduce_avg(conf: &Value, vals: &[&Value], helpers: &[Option<&Value>]) -> Valu
         _ => {
             let (mut n, mut s) = (0u64, 0f64);
             for i in &live {
-                let h = helpers[*i].unwrap();
-                n += count_of(h, "count");
-                s += num(h, "sum").unwrap_or(0.0);
+                let (c, sum) = avg_parts(helpers[*i].unwrap());
+                n += c;
+                s += sum;
             }
             let avg = s / n as f64;
             let mut out = json!({ "value": avg });
@@ -916,7 +1022,8 @@ fn reduce_top_hits(conf: &Value, vals: &[&Value]) -> Value {
 /// Whether a rendered bucket key belongs to a sub-aggregation result.
 fn is_sub_key(k: &str, subs: Option<&Value>) -> bool {
     let name = k.split_once('#').map(|(_, n)| n).unwrap_or(k);
-    if k.starts_with("__fanout_") || name.starts_with("__fanout_") {
+    let p = prefix();
+    if k.starts_with(&p) || name.starts_with(&p) {
         return true;
     }
     subs.and_then(Value::as_object).map(|m| m.contains_key(k) || m.contains_key(name)).unwrap_or(false)
@@ -1025,7 +1132,9 @@ fn reduce_terms(conf: &Value, subs: Option<&Value>, vals: &[&Value], typed: bool
         let own = v["doc_count_error_upper_bound"].as_i64().unwrap_or(0);
         node_err.push(if own < 0 || trunc < 0 { -1 } else { own + trunc });
         for b in bs {
-            let g = *index.entry(b["key"].to_string()).or_insert_with(|| {
+            // Equal numeric keys are one bucket whatever their spelling (a
+            // long field's `1`, a double field's `1.0`).
+            let g = *index.entry(elasticsearch_engine::aggs::partial::terms_key_identity(&b["key"])).or_insert_with(|| {
                 groups.push((Vec::new(), Vec::new()));
                 groups.len() - 1
             });
@@ -1036,6 +1145,7 @@ fn reduce_terms(conf: &Value, subs: Option<&Value>, vals: &[&Value], typed: bool
     let mut buckets: Vec<Value> = Vec::new();
     for (bs, nodes) in &groups {
         let mut m = merge_bucket(bs, subs, typed);
+        elasticsearch_engine::aggs::partial::promote_numeric_key(&mut m, bs);
         m.shift_remove("doc_count_error_upper_bound");
         if show_err {
             let mut e = 0i64;
@@ -1292,12 +1402,12 @@ fn reduce_fixed(subs: Option<&Value>, vals: &[&Value], typed: bool) -> Value {
                 }
             }
             // Pipelines run over a list; the bucket name rides along.
-            const TAG: &str = "__fanout_bucket_name";
+            let tag = format!("{}bucket_name", prefix());
             let mut list: Vec<Value> = m
                 .into_iter()
                 .map(|(k, mut b)| {
                     if let Some(o) = b.as_object_mut() {
-                        o.insert(TAG.into(), json!(k));
+                        o.insert(tag.clone(), json!(k));
                     }
                     b
                 })
@@ -1305,7 +1415,7 @@ fn reduce_fixed(subs: Option<&Value>, vals: &[&Value], typed: bool) -> Value {
             apply_parents(subs, &mut list, typed);
             let mut m = Map::new();
             for mut b in list {
-                let k = b.as_object_mut().and_then(|o| o.shift_remove(TAG)).and_then(|k| k.as_str().map(str::to_string)).unwrap_or_default();
+                let k = b.as_object_mut().and_then(|o| o.shift_remove(&tag)).and_then(|k| k.as_str().map(str::to_string)).unwrap_or_default();
                 m.insert(k, b);
             }
             Value::Object(m)
@@ -1482,87 +1592,51 @@ fn sibling_pipeline(name: &str, t: &str, body: &Value, results: &HashMap<String,
             }
             m
         }
-        "percentiles_bucket" => {
-            let mut sorted: Vec<f64> = vals.iter().map(|x| x.1).collect();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            let percents: Vec<f64> = body.get("percents").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_else(|| vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]);
-            let mut m = Map::new();
-            for p in percents {
-                let v = if sorted.is_empty() { None } else { Some(sorted[((p / 100.0 * sorted.len() as f64).ceil() as usize).saturating_sub(1).min(sorted.len() - 1)]) };
-                m.insert(jfmt(p), opt_num(v));
-            }
-            json!({ "values": m })
-        }
+        "percentiles_bucket" => elasticsearch_engine::aggs::percentiles_bucket_values(vals.iter().map(|x| x.1).collect(), body),
         _ => json!({}),
     })
 }
 
-fn script_source(body: &Value) -> Result<String, String> {
-    match body.get("script") {
-        Some(Value::String(s)) => Ok(s.clone()),
-        Some(Value::Object(o)) => o.get("source").or(o.get("inline")).and_then(Value::as_str).map(str::to_string).ok_or_else(|| "script source is required".to_string()),
-        _ => Err("[script] is required".into()),
-    }
-}
-
-fn script_vars(body: &Value, b: &Map<String, Value>) -> Option<HashMap<String, f64>> {
-    let mut vars = HashMap::new();
-    match body.get("buckets_path") {
-        Some(Value::Object(paths)) => {
-            for (k, p) in paths {
-                vars.insert(k.clone(), resolve_path(b, p.as_str()?)?);
-            }
-        }
-        Some(Value::String(p)) => {
-            vars.insert("_value".into(), resolve_path(b, p)?);
-        }
-        _ => {}
-    }
-    if let Some(Value::Object(params)) = body.get("script").and_then(|s| s.get("params")) {
-        for (k, v) in params {
-            if let Some(f) = v.as_f64() {
-                vars.entry(k.clone()).or_insert(f);
-            }
-        }
-    }
-    Some(vars)
-}
-
 /// Run the parent pipelines declared in `subs` over a merged bucket list
-/// (engine `apply_parent_pipelines`), in declaration order.
+/// with the engine's implementation (the one local execution runs): in
+/// dependency order, with the same gap policies and selector semantics.
 fn apply_parents(subs: Option<&Value>, buckets: &mut Vec<Value>, typed: bool) {
     let Some(sub) = subs.and_then(Value::as_object) else { return };
-    for (name, def) in sub {
-        let Some((t, body, _)) = parse(def) else { continue };
-        if elasticsearch_engine::aggs::partial::ENGINE_PARENT_PIPELINES.contains(&t) {
-            // The engine's implementation over plain-keyed copies.
-            let names = spec_names(Some(&Value::Object(sub.clone())));
-            let mut plain: Vec<Map<String, Value>> = buckets.iter().map(|b| untyped(b, &names).as_object().cloned().unwrap_or_default()).collect();
-            if let Err(e) = elasticsearch_engine::aggs::partial::engine_parent_pipeline(name, t, body, &mut plain) {
-                fail_es(e);
-                return;
-            }
-            // The engine's typed prefixes (`search.rs`).
-            let prefix = match t {
-                "normalize" | "serial_diff" | "moving_fn" => "simple_value",
-                "cumulative_cardinality" => "simple_long_value",
-                other => other,
-            };
-            let key = if typed { format!("{prefix}#{name}") } else { name.clone() };
-            for (b, p) in buckets.iter_mut().zip(plain) {
-                if let (Some(o), Some(v)) = (b.as_object_mut(), p.get(name)) {
-                    o.insert(key.clone(), v.clone());
+    let pipes: Vec<(&String, &str)> = sub.iter().filter_map(|(n, d)| parse(d).map(|(t, _, _)| (n, t)))
+        .filter(|(_, t)| PARENT_PIPELINES.contains(t) || elasticsearch_engine::aggs::partial::ENGINE_PARENT_PIPELINES.contains(t)).collect();
+    if pipes.is_empty() {
+        return;
+    }
+    // Plain-keyed copies tagged with their position: selectors drop and
+    // sorts reorder them.
+    let at = format!("{}at", prefix());
+    let names = spec_names(subs);
+    let mut plain: Vec<Map<String, Value>> = buckets.iter().enumerate().map(|(i, b)| {
+        let mut m = untyped(b, &names).as_object().cloned().unwrap_or_default();
+        m.insert(at.clone(), json!(i));
+        m
+    }).collect();
+    if let Err(e) = elasticsearch_engine::aggs::partial::run_parent_pipelines(sub, &mut plain) {
+        fail_es(e);
+        return;
+    }
+    let mut originals: Vec<Option<Value>> = std::mem::take(buckets).into_iter().map(Some).collect();
+    for p in plain {
+        let Some(mut b) = p.get(&at).and_then(Value::as_u64).and_then(|i| originals.get_mut(i as usize)).and_then(Option::take) else { continue };
+        if let Some(o) = b.as_object_mut() {
+            for (name, t) in &pipes {
+                if let Some(v) = p.get(name.as_str()) {
+                    // The engine's typed prefixes (`search.rs`).
+                    let prefix = match *t {
+                        "cumulative_sum" | "bucket_script" | "normalize" | "serial_diff" | "moving_fn" => "simple_value",
+                        "cumulative_cardinality" => "simple_long_value",
+                        other => other,
+                    };
+                    o.insert(if typed { format!("{prefix}#{name}") } else { (*name).clone() }, v.clone());
                 }
             }
-            continue;
         }
-        if !PARENT_PIPELINES.contains(&t) {
-            continue;
-        }
-        if let Err(e) = apply_parent(name, t, body, buckets, typed) {
-            fail(e);
-            return;
-        }
+        buckets.push(b);
     }
 }
 
@@ -1675,127 +1749,6 @@ fn buckets_of_ref(v: &Value) -> impl Iterator<Item = &Value> {
     v["buckets"].as_array().into_iter().flatten()
 }
 
-fn apply_parent(name: &str, t: &str, body: &Value, buckets: &mut Vec<Value>, typed: bool) -> Result<(), String> {
-    let key = if typed { format!("{t}#{name}") } else { name.to_string() };
-    let empty = Map::new();
-    let obj = |b: &Value| b.as_object().cloned().unwrap_or_default();
-    let set = |b: &mut Value, v: Value| {
-        if let Some(o) = b.as_object_mut() {
-            o.insert(key.clone(), v);
-        }
-    };
-    match t {
-        "cumulative_sum" => {
-            let path = path_of(body, t)?;
-            let mut acc = 0.0;
-            for b in buckets.iter_mut() {
-                acc += resolve_path(b.as_object().unwrap_or(&empty), &path).filter(|v| v.is_finite()).unwrap_or(0.0);
-                set(b, json!({ "value": fnum(acc) }));
-            }
-        }
-        "derivative" => {
-            let path = path_of(body, t)?;
-            let mut prev: Option<f64> = None;
-            for b in buckets.iter_mut() {
-                let cur = resolve_path(b.as_object().unwrap_or(&empty), &path).filter(|v| v.is_finite());
-                if let (Some(p), Some(c)) = (prev, cur) {
-                    set(b, json!({ "value": fnum(c - p) }));
-                }
-                if cur.is_some() {
-                    prev = cur;
-                }
-            }
-        }
-        "bucket_script" => {
-            let script=body.get("script").ok_or_else(||"[script] is required".to_string())?;
-            for b in buckets.iter_mut() {
-                if let Some(vars) = script_vars(body, &obj(b)) {
-                    let v = match eexpr::eval_search_script(script, &vars, ScriptContext::BucketScript) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            fail_es(e);
-                            return Ok(());
-                        }
-                    };
-                    if v.is_null() {
-                        continue;
-                    }
-                    let x = v.as_f64().ok_or_else(|| format!("buckets_path must reference either a number value or a single value numeric metric aggregation, but [{name}] returned a {}", v.type_name()))?;
-                    set(b, json!({ "value": fnum(x) }));
-                }
-            }
-        }
-        "bucket_selector" => {
-            let script=body.get("script").ok_or_else(||"[script] is required".to_string())?;
-            let mut keep = Vec::new();
-            for b in buckets.drain(..) {
-                match script_vars(body, &obj(&b)) {
-                    Some(vars) => {
-                        let v = match eexpr::eval_search_script(script, &vars, ScriptContext::BucketSelector) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                fail_es(e);
-                                return Ok(());
-                            }
-                        };
-                        match v {
-                            Val::Bool(true) => keep.push(b),
-                            Val::Bool(false) => {}
-                            other => return Err(format!("Script for [{name}] must return a boolean, got [{}]", other.type_name())),
-                        }
-                    }
-                    None => keep.push(b),
-                }
-            }
-            *buckets = keep;
-        }
-        "bucket_sort" => {
-            let mut crit: Vec<(String, bool)> = Vec::new();
-            if let Some(Value::Array(a)) = body.get("sort") {
-                for s in a {
-                    match s {
-                        Value::String(p) => crit.push((p.clone(), true)),
-                        Value::Object(m) => {
-                            for (p, d) in m {
-                                let asc = match d {
-                                    Value::String(x) => x != "desc",
-                                    Value::Object(x) => x.get("order").and_then(Value::as_str) != Some("desc"),
-                                    _ => true,
-                                };
-                                crit.push((p.clone(), asc));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if !crit.is_empty() {
-                buckets.sort_by(|a, b| {
-                    let (a, b) = (a.as_object().unwrap_or(&empty), b.as_object().unwrap_or(&empty));
-                    for (p, asc) in &crit {
-                        let c = match (resolve_path(a, p), resolve_path(b, p)) {
-                            (Some(x), Some(y)) if *asc => x.total_cmp(&y),
-                            (Some(x), Some(y)) => y.total_cmp(&x),
-                            (None, Some(_)) => Ordering::Greater,
-                            (Some(_), None) => Ordering::Less,
-                            _ => Ordering::Equal,
-                        };
-                        if c != Ordering::Equal {
-                            return c;
-                        }
-                    }
-                    Ordering::Equal
-                });
-            }
-            let from = body.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let size = body.get("size").and_then(Value::as_u64).map(|s| s as usize).unwrap_or(usize::MAX);
-            *buckets = buckets.drain(..).skip(from).take(size).collect();
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// Bucket groups by key across nodes, in first-seen order.
 fn group_buckets<'a>(vals: &[&'a Value]) -> Vec<Vec<&'a Value>> {
     let mut groups: Vec<Vec<&Value>> = Vec::new();
@@ -1860,6 +1813,8 @@ fn sig_score(h: &str, p: &Map<String, Value>, sub_f: f64, sub_n: f64, sup_f: f64
             }
         }
         "gnd" => {
+            // ES `GND.getScore`: a separate background gets the foreground added.
+            let (sup_f, sup_n) = if flag("background_is_superset", true) { (sup_f, sup_n) } else { (sup_f + sub_f, sup_n + sub_n) };
             let (fx, fy, fxy) = (sup_f, sub_n, sub_f);
             if fx == 0.0 || fy == 0.0 || fxy == 0.0 {
                 return 0.0;
@@ -1920,7 +1875,7 @@ fn reduce_sig(name: &str, conf: &Value, subs: Option<&Value>, vals: &[&Value], h
     }
     // Exact background counts when the root-level helper holds every term
     // of every node; otherwise ES's: the sum over nodes that returned it.
-    let bg_entry = SIG_BG.with(|s| s.borrow().get(name).cloned());
+    let bg_entry = SIG_BG.with(|s| s.borrow().get(&current_path()).cloned());
     let bg_exact = bg_entry.as_ref().is_some_and(|b| b.1);
     let bg = bg_entry.filter(|b| b.1).map(|b| b.0).unwrap_or_default();
     // Every node's subset counts, when each helper holds all its terms: with
@@ -2079,16 +2034,19 @@ fn reduce_composite(conf: &Value, subs: Option<&Value>, vals: &[&Value], typed: 
             sources.push((name.clone(), desc, nulls_first));
         }
     }
+    // `version` / `ip` sources order their rendered keys as the shards did.
+    let key_types = elasticsearch_engine::aggs::composite_key_types(vals);
     let mut buckets: Vec<Value> = group_buckets(vals).iter().map(|bs| Value::Object(merge_bucket(bs, subs, typed))).collect();
     buckets.sort_by(|a, b| {
         for (n, desc, nulls_first) in &sources {
             let (x, y) = (&a["key"][n.as_str()], &b["key"][n.as_str()]);
+            let base = || elasticsearch_engine::aggs::composite_typed_cmp(key_types.get(n).and_then(Value::as_str), x, y).unwrap_or_else(|| cmp_key(x, y));
             let c = match (x.is_null(), y.is_null()) {
                 (true, true) => Ordering::Equal,
                 (true, false) => if *nulls_first { Ordering::Less } else { Ordering::Greater },
                 (false, true) => if *nulls_first { Ordering::Greater } else { Ordering::Less },
-                _ if *desc => cmp_key(x, y).reverse(),
-                _ => cmp_key(x, y),
+                _ if *desc => base().reverse(),
+                _ => base(),
             };
             if c != Ordering::Equal {
                 return c;
@@ -2241,15 +2199,28 @@ mod tests {
         // rate: node rates over the same unit add up.
         let r = red(json!({"r": {"rate": {"field": "v", "unit": "hour"}}}), vec![json!({"r": {"value": 2.0}}), json!({"r": {"value": 3.5}})]);
         assert_eq!(r["r"]["value"], json!(5.5));
-        // weighted_avg: averages weighted by each node's summed weights.
+        // weighted_avg: the nodes' weighted sums over their summed weights,
+        // a weight counted once per value (ES `InternalWeightedAvg`): node
+        // one holds v:[0,2],w:1 (average 1), node two v:[10],w:1.
         let spec = json!({"w": {"weighted_avg": {"value": {"field": "v"}, "weight": {"field": "w"}}}});
-        let rw = rewrite(&spec);
-        assert_eq!(rw["__fanout_wavg__w"]["filter"], json!({"exists": {"field": "v"}}));
-        let r = red(spec, vec![
-            json!({"w": {"value": 2.0}, "__fanout_wavg__w": {"doc_count": 1, "w": {"value": 1.0}}}),
-            json!({"w": {"value": 5.0}, "__fanout_wavg__w": {"doc_count": 2, "w": {"value": 2.0}}}),
+        assert_eq!(rewrite(&spec), spec, "no helper: shards carry state");
+        let r = red(spec.clone(), vec![
+            json!({"w": {"value": 1.0, "__p": {"sum": 2.0, "weight": 2.0, "fmt": null}}}),
+            json!({"w": {"value": 10.0, "__p": {"sum": 10.0, "weight": 1.0, "fmt": null}}}),
         ]);
         assert_eq!(r["w"]["value"], json!(4.0));
+        // A node without matching docs adds nothing; none at all is null.
+        let r = red(spec.clone(), vec![
+            json!({"w": {"value": 1.0, "__p": {"sum": 2.0, "weight": 2.0, "fmt": null}}}),
+            json!({"w": {"value": null, "__p": {"sum": 0.0, "weight": 0.0, "fmt": null}}}),
+        ]);
+        assert_eq!(r["w"]["value"], json!(1.0));
+        let r = red(spec.clone(), vec![json!({"w": {"value": null, "__p": {"sum": 0.0, "weight": 0.0, "fmt": null}}})]);
+        assert_eq!(r["w"]["value"], Value::Null);
+        // A node that predates the state is refused, never averaged wrongly.
+        ERR.with(|e| *e.borrow_mut() = None);
+        let _ = red(spec, vec![json!({"w": {"value": 1.0, "__p": {"sum": 2.0, "weight": 2.0}}}), json!({"w": {"value": 10.0}})]);
+        assert!(take_error().is_some());
         // geo_centroid: weighted by count.
         let r = red(json!({"c": {"geo_centroid": {"field": "p"}}}), vec![
             json!({"c": {"location": {"lat": 10.0, "lon": 0.0}, "count": 1}}),
@@ -2323,6 +2294,41 @@ mod tests {
         assert!(unsupported(&json!({"m": {"no_such_aggregation": {"field": "c"}}})).is_some());
     }
 
+    /// #170: one counter series spanning two backing indices (two shards)
+    /// merges its pieces before normalising: (0s,0),(1s,10) + (2s,20),(3s,30)
+    /// is 10/s, not 20/s; a reset at the boundary counts the new start.
+    #[test]
+    fn counter_rate_merges_a_series_across_backing_indices() {
+        let piece = |st: i64, sv: f64, et: i64, ev: f64, inc: f64| {
+            let rate = inc / ((et - st) as f64 / 1000.0);
+            json!({"value": rate, "__p": {"counter": {"st": st, "sv": sv, "et": et, "ev": ev, "inc": inc, "unit_ms": 1000.0}}})
+        };
+        for keyed in [false, true] {
+            let spec = json!({"ts": {"time_series": {"keyed": keyed}, "aggs": {"r": {"rate": {"field": "c", "unit": "second"}}}}});
+            let shard = |r: Value| if keyed {
+                json!({"ts": {"buckets": {"{host=a}": {"key": {"host": "a"}, "doc_count": 2, "r": r}}}})
+            } else {
+                json!({"ts": {"buckets": [{"key": {"host": "a"}, "doc_count": 2, "r": r}]}})
+            };
+            let bucket = |out: &Value| if keyed { out["ts"]["buckets"]["{host=a}"].clone() } else { out["ts"]["buckets"][0].clone() };
+            let out = red(spec.clone(), vec![shard(piece(0, 0.0, 1000, 10.0, 10.0)), shard(piece(2000, 20.0, 3000, 30.0, 10.0))]);
+            let b = bucket(&out);
+            assert_eq!(b["doc_count"], json!(4));
+            assert_eq!(b["r"]["value"].as_f64(), Some(10.0), "{out}");
+            assert!(b["r"].get("__p").is_none());
+            // Order of the shard responses does not matter.
+            let out = red(spec.clone(), vec![shard(piece(2000, 20.0, 3000, 30.0, 10.0)), shard(piece(0, 0.0, 1000, 10.0, 10.0))]);
+            assert_eq!(bucket(&out)["r"]["value"].as_f64(), Some(10.0));
+            // A reset at the boundary: 10 + 5 (from 0 again) + 10 over 3s.
+            let out = red(spec.clone(), vec![shard(piece(0, 0.0, 1000, 10.0, 10.0)), shard(piece(2000, 5.0, 3000, 15.0, 10.0))]);
+            assert!((bucket(&out)["r"]["value"].as_f64().unwrap() - 25.0 / 3.0).abs() < 1e-9);
+            // One sample on each side still makes a rate.
+            let one = |t: i64, v: f64| json!({"value": "NaN", "__p": {"counter": {"st": t, "sv": v, "et": t, "ev": v, "inc": 0.0, "unit_ms": 1000.0}}});
+            let out = red(spec, vec![shard(one(0, 0.0)), shard(one(2000, 20.0))]);
+            assert_eq!(bucket(&out)["r"]["value"].as_f64(), Some(10.0));
+        }
+    }
+
     #[test]
     fn rewrite_asks_for_shard_size_and_helpers() {
         let r = rewrite(&json!({
@@ -2331,7 +2337,7 @@ mod tests {
         }));
         assert_eq!(r["t"]["terms"], json!({"field": "k", "size": 13, "min_doc_count": 1}));
         assert_eq!(r["t"]["aggs"]["a"], json!({"avg": {"field": "v"}}));
-        assert_eq!(r["t"]["aggs"]["__fanout_avg__a"], json!({"stats": {"field": "v"}}));
+        assert_eq!(r["t"]["aggs"]["__fanout_avg__a"], json!({"filter": {"match_all": {}}, "aggs": {"s": {"sum": {"field": "v"}}, "c": {"value_count": {"field": "v"}}}}));
         assert_eq!(r["t"]["aggs"]["c"], json!({"cardinality": {"field": "u"}}));
         assert!(r["t"]["aggs"].get("__fanout_card__c").is_none(), "cardinality carries shard state: {r}");
         assert_eq!(r["h"]["top_hits"], json!({"size": 3, "from": 0}));
@@ -2361,7 +2367,63 @@ mod tests {
         assert!(r["h"]["aggs"].get("s").is_none());
         assert!(r["h"]["aggs"].get("c").is_some());
         assert_eq!(r["t"]["aggs"]["sig"]["significant_terms"], json!({"field": "k", "chi_square": {}, "size": 25, "min_doc_count": 1}));
-        assert_eq!(r["__fanout_sigbg__sig"]["aggs"]["f"]["aggs"]["t"], json!({"terms": {"field": "k", "size": 10000}}));
+        assert_eq!(r["__fanout_sigbg__0"]["aggs"]["f"]["aggs"]["t"], json!({"terms": {"field": "k", "size": 10000}}));
+    }
+
+    /// One node's rendered `significant_terms` with its background helper.
+    fn sig_node(subset: u64, bs: &[(&str, u64, u64)]) -> Value {
+        json!({"doc_count": subset, "bg_count": 100, "buckets": bs.iter().map(|(k, c, bg)| json!({"key": k, "doc_count": c, "bg_count": bg, "score": 1.0})).collect::<Vec<_>>()})
+    }
+
+    fn sig_bg(bs: &[(&str, u64)]) -> Value {
+        json!({"doc_count": 100, "f": {"doc_count": 100, "t": {"doc_count_error_upper_bound": 0, "sum_other_doc_count": 0,
+            "buckets": bs.iter().map(|(k, c)| json!({"key": k, "doc_count": c})).collect::<Vec<_>>()}}})
+    }
+
+    #[test]
+    fn significant_terms_same_name_under_different_parents_is_isolated() {
+        // `a > sig` over field k and `b > sig` over field g: each its own
+        // background helper (by path), counts never shared or added twice.
+        let a = json!({"a": {"filter": {"term": {"x": 1}}, "aggs": {"sig": {"significant_terms": {"field": "k", "min_doc_count": 1}}}}});
+        let b = json!({"b": {"filter": {"term": {"x": 2}}, "aggs": {"sig": {"significant_terms": {"field": "g", "min_doc_count": 1, "chi_square": {}}}}}});
+        let mut both = a.clone();
+        both.as_object_mut().unwrap().extend(b.as_object().unwrap().clone());
+        let rw = rewrite_root(&both);
+        assert_eq!(rw["__fanout_sigbg__0"]["aggs"]["f"]["aggs"]["t"]["terms"]["field"], "k", "{rw}");
+        assert_eq!(rw["__fanout_sigbg__1"]["aggs"]["f"]["aggs"]["t"]["terms"]["field"], "g", "{rw}");
+        assert_eq!(rewrite_root(&a)["__fanout_sigbg__0"]["aggs"]["f"]["aggs"]["t"]["terms"]["field"], "k");
+        assert_eq!(rewrite_root(&b)["__fanout_sigbg__0"]["aggs"]["f"]["aggs"]["t"]["terms"]["field"], "g");
+        // Two nodes' answers for each parent and its background counts.
+        let a_nodes = [json!({"doc_count": 10, "sig": sig_node(10, &[("x", 6, 9), ("y", 2, 30)])}), json!({"doc_count": 10, "sig": sig_node(10, &[("x", 4, 9), ("z", 3, 5)])})];
+        let b_nodes = [json!({"doc_count": 20, "sig": sig_node(20, &[("p", 9, 20), ("q", 1, 40)])}), json!({"doc_count": 20, "sig": sig_node(20, &[("p", 7, 18), ("r", 4, 6)])})];
+        let a_bg = [sig_bg(&[("x", 9), ("y", 30), ("z", 5)]), sig_bg(&[("x", 9), ("y", 30), ("z", 6)])];
+        let b_bg = [sig_bg(&[("p", 20), ("q", 40), ("r", 6)]), sig_bg(&[("p", 18), ("q", 41), ("r", 7)])];
+        let alone_a: Vec<Value> = (0..2).map(|i| json!({"a": a_nodes[i], "__fanout_sigbg__0": a_bg[i]})).collect();
+        let alone_b: Vec<Value> = (0..2).map(|i| json!({"b": b_nodes[i], "__fanout_sigbg__0": b_bg[i]})).collect();
+        let together: Vec<Value> = (0..2).map(|i| json!({"a": a_nodes[i], "b": b_nodes[i], "__fanout_sigbg__0": a_bg[i], "__fanout_sigbg__1": b_bg[i]})).collect();
+        let root = |spec: &Value, parts: &[Value]| {
+            let refs: Vec<&Value> = parts.iter().collect();
+            let out = reduce_root(spec, &refs, false);
+            assert!(take_error().is_none());
+            out
+        };
+        let (ra, rb, rab) = (root(&a, &alone_a), root(&b, &alone_b), root(&both, &together));
+        assert_eq!(rab["a"], ra["a"], "{rab}");
+        assert_eq!(rab["b"], rb["b"], "{rab}");
+        // Background counts are the merged helper's, added once.
+        let x = ra["a"]["sig"]["buckets"].as_array().unwrap().iter().find(|b| b["key"] == "x").cloned().unwrap();
+        assert_eq!(x["bg_count"], 18, "{ra}");
+        let p = rb["b"]["sig"]["buckets"].as_array().unwrap().iter().find(|b| b["key"] == "p").cloned().unwrap();
+        assert_eq!(p["bg_count"], 38, "{rb}");
+        // Same name, same field, different parents and background filters.
+        let c = json!({"c": {"filter": {"term": {"x": 1}}, "aggs": {"sig": {"significant_terms": {"field": "k", "min_doc_count": 1}}}},
+            "d": {"terms": {"field": "t"}, "aggs": {"sig": {"significant_terms": {"field": "k", "min_doc_count": 1, "background_filter": {"term": {"y": 1}}}}}}});
+        let rw = rewrite_root(&c);
+        assert!(rw["__fanout_sigbg__0"]["aggs"]["f"]["filter"].get("match_all").is_some(), "{rw}");
+        assert_eq!(rw["__fanout_sigbg__1"]["aggs"]["f"]["filter"], json!({"term": {"y": 1}}), "{rw}");
+        // No reduce state is left behind for the next request.
+        assert!(SIG_BG.with(|s| s.borrow().is_empty()));
+        assert!(PATH.with(|p| p.borrow().is_empty()));
     }
 
     fn values(pairs: &[(f64, u64)]) -> Value {
@@ -2466,7 +2528,7 @@ mod tests {
         let parts = vec![a, b];
         let refs: Vec<&Value> = parts.iter().collect();
         SIG_BG.with(|s| {
-            s.borrow_mut().insert("s".into(), (HashMap::from([(json!("x").to_string(), 8u64), (json!("y").to_string(), 20u64)]), true));
+            s.borrow_mut().insert(vec!["s".to_string()], (HashMap::from([(json!("x").to_string(), 8u64), (json!("y").to_string(), 20u64)]), true));
         });
         let out = reduce(&spec, &refs, false);
         SIG_BG.with(|s| s.borrow_mut().clear());
@@ -2516,6 +2578,20 @@ mod tests {
         let out = red(spec, vec![a, b]);
         assert_eq!(out["c"], json!({"after_key": {"k": "a", "n": 1}, "buckets": [
             {"key": {"k": "b", "n": 0}, "doc_count": 1}, {"key": {"k": "b", "n": 1}, "doc_count": 1}, {"key": {"k": "a", "n": 1}, "doc_count": 3}]}));
+    }
+
+    /// #528: shard pages of a version (and an ip) source merge in version
+    /// (address) order, as the shards told (`__p.key_types`).
+    #[test]
+    fn composite_typed_sources_merge_in_their_order() {
+        let spec = json!({"c": {"composite": {"size": 3, "sources": [{"v": {"terms": {"field": "v"}}}]}}});
+        let part = |keys: &[&str], ty: &str| json!({"c": {"buckets": keys.iter().map(|k| json!({"key": {"v": k}, "doc_count": 1})).collect::<Vec<_>>(), "__p": {"key_types": {"v": ty}}}});
+        let out = red(spec.clone(), vec![part(&["2.0.0", "10.0.0"], "version"), part(&["1.5.0"], "version")]);
+        let keys: Vec<&str> = out["c"]["buckets"].as_array().unwrap().iter().map(|b| b["key"]["v"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["1.5.0", "2.0.0", "10.0.0"], "{out}");
+        let out = red(spec, vec![part(&["10.0.0.9", "10.0.0.10"], "ip")]);
+        let keys: Vec<&str> = out["c"]["buckets"].as_array().unwrap().iter().map(|b| b["key"]["v"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["10.0.0.9", "10.0.0.10"], "{out}");
     }
 
     #[test]
@@ -2569,6 +2645,134 @@ mod tests {
         let out = red(spec, vec![part(1.0, 5.0, 9.0, 3), part(-2.0, 4.0, 3.0, 1)]);
         assert_eq!(out, json!({"mn": {"value": -2.0}, "mx": {"value": 5.0}, "s": {"value": 12.0}, "n": {"value": 4}, "a": {"value": 3.0},
             "st": {"count": 4, "min": -2.0, "max": 5.0, "avg": 3.0, "sum": 12.0}}));
+    }
+
+    /// #216: the avg helper is a sum and a value count, which
+    /// `aggregate_metric_double` supports (a `stats` helper fails its
+    /// shards): two nodes' sums and counts weigh the average.
+    #[test]
+    fn avg_helper_is_a_sum_and_value_count() {
+        let r = rewrite(&json!({"a": {"avg": {"field": "gauge", "missing": 0}}}));
+        let h = &r["__fanout_avg__a"];
+        assert!(h.get("stats").is_none(), "{r}");
+        assert_eq!(h["aggs"]["s"], json!({"sum": {"field": "gauge", "missing": 0}}));
+        assert_eq!(h["aggs"]["c"], json!({"value_count": {"field": "gauge", "missing": 0}}));
+        let spec = json!({"a": {"avg": {"field": "gauge"}}});
+        let part = |s: f64, n: u64| json!({"a": {"value": s / n as f64}, "__fanout_avg__a": {"doc_count": 1, "s": {"value": s}, "c": {"value": n}}});
+        // A downsampled index (sum 30 over 5 values) and a raw one (2 values).
+        let out = red(spec, vec![part(30.0, 5), part(5.0, 2)]);
+        assert_eq!(out, json!({"a": {"value": 5.0}}));
+    }
+
+    /// #577: the children of a bucket the reduce fills (no shard has it)
+    /// render their empty results; sketch metrics do not fail the search.
+    #[test]
+    fn filled_buckets_render_empty_sketch_metrics() {
+        let _ = take_error();
+        let spec = json!({
+            "c": {"cardinality": {"field": "k"}},
+            "p": {"percentiles": {"field": "v", "percents": [50]}},
+            "b": {"boxplot": {"field": "v"}},
+            "t": {"t_test": {"a": {"field": "v"}, "b": {"field": "w"}, "type": "paired"}}
+        });
+        let out = reduce(&spec, &[], false);
+        assert!(take_error().is_none(), "{out}");
+        assert_eq!(out["c"], json!({"value": 0}), "{out}");
+        assert!(out["p"]["values"].as_object().is_some_and(|v| v.values().all(Value::is_null)), "{out}");
+        assert!(out["b"].get("min").is_some(), "{out}");
+        assert!(out["t"].get("value").is_some(), "{out}");
+    }
+
+    /// #569: a user aggregation named like a helper keeps its own result
+    /// and the average its own sum and count, in both declaration orders.
+    #[test]
+    fn user_names_like_helpers_do_not_collide() {
+        for spec in [
+            json!({"a": {"avg": {"field": "x"}}, "__fanout_avg__a": {"stats": {"field": "y"}}}),
+            json!({"__fanout_avg__a": {"stats": {"field": "y"}}, "a": {"avg": {"field": "x"}}}),
+        ] {
+            let rw = rewrite_root(&spec);
+            assert_eq!(rw["__fanout_avg__a"], json!({"stats": {"field": "y"}}), "{rw}");
+            assert!(rw.get("__fanout1_avg__a").is_some(), "{rw}");
+            let part = |x: f64, y: f64| json!({
+                "a": {"value": x},
+                "__fanout_avg__a": {"count": 1, "min": y, "max": y, "avg": y, "sum": y},
+                "__fanout1_avg__a": {"doc_count": 1, "s": {"value": x}, "c": {"value": 1}}
+            });
+            let parts = [part(10.0, 100.0), part(20.0, 200.0)];
+            let out = reduce_root(&spec, &parts.iter().collect::<Vec<_>>(), false);
+            assert_eq!(out["a"]["value"].as_f64(), Some(15.0), "{out}");
+            assert_eq!(out["__fanout_avg__a"]["sum"].as_f64(), Some(300.0), "{out}");
+            assert!(out.get("__fanout1_avg__a").is_none(), "{out}");
+        }
+    }
+
+    /// #217: shards report unit-wide buckets (with their chosen interval
+    /// as the floor), so the coordinator's rounding splits nothing: A at
+    /// 0s,10s and B at 5s,14s,15s give 0s:2, 10s:3 (not 3/2).
+    #[test]
+    fn auto_date_histogram_merges_unit_buckets_under_global_boundaries() {
+        let spec = json!({"a": {"auto_date_histogram": {"field": "t", "buckets": 2}, "aggs": {"s": {"sum": {"field": "v"}}}}});
+        let b = |k: i64, n: u64, s: f64| json!({"key": k, "doc_count": n, "s": {"value": s}});
+        let a = json!({"a": {"buckets": [b(0, 1, 1.0), b(10_000, 1, 1.0)], "interval": "10s"}});
+        let bb = json!({"a": {"buckets": [b(5_000, 1, 2.0), b(14_000, 1, 2.0), b(15_000, 1, 2.0)], "interval": "10s"}});
+        let out = red(spec, vec![a, bb]);
+        let got: Vec<(i64, u64, f64)> = out["a"]["buckets"].as_array().unwrap().iter()
+            .map(|x| (x["key"].as_i64().unwrap(), x["doc_count"].as_u64().unwrap(), x["s"]["value"].as_f64().unwrap())).collect();
+        assert_eq!(got, vec![(0, 2, 3.0), (10_000, 3, 5.0)], "{out}");
+        assert_eq!(out["a"]["interval"], "10s");
+    }
+
+    /// #228: a long field's `1` and a double field's `1.0` are one terms
+    /// bucket (promoted to double), counted and merged together.
+    #[test]
+    fn terms_merge_equal_numeric_keys_across_spellings() {
+        let spec = json!({"t": {"terms": {"field": "n", "min_doc_count": 2}, "aggs": {"s": {"sum": {"field": "n"}}}}});
+        let a = json!({"t": {"doc_count_error_upper_bound": 0, "sum_other_doc_count": 0, "buckets": [{"key": 1, "doc_count": 1, "s": {"value": 1.0}}]}});
+        let b = json!({"t": {"doc_count_error_upper_bound": 0, "sum_other_doc_count": 0, "buckets": [{"key": 1.0, "doc_count": 1, "s": {"value": 1.0}}]}});
+        let out = red(spec, vec![a.clone(), b]);
+        let t = &out["t"];
+        assert_eq!(t["buckets"].as_array().unwrap().len(), 1, "{out}");
+        assert_eq!(t["buckets"][0]["doc_count"], 2);
+        assert_eq!(t["buckets"][0]["s"]["value"], 2.0);
+        assert!(t["buckets"][0]["key"].is_f64(), "promoted to double: {out}");
+        // A homogeneous control keeps its integer key.
+        let out = red(json!({"t": {"terms": {"field": "n"}}}), vec![a.clone(), a]);
+        assert_eq!(out["t"]["buckets"][0]["key"], json!(1));
+        assert_eq!(out["t"]["buckets"][0]["doc_count"], 2);
+    }
+
+    /// #358: geo_centroid of shapes on two nodes weights each shard's
+    /// polygons by area (and drops lower dimensions), as one shard does.
+    #[test]
+    fn shape_centroids_reduce_by_weight_and_dimension() {
+        let spec = json!({"c": {"geo_centroid": {"field": "g"}}});
+        let part = |lon: f64, w: f64, dim: u8, lat: f64| json!({"c": {"location": {"lat": lat, "lon": lon}, "count": 1,
+            "__p": {"centroid": [{"shape": true, "lat": lat * w, "lon": lon * w, "weight": w, "dim": dim, "count": 1}]}}});
+        // Areas 1 and 9 at longitudes 0 and 10: longitude 9, not 5.
+        let out = red(spec.clone(), vec![part(0.0, 1.0, 2, 0.0), part(10.0, 9.0, 2, 0.0)]);
+        assert!((out["c"]["location"]["lon"].as_f64().unwrap() - 9.0).abs() < 1e-9, "{out}");
+        assert_eq!(out["c"]["count"], 2);
+        // A polygon and a point: the point does not count.
+        let out = red(spec, vec![part(0.0, 1.0, 2, 0.0), part(10.0, 1.0, 0, 0.0)]);
+        assert!((out["c"]["location"]["lon"].as_f64().unwrap()).abs() < 1e-9, "{out}");
+        assert_eq!(out["c"]["count"], 1);
+    }
+
+    /// #358: cartesian_centroid of shapes reduces the same way.
+    #[test]
+    fn cartesian_shape_centroids_reduce_by_weight_and_dimension() {
+        let spec = json!({"c": {"cartesian_centroid": {"field": "s"}}});
+        let part = |x: f64, w: f64, dim: u8| json!({"c": {"location": {"x": x, "y": 2.0}, "count": 1,
+            "__p": {"centroid": [{"shape": true, "lat": 2.0 * w, "lon": x * w, "weight": w, "dim": dim, "count": 1}]}}});
+        let out = red(spec.clone(), vec![part(0.0, 1.0, 2), part(10.0, 9.0, 2)]);
+        assert!((out["c"]["location"]["x"].as_f64().unwrap() - 9.0).abs() < 1e-9, "{out}");
+        assert!((out["c"]["location"]["y"].as_f64().unwrap() - 2.0).abs() < 1e-9, "{out}");
+        assert_eq!(out["c"]["count"], 2);
+        assert!(out["c"].get("__p").is_none(), "{out}");
+        let out = red(spec, vec![part(0.0, 1.0, 2), part(10.0, 1.0, 0)]);
+        assert!(out["c"]["location"]["x"].as_f64().unwrap().abs() < 1e-9, "{out}");
+        assert_eq!(out["c"]["count"], 1);
     }
 
     #[test]

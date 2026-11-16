@@ -116,6 +116,8 @@ schemars = "1"
 [features]
 default = ["mutable-hnsw"]
 mutable-hnsw = ["elasticsearch-node/mutable-hnsw"]
+# Real CPU inference for `.multilingual-e5-small` (candle).
+candle-models = ["elasticsearch-node/candle-models"]
 
 [dependencies]
 elasticsearch-node = { path = "cluster/crates/elasticsearch-node" }

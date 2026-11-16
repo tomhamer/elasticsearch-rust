@@ -90,6 +90,17 @@ pub fn plan(pods: &[PodView], expected: usize, es: &EsObservation, max_unavailab
         return p;
     }
 
+    // 2b. repair: an outdated pod that is not ready and not a member of the
+    // cluster serves nothing; replacing it (its volume stays) costs no
+    // availability, so neither the budget nor green health gates it. A
+    // failed image is otherwise never rolled back while other pods stay
+    // healthy (production review #288).
+    for pd in outdated.iter().filter(|pd| !pd.ready && !pd.terminating && es.node_id(&pd.name).is_none()) {
+        p.actions.push(RollingAction::DeletePod { pod: pd.name.clone() });
+    }
+    let repaired = |name: &str| p.actions.iter().any(|a| matches!(a, RollingAction::DeletePod { pod } if pod == name));
+    let repaired_names: Vec<String> = outdated.iter().filter(|pd| repaired(&pd.name)).map(|pd| pd.name.clone()).collect();
+
     // 3. continue restarts already prepared
     let mut in_progress = 0usize;
     let mut prepared_ready = 0usize;
@@ -110,7 +121,11 @@ pub fn plan(pods: &[PodView], expected: usize, es: &EsObservation, max_unavailab
     let terminating = outdated.iter().filter(|pd| pd.terminating).count();
     in_progress += terminating;
 
-    // 4. start new restarts
+    // 4. start new restarts, never while a repair is replacing a pod
+    if !repaired_names.is_empty() {
+        p.waiting.push("rolling restart: replacing unavailable outdated pods first".into());
+        return p;
+    }
     let unavailable = expected.saturating_sub(ready_count);
     let mut budget: i64 = match max_unavailable {
         None => i64::MAX,
@@ -126,7 +141,7 @@ pub fn plan(pods: &[PodView], expected: usize, es: &EsObservation, max_unavailab
     let mut candidates: Vec<&PodView> = outdated
         .iter()
         .copied()
-        .filter(|pd| !pd.terminating && es.node_id(&pd.name).is_none_or(|id| !es.shutdowns.iter().filter(ours).any(|r| r.node_id == id)))
+        .filter(|pd| !pd.terminating && !repaired_names.contains(&pd.name) && es.node_id(&pd.name).is_none_or(|id| !es.shutdowns.iter().filter(ours).any(|r| r.node_id == id)))
         .collect();
     candidates.sort_by(|a, b| a.master.cmp(&b.master).then(a.sts.cmp(&b.sts)).then(b.ordinal.cmp(&a.ordinal)));
 
@@ -176,6 +191,24 @@ mod tests {
 
     fn rec(pod: &str, status: &str) -> ShutdownRecord {
         ShutdownRecord { node_id: format!("id-{pod}"), type_: ShutdownType::Restart, reason: SHUTDOWN_REASON.into(), status: status.into() }
+    }
+
+    /// Production review #288: a replacement stuck on a bad image (not
+    /// ready, not in the cluster, still outdated after the spec is fixed)
+    /// is replaced although another pod's absence already uses the
+    /// maxUnavailable budget and health is not green; no healthy pod is
+    /// restarted meanwhile. The planner is pure, so an operator restart
+    /// in this state plans the same.
+    #[test]
+    fn a_failed_replacement_is_repaired_without_consuming_availability() {
+        let mut pods = vec![pod("c-es-d", 0, true, true, true), pod("c-es-d", 1, true, true, true), pod("c-es-d", 2, true, true, true)];
+        pods[2].ready = false;
+        let mut o = obs(&pods[..2], Health::Yellow);
+        o.nodes.retain(|n| n.name != "c-es-d-2");
+        let p = plan(&pods, 3, &o, Some(1));
+        assert_eq!(p.actions, vec![RollingAction::DeletePod { pod: "c-es-d-2".into() }], "{:?}", p.waiting);
+        // A ready outdated member is never restarted while the repair runs.
+        assert!(!p.actions.iter().any(|a| matches!(a, RollingAction::PrepareShutdown { .. })));
     }
 
     #[test]

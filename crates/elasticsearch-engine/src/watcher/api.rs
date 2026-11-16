@@ -5,6 +5,7 @@ use super::model;
 use super::{iso, put_doc, service, watches_index, CachedWatch, WatcherService};
 use crate::error::{EsError, Result};
 use crate::node::{Node, ResolveOpts, NODE_ID};
+use crate::security::owner::StoredAuthn;
 use crate::shard::WriteCond;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -127,9 +128,9 @@ pub struct PutParams {
     pub version: Option<i64>,
     pub if_seq_no: Option<i64>,
     pub if_primary_term: Option<u64>,
-    /// Security: the (effective) user storing the watch; scheduled
-    /// executions run as this user.
-    pub user: Option<String>,
+    /// Security: the subject storing the watch; scheduled executions run
+    /// as it (stored with the watch, as ES stores the security headers).
+    pub identity: Option<StoredAuthn>,
 }
 
 /// `PUT _watcher/watch/{id}`.
@@ -150,8 +151,8 @@ pub fn put_watch(node: &Node, id: &str, body: &Value, p: &PutParams) -> Result<V
         model::restore_redacted(&mut body, stored.as_ref());
     }
     let mut src = model::parse_watch(id, &body, now, p.active)?;
-    if let Some(u) = p.user.as_ref().filter(|_| node.security.enabled()) {
-        src["status"]["headers"] = json!({"_xpack_security_authentication": u});
+    if let Some(id) = p.identity.as_ref().filter(|_| node.security.enabled()) {
+        src["status"]["headers"] = json!({"_xpack_security_authentication": id.encode()});
     }
     validate_accounts(node, &src)?;
     validate_scripts(&src)?;
@@ -165,10 +166,56 @@ pub fn put_watch(node: &Node, id: &str, body: &Value, p: &PutParams) -> Result<V
     Ok(json!({"_id": id, "_version": version, "_seq_no": seq_no, "_primary_term": pt, "created": created}))
 }
 
+/// On a cluster, make the cached copy of watch `id` the one in `.watches`
+/// (read through the coordinator, real time, as ES's `TransportGetWatchAction`
+/// reads the index): executions on other nodes update a watch's status, and
+/// another master may have stored it. Off a cluster the cache is the index.
+pub fn sync_from_index(node: &Node, svc: &WatcherService, id: &str) -> Result<()> {
+    if super::remote().is_none() {
+        return Ok(());
+    }
+    reload_one(node, svc, id)
+}
+
+/// Make the cached copy of watch `id` the document in `.watches` (on a
+/// cluster through the coordinator, else this node's index). A watch whose
+/// trigger, start time and activity did not change keeps its next fire time.
+fn reload_one(node: &Node, svc: &WatcherService, id: &str) -> Result<()> {
+    let current = match node.get_index(super::WATCHES_INDEX) {
+        Some(idx) => super::get_doc(&idx, id)?,
+        None if super::remote().is_some() => {
+            // Not known here yet: the coordinator still knows the index.
+            let rest = super::remote().ok_or_else(|| EsError::internal("no coordinator"))?;
+            match rest("GET", &format!("/{}/_doc/{}", super::WATCHES_INDEX, super::path_expr(id)), None) {
+                Ok(v) if v["found"] == true => Some((v["_source"].clone(), v["_version"].as_u64().unwrap_or(1), v["_seq_no"].as_i64().unwrap_or(0), v["_primary_term"].as_u64().unwrap_or(1))),
+                Ok(_) => None,
+                Err(e) if e.kind == "index_not_found_exception" => None,
+                Err(e) => return Err(e),
+            }
+        }
+        None => None,
+    };
+    let _g = svc.load_lock.lock();
+    let mut cache = svc.cache.write();
+    let Some((src, version, seq_no, pt)) = current else {
+        cache.remove(id);
+        return Ok(());
+    };
+    let mut cw = model::build_cached(id, src, version, seq_no, pt)?;
+    if let Some(old) = cache.get(id) {
+        if old.src["trigger"] == cw.src["trigger"] && old.start_time() == cw.start_time() && old.active() == cw.active() {
+            cw.next_fire = old.next_fire;
+        }
+    }
+    cache.insert(id.to_string(), cw);
+    Ok(())
+}
+
 /// `GET _watcher/watch/{id}` -> `(status code, body)`.
 pub fn get_watch(node: &Node, id: &str) -> Result<(u16, Value)> {
     let svc = service(node);
     svc.ensure_loaded(node);
+    sync_from_index(node, &svc, id)?;
     let cache = svc.cache.read();
     match cache.get(id) {
         None => Ok((404, json!({"found": false, "_id": id}))),
@@ -198,29 +245,120 @@ pub fn delete_watch(node: &Node, id: &str) -> Result<(u16, Value)> {
     }
 }
 
-/// Persist `status` of watch `id` (called by the executor).
-pub fn store_status(node: &Node, svc: &WatcherService, id: &str, status: &Value) {
-    let _g = svc.load_lock.lock();
-    let Some(idx) = node.get_index(super::WATCHES_INDEX) else { return };
-    let mut cache = svc.cache.write();
-    let Some(cw) = cache.get_mut(id) else { return };
-    let mut src = cw.src.clone();
-    let headers = src["status"].get("headers").cloned();
-    src["status"] = status.clone();
-    if let Some(h) = headers {
-        src["status"]["headers"] = h;
-    }
-    match put_doc(&idx, id, &src, WriteCond::default()) {
-        Ok((v, s, pt, _)) => {
-            cw.src = src;
-            cw.version = v;
-            cw.seq_no = s;
-            cw.primary_term = pt;
-        }
-        Err(e) => tracing::warn!("failed to store status of watch [{id}]: {e}"),
-    }
+/// How often a status write retries after a concurrent change of the watch.
+const STATUS_RETRIES: usize = 16;
+
+fn is_conflict(e: &EsError) -> bool {
+    e.kind == "version_conflict_engine_exception"
 }
 
+/// The status an execution stores, merged into the watch's `current` status
+/// (ES `ExecutionService.updateWatchStatus` writes the status without its
+/// `state`, conditioned on the watch's seq_no/primary_term). `base` is the
+/// status the execution started from and `exec` the one it computed. Control
+/// state accepted meanwhile wins: activation is never the execution's to
+/// write, and an action whose ack changed since `base` (acknowledged, or
+/// reset by another execution) keeps the current ack. Actions the current
+/// watch no longer has (it was replaced) are dropped.
+pub fn merge_exec_status(current: &Value, base: &Value, exec: &Value) -> Value {
+    let mut out = exec.clone();
+    match current.get("state") {
+        Some(st) => out["state"] = st.clone(),
+        None => {
+            if let Some(o) = out.as_object_mut() {
+                o.remove("state");
+            }
+        }
+    }
+    if let Some(h) = current.get("headers") {
+        out["headers"] = h.clone();
+    }
+    let cur_actions = current.get("actions").and_then(Value::as_object);
+    if let Some(acts) = out.get_mut("actions").and_then(Value::as_object_mut) {
+        if let Some(cur) = cur_actions {
+            acts.retain(|aid, _| cur.contains_key(aid));
+        }
+        for (aid, a) in acts.iter_mut() {
+            let Some(cur_ack) = cur_actions.and_then(|c| c.get(aid)).and_then(|c| c.get("ack")) else { continue };
+            if base["actions"][aid]["ack"] != *cur_ack {
+                a["ack"] = cur_ack.clone();
+            }
+        }
+        if let Some(cur) = cur_actions {
+            for (aid, c) in cur {
+                if !acts.contains_key(aid) {
+                    acts.insert(aid.clone(), c.clone());
+                }
+            }
+        }
+    }
+    canon_with_headers(&out)
+}
+
+/// [`canon_status`], keeping the stored security `headers`.
+fn canon_with_headers(s: &Value) -> Value {
+    let mut c = canon_status(s);
+    if let Some(h) = s.get("headers") {
+        c["headers"] = h.clone();
+    }
+    c
+}
+
+/// Persist the status an execution of watch `id` computed (`exec`, from the
+/// status `base` it started with). The watch is re-read, the status merged
+/// into it ([`merge_exec_status`]) and written conditionally on the read's
+/// seq_no/primary_term; a concurrent change (ack, (de)activation, another
+/// execution) makes the write retry from a fresh read, so an accepted
+/// control change is never undone. A watch deleted meanwhile is left alone.
+pub fn store_status(node: &Node, svc: &WatcherService, id: &str, base: &Value, exec: &Value) {
+    let Some(idx) = node.get_index(super::WATCHES_INDEX) else { return };
+    let _g = svc.load_lock.lock();
+    for _ in 0..STATUS_RETRIES {
+        let (mut src, _, seq_no, pt) = match super::get_doc(&idx, id) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                svc.cache.write().remove(id);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("failed to read watch [{id}] to store its status: {e}");
+                return;
+            }
+        };
+        src["status"] = merge_exec_status(&src["status"], base, exec);
+        let cond = WriteCond { if_seq_no: Some(seq_no), if_primary_term: Some(pt), ..Default::default() };
+        match put_doc(&idx, id, &src, cond) {
+            Ok((v, s, pt, _)) => {
+                let mut cache = svc.cache.write();
+                if cache.get(id).is_some_and(|old| old.seq_no > s) {
+                    return;
+                }
+                match model::build_cached(id, src, v, s, pt) {
+                    Ok(mut cw) => {
+                        if let Some(old) = cache.get(id) {
+                            if old.src["trigger"] == cw.src["trigger"] && old.start_time() == cw.start_time() && old.active() == cw.active() {
+                                cw.next_fire = old.next_fire;
+                            }
+                        }
+                        cache.insert(id.to_string(), cw);
+                    }
+                    Err(e) => tracing::warn!("failed to cache watch [{id}]: {e}"),
+                }
+                return;
+            }
+            Err(e) if is_conflict(&e) => continue,
+            Err(e) => {
+                tracing::warn!("failed to store status of watch [{id}]: {e}");
+                return;
+            }
+        }
+    }
+    tracing::warn!("failed to store status of watch [{id}]: it kept changing concurrently");
+}
+
+/// Write `new_status` of the cached watch `id`, conditioned on the cached
+/// copy's seq_no/primary_term (ES's ack and (de)activate actions update the
+/// watch with `if_seq_no`); a conflict surfaces to the caller, which re-reads.
 fn update_status(node: &Node, svc: &WatcherService, id: &str, new_status: Value) -> Result<(u64, i64, u64)> {
     let idx = watches_index(node)?;
     let mut cache = svc.cache.write();
@@ -231,7 +369,8 @@ fn update_status(node: &Node, svc: &WatcherService, id: &str, new_status: Value)
     if let Some(h) = headers {
         src["status"]["headers"] = h;
     }
-    let (v, s, pt, _) = put_doc(&idx, id, &src, WriteCond::default())?;
+    let cond = WriteCond { if_seq_no: Some(cw.seq_no), if_primary_term: Some(cw.primary_term), ..Default::default() };
+    let (v, s, pt, _) = put_doc(&idx, id, &src, cond)?;
     cw.src = src;
     cw.version = v;
     cw.seq_no = s;
@@ -240,10 +379,30 @@ fn update_status(node: &Node, svc: &WatcherService, id: &str, new_status: Value)
     Ok((v, s, pt))
 }
 
+/// Run a status change of watch `id` against a fresh read of it, retrying
+/// from a new read when the watch changed concurrently.
+fn with_retry<T>(node: &Node, svc: &WatcherService, id: &str, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Err(e) if is_conflict(&e) && attempt + 1 < STATUS_RETRIES => {
+                attempt += 1;
+                reload_one(node, svc, id)?;
+            }
+            r => return r,
+        }
+    }
+}
+
 /// `POST _watcher/watch/{id}/_ack[/{actions}]`.
 pub fn ack_watch(node: &Node, id: &str, actions: Option<&str>) -> Result<Value> {
     let svc = service(node);
     svc.ensure_loaded(node);
+    sync_from_index(node, &svc, id)?;
+    with_retry(node, &svc, id, || ack_once(node, &svc, id, actions))
+}
+
+fn ack_once(node: &Node, svc: &WatcherService, id: &str, actions: Option<&str>) -> Result<Value> {
     let _g = svc.load_lock.lock();
     let (mut status, loaded_version) = {
         let cache = svc.cache.read();
@@ -265,7 +424,7 @@ pub fn ack_watch(node: &Node, id: &str, actions: Option<&str>) -> Result<Value> 
         }
     }
     if changed {
-        update_status(node, &svc, id, status.clone())?;
+        update_status(node, svc, id, status.clone())?;
     }
     status["version"] = json!(loaded_version);
     Ok(json!({"status": canon_status(&status)}))
@@ -275,6 +434,11 @@ pub fn ack_watch(node: &Node, id: &str, actions: Option<&str>) -> Result<Value> 
 pub fn set_active(node: &Node, id: &str, active: bool) -> Result<Value> {
     let svc = service(node);
     svc.ensure_loaded(node);
+    sync_from_index(node, &svc, id)?;
+    with_retry(node, &svc, id, || set_active_once(node, &svc, id, active))
+}
+
+fn set_active_once(node: &Node, svc: &WatcherService, id: &str, active: bool) -> Result<Value> {
     let _g = svc.load_lock.lock();
     let (mut status, loaded_version) = {
         let cache = svc.cache.read();
@@ -290,16 +454,23 @@ pub fn set_active(node: &Node, id: &str, active: bool) -> Result<Value> {
     if status["state"]["active"].as_bool() != Some(active) {
         status["state"] = json!({"active": active, "timestamp": iso(crate::date::now_millis())});
     }
-    let (version, _, _) = update_status(node, &svc, id, status.clone())?;
+    let (version, _, _) = update_status(node, svc, id, status.clone())?;
     status["version"] = json!(version);
     Ok(json!({"status": canon_status(&status)}))
 }
 
 /// Request-level parameters of `_execute`.
-pub fn execute_watch(node: &Node, id: Option<&str>, body: &Value, _debug: bool, user: Option<String>) -> Result<Value> {
+/// `caller`: the requesting subject. `_execute` runs the watch, inline or
+/// stored, as it (ES `TransportExecuteWatchAction` replaces the stored
+/// watch's security headers with the request's, so a run-as request runs
+/// and records as the run-as user); scheduled runs use the stored subject.
+pub fn execute_watch(node: &Node, id: Option<&str>, body: &Value, _debug: bool, caller: Option<StoredAuthn>) -> Result<Value> {
     let svc = service(node);
     svc.ensure_loaded(node);
-    let mut opts = ExecOptions { manual: true, user, ..Default::default() };
+    let mut opts = ExecOptions { manual: true, identity: caller, ..Default::default() };
+    if let Some(id) = id {
+        sync_from_index(node, &svc, id)?;
+    }
     let mut inline: Option<Value> = None;
     if let Some(o) = body.as_object() {
         let pe = |m: String| model::parse_exc(format!("could not parse watch execution request. {m}"));
@@ -344,6 +515,9 @@ pub fn execute_watch(node: &Node, id: Option<&str>, body: &Value, _debug: bool, 
                     not_exist(id)
                 }
             })?;
+            if opts.identity.is_none() {
+                opts.identity = exec::stored_identity(node, id, &cw.src)?;
+            }
             (id.to_string(), cw.src.clone(), cw.version as i64)
         }
         (Some(_), Some(_)) => return Err(EsError::action_validation(&["a watch cannot be both stored and inlined"])),
@@ -587,4 +761,136 @@ pub fn cached(node: &Node, id: &str) -> Option<Arc<Value>> {
     let svc = service(node);
     let cache = svc.cache.read();
     cache.get(id).map(|w: &CachedWatch| Arc::new(w.src.clone()))
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    //! An execution that started before an ack or a deactivation stores its
+    //! status after them: the accepted control change must stay effective
+    //! (ES `ExecutionService.updateWatchStatus` never writes `state` and
+    //! writes conditionally on the watch's seq_no/primary_term).
+    use super::*;
+    use crate::watcher::{get_doc, put_doc_local, WATCHES_INDEX};
+
+    fn watch() -> Value {
+        json!({
+            "trigger": {"schedule": {"interval": "1h"}},
+            "input": {"simple": {"n": 1}},
+            "condition": {"always": {}},
+            "actions": {"log": {"logging": {"text": "watch {{ctx.watch_id}}"}}}
+        })
+    }
+
+    fn setup(id: &str) -> (tempfile::TempDir, Arc<Node>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let p = PutParams { active: true, version: None, if_seq_no: None, if_primary_term: None, identity: None };
+        put_watch(&node, id, &watch(), &p).unwrap();
+        (tmp, node)
+    }
+
+    /// The `.watches` document as stored (not the cache).
+    fn stored(node: &Node, id: &str) -> Value {
+        let idx = node.get_index(WATCHES_INDEX).unwrap();
+        get_doc(&idx, id).unwrap().unwrap().0
+    }
+
+    /// Run the watch from `src` (the copy an execution started with) and
+    /// record it, as a scheduled or `record_execution: true` run does.
+    fn run(node: &Node, id: &str, src: &Value) {
+        let svc = service(node);
+        let opts = ExecOptions { record: true, manual: true, ..Default::default() };
+        exec::execute(node, &svc, id, src, 1, None, crate::date::now_millis(), &opts).unwrap();
+    }
+
+    fn snapshot(node: &Node, id: &str) -> Value {
+        (*cached(node, id).unwrap()).clone()
+    }
+
+    #[test]
+    fn ack_during_execution_is_not_undone() {
+        let (_tmp, node) = setup("w");
+        run(&node, "w", &snapshot(&node, "w"));
+        assert_eq!(stored(&node, "w")["status"]["actions"]["log"]["ack"]["state"], "ackable");
+        // An execution starts from this copy, the watch is acknowledged
+        // meanwhile, then the execution stores its status.
+        let inflight = snapshot(&node, "w");
+        let before = stored(&node, "w")["status"]["last_checked"].clone();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let r = ack_watch(&node, "w", None).unwrap();
+        assert_eq!(r["status"]["actions"]["log"]["ack"]["state"], "acked");
+        run(&node, "w", &inflight);
+        let st = stored(&node, "w")["status"].clone();
+        assert_eq!(st["actions"]["log"]["ack"]["state"], "acked", "ack reverted by the in-flight execution: {st}");
+        let (_, got) = get_watch(&node, "w").unwrap();
+        assert_eq!(got["status"]["actions"]["log"]["ack"]["state"], "acked", "{got}");
+        // The execution's own fields still landed.
+        assert!(st["last_checked"].is_string() && st["last_checked"] != before, "{st}");
+        assert!(st["execution_state"].is_string(), "{st}");
+        assert_eq!(st["state"]["active"], true);
+    }
+
+    #[test]
+    fn deactivate_during_execution_is_not_undone() {
+        let (_tmp, node) = setup("w");
+        let inflight = snapshot(&node, "w");
+        assert_eq!(inflight["status"]["state"]["active"], true);
+        let r = set_active(&node, "w", false).unwrap();
+        assert_eq!(r["status"]["state"]["active"], false);
+        run(&node, "w", &inflight);
+        let st = stored(&node, "w")["status"].clone();
+        assert_eq!(st["state"]["active"], false, "deactivation reverted by the in-flight execution: {st}");
+        assert!(st["last_checked"].is_string(), "the execution's status was stored: {st}");
+        assert_eq!(cached(&node, "w").unwrap()["status"]["state"]["active"], false);
+        let (_, got) = get_watch(&node, "w").unwrap();
+        assert_eq!(got["status"]["state"]["active"], false, "{got}");
+        // A deactivated watch is not scheduled.
+        let svc = service(&node);
+        assert!(crate::watcher::due_watches(&svc, crate::date::now_millis() + 10 * 3_600_000).iter().all(|(id, _)| id != "w"));
+        // Re-activation still works and is likewise kept.
+        let inflight = snapshot(&node, "w");
+        set_active(&node, "w", true).unwrap();
+        run(&node, "w", &inflight);
+        assert_eq!(stored(&node, "w")["status"]["state"]["active"], true);
+    }
+
+    #[test]
+    fn ack_retries_after_a_concurrent_status_write() {
+        let (_tmp, node) = setup("w");
+        run(&node, "w", &snapshot(&node, "w"));
+        // Another writer (an execution on another node) stores a status the
+        // cache has not seen: the conditional ack conflicts, re-reads and
+        // keeps that write's fields.
+        let idx = node.get_index(WATCHES_INDEX).unwrap();
+        let mut src = stored(&node, "w");
+        src["status"]["last_checked"] = json!("2030-01-01T00:00:00.000Z");
+        put_doc_local(&idx, "w", &src, WriteCond::default()).unwrap();
+        let r = ack_watch(&node, "w", None).unwrap();
+        assert_eq!(r["status"]["actions"]["log"]["ack"]["state"], "acked", "{r}");
+        let st = stored(&node, "w")["status"].clone();
+        assert_eq!(st["actions"]["log"]["ack"]["state"], "acked", "{st}");
+        assert_eq!(st["last_checked"], "2030-01-01T00:00:00.000Z", "the concurrent write survived: {st}");
+    }
+
+    #[test]
+    fn merge_keeps_control_state_and_execution_fields() {
+        let base = json!({"state": {"active": true, "timestamp": "t0"}, "actions": {"a": {"ack": {"state": "ackable", "timestamp": "t0"}}, "gone": {"ack": {"state": "ackable"}}}});
+        let current = json!({"state": {"active": false, "timestamp": "t1"}, "headers": {"h": "x"},
+            "actions": {"a": {"ack": {"state": "acked", "timestamp": "t1"}}, "b": {"ack": {"state": "awaits_successful_execution"}}}});
+        let exec = json!({"state": {"active": true, "timestamp": "t0"}, "last_checked": "t2", "execution_state": "executed",
+            "actions": {"a": {"ack": {"state": "ackable", "timestamp": "t0"}, "last_execution": {"timestamp": "t2", "successful": true}}, "gone": {"ack": {"state": "ackable"}}}});
+        let m = merge_exec_status(&current, &base, &exec);
+        assert_eq!(m["state"], current["state"]);
+        assert_eq!(m["headers"], current["headers"]);
+        assert_eq!(m["actions"]["a"]["ack"]["state"], "acked");
+        assert_eq!(m["actions"]["a"]["last_execution"]["timestamp"], "t2");
+        assert_eq!(m["last_checked"], "t2");
+        assert_eq!(m["execution_state"], "executed");
+        assert!(m["actions"].get("gone").is_none(), "{m}");
+        assert_eq!(m["actions"]["b"], current["actions"]["b"]);
+        // An ack the execution itself changed (base == current) is the execution's.
+        let current2 = json!({"state": {"active": true}, "actions": {"a": {"ack": {"state": "ackable", "timestamp": "t0"}}}});
+        let exec2 = json!({"actions": {"a": {"ack": {"state": "awaits_successful_execution", "timestamp": "t2"}}}});
+        assert_eq!(merge_exec_status(&current2, &base, &exec2)["actions"]["a"]["ack"]["state"], "awaits_successful_execution");
+    }
 }

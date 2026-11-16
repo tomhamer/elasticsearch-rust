@@ -63,7 +63,10 @@ pub fn validate_profiling_status(path: &str, params: &std::collections::HashMap<
 
 mod datastream;
 mod docs;
+#[doc(hidden)]
+pub use docs::set_dls_check_hook;
 mod indices;
+pub use indices::IF_INDEX_UUID_HEADER;
 mod ingest;
 
 /// Ingest already executed by a trusted cluster coordinator, by bulk position.
@@ -74,6 +77,14 @@ pub enum PreparedBulkIngest {
     Dropped,
     Failed(elasticsearch_engine::ingest::IngestFailure),
 }
+/// A bulk that is a snapshot restore's own document replay into the index
+/// with this name (its incarnation checked by the cluster): its writes
+/// pass that index's write block
+/// (`elasticsearch_engine::index::enter_restore_writes`). Set only by the
+/// cluster for its internal requests.
+#[derive(Clone, Debug)]
+pub struct RestoreReplay(pub String);
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PreparedBulkIngestItems(pub std::collections::BTreeMap<usize, PreparedBulkIngest>);
 
@@ -95,6 +106,7 @@ mod obs_search;
 mod observability;
 pub mod pools;
 mod query_lang;
+mod async_query;
 mod request_cache;
 mod scripts;
 mod search_api;
@@ -104,6 +116,11 @@ pub mod security;
 /// Trusted native-user API projection into the real security-index primary.
 #[derive(Clone)]
 pub struct NativeSecurityMirror(pub Arc<dyn Fn(&str, Option<Value>) -> Result<(), EsError> + Send + Sync>);
+/// Cluster-wide security cache invalidation for the `_clear_cache` security
+/// APIs: `(kind, names, usernames)` clears every node's caches (see
+/// `Security::clear_cache`) and returns the `_nodes` response body.
+#[derive(Clone)]
+pub struct SecurityCacheClear(pub Arc<dyn Fn(&str, Vec<String>, Vec<String>) -> Result<Value, EsError> + Send + Sync>);
 /// The node's enrollment material for `GET /_security/enroll/{node,kibana}`
 /// (ES `TransportNodeEnrollmentAction` / `TransportKibanaEnrollmentAction`),
 /// attached by the cluster layer to `/_security/enroll/*` requests: whether
@@ -134,10 +151,11 @@ pub fn body_not_supported(method: &axum::http::Method, path: &str, version: elas
 mod tasks;
 pub mod tls;
 pub use tls::TlsListener;
+pub use tasks::remote_whitelist;
 mod termvectors;
 mod sysinfo;
 pub use sysinfo::{configure_processors, set_memory_locked};
-mod util;
+pub mod util;
 pub mod typed_bulk;
 mod enrich;
 mod ccr;
@@ -150,7 +168,7 @@ pub mod watcher;
 mod text_structure;
 mod logstash;
 mod license;
-mod system_features;
+pub mod system_features;
 pub use system_features::feature_system_indices;
 pub mod outgoing_headers;
 pub mod wire;
@@ -158,6 +176,7 @@ pub mod xcontent_in;
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
+use elasticsearch_engine::boxed_future::{boxed, BoxFuture};
 use elasticsearch_engine::error::EsError;
 use elasticsearch_engine::node::Node;
 pub use elasticsearch_engine::version::RestApiVersion;
@@ -166,9 +185,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub use util::{filter_path, humanize};
+pub use util::{filter_path, humanize, validate_refresh};
 pub use async_search::untype_keys as untype_search_keys;
-pub use search_api::{apply_search_routing, rank_license as check_search_license, MsearchBreaker};
+pub use search_api::{apply_search_routing, rank_license as check_search_license, MsearchBreaker, CHILD_SHARDS_KEY};
 
 /// Trusted in-process lookup for a connector stored on another primary.
 #[derive(Clone)]
@@ -308,6 +327,13 @@ impl PreparedBulk {
 /// page's hit spans, and the response header carrying them
 /// ([`encode_hit_spans`]): internal, stripped from client requests.
 pub const HIT_SPANS_HEADER: &str = "x-rustic-internal-hit-spans";
+/// Internal: a search's hits carry the indexing input (`_recovery_source`)
+/// as `_source` (the cluster resize copy, production review #485).
+pub const RECOVERY_SOURCE_HEADER: &str = "x-rustic-internal-recovery-source";
+
+/// Request extension of [`RECOVERY_SOURCE_HEADER`].
+#[derive(Clone, Copy, Debug)]
+pub struct InternalRecoverySource;
 
 /// `tail,len,len,...`: the bytes after the last hit of a response's
 /// `hits.hits` to the end of the body, then each hit's length (hits are
@@ -459,6 +485,12 @@ pub struct CoordinatorLocal;
 #[derive(Clone)]
 pub struct QueryTargetExpander(pub Arc<dyn Fn(Vec<elasticsearch_engine::search::Target>) -> Result<Vec<elasticsearch_engine::search::Target>, EsError> + Send + Sync>);
 
+/// Http request extension: the caller's authorization of every index
+/// expression an ES|QL or SQL query resolves (set by the security layer;
+/// absent with security off).
+#[derive(Clone)]
+pub struct QueryIndexAuthz(pub elasticsearch_engine::esql::exec::AuthorizeIndices);
+
 /// In-process node telemetry gathering after frontend authorization. It is
 /// restricted to GET /_nodes/_local and cannot be supplied by network clients.
 #[derive(Clone, Copy)]
@@ -475,6 +507,14 @@ pub use observability::{HttpConnection, http_request};
 /// network clients cannot supply extensions.
 #[derive(Clone, Copy)]
 pub struct SystemIdentity;
+
+/// Cluster-internal work running as a stored subject (a watch's owner, see
+/// `elasticsearch_engine::watcher`): the request authenticates as this
+/// identity, with its roles resolved now, instead of by credentials. Only
+/// the cluster layer attaches it, for node-to-node requests carrying its
+/// internal identity header; network clients cannot supply extensions.
+#[derive(Clone)]
+pub struct InternalIdentity(pub elasticsearch_engine::security::owner::StoredAuthn);
 
 /// Runs a REST request through the cluster coordinator as the system
 /// (after authorization): `(method, uri, body)` → response body, or the
@@ -498,6 +538,13 @@ pub struct ClusterRestMany(pub Arc<dyn Fn(Vec<(String, String, Option<Value>)>) 
 pub struct ClusterRestRaw(pub Arc<dyn Fn(&str, &str, Option<Value>) -> Result<(u16, String), EsError> + Send + Sync>);
 
 
+/// Builds [`ClusterRest`] calls through the cluster coordinator that run as
+/// a stored subject ([`InternalIdentity`]), or as `_system` for `None`:
+/// background work that outlives its request (scheduled watches) names the
+/// identity of each call instead of borrowing a requester's credentials.
+#[derive(Clone)]
+pub struct ClusterRestAs(pub Arc<dyn Fn(Option<&elasticsearch_engine::security::owner::StoredAuthn>) -> Result<ClusterRest, EsError> + Send + Sync>);
+
 /// [`ClusterRest`] running as the internal `_system` user, for work ES runs
 /// under an internal origin once the triggering request was authorized
 /// (enrich policy execution, downsampling): the caller needs no privileges
@@ -506,6 +553,23 @@ pub struct ClusterRestRaw(pub Arc<dyn Fn(&str, &str, Option<Value>) -> Result<(u
 pub struct InternalClusterRest(pub Arc<dyn Fn(&str, &str, Option<Value>) -> Result<Value, EsError> + Send + Sync>);
 
 impl Req {
+    /// An owned copy for work that outlives the handler (a background
+    /// async query): same method, path, parameters, body, headers, access
+    /// and extensions.
+    pub(crate) fn detached_clone(&self) -> Req {
+        Req {
+            method: self.method.clone(),
+            path: self.path.clone(),
+            segs: self.segs.clone(),
+            params: self.params.clone(),
+            body: self.body.clone(),
+            headers: self.headers.clone(),
+            access: self.access.clone(),
+            extensions: self.extensions.clone(),
+            api_version: self.api_version,
+        }
+    }
+
     /// The internal-origin coordinator call when the cluster layer provides
     /// one, else the caller's.
     pub(crate) fn internal_cluster_rest(&self) -> Option<ClusterRest> {
@@ -547,6 +611,11 @@ pub enum InternalRankPlan {
     /// (`elasticsearch_engine::retriever::RANK_PLAN_KEY`).
     Apply,
 }
+
+/// The point in time a cluster coordinator opened for a compound
+/// retriever search (its id): the plan phase's child searches read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InternalRankPit(pub String);
 
 /// A cluster coordinator renewing a scroll sub-context (only the cluster
 /// front end attaches this): `_search/scroll` renews the context's expiry
@@ -609,6 +678,12 @@ pub struct InternalQtfPinned;
 /// `fetch_refs`).
 #[derive(Clone, Copy, Debug)]
 pub struct InternalQtfLight;
+
+/// Http request extension of a coordinator's point-in-time sub search: a
+/// search ordered by score names each hit's shard
+/// ([`elasticsearch_engine::search::ShardTagScope`]) for the merge's ties.
+#[derive(Clone, Copy, Debug)]
+pub struct InternalPitShardTags;
 
 /// Body key of a query_then_fetch fetch phase (see [`InternalQtf::Fetch`]).
 pub const QTF_FETCH_KEY: &str = "_rustic_fetch";
@@ -719,13 +794,88 @@ impl Req {
     }
 }
 
+/// Request parameters every ES API that takes them reads with
+/// `RestRequest.paramAsBoolean` (`Booleans.parseBoolean`): `true`, `false`
+/// or empty (= `true`); anything else is a 400 before the API runs.
+const BOOLEAN_PARAMS: &[&str] = &[
+    "allow_no_indices", "allow_partial_search_results", "analyze_wildcard", "ccs_minimize_roundtrips", "flat_settings",
+    "force_synthetic_source", "ignore_throttled", "ignore_unavailable", "include_defaults", "only_expunge_deletes",
+    "require_alias", "require_data_stream", "rest_total_hits_as_int", "seq_no_primary_term", "typed_keys",
+];
+
+/// The response channel's flags (ES `AbstractRestChannel`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChannelParams {
+    pub pretty: bool,
+    pub human: bool,
+}
+
+/// ES `AbstractRestChannel`'s constructor: `pretty`, then `human`, each by
+/// `paramAsBoolean(key, false)`. The first bad value is the request's 400
+/// (`illegal_argument_exception`, as `dispatchBadRequest` renders it).
+pub fn channel_params(params: &std::collections::HashMap<String, String>) -> Result<ChannelParams, EsError> {
+    use elasticsearch_engine::settings::param_bool;
+    Ok(ChannelParams {
+        pretty: param_bool(params.get("pretty").map(String::as_str), false)?,
+        human: param_bool(params.get("human").map(String::as_str), false)?,
+    })
+}
+
+/// `http.detailed_errors.enabled` (default `true`).
+pub fn detailed_errors_enabled(node: &Node) -> bool {
+    node.node_settings.read().get("http.detailed_errors.enabled").is_none_or(|v| v != "false" && *v != Value::Bool(false))
+}
+
+/// ES `RestController.validateErrorTrace`, run for every request before
+/// handler lookup: `error_trace` is parsed strictly, and `true` with
+/// `http.detailed_errors.enabled: false` is refused. Either failure is the
+/// message of a simple error response (`{"error": msg, "status": 400}`).
+pub fn validate_error_trace(params: &std::collections::HashMap<String, String>, detailed_errors: bool) -> Result<(), String> {
+    match elasticsearch_engine::settings::param_bool(params.get("error_trace").map(String::as_str), false) {
+        Err(e) => Err(e.reason.clone()),
+        Ok(true) if !detailed_errors => Err("error traces in responses are disabled.".into()),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// [`BOOLEAN_PARAMS`] (and `_cat`'s `v` / `help`) checked strictly, as
+/// ES's REST handlers parse them.
+pub fn check_bool_params(path: &str, params: &std::collections::HashMap<String, String>) -> Result<(), EsError> {
+    let cat = path == "/_cat" || path.starts_with("/_cat/");
+    let mut keys: Vec<&String> = params.keys().filter(|k| BOOLEAN_PARAMS.contains(&k.as_str()) || (cat && matches!(k.as_str(), "v" | "help"))).collect();
+    keys.sort();
+    for k in keys {
+        let v = &params[k];
+        if !v.is_empty() {
+            elasticsearch_engine::settings::parse_bool(v)?;
+        }
+    }
+    Ok(())
+}
+
 /// Parse a JSON body exactly as ES's Jackson-backed parser would fail:
 /// syntax errors carry Jackson's message and location, duplicate keys and
 /// trailing tokens are rejected.
 pub fn parse_body(text: &[u8]) -> Result<Value, EsError> {
     use elasticsearch_engine::jsonpos::{self, Trailing};
-    // Plain JSON parses in one pass; anything else takes the Jackson path.
+    // Plain JSON parses in one pass (serde stops at 128 levels); anything
+    // else takes the Jackson path.
     if let Some(v) = jsonpos::parse_plain(text).filter(|v| !v.is_null()) {
+        return Ok(v);
+    }
+    // Only a body the fast parse refused pays the depth pass. ES (Jackson
+    // `StreamReadConstraints`): nesting up to 1000 levels, past which the
+    // body is refused before any recursive parse.
+    let (depth, beyond) = jsonpos::nesting(text, jsonpos::MAX_NESTING_DEPTH);
+    if let Some((line, col)) = beyond {
+        return Err(jsonpos::nesting_error(depth, line, col));
+    }
+    if depth > jsonpos::SERDE_DEPTH {
+        // Deeper than serde's default: parsed (and validated) on the guarded stack.
+        let v = jsonpos::parse_deep(text).map_err(|e| EsError::json_parse(&e))?;
+        if v.is_null() {
+            return Err(EsError::parsing("Expected [START_OBJECT] but found [VALUE_NULL]").cursor("root").with_lc());
+        }
         return Ok(v);
     }
     match jsonpos::validate(text) {
@@ -762,6 +912,7 @@ where
     let selected = READ_SHARD.try_with(|s| *s).ok().flatten();
     let inf = elasticsearch_engine::inference::scoped_current();
     let coordinator = elasticsearch_engine::coord::current();
+    let internal_coordinator = elasticsearch_engine::coord::current_internal();
     let api_version = elasticsearch_engine::version::current_rest_api_version();
     let memory = elasticsearch_engine::memory::current_scope();
     // The executor the request's route selected (see `pools::pool_for`);
@@ -775,7 +926,9 @@ where
         let _count = elasticsearch_engine::search::ReadShardCountScope::enter(selected.and_then(|s| s.1));
         elasticsearch_engine::memory::scoped(memory, || {
             util::collect_deferred_refreshes(|| elasticsearch_engine::coord::scoped(coordinator, || {
-                elasticsearch_engine::version::with_rest_api_version(api_version, || elasticsearch_engine::inference::scoped(inf, f))
+                elasticsearch_engine::coord::scoped_internal(internal_coordinator, || {
+                    elasticsearch_engine::version::with_rest_api_version(api_version, || elasticsearch_engine::inference::scoped(inf, f))
+                })
             }))
         })
     });
@@ -834,7 +987,14 @@ fn no_handler(req: &Req) -> Resp {
     )
 }
 
-async fn dispatch(node: Arc<Node>, mut req: Req) -> R {
+/// The route dispatch, as a boxed future: authorization and several
+/// sub-request paths await it, and keeping it on the heap keeps their poll
+/// frames small (see [`elasticsearch_engine::boxed_future`]).
+fn dispatch(node: Arc<Node>, req: Req) -> BoxFuture<'static, R> {
+    boxed(move || dispatch_scoped(node, req))
+}
+
+async fn dispatch_scoped(node: Arc<Node>, mut req: Req) -> R {
     let selected = req.extensions.remove::<ReadShardSelection>().map(|s| (s.0, s.1));
     // A retriever's plan phase coordinates child searches and waits for
     // them: on `search_coordination`, never on a `search` thread the
@@ -857,7 +1017,7 @@ async fn dispatch(node: Arc<Node>, mut req: Req) -> R {
         }
     } else { Vec::new() };
     let nested = req.extensions.get::<NestedRequest>().is_some();
-    ENGINE_POOL.scope(pool, NESTED.scope(nested, READ_SHARD.scope(selected, dispatch_inner(node, req)))).await
+    ENGINE_POOL.scope(pool, NESTED.scope(nested, READ_SHARD.scope(selected, boxed(move || dispatch_inner(node, req))))).await
 }
 
 async fn dispatch_inner(node: Arc<Node>, mut req: Req) -> R {
@@ -885,67 +1045,71 @@ async fn dispatch_inner(node: Arc<Node>, mut req: Req) -> R {
     let t_pre = t0.elapsed().as_micros();
     let deprecations = deprecations::for_request(&req,&mut warning_owner.0.lock().unwrap())?;
     elasticsearch_engine::inference::attach(&node.data);
+    // Trained models are served from the model indices of this node.
+    elasticsearch_engine::inference::model_store::bind_node(&node);
+    // `xpack.inference.builtin_fallback` (node setting; may change in tests).
+    elasticsearch_engine::inference::service_for(&node.data).configure(&node.node_settings.read());
     let t_dep = t0.elapsed().as_micros();
     let r = if segs.is_empty() {
         cluster::root(&node, &req)
     } else if first.starts_with('_') && first != "_all" {
         match first {
-            "_search" | "_msearch" if segs.get(1).copied() == Some("template") => query_lang::handle(node, req, None).await,
-            "_application" if segs.get(1).copied() == Some("analytics") => analytics::handle(node, req).await,
+            "_search" | "_msearch" if segs.get(1).copied() == Some("template") => boxed(|| query_lang::handle(node, req, None)).await,
+            "_application" if segs.get(1).copied() == Some("analytics") => boxed(|| analytics::handle(node, req)).await,
             "_eql" if segs.get(1).copied() == Some("stats") && segs.len() == 2 && m == Method::GET => misc9::eql_stats(&node),
-            "_render" | "_query" | "_sql" | "_eql" | "_rank_eval" | "_application" | "_query_rules" | "_synonyms" => query_lang::handle(node, req, None).await,
-            "_search" | "_msearch" | "_count" | "_pit" => search_api::handle(node, req, None).await,
-            "_bulk" | "_mget" => docs::handle(node, req, None).await,
-            "_mtermvectors" => termvectors::handle(node, req, None).await,
-            "_cat" => cat::handle(node, req).await,
-            "_tasks" | "_reindex" | "_update_by_query" | "_delete_by_query" => tasks::handle(node, req).await,
-            "_async_search" => async_search::handle(node, req, None).await,
-            "_field_caps" => async_search::field_caps(node, req, None).await,
-            "_data_stream" if ilm::owns_data_stream_route(&req) => ilm::handle_data_stream(node, req).await,
-            "_data_stream" => datastream::handle(node, req).await,
-            "_snapshot" if segs.get(3).copied() == Some("_clone") && segs.len() == 5 => snapshot_api::handle_clone(node, req).await,
-            "_snapshot" => snapshot_api::handle(node, req).await,
-            "_ilm" | "_slm" | "_lifecycle" => ilm::handle_global(node, req).await,
-            "_watcher" => watcher::handle(node, req).await,
+            "_render" | "_query" | "_sql" | "_eql" | "_rank_eval" | "_application" | "_query_rules" | "_synonyms" => boxed(|| query_lang::handle(node, req, None)).await,
+            "_search" | "_msearch" | "_count" | "_pit" => boxed(|| search_api::handle(node, req, None)).await,
+            "_bulk" | "_mget" => boxed(|| docs::handle(node, req, None)).await,
+            "_mtermvectors" => boxed(|| termvectors::handle(node, req, None)).await,
+            "_cat" => boxed(|| cat::handle(node, req)).await,
+            "_tasks" | "_reindex" | "_update_by_query" | "_delete_by_query" => boxed(|| tasks::handle(node, req)).await,
+            "_async_search" => boxed(|| async_search::handle(node, req, None)).await,
+            "_field_caps" => boxed(|| async_search::field_caps(node, req, None)).await,
+            "_data_stream" if ilm::owns_data_stream_route(&req) => boxed(|| ilm::handle_data_stream(node, req)).await,
+            "_data_stream" => boxed(|| datastream::handle(node, req)).await,
+            "_snapshot" if segs.get(3).copied() == Some("_clone") && segs.len() == 5 => boxed(|| snapshot_api::handle_clone(node, req)).await,
+            "_snapshot" => boxed(|| snapshot_api::handle(node, req)).await,
+            "_ilm" | "_slm" | "_lifecycle" => boxed(|| ilm::handle_global(node, req)).await,
+            "_watcher" => boxed(|| watcher::handle(node, req)).await,
             "_scripts" if segs.get(1).copied() == Some("painless") && segs.get(2).copied() == Some("_context") && segs.len() == 3 && m == Method::GET => misc9::painless_context(&req),
-            "_scripts" | "_script_context" | "_script_language" => scripts::handle(node, req).await,
-            "_dangling" => misc9::dangling(node, req).await,
-            "_streams" => misc9::streams(node, req).await,
-            "_nodes" if segs.get(1).copied() == Some("shutdown") && segs.len() == 2 || segs.get(2).copied() == Some("shutdown") && segs.len() == 3 => misc9::shutdown(node, req).await,
-            "_nodes" if segs.iter().skip(1).take(2).any(|s| matches!(*s, "stats" | "hot_threads" | "hotthreads" | "usage")) => observability::handle_nodes(node, req).await,
-            "_cluster" if matches!(segs.get(1).copied(), Some("stats") | Some("allocation") | Some("reroute")) => observability::handle_cluster(node, req).await,
-            "_migration" if segs.get(1).copied() == Some("system_features") => system_features::handle_migration(node, req).await,
-            "_migration" if segs.get(1).copied() == Some("reindex") => datastream::migration_reindex(node, req).await,
-            "_create_from" => datastream::create_from(node, req).await,
-            "_migration" | "_health_report" | "_recovery" | "_shard_stores" | "_search_shards" | "_validate" | "_terms_enum" | "_explain" | "_cache" | "_segments" | "_internal" => observability::handle_global(node, req).await,
-            "_resolve" => observability::handle_global(node, req).await,
-            "_remote" => observability::handle_global(node, req).await,
-            "_ingest" => ingest::handle(node, req).await,
-            "_enrich" => enrich::handle(node, req).await,
-            "_ccr" => ccr::handle_global(node, req).await,
-            "_transform" => transform::handle(node, req).await,
-            "_text_structure" => text_structure::handle(node, req).await,
-            "_logstash" => logstash::handle(node, req).await,
+            "_scripts" | "_script_context" | "_script_language" => boxed(|| scripts::handle(node, req)).await,
+            "_dangling" => boxed(|| misc9::dangling(node, req)).await,
+            "_streams" => boxed(|| misc9::streams(node, req)).await,
+            "_nodes" if segs.get(1).copied() == Some("shutdown") && segs.len() == 2 || segs.get(2).copied() == Some("shutdown") && segs.len() == 3 => boxed(|| misc9::shutdown(node, req)).await,
+            "_nodes" if segs.iter().skip(1).take(2).any(|s| matches!(*s, "stats" | "hot_threads" | "hotthreads" | "usage")) => boxed(|| observability::handle_nodes(node, req)).await,
+            "_cluster" if matches!(segs.get(1).copied(), Some("stats") | Some("allocation") | Some("reroute")) => boxed(|| observability::handle_cluster(node, req)).await,
+            "_migration" if segs.get(1).copied() == Some("system_features") => boxed(|| system_features::handle_migration(node, req)).await,
+            "_migration" if segs.get(1).copied() == Some("reindex") => boxed(|| datastream::migration_reindex(node, req)).await,
+            "_create_from" => boxed(|| datastream::create_from(node, req)).await,
+            "_migration" | "_health_report" | "_recovery" | "_shard_stores" | "_search_shards" | "_validate" | "_terms_enum" | "_explain" | "_cache" | "_segments" | "_internal" => boxed(|| observability::handle_global(node, req)).await,
+            "_resolve" => boxed(|| observability::handle_global(node, req)).await,
+            "_remote" => boxed(|| observability::handle_global(node, req)).await,
+            "_ingest" => boxed(|| ingest::handle(node, req)).await,
+            "_enrich" => boxed(|| enrich::handle(node, req)).await,
+            "_ccr" => boxed(|| ccr::handle_global(node, req)).await,
+            "_transform" => boxed(|| transform::handle(node, req)).await,
+            "_text_structure" => boxed(|| text_structure::handle(node, req)).await,
+            "_logstash" => boxed(|| logstash::handle(node, req)).await,
             "_security" => security::disabled(&req),
-            "_inference" => inference::handle(node, req).await,
-            "_ml" => ml::handle(node, req).await,
-            "_connector" => connector::handle(node, req).await,
-            "_fleet" => fleet::handle(node, req, None).await,
-            "_monitoring" => monitoring::handle(node, req).await,
-            "_profiling" => profiling::handle(node, req).await,
-            "_rollup" => rollup::handle_global(node, req).await,
-            "_autoscaling" => autoscaling::handle(node, req).await,
-            "_rollup_search" => rollup::search(node, req, None).await,
-            "_searchable_snapshots" => rollup::searchable_snapshots(node, req, None).await,
-            "_license" => license::handle(node, req).await,
-            "_xpack" if segs.get(1).copied() != Some("usage") => license::handle(node, req).await,
-            "_features" => system_features::handle_features(node, req).await,
+            "_inference" => boxed(|| inference::handle(node, req)).await,
+            "_ml" => boxed(|| ml::handle(node, req)).await,
+            "_connector" => boxed(|| connector::handle(node, req)).await,
+            "_fleet" => boxed(|| fleet::handle(node, req, None)).await,
+            "_monitoring" => boxed(|| monitoring::handle(node, req)).await,
+            "_profiling" => boxed(|| profiling::handle(node, req)).await,
+            "_rollup" => boxed(|| rollup::handle_global(node, req)).await,
+            "_autoscaling" => boxed(|| autoscaling::handle(node, req)).await,
+            "_rollup_search" => boxed(|| rollup::search(node, req, None)).await,
+            "_searchable_snapshots" => boxed(|| rollup::searchable_snapshots(node, req, None)).await,
+            "_license" => boxed(|| license::handle(node, req)).await,
+            "_xpack" if segs.get(1).copied() != Some("usage") => boxed(|| license::handle(node, req)).await,
+            "_features" => boxed(|| system_features::handle_features(node, req)).await,
             "_nodes" if segs.get(1).copied() == Some("reload_secure_settings") || matches!(segs.get(2).copied(), Some("reload_secure_settings") | Some("_repositories_metering")) => {
-                system_features::handle_nodes(node, req).await
+                boxed(|| system_features::handle_nodes(node, req)).await
             }
             "_ssl" if segs.get(1).copied() == Some("certificates") && segs.len() == 2 => system_features::ssl_certificates(&node, &req),
-            "_cluster" | "_nodes" | "_xpack" | "_info" | "_capabilities" => cluster::handle(node, req).await,
-            _ => indices::handle_global(node, req).await,
+            "_cluster" | "_nodes" | "_xpack" | "_info" | "_capabilities" => boxed(|| cluster::handle(node, req)).await,
+            _ => boxed(|| indices::handle_global(node, req)).await,
         }
     } else {
         // /{index}/...
@@ -954,29 +1118,29 @@ async fn dispatch_inner(node: Arc<Node>, mut req: Req) -> R {
         index.push_str(first);
         let second = segs.get(1).copied().unwrap_or("");
         match second {
-            "" => indices::handle_index(node, req, index).await,
-            "_doc" | "_create" | "_update" | "_source" | "_bulk" | "_mget" => docs::handle(node, req, Some(index)).await,
-            "_termvectors" | "_mtermvectors" => termvectors::handle(node, req, Some(index)).await,
-            "_search" | "_msearch" if segs.get(2).copied() == Some("template") => query_lang::handle(node, req, Some(index)).await,
-            "_eql" | "_rank_eval" => query_lang::handle(node, req, Some(index)).await,
-            "_search" | "_msearch" | "_count" | "_pit" | "_knn_search" => search_api::handle(node, req, Some(index)).await,
-            "_mvt" => mvt::handle(node, req, index).await,
-            "_update_by_query" | "_delete_by_query" => tasks::by_query(node, req, index).await,
-            "_async_search" => async_search::handle(node, req, Some(index)).await,
-            "_field_caps" => async_search::field_caps(node, req, Some(index)).await,
-            "_rollover" => datastream::rollover(node, req, index).await,
-            "_downsample" => datastream::downsample(node, req, index).await,
-            "_graph" => graph::handle(node, req, index).await,
-            "_ccr" => ccr::handle_index(node, req, index).await,
-            "_fleet" => fleet::handle(node, req, Some(index)).await,
-            "_rollup" => rollup::index_caps(node, req, index).await,
-            "_rollup_search" => rollup::search(node, req, Some(index)).await,
-            "_searchable_snapshots" => rollup::searchable_snapshots(node, req, Some(index)).await,
-            "_ilm" | "_lifecycle" | "_clone" | "_shrink" | "_split" | "_freeze" | "_unfreeze" => ilm::handle_index(node, req, index).await,
+            "" => boxed(|| indices::handle_index(node, req, index)).await,
+            "_doc" | "_create" | "_update" | "_source" | "_bulk" | "_mget" => boxed(|| docs::handle(node, req, Some(index))).await,
+            "_termvectors" | "_mtermvectors" => boxed(|| termvectors::handle(node, req, Some(index))).await,
+            "_search" | "_msearch" if segs.get(2).copied() == Some("template") => boxed(|| query_lang::handle(node, req, Some(index))).await,
+            "_eql" | "_rank_eval" => boxed(|| query_lang::handle(node, req, Some(index))).await,
+            "_search" | "_msearch" | "_count" | "_pit" | "_knn_search" => boxed(|| search_api::handle(node, req, Some(index))).await,
+            "_mvt" => boxed(|| mvt::handle(node, req, index)).await,
+            "_update_by_query" | "_delete_by_query" => boxed(|| tasks::by_query(node, req, index)).await,
+            "_async_search" => boxed(|| async_search::handle(node, req, Some(index))).await,
+            "_field_caps" => boxed(|| async_search::field_caps(node, req, Some(index))).await,
+            "_rollover" => boxed(|| datastream::rollover(node, req, index)).await,
+            "_downsample" => boxed(|| datastream::downsample(node, req, index)).await,
+            "_graph" => boxed(|| graph::handle(node, req, index)).await,
+            "_ccr" => boxed(|| ccr::handle_index(node, req, index)).await,
+            "_fleet" => boxed(|| fleet::handle(node, req, Some(index))).await,
+            "_rollup" => boxed(|| rollup::index_caps(node, req, index)).await,
+            "_rollup_search" => boxed(|| rollup::search(node, req, Some(index))).await,
+            "_searchable_snapshots" => boxed(|| rollup::searchable_snapshots(node, req, Some(index))).await,
+            "_ilm" | "_lifecycle" | "_clone" | "_shrink" | "_split" | "_freeze" | "_unfreeze" => boxed(|| ilm::handle_index(node, req, index)).await,
             "_recovery" | "_segments" | "_shard_stores" | "_disk_usage" | "_field_usage_stats" | "_block" | "_reload_search_analyzers" | "_search_shards" | "_validate" | "_terms_enum" | "_explain" | "_migration" | "_cache" => {
-                observability::handle_index(node, req, index).await
+                boxed(|| observability::handle_index(node, req, index)).await
             }
-            _ => indices::handle_index(node, req, index).await,
+            _ => boxed(|| indices::handle_index(node, req, index)).await,
         }
     };
     let _ = m;
@@ -1564,7 +1728,61 @@ pub struct InFlightBody {
     reservation: elasticsearch_engine::memory::Reservation,
     policy: InFlight,
     buffered: Option<elasticsearch_engine::memory::Reservation>,
+    /// Buffering of a body that did not authenticate: its own small budget,
+    /// never the native/control budget ([`UNAUTHENTICATED_BODY_BUDGET`]).
+    unauthenticated: UnauthenticatedHold,
     breakers: &'static elasticsearch_engine::memory::Breakers,
+}
+
+/// Largest body buffered for a request that did not authenticate (ES
+/// authenticates on the headers before aggregating content; such bodies are
+/// normally never read at all, see `security::edge`).
+pub const UNAUTHENTICATED_BODY_LIMIT: usize = 64 << 10;
+/// Aggregate bytes all unauthenticated bodies may buffer at once.
+pub const UNAUTHENTICATED_BODY_BUDGET: u64 = 16 << 20;
+static UNAUTHENTICATED_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes currently buffered for unauthenticated request bodies.
+pub fn unauthenticated_body_bytes() -> u64 {
+    UNAUTHENTICATED_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Default)]
+struct UnauthenticatedHold(u64);
+impl UnauthenticatedHold {
+    fn resize(&mut self, bytes: u64) -> Result<(), EsError> {
+        use std::sync::atomic::Ordering;
+        if bytes <= self.0 {
+            UNAUTHENTICATED_HELD.fetch_sub(self.0 - bytes, Ordering::Relaxed);
+            self.0 = bytes;
+            return Ok(());
+        }
+        let more = bytes - self.0;
+        UNAUTHENTICATED_HELD.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| held.checked_add(more).filter(|n| *n <= UNAUTHENTICATED_BODY_BUDGET))
+            .map_err(|_| EsError::new(429, "circuit_breaking_exception", "[unauthenticated_request_bodies] too many unauthenticated request bodies are being received"))?;
+        self.0 = bytes;
+        Ok(())
+    }
+}
+impl Drop for UnauthenticatedHold {
+    fn drop(&mut self) {
+        UNAUTHENTICATED_HELD.fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Request body read deadlines (ms): between two chunks, for a whole
+/// authenticated body, for a whole unauthenticated one. A stalled or
+/// trickled body is answered 408 and its buffers / reservations released.
+static BODY_IDLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
+static BODY_TOTAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(300_000);
+static UNAUTHENTICATED_BODY_TOTAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10_000);
+
+/// Set the request body read deadlines (node settings, tests).
+pub fn set_body_deadlines(idle: std::time::Duration, total: std::time::Duration, unauthenticated_total: std::time::Duration) {
+    use std::sync::atomic::Ordering;
+    BODY_IDLE_MS.store(idle.as_millis() as u64, Ordering::Relaxed);
+    BODY_TOTAL_MS.store(total.as_millis() as u64, Ordering::Relaxed);
+    UNAUTHENTICATED_BODY_TOTAL_MS.store(unauthenticated_total.as_millis() as u64, Ordering::Relaxed);
 }
 
 impl InFlightBody {
@@ -1579,18 +1797,18 @@ impl InFlightBody {
         let reservation = match policy {
             InFlight::Trips => match breakers.reserve(Kind::InflightRequests, bytes, Self::LABEL) {
                 Ok(r) => r,
-                Err(_) if !authenticated() => return Ok(InFlightBody { reservation: breakers.reserve_without_breaking(Kind::InflightRequests, bytes), policy: InFlight::Holds, buffered:None, breakers }),
+                Err(_) if !authenticated() => return Ok(InFlightBody { reservation: breakers.reserve_without_breaking(Kind::InflightRequests, bytes), policy: InFlight::Holds, buffered:None, unauthenticated: Default::default(), breakers }),
                 Err(e) => return Err(e),
             },
             InFlight::Holds => breakers.reserve_without_breaking(Kind::InflightRequests, bytes),
             InFlight::Streamed => match breakers.reserve(Kind::InflightRequests, 0, Self::LABEL) {
                 Ok(r) => r,
-                Err(_) if !authenticated() => return Ok(InFlightBody { reservation: breakers.reserve_without_breaking(Kind::InflightRequests, 0), policy: InFlight::Uncharged, buffered:None, breakers }),
+                Err(_) if !authenticated() => return Ok(InFlightBody { reservation: breakers.reserve_without_breaking(Kind::InflightRequests, 0), policy: InFlight::Uncharged, buffered:None, unauthenticated: Default::default(), breakers }),
                 Err(e) => return Err(e),
             },
             InFlight::Uncharged => breakers.reserve_without_breaking(Kind::InflightRequests, 0),
         };
-        Ok(InFlightBody { reservation, policy, buffered:None, breakers })
+        Ok(InFlightBody { reservation, policy, buffered:None, unauthenticated: Default::default(), breakers })
     }
 
     /// Admit aggregate buffering before growing an owned body buffer. A
@@ -1602,8 +1820,13 @@ impl InFlightBody {
         // overhead), not allocator capacity or the transient realloc peak.
         // Admit the latter separately so a sub-limit body is not rejected by
         // the inflight limit merely because the transport split it in chunks.
+        if !authenticated {
+            // Isolated from the control budget: a stalled unauthenticated
+            // body can never starve control-plane requests.
+            return self.unauthenticated.resize(bytes);
+        }
         if self.buffered.is_none() {
-            self.buffered=Some(if self.policy==InFlight::Holds||!authenticated {
+            self.buffered=Some(if self.policy==InFlight::Holds {
                 self.breakers.reserve_native(0,"HTTP control body")?
             } else { self.breakers.reserve(Kind::Request,0,Self::LABEL)? });
         }
@@ -1649,10 +1872,26 @@ fn append_body(out:&mut Vec<u8>,chunk:&[u8],limit:usize,base:u64,budget:&mut InF
     Ok(())
 }
 pub async fn collect_request_body(body:Body,limit:usize,budget:&mut InFlightBody,authenticated:bool)->Result<Vec<u8>,EsError> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let millis=|v:u64|if v==0 {Duration::from_secs(365*24*3600)} else {Duration::from_millis(v)};
+    let idle=millis(BODY_IDLE_MS.load(Ordering::Relaxed));
+    let total=millis(if authenticated {BODY_TOTAL_MS.load(Ordering::Relaxed)} else {UNAUTHENTICATED_BODY_TOTAL_MS.load(Ordering::Relaxed)});
+    collect_request_body_within(body,limit,budget,authenticated,idle,total).await
+}
+async fn collect_request_body_within(body:Body,limit:usize,budget:&mut InFlightBody,authenticated:bool,idle:std::time::Duration,total:std::time::Duration)->Result<Vec<u8>,EsError> {
     use futures::StreamExt;
     let mut stream=body.into_data_stream();
     let mut out=Vec::new();
-    while let Some(chunk)=stream.next().await {
+    let limit=if authenticated {limit} else {limit.min(UNAUTHENTICATED_BODY_LIMIT)};
+    let deadline=tokio::time::Instant::now()+total;
+    loop {
+        let wait=idle.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let next=match tokio::time::timeout(wait,stream.next()).await {
+            Ok(next)=>next,
+            Err(_)=>return Err(EsError::new(408,"request_timeout_exception",format!("timed out reading the request body ({} bytes received)",out.len()))),
+        };
+        let Some(chunk)=next else {break};
         let chunk=chunk.map_err(|e|EsError::new(400,"parse_exception",format!("failed to read request body: {e}")))?;
         append_body(&mut out,&chunk,limit,chunk.len() as u64,budget,authenticated)?;
     }
@@ -1753,6 +1992,76 @@ mod request_body_limit_tests {
         assert_eq!(breakers.get(Kind::Request).reserved(),0);
     }
 
+    /// Production review #18: many request bodies held open mid-stream are
+    /// reclaimed by the idle / total deadlines, unauthenticated buffering is
+    /// capped in its own budget, and control reservations stay available.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_bodies_are_reclaimed_and_never_starve_control() {
+        use futures::StreamExt;
+        use elasticsearch_engine::memory::{Breakers,Kind};
+        use std::time::{Duration,Instant};
+        let breakers=Breakers::leak_for_tests(1<<30);
+        breakers.apply_settings(&|key|match key {
+            "network.breaker.inflight_requests.limit"=>Some("512mb".into()),
+            "indices.breaker.total.limit"=>Some("-1".into()),_=>None,
+        });
+        let native_before=breakers.get(Kind::Accounting).reserved();
+        let started=Instant::now();
+        let mut tasks=Vec::new();
+        for i in 0..400usize {
+            let authenticated=i%2==0;
+            // Control (`Holds`) and ordinary (`Trips`) bodies, each sending a
+            // first chunk and then stalling forever.
+            let policy=if i%4<2 {InFlight::Holds} else {InFlight::Trips};
+            let first=Bytes::from(vec![b'{';if authenticated {256<<10} else {60<<10}]);
+            tasks.push(tokio::spawn(async move {
+                let stream=futures::stream::iter([Ok::<_,std::io::Error>(first)]).chain(futures::stream::pending());
+                let mut budget=InFlightBody::reserve(breakers,policy,0,||authenticated).unwrap();
+                let total=if authenticated {Duration::from_secs(2)} else {Duration::from_millis(600)};
+                let r=collect_request_body_within(Body::from_stream(stream),100<<20,&mut budget,authenticated,Duration::from_millis(300),total).await;
+                drop(budget);
+                r.map(|b|b.len()).map_err(|e|e.status)
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // While all of them are held: unauthenticated buffering stays within
+        // its own budget, and the native/control budget is untouched by it.
+        assert!(unauthenticated_body_bytes()<=UNAUTHENTICATED_BODY_BUDGET);
+        let control=breakers.reserve_native(1<<20,"control plane request").expect("control budget available");
+        drop(control);
+        let mut timed_out=0;let mut refused=0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Err(408)=>timed_out+=1,
+                Err(429)=>refused+=1,
+                other=>panic!("stalled body must not complete: {other:?}"),
+            }
+        }
+        // 200 unauthenticated x 60kb exceed the 16mb unauthenticated budget:
+        // the excess is refused at once, the rest time out like the others.
+        assert!(refused>0 && refused<200,"{refused} refused");
+        assert_eq!(timed_out+refused,400);
+        assert!(started.elapsed()<Duration::from_secs(4),"reclaimed after {:?}",started.elapsed());
+        assert_eq!(breakers.get(Kind::InflightRequests).reserved(),0);
+        assert_eq!(breakers.get(Kind::Request).reserved(),0);
+        assert_eq!(breakers.get(Kind::Accounting).reserved(),native_before);
+    }
+
+    #[tokio::test]
+    async fn trickled_body_hits_the_total_deadline() {
+        use std::time::{Duration,Instant};
+        let breakers=elasticsearch_engine::memory::Breakers::leak_for_tests(1<<30);
+        // A byte every 50ms never trips the 300ms idle deadline; the total does.
+        let stream=futures::stream::unfold((),|_|async{tokio::time::sleep(Duration::from_millis(50)).await;Some((Ok::<_,std::io::Error>(Bytes::from_static(b"x")),()))});
+        let mut budget=InFlightBody::reserve(breakers,InFlight::Trips,0,||true).unwrap();
+        let started=Instant::now();
+        let error=collect_request_body_within(Body::from_stream(stream),1<<20,&mut budget,true,Duration::from_millis(300),Duration::from_millis(800)).await.unwrap_err();
+        assert_eq!(error.status,408);
+        assert!(started.elapsed()<Duration::from_millis(1500));
+        drop(budget);
+        assert_eq!(breakers.inflight_requests.reserved(),0);
+    }
+
     #[tokio::test]
     async fn chunked_body_admission_applies_without_content_length() {
         use elasticsearch_engine::memory::Breakers;
@@ -1792,7 +2101,7 @@ mod request_body_limit_tests {
 
 async fn handle(node: Arc<Node>,request:Request<Body>)->Response<Body>{
     let (parts, body) = request.into_parts();
-    handle_parts(node, parts, RequestBody::Stream(body)).await
+    boxed(move || handle_parts(node, parts, RequestBody::Stream(body))).await
 }
 
 /// Where [`handle_inner`] takes a request's body from.
@@ -1809,7 +2118,7 @@ enum RequestBody {
 async fn handle_parts(node: Arc<Node>, parts: axum::http::request::Parts, body: RequestBody) -> Response<Body> {
     let control=in_flight_policy(parts.method.as_str(),parts.uri.path(),incremental_bulk(&node))==InFlight::Holds;
     let started = std::time::Instant::now();
-    let r = elasticsearch_engine::memory::request_policy_future(control,handle_inner(node,parts,body)).await;
+    let r = elasticsearch_engine::memory::request_policy_future(control,boxed(move || handle_inner(node,parts,body))).await;
     elasticsearch_engine::search::search_phases::record_named("engine_http", vec![("total", started.elapsed().as_micros())]);
     r
 }
@@ -1825,14 +2134,21 @@ async fn handle_inner(node: Arc<Node>, mut parts: axum::http::request::Parts, bo
     };
     let is_head = parts.method == Method::HEAD;
     let accepts_gzip = parts.headers.get("accept-encoding").and_then(|v| v.to_str().ok()).map(|v| v.contains("gzip")).unwrap_or(false);
-    let pretty = matches!(params.get("pretty").map(String::as_str), Some("") | Some("true"));
-    let detailed_errors = node.node_settings.read().get("http.detailed_errors.enabled").is_none_or(|v| v != "false" && *v != Value::Bool(false));
+    // ES `AbstractRestChannel`: `pretty` and `human` are parsed strictly
+    // when the channel is built; a bad value answers 400 on a channel built
+    // without the request's parameters (no pretty, no filter_path, no
+    // error trace). See [`channel_params`].
+    let channel = channel_params(&params);
+    let pretty = channel.as_ref().is_ok_and(|c| c.pretty);
+    let detailed_errors = detailed_errors_enabled(&node);
     let mut head = ReqHead {
         detailed_errors,
         api_version: RestApiVersion::CURRENT,
         pretty,
-        filter_path: match params.get("filter_path").map(|value|metadata.text(value)).transpose() { Ok(value)=>value,Err(_)=>return input_metadata::refusal(parts.method==Method::HEAD) },
-        error_trace: matches!(params.get("error_trace").map(String::as_str), Some("") | Some("true")),
+        filter_path: match params.get("filter_path").filter(|_| channel.is_ok()).map(|value|metadata.text(value)).transpose() { Ok(value)=>value,Err(_)=>return input_metadata::refusal(parts.method==Method::HEAD) },
+        // Strictly validated below (`validateErrorTrace`); unset on a
+        // parameterless (bad-parameter) channel.
+        error_trace: channel.is_ok() && elasticsearch_engine::settings::param_bool(params.get("error_trace").map(String::as_str), false).unwrap_or(false),
         is_head,
         gzip: accepts_gzip,
         content_type: "application/json".into(),
@@ -1895,6 +2211,25 @@ async fn handle_inner(node: Arc<Node>, mut parts: axum::http::request::Parts, bo
         Err(error) => return finish(&head, Err(error)),
     }
     }};
+    // The request is whole (ES aggregates it, and refuses an oversized
+    // body, before the REST layer). First the channel's own parameters,
+    // then `RestController.validateErrorTrace` for every request, matched
+    // or not; then the handlers' boolean parameters.
+    let channel = match channel {
+        Ok(channel) => channel,
+        Err(error) => return finish(&head, Err(error)),
+    };
+    if let Err(message) = validate_error_trace(&params, head.detailed_errors) {
+        head.error_trace = false;
+        head.filter_path = None;
+        let e = serde_json::json!({"error": message, "status": 400});
+        return finish(&head, Ok(Resp::json(400, e)));
+    }
+    if parts.extensions.get::<InternalHttpDispatch>().is_none() {
+        if let Err(e) = check_bool_params(&path, &params) {
+            return finish(&head, Err(e));
+        }
+    }
     let t_body = t_entry.elapsed().as_micros();
     if let Err(error)=metadata.media(&parts.headers){return finish(&head,Err(error))}
     let api_version = match media_select(&parts.headers, params.get("format").map(String::as_str), !body.is_empty()) {
@@ -1974,11 +2309,7 @@ async fn handle_inner(node: Arc<Node>, mut parts: axum::http::request::Parts, bo
     }
     let t_route = t_entry.elapsed().as_micros();
     let segs=match metadata.segments(&path){Ok(value)=>value,Err(error)=>return finish(&head,Err(error))};
-    head.human = matches!(params.get("human").map(String::as_str), Some("") | Some("true")) && util::human_applies(&segs);
-    // `RestController.validateErrorTrace`.
-    if route.is_some() && head.error_trace && !head.detailed_errors {
-        return finish(&head, Err(EsError::illegal_argument("error traces in responses are disabled.")));
-    }
+    head.human = channel.human && util::human_applies(&segs);
     let metadata_owner=input_metadata::Owner(std::sync::Arc::new(std::sync::Mutex::new(metadata.memory.into_result_owner())));
     parts.extensions.insert(metadata_owner.clone());
     // ReqHead fields drop before its final owner field.
@@ -2013,11 +2344,14 @@ async fn handle_inner(node: Arc<Node>, mut parts: axum::http::request::Parts, bo
     // Engine work that must reach every shard of a cluster (ML results,
     // datafeed sources) goes through the coordinator that sent this request.
     let coordinator = req.extensions.get::<ClusterRest>().map(|c| c.0.clone());
+    // Internal-origin work (ML's model store) goes through the coordinator
+    // running as `_system` (`InternalClusterRest`), when the cluster gives one.
+    let internal_coordinator = req.extensions.get::<InternalClusterRest>().map(|c| c.0.clone());
     // Request-breaker bytes of this request, across the threads it runs on.
     let scope_label=match diagnostic_owner.formatted(format_args!("{} {}",req.method,req.path),!authenticated){Ok(value)=>value,Err(error)=>return finish(&head,Err(error))};
     let scope = elasticsearch_engine::memory::RequestScope::with_label_owner(scope_label, node.breakers, diagnostic_owner.0.clone());
     let t_pre = t_entry.elapsed().as_micros();
-    let mut routed = std::pin::pin!(async move {
+    let mut routed = boxed(move || async move {
         if node.security.enabled() && !internal_monitor {
             security::handle(node, req).await
         } else {
@@ -2033,7 +2367,9 @@ async fn handle_inner(node: Arc<Node>, mut parts: axum::http::request::Parts, bo
         let p0 = std::time::Instant::now();
         let out = elasticsearch_engine::memory::scoped(Some(polling_scope.clone()), || {
             elasticsearch_engine::coord::scoped(coordinator.clone(), || {
-                elasticsearch_engine::version::with_rest_api_version(api_version, || elasticsearch_engine::inference::scoped(inf.clone(), || routed.as_mut().poll(cx)))
+                elasticsearch_engine::coord::scoped_internal(internal_coordinator.clone(), || {
+                    elasticsearch_engine::version::with_rest_api_version(api_version, || elasticsearch_engine::inference::scoped(inf.clone(), || routed.as_mut().poll(cx)))
+                })
             })
         });
         polls += 1;
@@ -2105,7 +2441,7 @@ pub fn router(node: Arc<Node>) -> axum::Router {
     WAKE.call_once(|| elasticsearch_engine::memory::add_wake_hook(pools::wake_idle));
     axum::Router::new().fallback(move |req: Request<Body>| {
         let node = node.clone();
-        panic_guard(async move { handle(node, req).await })
+        panic_guard(boxed(move || handle(node, req)))
     })
 }
 

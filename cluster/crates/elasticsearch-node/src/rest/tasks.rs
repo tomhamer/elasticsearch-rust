@@ -77,7 +77,7 @@ static BANS: LazyLock<Mutex<BanCache>> = LazyLock::new(Default::default);
 /// ban without taking the lock while nothing is banned.
 static ANY_BANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn encode_id(k: u32, n: u64) -> u64 {
+pub(crate) fn encode_id(k: u32, n: u64) -> u64 {
     ((k as u64) << ID_BITS) | (n & ((1u64 << ID_BITS) - 1))
 }
 
@@ -781,13 +781,23 @@ fn owner(node:&ClusterNode,id:&str)->Result<(SharedText,u64,bool),EsError>{
 async fn get_task(node: &Arc<ClusterNode>, req: &RestReq, id: &str) -> Result<RestResp, EsError> {
     let p = req.params();
     let (n, num, known) = owner(node, id)?;
-    if !known {
-        return Err(task_error(404,"resource_not_found_exception",format_args!("task [{id}] belongs to the node [{n}] which isn't part of the cluster and there is no record of the task")));
-    }
     let wait = flag(&p, "wait_for_completion")?;
     let timeout = if wait { timeout_param(&p)? } else { Duration::ZERO };
+    if !known {
+        // ES: the owner left the cluster; its stored result may remain.
+        if let Some(doc) = crate::front::bg_task::stored_result(node, id).await {
+            return Ok(RestResp::json(200, &doc));
+        }
+        return Err(task_error(404,"resource_not_found_exception",format_args!("task [{id}] belongs to the node [{n}] which isn't part of the cluster and there is no record of the task")));
+    }
     let r = NodeReq { op: SharedText::try_new("get")?, task: Some(num), task_str: SharedText::try_new(id)?, wait, timeout_ms: timeout.as_millis() as u64, ..Default::default() };
     match call(node, &n, &r).await {
+        // Neither running nor remembered by its node (restarted since):
+        // the result stored in `.tasks` (ES `getFinishedTaskFromIndex`).
+        Ok(resp) if resp.status == 404 => match crate::front::bg_task::stored_result(node, id).await {
+            Some(doc) => Ok(RestResp::json(200, &doc)),
+            None => Ok(from_node(resp)),
+        },
         Ok(resp) => Ok(from_node(resp)),
         Err(CallFailure::Admission(e))=>Err(e),
         Err(CallFailure::Owned(f))=>{
@@ -895,7 +905,9 @@ pub async fn as_child(node: &Arc<ClusterNode>, k: u32, req: &RestReq) -> RestRes
         let mut candidates=TaskVec::new()?;
         let mut failure=None;
         engine.tasks.try_visit_running(|t|{
-            if !before.contains(&t.id)&&!linked.contains(&t.id)&&t.parent.is_none()&&BULK_ACTIONS.contains(&t.action.as_str()){
+            // Only the tasks this request created: each registers with its
+            // cluster parent's id (no capture of a concurrent parent's).
+            if !before.contains(&t.id)&&!linked.contains(&t.id)&&t.parent.as_deref()==Some(&*parent)&&BULK_ACTIONS.contains(&t.action.as_str()){
                 if failure.is_some(){t.request_cancel();}
                 else if let Err(e)=candidates.push(t.clone()){t.request_cancel();failure=Some(e);}
             }

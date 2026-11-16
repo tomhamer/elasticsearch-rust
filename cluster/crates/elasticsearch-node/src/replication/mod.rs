@@ -237,14 +237,56 @@ pub(crate) fn write_atomic(dir: &std::path::Path, name: &str, bytes: &[u8]) -> s
         f.sync_all()?;
     }
     std::fs::rename(&tmp, dir.join(name))?;
-    sync_dir(dir);
-    Ok(())
+    sync_dir(dir)
 }
 
-pub(crate) fn sync_dir(dir: &std::path::Path) {
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
+/// fsync `dir` so the entries created, renamed or removed in it are
+/// durable. Errors (opening the directory included) are returned: the
+/// caller's step did not complete durably and must fail.
+pub(crate) fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    sync_dir_test_hook::check(dir)?;
+    elasticsearch_engine::rustic_core::platform::sync_dir(dir)
+}
+
+/// Tests: make [`sync_dir`] fail for directories under a path.
+pub(crate) mod sync_dir_test_hook {
+    #[cfg(test)]
+    static FAIL_UNDER: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
+    #[cfg(test)]
+    pub fn fail_under(dir: &std::path::Path, fail: bool) {
+        let mut v = FAIL_UNDER.lock();
+        v.retain(|d| d != dir);
+        if fail { v.push(dir.to_path_buf()); }
+    }
+    #[allow(unused_variables)]
+    pub fn check(dir: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_UNDER.lock().iter().any(|d| dir.starts_with(d)) {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        Ok(())
     }
 }
 
 mod ops_copy;
+
+#[cfg(test)]
+mod durability_tests {
+    /// A failed directory fsync fails the step that needed it: the atomic
+    /// state write, opening (and removing) a replica WAL. A directory that
+    /// cannot be opened is an error too, never skipped.
+    #[test]
+    fn directory_fsync_failures_fail_the_step() {
+        let dir = tempfile::tempdir().unwrap();
+        super::sync_dir_test_hook::fail_under(dir.path(), true);
+        assert!(super::sync_dir(dir.path()).is_err());
+        assert!(super::write_atomic(dir.path(), "state.json", b"{}").is_err());
+        assert!(super::wal::ReplicaWal::open(&dir.path().join("shard-0")).is_err());
+        assert!(super::wal::remove(&dir.path().join("shard-0")).is_err());
+        super::sync_dir_test_hook::fail_under(dir.path(), false);
+        assert!(super::sync_dir(dir.path()).is_ok());
+        assert!(super::write_atomic(dir.path(), "state.json", b"{}").is_ok());
+        assert!(super::wal::ReplicaWal::open(&dir.path().join("shard-0")).is_ok());
+        assert!(super::sync_dir(&dir.path().join("absent")).is_err());
+    }
+}

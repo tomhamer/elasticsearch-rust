@@ -90,6 +90,18 @@ spec:
               value: "true"
             - name: ES_SHUTDOWN_TIMEOUT
               value: "100"
+            # The `elastic` superuser's (bootstrap) password.
+            - name: ELASTIC_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: elasticsearch-credentials, key: password }
+            # Probes and preStop: HTTPS to the local node, verifying the
+            # certificate against the client Service name, authenticated.
+            - name: ES_URL
+              value: https://elasticsearch:9200
+            - name: ES_CONNECT_TO
+              value: "::127.0.0.1:"
+            - name: ES_CA_CERT
+              value: /usr/share/elasticsearch/config/certs/ca.crt
           resources:
             requests: { cpu: "1", memory: 2Gi }
             limits: { memory: 2Gi }
@@ -123,12 +135,20 @@ spec:
               mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
               subPath: elasticsearch.yml
               readOnly: true
+            - name: certs
+              mountPath: /usr/share/elasticsearch/config/certs
+              readOnly: true
             - name: bootstrap
               mountPath: /usr/share/elasticsearch/settings.d/bootstrap
               readOnly: true
       volumes:
         - name: config
           configMap: { name: elasticsearch-config }
+        # CA + node certificate (tls.crt, tls.key, ca.crt): ../create-secrets.sh
+        - name: certs
+          secret:
+            secretName: elasticsearch-certs
+            defaultMode: 0440
         - name: elasticsearch-logs
           emptyDir: {}
         # cluster.initial_master_nodes for the first bootstrap only; the

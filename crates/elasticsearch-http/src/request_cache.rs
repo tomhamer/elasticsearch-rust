@@ -116,11 +116,11 @@ pub fn key(targets: &[Target], body: &Value, params: &HashMap<String, String>, s
         return None;
     }
     ps.sort();
+    // Length-prefixed: a decoded `&`, `=` or newline inside a parameter value
+    // (`q=foo&size=0` as one value) cannot read as another parameter map
+    // (#566).
     for (k, v) in ps {
-        key.push_str(k);
-        key.push('=');
-        key.push_str(v);
-        key.push('&');
+        key.push_str(&format!("{}:{k}{}:{v}", k.len(), v.len()));
     }
     key.push('\n');
     key.push_str(&body_s);
@@ -153,8 +153,16 @@ pub fn key(targets: &[Target], body: &Value, params: &HashMap<String, String>, s
         for x in fp {
             let _ = write!(key, "{x:x},");
         }
+        // The alias filter is part of the query (ES rewrites it into the
+        // shard request): `now` date math, scripts or lookups in it make the
+        // request as uncacheable as they would in the body; a rolling-window
+        // alias must never serve a count frozen at its first run.
         if let Some(f) = &t.alias_filter {
-            key.push_str(&f.to_string());
+            let fs = f.to_string();
+            if UNCACHEABLE.iter().any(|m| fs.contains(m)) {
+                return None;
+            }
+            key.push_str(&fs);
         }
         if let Some(r) = &t.routing {
             let _ = write!(key, "|r={r}");
@@ -201,8 +209,29 @@ fn with_took(json: &str, took_ms: u128) -> String {
 }
 
 /// Cache a successful, complete response.
+/// Whether a search response completed on every shard: its own `_shards`
+/// and `timed_out` read structurally (any failed count, any spelling), the
+/// only responses the cache keeps.
+fn complete_response(json: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Shards {
+        #[serde(default)]
+        failed: serde_json::Value,
+    }
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(default)]
+        timed_out: bool,
+        #[serde(rename = "_shards")]
+        shards: Option<Shards>,
+    }
+    let Ok(h) = serde_json::from_str::<Head>(json) else { return false };
+    let failed_none = h.shards.as_ref().is_some_and(|s| s.failed.as_f64() == Some(0.0) || s.failed.is_null());
+    !h.timed_out && failed_none
+}
+
 pub fn put(key: String, lookups: Vec<Weak<FieldLookup>>, json: &str) {
-    if json.len() > MAX_ENTRY || !json.starts_with("{\"took\":") || json.contains("\"timed_out\":true") || json.contains("\"failed\":1") {
+    if json.len() > MAX_ENTRY || !json.starts_with("{\"took\":") || !complete_response(json) {
         return;
     }
     let Ok(mut c) = CACHE.lock() else { return };
@@ -255,6 +284,62 @@ pub fn clear(uuids: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #172: a filtered alias with `now` date math is not cacheable (as a
+    /// `now` in the body is not); a literal alias filter still is.
+    #[test]
+    fn dynamic_alias_filters_are_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = elasticsearch_engine::node::Node::open(dir.path()).unwrap();
+        node.create_index("logs", &serde_json::json!({"mappings": {"properties": {"@timestamp": {"type": "date"}, "k": {"type": "keyword"}}}})).unwrap();
+        let svc = node.get_index("logs").unwrap();
+        let target = |filter: Option<Value>| Target { svc: svc.clone(), remote_index: None, alias_filter: filter, snapshot: None, access: None, shard: None, routing: None };
+        let body = serde_json::json!({"size": 0, "aggs": {"n": {"value_count": {"field": "k"}}}});
+        let params = HashMap::new();
+        let rolling = serde_json::json!({"range": {"@timestamp": {"gte": "now-1d"}}});
+        assert!(key(&[target(Some(rolling))], &body, &params, 0).is_none(), "a rolling-window alias is not cached");
+        let lookup = serde_json::json!({"terms": {"k": {"index": "other", "id": "1", "path": "ks"}}});
+        assert!(key(&[target(Some(lookup))], &body, &params, 0).is_none(), "a lookup in an alias filter is not cached");
+        let fixed = serde_json::json!({"term": {"k": "a"}});
+        let (k1, _) = key(&[target(Some(fixed.clone()))], &body, &params, 0).expect("a literal alias filter is cacheable");
+        let (k2, _) = key(&[target(None)], &body, &params, 0).unwrap();
+        assert_ne!(k1, k2, "the alias filter is part of the key");
+    }
+
+    /// #566: parameter maps whose values contain separators get distinct
+    /// keys (`q=foo&size=0` as one value vs `q=foo`, `size=0`).
+    #[test]
+    fn separator_characters_in_parameters_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = elasticsearch_engine::node::Node::open(dir.path()).unwrap();
+        node.create_index("k", &serde_json::json!({"mappings": {"properties": {"k": {"type": "keyword"}}}})).unwrap();
+        let svc = node.get_index("k").unwrap();
+        let t = Target { svc, remote_index: None, alias_filter: None, snapshot: None, access: None, shard: None, routing: None };
+        let body = serde_json::json!({"size": 0});
+        let p = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+        let a = key(std::slice::from_ref(&t), &body, &p(&[("df", "k"), ("q", "foo&size=0")]), 0).unwrap().0;
+        let b = key(std::slice::from_ref(&t), &body, &p(&[("df", "k"), ("q", "foo"), ("size", "0")]), 0).unwrap().0;
+        assert_ne!(a, b);
+        let c = key(std::slice::from_ref(&t), &body, &p(&[("a", "b=c")]), 0).unwrap().0;
+        let d = key(std::slice::from_ref(&t), &body, &p(&[("a=b", "c")]), 0).unwrap().0;
+        assert_ne!(c, d);
+    }
+
+    /// #372: any number of failed shards (or a timeout) keeps a response
+    /// out of the cache; a complete one is cached.
+    #[test]
+    fn only_complete_responses_are_cached() {
+        let body = |failed: u64, timed_out: bool| format!("{{\"took\":1,\"timed_out\":{timed_out},\"_shards\":{{\"total\":3,\"successful\":{},\"skipped\":0,\"failed\":{failed}}},\"hits\":{{\"total\":{{\"value\":0,\"relation\":\"eq\"}},\"max_score\":null,\"hits\":[]}}}}", 3 - failed);
+        assert!(complete_response(&body(0, false)));
+        for (failed, timed_out) in [(1, false), (2, false), (0, true)] {
+            assert!(!complete_response(&body(failed, timed_out)), "{failed} {timed_out}");
+            let key = format!("test-key-{failed}-{timed_out}");
+            put(key.clone(), Vec::new(), &body(failed, timed_out));
+            assert!(!CACHE.lock().unwrap().map.contains_key(&key));
+        }
+        put("test-key-ok".into(), Vec::new(), &body(0, false));
+        assert!(CACHE.lock().unwrap().map.contains_key("test-key-ok"));
+    }
 
     #[test]
     fn took_is_rewritten() {

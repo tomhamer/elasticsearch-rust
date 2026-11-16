@@ -669,3 +669,139 @@ fn disconnect_notification_fails_leader_and_follower_immediately() {
         assert_eq!(c.nodes[f].c().mode(), Mode::Follower, "seed {seed}");
     }
 }
+
+/// Full cluster restart (every node at once, 3 masters + 2 data nodes, as
+/// the Helm e2e's step 13) over slow links (TLS handshakes, large first
+/// states) and slow disks. The masters come back as candidates together;
+/// a master elected in the new term must not be deposed over and over
+/// before its first publication lands. ES keeps a node's election
+/// scheduler (with its growing, randomised back-off) until a state of the
+/// current term has been applied, so a leader that drops back to
+/// CANDIDATE does not restart its elections at
+/// `cluster.election.initial_timeout`; the cluster stabilises and the
+/// term grows by a bounded amount.
+#[test]
+fn full_restart_over_slow_links_elects_a_stable_master() {
+    let seeds = seed_count(40);
+    // ES's election back-off reaches `cluster.election.max_timeout` (10s)
+    // after ~100 attempts; publications here take up to ~5s and the
+    // cluster settles in under 15s (pre-fix: never, term +5..10/s).
+    const STABLE_WITHIN_MS: u64 = 30_000;
+    const MAX_TERM_GROWTH: u64 = 60;
+    let mut worst = (0u64, 0u64);
+    let mut slowest = 0u64;
+    for seed in first_seed()..first_seed() + seeds {
+        // Even seeds: Kubernetes-style, every pod returns with a new IP
+        // and seed hosts are names that resolve to the current one (the
+        // persisted cluster state then names dead addresses). Odd seeds:
+        // nodes return at their old addresses.
+        let new_ips = seed % 2 == 0;
+        let mut c = Cluster::empty(seed);
+        let seed_hosts: Vec<String> = (0..3).map(|i| if new_ips { format!("e2e-master-{i}.e2e-master-headless:9300") } else { mk_node("", i, true, 0).transport_address }).collect();
+        let initial: Vec<String> = (0..3).map(|i| mk_node("", i, true, 0).name).collect();
+        for i in 0..5 {
+            let idx = c.add_node("", i, i < 3, settings::with(seed_hosts.clone(), if i < 3 { initial.clone() } else { vec![] }), None);
+            c.nodes[idx].new_address_on_restart = new_ips;
+            if new_ips && i < 3 {
+                c.alias(&seed_hosts[i], idx);
+            }
+        }
+        for i in 0..5 {
+            c.start(i);
+        }
+        assert!(c.run_until(30_000, |c| c.stable_leader().is_some()).is_some(), "seed {seed}: did not form");
+        for _ in 0..3 {
+            c.submit_log_task();
+            c.run_for(100);
+        }
+        assert!(c.run_until(5_000, |c| c.acked_log_values.len() == 3).is_some(), "seed {seed}: tasks not acked");
+        let term_before = (0..5).map(|i| c.nodes[i].c().current_term()).max().unwrap();
+        for i in 0..5 {
+            c.crash(i);
+        }
+        c.run_for(1_000);
+        // Slow links (TLS): small messages take a few to tens of ms. A
+        // publication takes longer before its receiver acts on it: a full
+        // state, the first on its connection, a few hundred ms; or seconds
+        // when the receiver first probes every member's capabilities and
+        // the restored state still names dead pod addresses (2s connect
+        // bound each). Slow disks.
+        c.min_delay = c.rng.gen_range(1..10);
+        c.max_delay = c.min_delay + c.rng.gen_range(5..40);
+        let lo = if seed % 4 < 2 { c.rng.gen_range(100..250) } else { c.rng.gen_range(1_000..2_500) };
+        c.publish_extra_delay = (lo, lo + c.rng.gen_range(100..1_500));
+        c.max_disk_delay = c.rng.gen_range(5..60);
+        let elections_before = c.stats.elections;
+        for i in 0..5 {
+            c.start(i);
+        }
+        let t = c.run_until(STABLE_WITHIN_MS, |c| c.stable_leader().is_some());
+        let term_now = (0..5).map(|i| c.nodes[i].c().current_term()).max().unwrap();
+        assert!(
+            t.is_some(),
+            "seed {seed} (new IPs: {new_ips}, delay {}..{}ms, publish +{:?}ms, disk {}ms): no stable master within {STABLE_WITHIN_MS}ms of a full restart; term {term_before} -> {term_now}, {} elections: {}",
+            c.min_delay,
+            c.max_delay,
+            c.publish_extra_delay,
+            c.max_disk_delay,
+            c.stats.elections - elections_before,
+            c.describe_pending()
+        );
+        let growth = term_now - term_before;
+        assert!(growth <= MAX_TERM_GROWTH, "seed {seed}: term grew by {growth} ({term_before} -> {term_now}) before the cluster stabilised");
+        if growth > worst.0 {
+            worst = (growth, seed);
+        }
+        slowest = slowest.max(t.unwrap());
+        eprintln!("seed {seed}: new IPs {new_ips}, publish +{:?}ms: stable after {}ms, term +{growth}", c.publish_extra_delay, t.unwrap());
+        // It stays stable: same leader, same term.
+        let l = c.stable_leader().unwrap();
+        c.run_for(5_000);
+        assert_eq!(c.stable_leader(), Some(l), "seed {seed}: leader changed after stabilising");
+        assert_eq!((0..5).map(|i| c.nodes[i].c().current_term()).max().unwrap(), term_now, "seed {seed}: term moved after stabilising");
+        let s = c.nodes[l].c().applied_state();
+        assert_eq!(sim_log(s).len(), 3, "seed {seed}: acknowledged writes lost");
+    }
+    eprintln!("full restart: {seeds} seeds, worst term growth {} (seed {}), slowest stabilisation {slowest}ms", worst.0, worst.1);
+}
+
+/// Production review #298: `cluster.auto_shrink_voting_configuration` is
+/// dynamic. Started with it off, five voters lose two: the configuration
+/// stays at five; enabling it as a persistent cluster setting shrinks the
+/// live configuration to the three live voters.
+#[test]
+fn dynamic_auto_shrink_reconfigures_the_live_voters() {
+    for seed in 0..10 {
+        let mut c = Cluster::empty(seed);
+        let seeds: Vec<String> = (0..5).map(|i| mk_node("", i, true, 0).transport_address).collect();
+        let initial: Vec<String> = (0..5).map(|i| mk_node("", i, true, 0).name).collect();
+        for i in 0..5 {
+            let mut s = settings_for("sim", seeds.clone(), initial.clone());
+            s.auto_shrink_voting_configuration = false;
+            c.add_node("", i, true, s, None);
+        }
+        for i in 0..5 {
+            c.start(i);
+        }
+        assert!(c.run_until(30_000, |c| c.stable_leader().is_some() && voting_config(c, c.stable_leader().unwrap()).len() == 5).is_some(), "seed {seed}");
+        let l = c.stable_leader().unwrap();
+        for v in (0..5).filter(|i| *i != l).take(2).collect::<Vec<_>>() {
+            c.crash(v);
+        }
+        let alive = c.alive();
+        assert!(c.run_until(20_000, |c| c.stable_among(&alive).is_some()).is_some(), "seed {seed}");
+        let l = c.stable_among(&alive).unwrap();
+        assert_eq!(voting_config(&c, l).len(), 5, "seed {seed}: auto-shrink off keeps the departed voters");
+        c.leader_op(|co, now| co.submit_task(now, Box::new(|cur: &ClusterState| {
+            let mut s = cur.clone();
+            s.metadata.persistent_settings.insert("cluster.auto_shrink_voting_configuration".into(), serde_json::json!("true"));
+            Ok(s)
+        }))).unwrap();
+        let live: BTreeSet<String> = alive.iter().map(|i| c.nodes[*i].node.id.clone()).collect();
+        assert!(
+            c.run_until(30_000, |c| c.stable_among(&alive).is_some_and(|l| voting_config(c, l).into_iter().collect::<BTreeSet<_>>() == live)).is_some(),
+            "seed {seed}: the dynamic setting did not shrink the configuration ({:?})",
+            voting_config(&c, l)
+        );
+    }
+}

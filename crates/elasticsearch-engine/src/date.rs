@@ -81,15 +81,13 @@ impl Tz {
                 chrono::LocalResult::Single(d) => d.timestamp_millis(),
                 chrono::LocalResult::Ambiguous(a, _) => a.timestamp_millis(),
                 chrono::LocalResult::None => {
-                    // In a gap: shift forward by the gap length.
-                    let mut l = local;
-                    for _ in 0..4 {
-                        l += Duration::minutes(30);
-                        if let chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) = tz.from_local_datetime(&l) {
-                            return d.timestamp_millis() - 30 * 60 * 1000;
-                        }
-                    }
-                    local.and_utc().timestamp_millis()
+                    // In a gap: java.time moves the wall time later by the
+                    // gap's length, i.e. reads it with the offset in force
+                    // before the transition (finding 251). Transitions are
+                    // months apart: a day earlier is before this one.
+                    let wall = local.and_utc().timestamp_millis();
+                    let before = self.offset_at(wall - 86_400_000);
+                    wall - before as i64 * 1000
                 }
             },
         }
@@ -200,8 +198,80 @@ enum Fmt {
 pub struct DateFormatter {
     pub spec: String,
     fmts: Vec<Fmt>,
-    /// French month / day names (`locale: fr`).
-    fr: bool,
+    /// Month / day names of the mapping `locale`.
+    lang: Lang,
+}
+
+/// The month and day names of a mapping `locale` (the shared CLDR table,
+/// [`crate::locale_names`], every JDK locale). Production review #466: a
+/// mapping `locale` used to parse English names whatever it named.
+#[derive(Clone, Copy, Debug)]
+pub struct Lang(&'static [Vec<&'static str>]);
+
+impl PartialEq for Lang {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+/// English names (no locale, `ROOT`, or a locale CLDR does not know).
+fn english() -> &'static [Vec<&'static str>] {
+    crate::locale_names::rows("en").expect("CLDR en")
+}
+
+impl Default for Lang {
+    fn default() -> Self {
+        Lang(english())
+    }
+}
+
+impl Lang {
+    /// The names of a mapping `locale` (`de`, `de_DE`, `ROOT`); never
+    /// refused: an unknown locale keeps English names.
+    pub fn of(locale: &str) -> Option<Lang> {
+        let root = locale.is_empty() || locale.eq_ignore_ascii_case("root");
+        Some(Lang(if root { english() } else { crate::locale_names::rows(locale).unwrap_or_else(english) }))
+    }
+
+    /// (months, short months, days, short days) of `standalone` (`L`) or
+    /// format (`M`, `E`) style, Monday first.
+    fn names(self, standalone: bool) -> (&'static [&'static str], &'static [&'static str], &'static [&'static str], &'static [&'static str]) {
+        let r = self.0;
+        if standalone {
+            (&r[2], &r[3], &r[6], &r[7])
+        } else {
+            (&r[0], &r[1], &r[4], &r[5])
+        }
+    }
+}
+
+impl Lang {
+    /// AM, PM (CLDR day periods: ES localizes `a`).
+    fn am_pm(self) -> [&'static str; 2] {
+        match self.0.get(8) {
+            Some(ap) if ap.len() == 2 => [ap[0], ap[1]],
+            _ => ["AM", "PM"],
+        }
+    }
+}
+
+/// The index of the name `rest` starts with (case-insensitive; a short
+/// name also without its trailing `.`), longest match first, and the
+/// matched byte length.
+fn match_any(rest: &[u8], lists: &[&[&str]]) -> Option<(usize, usize)> {
+    let r = std::str::from_utf8(rest).ok().map(|r| r.to_lowercase()).or_else(|| Some(String::from_utf8_lossy(rest).to_lowercase()))?;
+    let mut best: Option<(usize, usize)> = None;
+    for list in lists {
+        for (i, name) in list.iter().enumerate() {
+            let low = name.to_lowercase();
+            for cand in [low.as_str(), low.trim_end_matches('.')] {
+                if !cand.is_empty() && r.starts_with(cand) && best.is_none_or(|(_, l)| cand.len() > l) {
+                    best = Some((i, cand.len()));
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Allocation-free equivalent of the default formatter in UTC.
@@ -314,6 +384,13 @@ struct Parts {
     month: Option<u32>,
     day: Option<u32>,
     doy: Option<u32>,
+    /// Week-based year (`Y`), week of it (`w`), day of week (`e`/`E`,
+    /// Monday 1) and quarter (`Q`) (production review #465: accepted but
+    /// discarded).
+    weekyear: Option<i32>,
+    week: Option<u32>,
+    dow: Option<u32>,
+    quarter: Option<u32>,
     hour: Option<u32>,
     pm: Option<bool>,
     minute: Option<u32>,
@@ -323,19 +400,7 @@ struct Parts {
     zone: Option<Tz>,
 }
 
-const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const FR_MONTHS: [&str; 12] = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
-const FR_MONTHS_SHORT: [&str; 12] = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
-const FR_DAYS: [&str; 7] = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
-const FR_DAYS_SHORT: [&str; 7] = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."];
 
-/// Index and byte length of the leading name of `rest` among `names` (case-insensitive).
-fn match_name(rest: &[u8], names: &[&str]) -> Option<(usize, usize)> {
-    let r = std::str::from_utf8(rest).ok()?.to_lowercase();
-    names.iter().enumerate().find(|(_, n)| r.starts_with(&n.to_lowercase())).map(|(i, n)| (i, n.len()))
-}
-
-const DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 fn is_numeric_field(t: Option<&Tok>) -> bool {
     matches!(t, Some(Tok::Field(c, n)) if "yuMdDHhkKmsS".contains(*c) && !(*c == 'M' && *n >= 3))
@@ -352,7 +417,7 @@ fn take_digits(s: &[u8], pos: usize, min: usize, max: usize) -> Option<(i64, usi
     std::str::from_utf8(&s[pos..end]).ok()?.parse().ok().map(|v| (v, end))
 }
 
-fn parse_toks(toks: &[Tok], s: &[u8], mut pos: usize, p: &mut Parts, fr: bool) -> Option<usize> {
+fn parse_toks(toks: &[Tok], s: &[u8], mut pos: usize, p: &mut Parts, lang: Lang) -> Option<usize> {
     for (ti, t) in toks.iter().enumerate() {
         match t {
             Tok::Lit(l) => {
@@ -364,7 +429,7 @@ fn parse_toks(toks: &[Tok], s: &[u8], mut pos: usize, p: &mut Parts, fr: bool) -
             }
             Tok::Optional(inner) => {
                 let mut tmp = *p;
-                if let Some(np) = parse_toks(inner, s, pos, &mut tmp, fr) {
+                if let Some(np) = parse_toks(inner, s, pos, &mut tmp, lang) {
                     *p = tmp;
                     pos = np;
                 }
@@ -385,69 +450,29 @@ fn parse_toks(toks: &[Tok], s: &[u8], mut pos: usize, p: &mut Parts, fr: bool) -
                         } else {
                             take_digits(s, start, 1, 9)?
                         };
-                        p.year = Some(if neg { -(v as i32) } else { v as i32 });
+                        let v = if neg { -(v as i32) } else { v as i32 };
+                        if *c == 'Y' { p.weekyear = Some(v) } else { p.year = Some(v) }
                         pos = np;
                     }
-                    'M' | 'L' if n >= 3 && fr => {
-                        let (i, len) = match_name(&s[pos..], if n >= 4 { &FR_MONTHS } else { &FR_MONTHS_SHORT })?;
-                        p.month = Some(i as u32 + 1);
-                        pos += len;
-                    }
-                    'E' if fr => {
-                        let (_, len) = match_name(&s[pos..], if n >= 4 { &FR_DAYS } else { &FR_DAYS_SHORT })?;
-                        pos += len;
-                    }
                     'M' | 'L' if n >= 3 => {
-                        let rest = &s[pos..];
-                        let mut found = None;
-                        for (i, m) in MONTHS.iter().enumerate() {
-                            let full = m.as_bytes();
-                            let short = &full[..3];
-                            if n >= 4 && rest.len() >= full.len() && rest[..full.len()].eq_ignore_ascii_case(full) {
-                                found = Some((i, full.len()));
-                                break;
-                            }
-                            if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case(short) {
-                                found = Some((i, 3));
-                                if n == 3 {
-                                    break;
-                                }
-                            }
-                        }
-                        let (i, len) = found?;
+                        let (full, short, _, _) = lang.names(*c == 'L');
+                        let lists: Vec<&[&str]> = if n >= 4 { vec![full, short] } else { vec![short] };
+                        let (i, len) = match_any(&s[pos..], &lists)?;
                         p.month = Some(i as u32 + 1);
                         pos += len;
                     }
                     'E' => {
-                        let rest = &s[pos..];
-                        let mut len = None;
-                        for d in DAYS {
-                            let full = d.as_bytes();
-                            if n >= 4 && rest.len() >= full.len() && rest[..full.len()].eq_ignore_ascii_case(full) {
-                                len = Some(full.len());
-                                break;
-                            }
-                            if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case(&full[..3]) {
-                                len = Some(3);
-                                break;
-                            }
-                        }
-                        pos += len?;
+                        let (_, _, full, short) = lang.names(false);
+                        let lists: Vec<&[&str]> = if n >= 4 { vec![full, short] } else { vec![short, full] };
+                        let (i, len) = match_any(&s[pos..], &lists)?;
+                        p.dow = Some(i as u32 + 1);
+                        pos += len;
                     }
                     'a' => {
-                        let rest = &s[pos..];
-                        if rest.len() < 2 {
-                            return None;
-                        }
-                        let ap = &rest[..2];
-                        if ap.eq_ignore_ascii_case(b"AM") {
-                            p.pm = Some(false);
-                        } else if ap.eq_ignore_ascii_case(b"PM") {
-                            p.pm = Some(true);
-                        } else {
-                            return None;
-                        }
-                        pos += 2;
+                        let ap = lang.am_pm();
+                        let (i, len) = match_any(&s[pos..], &[&ap[..]])?;
+                        p.pm = Some(i == 1);
+                        pos += len;
                     }
                     'S' | 'n' => {
                         let max = if adjacent { n } else { 9 };
@@ -504,6 +529,9 @@ fn parse_toks(toks: &[Tok], s: &[u8], mut pos: usize, p: &mut Parts, fr: bool) -
                             'h' | 'K' => p.hour = Some(v % 12),
                             'm' => p.minute = Some(v),
                             's' => p.second = Some(v),
+                            'w' => p.week = Some(v),
+                            'e' => p.dow = Some(v),
+                            'Q' | 'q' => p.quarter = Some(v),
                             _ => {}
                         }
                         pos = np;
@@ -516,11 +544,31 @@ fn parse_toks(toks: &[Tok], s: &[u8], mut pos: usize, p: &mut Parts, fr: bool) -
 }
 
 fn parts_to_millis(p: &Parts, tz: Tz) -> Option<i64> {
-    let year = p.year.unwrap_or(1970);
-    let date = if let Some(doy) = p.doy {
+    parts_to_millis_in(p, tz, None)
+}
+
+/// The epoch nanoseconds of parsed `p` (sub-millisecond digits kept);
+/// `default_year` completes a value without a year (else 1970). Wide, so
+/// dates outside the `i64` nanosecond range (years 1677-2262) still parse.
+fn parts_to_nanos(p: &Parts, tz: Tz, default_year: Option<i32>) -> Option<i128> {
+    Some(parts_to_millis_in(p, tz, default_year)? as i128 * 1_000_000 + (p.nanos.unwrap_or(0) % 1_000_000) as i128)
+}
+
+/// The epoch milliseconds of parsed `p`, `default_year` completing a
+/// value without a year (else 1970).
+fn parts_to_millis_in(p: &Parts, tz: Tz, default_year: Option<i32>) -> Option<i64> {
+    let year = p.year.or(p.weekyear).or(default_year).unwrap_or(1970);
+    let date = if let Some(week) = p.week {
+        // ISO week rules (ES's default `ROOT` locale: Monday first, the
+        // first week has four days); a missing day of week is Monday.
+        let wy = p.weekyear.or(p.year).or(default_year).unwrap_or(1970);
+        let wd = chrono::Weekday::try_from((p.dow.unwrap_or(1).clamp(1, 7) - 1) as u8).ok()?;
+        NaiveDate::from_isoywd_opt(wy, week, wd)?
+    } else if let Some(doy) = p.doy {
         NaiveDate::from_yo_opt(year, doy)?
     } else {
-        NaiveDate::from_ymd_opt(year, p.month.unwrap_or(1), p.day.unwrap_or(1))?
+        let month = p.month.or(p.quarter.map(|q| (q.clamp(1, 4) - 1) * 3 + 1)).unwrap_or(1);
+        NaiveDate::from_ymd_opt(year, month, p.day.unwrap_or(1))?
     };
     let mut hour = p.hour.unwrap_or(0);
     if p.pm == Some(true) {
@@ -537,6 +585,10 @@ fn parts_to_millis(p: &Parts, tz: Tz) -> Option<i64> {
 
 /// ISO-8601 (`strict_date_optional_time`): `yyyy[-MM[-dd]]['T'HH[:mm[:ss[.S{1,9}]]]][Z|±HH[:]MM]`.
 fn parse_iso(s: &str, tz: Tz, strict: bool) -> Option<i64> {
+    parse_iso_parts(s, strict).and_then(|p| parts_to_millis(&p, tz))
+}
+
+fn parse_iso_parts(s: &str, strict: bool) -> Option<Parts> {
     let b = s.as_bytes();
     let mut p = Parts::default();
     let mut pos = 0;
@@ -610,36 +662,31 @@ fn parse_iso(s: &str, tz: Tz, strict: bool) -> Option<i64> {
     if pos != b.len() {
         return None;
     }
-    parts_to_millis(&p, tz)
+    Some(p)
 }
 
-fn format_toks(toks: &[Tok], dt: NaiveDateTime, offset: i32, out: &mut String, fr: bool) {
+fn format_toks(toks: &[Tok], dt: NaiveDateTime, offset: i32, out: &mut String, lang: Lang) {
     for t in toks {
         match t {
             Tok::Lit(l) => out.push_str(l),
-            Tok::Optional(inner) => format_toks(inner, dt, offset, out, fr),
+            Tok::Optional(inner) => format_toks(inner, dt, offset, out, lang),
             Tok::Field(c, n) => {
                 let n = *n;
                 match c {
                     'y' | 'u' | 'Y' => {
+                        let year = if *c == 'Y' { dt.iso_week().year() } else { dt.year() };
                         if n == 2 {
-                            out.push_str(&format!("{:02}", dt.year().rem_euclid(100)));
+                            out.push_str(&format!("{:02}", year.rem_euclid(100)));
                         } else {
-                            out.push_str(&format!("{:0width$}", dt.year(), width = n.max(4)));
+                            out.push_str(&format!("{:0width$}", year, width = n.max(4)));
                         }
                     }
-                    'M' | 'L' if fr && n >= 3 => {
-                        out.push_str(if n >= 4 { FR_MONTHS[dt.month0() as usize] } else { FR_MONTHS_SHORT[dt.month0() as usize] });
-                    }
-                    'E' if fr => {
-                        let d = dt.weekday().num_days_from_monday() as usize;
-                        out.push_str(if n >= 4 { FR_DAYS[d] } else { FR_DAYS_SHORT[d] });
-                    }
                     'M' | 'L' => {
+                        let (full, short, _, _) = lang.names(*c == 'L');
                         if n >= 4 {
-                            out.push_str(MONTHS[dt.month0() as usize]);
+                            out.push_str(full[dt.month0() as usize]);
                         } else if n == 3 {
-                            out.push_str(&MONTHS[dt.month0() as usize][..3]);
+                            out.push_str(short[dt.month0() as usize]);
                         } else {
                             out.push_str(&format!("{:0n$}", dt.month()));
                         }
@@ -656,10 +703,11 @@ fn format_toks(toks: &[Tok], dt: NaiveDateTime, offset: i32, out: &mut String, f
                         let nanos = format!("{:09}", dt.nanosecond() % 1_000_000_000);
                         out.push_str(&nanos[..n.min(9)]);
                     }
-                    'a' => out.push_str(if dt.hour() >= 12 { "PM" } else { "AM" }),
+                    'a' => out.push_str(lang.am_pm()[usize::from(dt.hour() >= 12)]),
                     'E' => {
-                        let d = DAYS[dt.weekday().num_days_from_monday() as usize];
-                        out.push_str(if n >= 4 { d } else { &d[..3] });
+                        let (_, _, full, short) = lang.names(false);
+                        let d = dt.weekday().num_days_from_monday() as usize;
+                        out.push_str(if n >= 4 { full[d] } else { short[d] });
                     }
                     'X' => out.push_str(&format_offset(offset, n >= 3, true)),
                     'x' => out.push_str(&format_offset(offset, n >= 3, false)),
@@ -683,10 +731,29 @@ fn format_toks(toks: &[Tok], dt: NaiveDateTime, offset: i32, out: &mut String, f
 }
 
 impl DateFormatter {
-    /// Apply a mapping `locale` (only `fr` changes names).
+    /// Apply a mapping `locale` (its month and day names).
     pub fn with_locale(mut self, locale: Option<&str>) -> Self {
-        self.fr = locale.is_some_and(|l| l == "fr" || l.starts_with("fr_") || l.starts_with("fr-"));
+        self.lang = locale.and_then(Lang::of).unwrap_or_default();
         self
+    }
+
+    /// One `||` alternative of this formatter, with its locale.
+    pub fn alternative(&self, spec: &str) -> Result<Self> {
+        Ok(DateFormatter { lang: self.lang, ..DateFormatter::new(spec)? })
+    }
+
+    /// Whether a pattern parses or prints month or day names (`MMM`,
+    /// `EEEE`), which the mapping `locale` decides.
+    pub fn has_text_fields(&self) -> bool {
+        fn text(toks: &[Tok]) -> bool {
+            toks.iter().any(|t| match t {
+                Tok::Field('M' | 'L', n) => *n >= 3,
+                Tok::Field('E', _) => true,
+                Tok::Optional(inner) => text(inner),
+                _ => false,
+            })
+        }
+        self.fmts.iter().any(|f| matches!(f, Fmt::Pattern(t) if text(t)))
     }
 
     pub fn new(spec: &str) -> Result<Self> {
@@ -709,7 +776,7 @@ impl DateFormatter {
         if fmts.is_empty() {
             return Err(EsError::illegal_argument(format!("Invalid format: [{spec}]")));
         }
-        Ok(Self { spec: spec.to_string(), fmts, fr: false })
+        Ok(Self { spec: spec.to_string(), fmts, lang: Lang::default() })
     }
 
     /// Parse a date string with the zone used when the value has none.
@@ -722,7 +789,7 @@ impl DateFormatter {
                 Fmt::EpochSecond => parse_epoch(s, 1000.0),
                 Fmt::Pattern(toks) => {
                     let mut p = Parts::default();
-                    match parse_toks(toks, s.as_bytes(), 0, &mut p, self.fr) {
+                    match parse_toks(toks, s.as_bytes(), 0, &mut p, self.lang) {
                         Some(end) if end == s.len() => parts_to_millis(&p, tz),
                         _ => None,
                     }
@@ -740,6 +807,31 @@ impl DateFormatter {
 
     pub fn parse(&self, s: &str) -> Result<i64> {
         self.parse_with_tz(s, Tz::UTC)
+    }
+
+    /// [`Self::parse_with_tz`] to epoch nanoseconds (sub-millisecond
+    /// digits kept), a value without a year taking `default_year` (ES ingest
+    /// `DateFormat` completes it with the current year).
+    pub fn parse_nanos_with(&self, s: &str, tz: Tz, default_year: Option<i32>) -> Result<i128> {
+        let s = s.trim();
+        for f in &self.fmts {
+            let r = match f {
+                Fmt::Iso { strict } => parse_iso_parts(s, *strict).and_then(|p| parts_to_nanos(&p, tz, default_year)),
+                Fmt::EpochMillis => parse_epoch(s, 1.0).map(|m| m as i128 * 1_000_000),
+                Fmt::EpochSecond => parse_epoch(s, 1000.0).map(|m| m as i128 * 1_000_000),
+                Fmt::Pattern(toks) => {
+                    let mut p = Parts::default();
+                    match parse_toks(toks, s.as_bytes(), 0, &mut p, self.lang) {
+                        Some(end) if end == s.len() => parts_to_nanos(&p, tz, default_year),
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(v) = r {
+                return Ok(v);
+            }
+        }
+        Err(EsError::illegal_argument(format!("failed to parse date field [{s}] with format [{}]", self.spec)))
     }
 
     /// Format with the first format of the list.
@@ -765,7 +857,7 @@ impl DateFormatter {
             Fmt::EpochSecond => (millis.div_euclid(1000)).to_string(),
             Fmt::Pattern(toks) => {
                 let mut out = String::new();
-                format_toks(toks, dt, offset, &mut out, self.fr);
+                format_toks(toks, dt, offset, &mut out, self.lang);
                 out
             }
         }
@@ -774,10 +866,11 @@ impl DateFormatter {
     /// Format epoch nanoseconds with the first format of the list: ISO keeps the
     /// sub-millisecond digits (3 to 9, trailing zeros past 3 dropped), patterns
     /// see the full nanosecond of second.
-    pub fn format_nanos(&self, nanos: i64, tz: Tz) -> String {
-        let millis = nanos.div_euclid(1_000_000);
+    pub fn format_nanos(&self, nanos: impl Into<i128>, tz: Tz) -> String {
+        let nanos: i128 = nanos.into();
+        let millis = nanos.div_euclid(1_000_000) as i64;
         let offset = tz.offset_at(millis);
-        let secs = nanos.div_euclid(1_000_000_000) + offset as i64;
+        let secs = nanos.div_euclid(1_000_000_000) as i64 + offset as i64;
         let sub = nanos.rem_euclid(1_000_000_000) as u32;
         let dt = chrono::DateTime::from_timestamp(secs, sub).map(|d| d.naive_utc()).unwrap_or_default();
         match &self.fmts[0] {
@@ -794,7 +887,7 @@ impl DateFormatter {
             Fmt::EpochSecond => millis.div_euclid(1000).to_string(),
             Fmt::Pattern(toks) => {
                 let mut out = String::new();
-                format_toks(toks, dt, offset, &mut out, self.fr);
+                format_toks(toks, dt, offset, &mut out, self.lang);
                 out
             }
         }
@@ -810,6 +903,22 @@ impl DateFormatter {
         self.fmts.iter().any(|f| matches!(f, Fmt::EpochMillis | Fmt::EpochSecond))
     }
 
+    /// Nanoseconds per unit of the first epoch alternative (`epoch_millis`:
+    /// 1e6, `epoch_second`: 1e9), the one a number parses with.
+    pub fn epoch_unit_nanos(&self) -> Option<i64> {
+        self.fmts.iter().find_map(|f| match f {
+            Fmt::EpochMillis => Some(1_000_000),
+            Fmt::EpochSecond => Some(1_000_000_000),
+            _ => None,
+        })
+    }
+
+    /// Whether the first alternative is an epoch format (a numeric string
+    /// then parses as epoch, keeping its whole decimal fraction).
+    pub fn epoch_first(&self) -> bool {
+        matches!(self.fmts.first(), Some(Fmt::EpochMillis | Fmt::EpochSecond))
+    }
+
     /// Parse a JSON number as a date: epoch millis (or seconds) when the
     /// format allows numbers.
     pub fn parse_number(&self, v: f64) -> Result<i64> {
@@ -823,6 +932,30 @@ impl DateFormatter {
         // ES parses numbers through the string formats too (e.g. "yyyy").
         self.parse(&format_number(v))
     }
+}
+
+/// Epoch nanoseconds of decimal text `t` (`1735689600.5`, `-12`, `1e3`
+/// excluded) counted in units of `unit` nanoseconds, the whole fraction
+/// kept (production review #468: a seconds fraction was scaled as
+/// milliseconds). `None`: not a plain decimal or out of range.
+pub fn epoch_text_nanos(t: &str, unit: i64) -> Option<i128> {
+    let t = t.trim();
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    if int.is_empty() && frac.is_empty() || !int.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut n: i128 = if int.is_empty() { 0 } else { int.parse::<i128>().ok()? }.checked_mul(unit as i128)?;
+    // The fraction's digits within one unit (beyond nanos: dropped).
+    let digits = (unit as f64).log10().round() as usize;
+    let f: String = frac.chars().chain(std::iter::repeat('0')).take(digits).collect();
+    if digits > 0 {
+        n = n.checked_add(f.parse::<i128>().ok()?)?;
+    }
+    Some(if neg { -n } else { n })
 }
 
 fn format_number(v: f64) -> String {

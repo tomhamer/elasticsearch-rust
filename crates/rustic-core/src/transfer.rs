@@ -6,7 +6,7 @@
 //! rewritten at commit, absent when a segment has no deletes) and the
 //! vector store's segment files (`vec_XXXXXXXX.rvec`: vectors and their
 //! HNSW graphs, copied verbatim, never rebuilt by a transfer), the mutable
-//! graph checkpoints (`.rmvc`) and the DiskBBQ index files (`ivf_*.rivc`,
+//! graph checkpoints (`.rmvc`, and their incremental deltas `.rmvd`) and the DiskBBQ index files (`ivf_*.rivc`,
 //! `ivf_*.rivp`), opened in place by the receiver.
 //!
 //! [`snapshot_commit`] pins one commit: it reads `meta.json` and maps every
@@ -326,7 +326,7 @@ pub fn remove_unreferenced(dir: &dyn Directory, manifest: &CommitManifest) -> Re
     let mut out = crate::codec::directory::AdmittedNames::new()?;
     let names=dir.list_admitted(false)?;
     for name in names.iter() {
-        let ours = (name.starts_with("seg_") && (name.ends_with(".rstc") || name.ends_with(".del"))) || (name.starts_with("vec_") && name.ends_with(".rvec")) || (name.starts_with("mutable_") && name.ends_with(".rmvc"))
+        let ours = (name.starts_with("seg_") && (name.ends_with(".rstc") || name.ends_with(".del"))) || (name.starts_with("vec_") && name.ends_with(".rvec")) || (name.starts_with("mutable_") && (name.ends_with(".rmvc") || name.ends_with(".rmvd")))
             || crate::vector::store::is_code_log_file(name) || crate::vector::ivf_field::is_ivf_file(&name);
         if ours && !keep.contains(name.as_str()) {
             // Prepare returned ownership before mutating durable files.

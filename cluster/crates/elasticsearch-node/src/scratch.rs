@@ -172,6 +172,8 @@ const VALIDATION_CUSTOMS: &[&str] = &[
     crate::meta_extra::SEARCH_APPS_CUSTOM,
     crate::meta_extra::INFERENCE_CUSTOM,
     crate::meta_extra::ESQL_VIEWS_CUSTOM,
+    // ILM's `wait_for_snapshot` reads the cluster's SLM policies.
+    "snapshot_lifecycle",
 ];
 
 impl ScratchEngine {
@@ -196,7 +198,7 @@ impl ScratchEngine {
         // as on any node that serves requests.
         elasticsearch_engine::license::start(&engine);
         let router = elasticsearch_http::router(engine.clone());
-        let uuids = Mutex::new(UuidMap::load(&dir.join("uuids.json")));
+        let uuids = Mutex::new(UuidMap::load(&dir.join("uuids.json")).map_err(|e| e.to_string())?);
         Ok(ScratchEngine { engine, router, uuids, synced: Mutex::new(Synced::default()), live: Arc::downgrade(live) })
     }
 

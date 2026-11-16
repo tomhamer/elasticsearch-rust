@@ -89,17 +89,138 @@ pub struct JList {
     cap: Cell<usize>,
     /// Physical order may differ from Java iteration order.
     dirty: Cell<bool>,
+    /// `HashSet` / `LinkedHashSet`: each element's position by its Java
+    /// `equals` / `hashCode` identity ([`Key`]), so membership, insertion
+    /// and (for `HashSet`) removal are O(1) as in Java. Built lazily;
+    /// dropped by every other mutation ([`Self::borrow_mut`]) and by the
+    /// Java-order fix-up, which move elements.
+    index: RefCell<Option<std::collections::HashMap<Key, usize>>>,
 }
 
 /// Eager stream storage owns its request reservation, including when aliased.
 #[derive(Debug)]
 pub struct JStream {
+    /// The source elements.
     pub(super) values: Vec<Val>,
     pub(super) allocation: super::allocation::Allocation,
+    /// Pending intermediate operations, in order. Java streams are lazy:
+    /// nothing runs until a terminal operation pulls elements through them
+    /// (`methods::drive`), and short-circuiting stops the pulling.
+    pub(super) ops: Vec<StreamOp>,
+}
+
+/// An intermediate stream operation awaiting its terminal operation.
+#[derive(Clone, Debug)]
+pub enum StreamOp {
+    Filter(Val),
+    /// `map` / `mapToObj` (no cast), `mapToInt` / `mapToLong` / `mapToDouble`.
+    Map(Val, Option<super::ast::Ty>),
+    Peek(Val),
+    FlatMap(Val),
+    Limit(u64),
+    Skip(u64),
+    /// A barrier: every upstream element is consumed before any flows on.
+    Sorted(Option<Val>),
+    Distinct,
+    AsDouble,
+    AsLong,
 }
 impl std::ops::Deref for JStream {
     type Target = Vec<Val>;
     fn deref(&self) -> &Self::Target { &self.values }
+}
+
+/// A lambda value (`Val::Lambda`): the index of its body in the program's
+/// lambda table and the outer locals it captured, by value, when the lambda
+/// expression was evaluated (`LambdaInfo::captures` order). Each invocation
+/// runs in its own frame (`Rt::enter_lambda`), so a lambda called from
+/// another function reads its own captures, never the callee's locals.
+#[derive(Debug)]
+pub struct Closure {
+    pub id: u32,
+    pub captured: Box<[Val]>,
+}
+
+/// Dropping a deep container graph would recurse once per level in native
+/// code: a script can chain lists or maps far deeper than a worker's stack
+/// with a plain loop. The last owner of a list's or map's storage drains it
+/// here instead, moving uniquely owned nested containers onto a work list,
+/// so every drop is shallow whatever the nesting.
+impl Drop for JList {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.data) == 1 {
+            if let Ok(mut data) = self.data.try_borrow_mut() {
+                let items = std::mem::take(&mut *data);
+                drop(data);
+                drop_flat(items);
+            }
+        }
+    }
+}
+
+impl Drop for JMap {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.data) == 1 {
+            if let Ok(mut data) = self.data.try_borrow_mut() {
+                let entries = std::mem::take(&mut *data);
+                drop(data);
+                drop_flat(map_values(entries));
+            }
+        }
+    }
+}
+
+fn map_values(entries: IndexMap<Key, Val>) -> Vec<Val> {
+    let mut out = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        if let Key::Obj(KeyObj(b)) = k {
+            out.push(*b);
+        }
+        out.push(v);
+    }
+    out
+}
+
+/// Drop `pending` without recursing through nested containers it owns last.
+fn drop_flat(mut pending: Vec<Val>) {
+    while let Some(v) = pending.pop() {
+        match v {
+            Val::List(l) | Val::Set(l) | Val::Array { items: l, .. } => {
+                if Rc::strong_count(&l) == 1 && Rc::strong_count(&l.data) == 1 {
+                    if let Ok(mut d) = l.data.try_borrow_mut() {
+                        pending.append(&mut d);
+                    }
+                }
+                // (now empty: its own drop is shallow)
+            }
+            Val::Map(m) => {
+                if Rc::strong_count(&m) == 1 && Rc::strong_count(&m.data) == 1 {
+                    if let Ok(mut d) = m.data.try_borrow_mut() {
+                        let entries = std::mem::take(&mut *d);
+                        drop(d);
+                        pending.extend(map_values(entries));
+                    }
+                }
+            }
+            Val::Optional(Some(inner)) => {
+                if let Ok(inner) = Rc::try_unwrap(inner) {
+                    pending.push(inner);
+                }
+            }
+            Val::Entry(e) => {
+                if let Ok((a, b)) = Rc::try_unwrap(e) {
+                    pending.push(a);
+                    pending.push(b);
+                }
+            }
+            Val::Lambda(c) => {
+                if let Ok(c) = Rc::try_unwrap(c) {
+                    pending.extend(c.captured.into_vec());
+                }
+            }
+            other => drop(other),
+        }
+    }
 }
 
 /// A Java map (`Val::Map`).
@@ -151,7 +272,7 @@ impl JList {
     pub fn new(kind: CollKind, v: Vec<Val>) -> JList {
         let cap = if kind == CollKind::HashSet { copy_capacity(v.len(), true) } else { 16 };
         let data = Rc::new(RefCell::new(v));
-        JList { data, allocation: super::allocation::Allocation::new(), registered: Cell::new(false), kind, cmp: None, immutable: false, cap: Cell::new(cap), dirty: Cell::new(kind != CollKind::List && kind != CollKind::LinkedSet) }
+        JList { data, allocation: super::allocation::Allocation::new(), registered: Cell::new(false), kind, cmp: None, immutable: false, cap: Cell::new(cap), dirty: Cell::new(kind != CollKind::List && kind != CollKind::LinkedSet), index: RefCell::new(None) }
     }
     pub fn register_mutation(&self) -> SResult<()> {
         if self.allocation.enabled() && !self.registered.get() {
@@ -190,9 +311,18 @@ impl JList {
     pub fn borrow(&self) -> Ref<'_, Vec<Val>> {
         self.data.borrow()
     }
-    /// Raw mutable storage; marks the Java order for recomputation.
+    /// Raw mutable storage; marks the Java order for recomputation (and
+    /// drops a set's element index).
     #[inline]
     pub fn borrow_mut(&self) -> RefMut<'_, Vec<Val>> {
+        self.note_mutation();
+        if self.kind != CollKind::List {
+            self.index.replace(None);
+        }
+        self.data.borrow_mut()
+    }
+
+    fn note_mutation(&self) {
         if self.kind != CollKind::List {
             self.dirty.set(true);
             if self.kind == CollKind::HashSet {
@@ -203,7 +333,66 @@ impl JList {
                 }
             }
         }
-        self.data.borrow_mut()
+    }
+
+    /// The set's element index (built on first use after a reset) with the storage.
+    fn with_index<R>(&self, f: impl FnOnce(&mut std::collections::HashMap<Key, usize>, &mut Vec<Val>) -> R) -> R {
+        let mut data = self.data.borrow_mut();
+        let mut index = self.index.borrow_mut();
+        let ix = index.get_or_insert_with(|| data.iter().enumerate().map(|(i, v)| (Key::from_val(v), i)).collect());
+        f(ix, &mut data)
+    }
+
+    /// `HashSet` / `LinkedHashSet` membership (Java `equals` / `hashCode`), O(1).
+    pub fn set_contains(&self, v: &Val) -> bool {
+        let k = Key::from_val(v);
+        self.with_index(|ix, _| ix.contains_key(&k))
+    }
+
+    /// `HashSet` / `LinkedHashSet` `add`, O(1): `false` when present.
+    pub fn set_insert(&self, v: Val) -> SResult<bool> {
+        let k = Key::from_val(&v);
+        if self.with_index(|ix, _| ix.contains_key(&k)) {
+            return Ok(false);
+        }
+        self.reserve_growth(1)?;
+        self.note_mutation();
+        self.with_index(|ix, d| {
+            ix.insert(k, d.len());
+            d.push(v);
+        });
+        Ok(true)
+    }
+
+    /// `HashSet` / `LinkedHashSet` `remove`: O(1) for a `HashSet` (its
+    /// physical order is not its iteration order), order-preserving for a
+    /// `LinkedHashSet`. `false` when absent.
+    pub fn set_remove(&self, v: &Val) -> bool {
+        let k = Key::from_val(v);
+        let hash_set = self.kind == CollKind::HashSet;
+        let removed = self.with_index(|ix, d| {
+            let pos = ix.remove(&k)?;
+            if hash_set {
+                d.swap_remove(pos);
+                if pos < d.len() {
+                    ix.insert(Key::from_val(&d[pos]), pos);
+                }
+                Some(true)
+            } else {
+                d.remove(pos);
+                Some(false)
+            }
+        });
+        match removed {
+            None => false,
+            Some(index_valid) => {
+                if !index_valid {
+                    self.index.replace(None);
+                }
+                self.dirty.set(true);
+                true
+            }
+        }
     }
     /// Contents in Java iteration order.
     pub fn ordered(&self) -> Ref<'_, Vec<Val>> {
@@ -216,6 +405,10 @@ impl JList {
         self.data.borrow()
     }
     fn fix(&self, d: &mut Vec<Val>) {
+        // Elements move: positions in the index go stale.
+        if let Ok(mut index) = self.index.try_borrow_mut() {
+            *index = None;
+        }
         match self.kind {
             CollKind::HashSet => {
                 let n = d.len();
@@ -346,8 +539,8 @@ pub enum Val {
     DocValues(Rc<DocValues>),
     /// The `doc` map itself.
     Doc,
-    /// A compiled lambda (index into the program's lambda table).
-    Lambda(u32),
+    /// A lambda value: its compiled body and its captured locals.
+    Lambda(Rc<Closure>),
     /// `Class::method` reference.
     MethodRef(Rc<(String, String)>),
     Stream(Rc<JStream>),
@@ -472,7 +665,7 @@ impl Val {
     /// True for variants without heap data (dropping them is a no-op).
     #[inline(always)]
     pub fn is_inline(&self) -> bool {
-        matches!(self, Val::Null | Val::Bool(_) | Val::Int(_) | Val::Long(_) | Val::Double(_) | Val::Char(_) | Val::Date(_) | Val::Instant(_) | Val::DayOfWeek(_) | Val::Month(_) | Val::ChronoUnit(_) | Val::Lambda(_) | Val::Doc)
+        matches!(self, Val::Null | Val::Bool(_) | Val::Int(_) | Val::Long(_) | Val::Double(_) | Val::Char(_) | Val::Date(_) | Val::Instant(_) | Val::DayOfWeek(_) | Val::Month(_) | Val::ChronoUnit(_) | Val::Doc)
     }
 
     pub fn str(s: &str) -> Val {
@@ -504,10 +697,10 @@ impl Val {
             let value = value?;
             allocation.push(&mut values, value)?;
         }
-        Ok(Val::Stream(Rc::new(JStream { values, allocation })))
+        Ok(Val::Stream(Rc::new(JStream { values, allocation, ops: Vec::new() })))
     }
     pub(super) fn stream_from_values(values: Vec<Val>, allocation: super::allocation::Allocation) -> Val {
-        Val::Stream(Rc::new(JStream { values, allocation }))
+        Val::Stream(Rc::new(JStream { values, allocation, ops: Vec::new() }))
     }
     pub(super) fn allocated(mut self, allocation: super::allocation::Allocation) -> Val {
         match &mut self {
@@ -668,15 +861,22 @@ impl Val {
             Val::Str(s) => out.push_str(s),
             Val::Utf16(s) => out.push_str(&String::from_utf16_lossy(s)),
             Val::List(l) | Val::Set(l) => {
+                let Some(_level) = super::walk::enter() else { return };
                 out.push('[');
                 for (i, v) in l.ordered().iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    v.write_java(out);
+                    // Java `AbstractCollection.toString`.
+                    match v {
+                        Val::List(x) | Val::Set(x) if Rc::ptr_eq(x, l) => out.push_str("(this Collection)"),
+                        _ => v.write_java(out),
+                    }
                 }
                 out.push(']');
             }
+            // A stream with pending operations is not evaluated by printing it.
+            Val::Stream(l) if !l.ops.is_empty() => out.push_str("java.util.stream.ReferencePipeline"),
             Val::Stream(l) => {
                 out.push('[');
                 for (i, v) in l.iter().enumerate() {
@@ -688,14 +888,18 @@ impl Val {
                 out.push(']');
             }
             Val::Map(m) => {
+                let Some(_level) = super::walk::enter() else { return };
                 out.push('{');
                 for (i, (k, v)) in m.ordered().iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    k.to_val().write_java(out);
+                    // Java `AbstractMap.toString`.
+                    let this = |x: &Val| matches!(x, Val::Map(o) if Rc::ptr_eq(o, m));
+                    let k = k.to_val();
+                    if this(&k) { out.push_str("(this Map)"); } else { k.write_java(out); }
                     out.push('=');
-                    v.write_java(out);
+                    if this(v) { out.push_str("(this Map)"); } else { v.write_java(out); }
                 }
                 out.push('}');
             }
@@ -803,6 +1007,19 @@ impl Val {
             }
             stack.push(a);
         }
+        // A script can chain containers deeper than the native stack allows
+        // with a constant number of instructions: the conversion is a
+        // bounded walk (depth and stack, `super::walk`).
+        let _level = match addr {
+            Some(_) => match super::walk::enter() {
+                Some(level) => Some(level),
+                None => {
+                    stack.pop();
+                    return if strict { Err(()) } else { Ok(Value::Null) };
+                }
+            },
+            None => None,
+        };
         let mut sub = |v: &Val| v.json_inner(stack, strict);
         let out = match self {
             Val::Null => Value::Null,
@@ -814,6 +1031,7 @@ impl Val {
             Val::Str(s) => Value::String(s.to_string()),
             Val::List(l) | Val::Set(l) => Value::Array(l.ordered().iter().map(&mut sub).collect::<Result<_, _>>()?),
             Val::Array { items, .. } => Value::Array(items.borrow().iter().map(&mut sub).collect::<Result<_, _>>()?),
+            Val::Stream(l) if !l.ops.is_empty() => Value::String("java.util.stream.ReferencePipeline".into()),
             Val::Stream(l) => Value::Array(l.iter().map(&mut sub).collect::<Result<_, _>>()?),
             Val::DocValues(d) => Value::Array(d.values.iter().map(&mut sub).collect::<Result<_, _>>()?),
             Val::Map(m) => {
@@ -866,16 +1084,35 @@ impl Val {
             Val::Utf16(s) => s.to_vec(),
             Val::Builder(b) => b.borrow().to_vec(),
             Val::Obj(obj) => obj.string_units().unwrap_or_else(|| self.to_java_string().encode_utf16().collect()),
-            Val::List(l) | Val::Set(l) => sequence(&l.ordered()),
-            Val::Stream(values) => sequence(values),
+            Val::List(l) | Val::Set(l) => {
+                let Some(_level) = super::walk::enter() else { return Vec::new() };
+                // Java `AbstractCollection.toString`: a direct self-reference
+                // prints as `(this Collection)`.
+                let mut out = vec![91];
+                for (i, value) in l.ordered().iter().enumerate() {
+                    if i > 0 { out.extend([44, 32]); }
+                    match value {
+                        Val::List(x) | Val::Set(x) if Rc::ptr_eq(x, l) => out.extend("(this Collection)".encode_utf16()),
+                        _ => out.extend(value.string_units()),
+                    }
+                }
+                out.push(93);
+                out
+            }
+            Val::Stream(values) if values.ops.is_empty() => sequence(values),
+            Val::Stream(_) => "java.util.stream.ReferencePipeline".encode_utf16().collect(),
             Val::DocValues(d) => sequence(&d.values),
             Val::Map(m) => {
+                let Some(_level) = super::walk::enter() else { return Vec::new() };
                 let mut out = vec![123];
+                // Java `AbstractMap.toString`: `(this Map)` for a self-reference.
+                let this = |x: &Val| matches!(x, Val::Map(o) if Rc::ptr_eq(o, m));
                 for (i, (key, value)) in m.ordered().iter().enumerate() {
                     if i > 0 { out.extend([44, 32]); }
-                    out.extend(key.to_val().string_units());
+                    let key = key.to_val();
+                    if this(&key) { out.extend("(this Map)".encode_utf16()); } else { out.extend(key.string_units()); }
                     out.push(61);
-                    out.extend(value.string_units());
+                    if this(value) { out.extend("(this Map)".encode_utf16()); } else { out.extend(value.string_units()); }
                 }
                 out.push(125);
                 out
@@ -907,7 +1144,8 @@ impl Val {
                         Val::Long(i)
                     }
                 } else if let Some(u) = n.as_u64() {
-                    Val::Double(u as f64)
+                    // Jackson reads an integer past `long` as a `BigInteger`.
+                    super::jbig::biginteger_u64(u)
                 } else {
                     Val::Double(n.as_f64().unwrap_or(0.0))
                 }
@@ -943,6 +1181,7 @@ impl Val {
                 if Rc::ptr_eq(a, b) {
                     return true;
                 }
+                let Some(_level) = super::walk::enter() else { return false };
                 let (a, b) = (a.borrow(), b.borrow());
                 if a.len() != b.len() {
                     return false;
@@ -957,6 +1196,7 @@ impl Val {
                 if Rc::ptr_eq(a, b) {
                     return true;
                 }
+                let Some(_level) = super::walk::enter() else { return false };
                 let (a, b) = (a.borrow(), b.borrow());
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals(y))
             }
@@ -964,12 +1204,16 @@ impl Val {
                 if Rc::ptr_eq(a, b) {
                     return true;
                 }
+                let Some(_level) = super::walk::enter() else { return false };
                 let (a, b) = (a.borrow(), b.borrow());
                 a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.equals(w)))
             }
             (Val::Date(a), Val::Date(b)) | (Val::Instant(a), Val::Instant(b)) => a == b,
             (Val::DayOfWeek(a), Val::DayOfWeek(b)) | (Val::Month(a), Val::Month(b)) => a == b,
-            (Val::Entry(a), Val::Entry(b)) => a.0.equals(&b.0) && a.1.equals(&b.1),
+            (Val::Entry(a), Val::Entry(b)) => {
+                let Some(_level) = super::walk::enter() else { return false };
+                a.0.equals(&b.0) && a.1.equals(&b.1)
+            }
             (Val::Optional(a), Val::Optional(b)) => match (a, b) {
                 (None, None) => true,
                 (Some(x), Some(y)) => x.equals(y),
@@ -977,7 +1221,8 @@ impl Val {
             },
             (Val::DocValues(a), Val::DocValues(b)) => Rc::ptr_eq(a, b),
             (Val::Stream(a), Val::Stream(b)) => Rc::ptr_eq(a, b),
-            (Val::Lambda(a), Val::Lambda(b)) => a == b,
+            // Java lambdas compare by identity.
+            (Val::Lambda(a), Val::Lambda(b)) => Rc::ptr_eq(a, b) || (a.id == b.id && a.captured.is_empty() && b.captured.is_empty()),
             (Val::ChronoUnit(a), Val::ChronoUnit(b)) => a == b,
             (Val::Time(_), _) | (_, Val::Time(_)) => super::jtime::equals(self, o),
             (Val::Big(a), Val::Big(b)) => a.equals(b),
@@ -1017,10 +1262,25 @@ impl Val {
             }
             Val::Null => 0,
             Val::Char(c) => *c as i32,
-            Val::List(l) => l.borrow().iter().fold(1i32, |h, v| h.wrapping_mul(31).wrapping_add(v.java_hash())),
-            Val::Set(l) => l.borrow().iter().fold(0i32, |h, v| h.wrapping_add(v.java_hash())),
-            Val::Map(m) => m.borrow().iter().fold(0i32, |h, (k, v)| h.wrapping_add(k.to_val().java_hash() ^ v.java_hash())),
-            Val::Entry(e) => e.0.java_hash() ^ e.1.java_hash(),
+            // Bounded walks ([`super::walk`]): a cyclic or exponentially
+            // shared graph ends as `stack_overflow_error`, never by
+            // exhausting the native stack.
+            Val::List(l) => {
+                let Some(_level) = super::walk::enter() else { return 0 };
+                l.borrow().iter().fold(1i32, |h, v| h.wrapping_mul(31).wrapping_add(v.java_hash()))
+            }
+            Val::Set(l) => {
+                let Some(_level) = super::walk::enter() else { return 0 };
+                l.borrow().iter().fold(0i32, |h, v| h.wrapping_add(v.java_hash()))
+            }
+            Val::Map(m) => {
+                let Some(_level) = super::walk::enter() else { return 0 };
+                m.borrow().iter().fold(0i32, |h, (k, v)| h.wrapping_add(k.to_val().java_hash() ^ v.java_hash()))
+            }
+            Val::Entry(e) => {
+                let Some(_level) = super::walk::enter() else { return 0 };
+                e.0.java_hash() ^ e.1.java_hash()
+            }
             Val::DayOfWeek(_) | Val::Month(_) | Val::ChronoUnit(_) => self.to_java_string().encode_utf16().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32)),
             Val::Time(t) => t.hash(),
             Val::Big(b) => b.hash(),

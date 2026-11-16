@@ -155,7 +155,7 @@ impl ShapeSum {
 
 /// ES `SpatialExtentStateWrappedLongitudeState.asRectangle` of a merged
 /// shape extent: the narrower of the dateline-wrapped and unwrapped boxes.
-fn shape_extent_wkt(e: &rustic_core::fieldtypes::shape::ShapeExtent) -> Val {
+pub(super) fn shape_extent_wkt(e: &rustic_core::fieldtypes::shape::ShapeExtent) -> Val {
     let top = decode_lat(e.top);
     let bottom = decode_lat(e.bottom);
     let neg_left = if e.neg_left <= 0 { decode_lon(e.neg_left) } else { f64::INFINITY };
@@ -398,9 +398,9 @@ fn streamed_stats(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, residual: 
 #[cfg(test)]
 thread_local! {
     /// Tests: STATS answered by [`columnar_stats`].
-    static COLUMNAR_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static COLUMNAR_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Tests: [`columnar_stats`] off (compare with the streamed rows).
-    static NO_COLUMNAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static NO_COLUMNAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// One STATS grouping key of [`columnar_stats`].
@@ -659,6 +659,10 @@ fn columnar_stats(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, rest: &[Cm
         .map(|_| crate::memory::breakers().reserve_request(0, crate::esql::exec::ESQL_LABEL).map(|r| std::sync::Mutex::new(Some(r))))
         .collect::<Result<_>>()?;
     let init = |ti: usize| ColPart::new(reservations.get(ti).and_then(|m| m.lock().ok()?.take()));
+    let mirrors: Vec<bool> = schema.targets.iter().map(|t| t.svc.synthetic_source() || {
+        let m = t.svc.mapping_json().to_string();
+        !m.contains("\"copy_to\"") && !m.contains("\"include_in_root\"") && !m.contains("\"include_in_parent\"")
+    }).collect();
     let fold = |st: &mut ColPart, view: &crate::search::LeafView<'_>| -> Result<()> {
         if st.bail { return Ok(()); }
         // A segment's columns, or a published memtable's.
@@ -666,7 +670,12 @@ fn columnar_stats(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, rest: &[Cm
             LeafReader::Segment(seg) => (Some(*seg), None),
             LeafReader::Memtable(w, _) => (None, Some(*w)),
         };
-        if view.target.field_access().is_some() || !view.target.svc.synthetic_source() {
+        // Stored as well as synthetic source: ES|QL reads keyword and
+        // numeric columns from their doc values (`BlockDocValuesReader`), as
+        // folded here; multi-valued and ignored values take the rows path,
+        // and so does an index whose doc values hold values its stored
+        // source lacks (`copy_to`, nested `include_in_root`/`_parent`).
+        if view.target.field_access().is_some() || !mirrors.get(view.target_idx).copied().unwrap_or(false) {
             st.bail = true;
             return Ok(());
         }
@@ -949,6 +958,14 @@ fn columnar_stats(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, rest: &[Cm
         }
         rows.push(row);
     }
+    // A global STATS answers one row even when no document matched (ES
+    // seeds the empty aggregation state): counts 0, the others null.
+    if keys.is_empty() && rows.is_empty() {
+        rows.push(plan.iter().map(|a| match a {
+            ColAgg::Count(_) | ColAgg::CountDistinct(_) => Val::Long(0),
+            _ => Val::Null,
+        }).collect());
+    }
     memory.grow(rows.iter().map(|r| crate::esql::exec::row_bytes(r)).sum::<u64>(), crate::esql::exec::ESQL_LABEL)?;
     memory.retain_for_request();
     taken();
@@ -1032,11 +1049,20 @@ fn shape_envelope_npoints(p: &crate::search::MatchPage<'_>, field: &str, d: rust
 /// rows are otherwise unchanged. `None`: nothing rewritten.
 fn shape_npoints_rewrite(full: &str, schema: &IndexSchema, local: &mut [Cmd]) -> Option<ExtraColumn> {
     const NAME: &str = "\u{0}st_envelope_npoints";
-    let is_shape = |c: &str| schema.cols.iter().any(|(n, s)| n == c && s.ty == "geo_shape" && s.declared == "geo_shape" && s.doc_values && s.per_index.is_empty() && s.constants.is_empty() && s.types.len() <= 1);
-    let envelope_of = |e: &Expr| -> Option<String> {
+    // Rewritten on a copy, committed only when the whole pipeline can take
+    // the rewrite (a second shape field leaves the commands untouched).
+    let mut work: Vec<Cmd> = local.to_vec();
+    // Names whose value is no longer the indexed column (an EVAL wrote
+    // them, a RENAME or DROP touched them): the doc-value extent no longer
+    // describes them.
+    let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let is_shape = |c: &str, shadowed: &std::collections::HashSet<String>| !shadowed.contains(c) && schema.cols.iter().any(|(n, s)| n == c && s.ty == "geo_shape" && s.declared == "geo_shape" && s.doc_values && s.per_index.is_empty() && s.constants.is_empty() && s.types.len() <= 1);
+    let envelope_of = |e: &Expr, shadowed: &std::collections::HashSet<String>| -> Option<String> {
         match e {
             Expr::Call(f, args, _) if f == "ST_ENVELOPE" => match args.as_slice() {
-                [Expr::Col(c, _)] if is_shape(c) => Some(c.clone()),
+                [Expr::Col(c, _)] if is_shape(c, shadowed) => Some(c.clone()),
+                // Bound over a geographic shape (the dateline marker).
+                [Expr::Col(c, _), Expr::Lit(Val::Str(m))] if m == super::super::func2::GEO_ENVELOPE && is_shape(c, shadowed) => Some(c.clone()),
                 _ => None,
             },
             _ => None,
@@ -1045,34 +1071,49 @@ fn shape_npoints_rewrite(full: &str, schema: &IndexSchema, local: &mut [Cmd]) ->
     // The envelope columns defined so far: name -> shape column.
     let mut envs: Vec<(String, String)> = Vec::new();
     let mut field: Option<String> = None;
-    for cmd in local.iter_mut() {
-        let Cmd::Eval(fields) = cmd else { continue };
-        for f in fields.iter_mut() {
-            if let Some(c) = envelope_of(&f.expr) {
-                envs.push((f.name.clone(), c));
-                continue;
+    for cmd in work.iter_mut() {
+        match cmd {
+            Cmd::Eval(fields) => {
+                for f in fields.iter_mut() {
+                    if let Some(c) = envelope_of(&f.expr, &shadowed) {
+                        envs.push((f.name.clone(), c));
+                        shadowed.insert(f.name.clone());
+                        continue;
+                    }
+                    let rewrite = match &f.expr {
+                        Expr::Call(name, args, _) if name == "ST_NPOINTS" => match args.as_slice() {
+                            [inner] => envelope_of(inner, &shadowed).or_else(|| match inner {
+                                // `env` defined above and read only here.
+                                Expr::Col(e, _) if word_count(full, e) == 2 => envs.iter().find(|(n, _)| n == e).map(|(_, c)| c.clone()),
+                                _ => None,
+                            }),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(c) = rewrite {
+                        if field.as_ref().is_some_and(|x| *x != c) {
+                            return None;
+                        }
+                        f.expr = Expr::Col(NAME.to_string(), f.pos);
+                        field = Some(c);
+                    }
+                    shadowed.insert(f.name.clone());
+                }
             }
-            let Expr::Call(name, args, _) = &f.expr else { continue };
-            if name != "ST_NPOINTS" {
-                continue;
+            Cmd::Where(..) | Cmd::Keep(..) | Cmd::Drop(..) | Cmd::Sort(..) | Cmd::Limit(..) => {}
+            Cmd::Rename(pairs, _) => {
+                for (from, to) in pairs.iter() {
+                    shadowed.insert(from.clone());
+                    shadowed.insert(to.clone());
+                }
             }
-            let src = match args.as_slice() {
-                [inner] => envelope_of(inner).or_else(|| match inner {
-                    // `env` defined above and read only here.
-                    Expr::Col(e, _) if word_count(full, e) == 2 => envs.iter().find(|(n, _)| n == e).map(|(_, c)| c.clone()),
-                    _ => None,
-                }),
-                _ => None,
-            };
-            let Some(c) = src else { continue };
-            if field.as_ref().is_some_and(|x| *x != c) {
-                return None;
-            }
-            f.expr = Expr::Col(NAME.to_string(), f.pos);
-            field = Some(c);
+            // Other commands may define or drop columns: no rewrite past them.
+            _ => break,
         }
     }
     let field = field?;
+    local.clone_from_slice(&work);
     Some(ExtraColumn { name: NAME.to_string(), ty: "integer".to_string(), value: ExtraValue::Doc(shape_envelope_npoints), field })
 }
 
@@ -1851,7 +1892,8 @@ fn streamed_top_n(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, residual: 
 /// then run the `LIMIT` (or the stable `SORT` and what follows) here.
 fn distributed_rows(ctx: &mut Ctx, schema: &IndexSchema, indices: &[String], query: &Value, residual: &[(Expr, usize)], rest: &[Cmd]) -> Result<Option<(Table, usize)>> {
     // Each node evaluates the rows: the same settings everywhere.
-    if ctx.settings.unmapped != super::super::settings::Unmapped::Default || ctx.settings.time_zone_set || ctx.fctx.locale.is_some() {
+    // (A SQL `time_zone` is this thread's zone, not a setting.)
+    if ctx.settings.unmapped != super::super::settings::Unmapped::Default || ctx.settings.time_zone_set || crate::esql::zone() != crate::date::Tz::UTC || ctx.fctx.locale.is_some() {
         return Ok(None);
     }
     let (k, sort, covered, n) = match top_n_shape(ctx, rest) {
@@ -2465,13 +2507,13 @@ fn sort_driven_lookup(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, rest: 
     // values: one indexed before the field was mapped has it in `_source`
     // only, which the whole-lookup path reads and the walk does not.
     let exists = |field: &str| json!({"exists": {"field": field}});
-    let base_all = crate::search::count(&base_targets, Some(query), None)?;
-    if crate::search::count(&base_targets, Some(&json!({"bool": {"filter": [query.clone(), exists(&base_key.path)]}})), None)? != base_all
-        || crate::search::count(&lookup_targets, Some(&exists(&lookup_key.path)), None)? != crate::search::count(&lookup_targets, None, None)? {
+    let base_all = crate::esql::remote::checked_count(&base_targets, Some(query), None)?;
+    if crate::esql::remote::checked_count(&base_targets, Some(&json!({"bool": {"filter": [query.clone(), exists(&base_key.path)]}})), None)? != base_all
+        || crate::esql::remote::checked_count(&lookup_targets, Some(&exists(&lookup_key.path)), None)? != crate::esql::remote::checked_count(&lookup_targets, None, None)? {
         return Ok(None);
     }
     if sort_path != sort_column.path {
-        if crate::search::count(&lookup_targets, Some(&exists(&sort_column.path)), None)? != crate::search::count(&lookup_targets, Some(&exists(&sort_path)), None)? {
+        if crate::esql::remote::checked_count(&lookup_targets, Some(&exists(&sort_column.path)), None)? != crate::esql::remote::checked_count(&lookup_targets, Some(&exists(&sort_path)), None)? {
             return Ok(None);
         }
     }
@@ -2651,7 +2693,7 @@ fn sort_driven_lookup(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, rest: 
     }
     // As the whole-lookup path counts them: every source document's key
     // read, every lookup document read.
-    ctx.documents_found += base_all + crate::search::count(&lookup_targets, None, None)?;
+    ctx.documents_found += base_all + crate::esql::remote::checked_count(&lookup_targets, None, None)?;
     ctx.values_loaded += loaded;
     #[cfg(test)]
     SORT_DRIVEN_RUNS.with(|n| n.set(n.get() + 1));
@@ -2890,7 +2932,7 @@ pub(super) fn lookup_prefilter(ctx: &mut Ctx, lookup: &IndexSchema, on: &[String
     }
     let all = json!({"match_all": {}});
     if !keyword_columns_single_and_covered(&targets, &all, &keys, true)? { return Ok(None); }
-    let total = crate::search::count(&targets, None, None)?;
+    let total = crate::esql::remote::checked_count(&targets, None, None)?;
     let mut terms = Vec::new();
     for (name, literal) in pairs {
         let Some((_, column)) = lookup.cols.iter().find(|(n, _)| n == name) else { return Ok(None) };
@@ -2905,7 +2947,7 @@ pub(super) fn lookup_prefilter(ctx: &mut Ctx, lookup: &IndexSchema, on: &[String
                 rustic_core::query::LeafReader::Segment(segment) => segment.fast_fields().get_multi_i64(id).is_none(),
                 rustic_core::query::LeafReader::Memtable(writer, ..) => writer.fast_fields().get_multi_i64(id).is_none(),
             }))?;
-            if !single || crate::search::count(&targets, Some(&json!({"exists": {"field": column.path}})), None)? != total { return Ok(None); }
+            if !single || crate::esql::remote::checked_count(&targets, Some(&json!({"exists": {"field": column.path}})), None)? != total { return Ok(None); }
             terms.push(json!({"term": {column.path.clone(): n}}));
             continue;
         }
@@ -2921,8 +2963,8 @@ pub(super) fn lookup_prefilter(ctx: &mut Ctx, lookup: &IndexSchema, on: &[String
             rustic_core::query::LeafReader::Memtable(writer, ..) => writer.fast_fields().get_multi_keyword(id).is_none(),
         }))?;
         let exists = |field: &str| json!({"exists": {"field": field}});
-        if !single || crate::search::count(&targets, Some(&exists(&path)), None)? != total
-            || crate::search::count(&targets, Some(&exists(&column.path)), None)? != total { return Ok(None); }
+        if !single || crate::esql::remote::checked_count(&targets, Some(&exists(&path)), None)? != total
+            || crate::esql::remote::checked_count(&targets, Some(&exists(&column.path)), None)? != total { return Ok(None); }
         terms.push(json!({"term": {path: literal}}));
     }
     Ok(Some(json!({"bool": {"filter": terms}})))
@@ -3003,11 +3045,11 @@ fn semi_join(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, left: &Table, l
     let mut filter = vec![query.clone()];
     filter.extend(terms);
     let narrowed = json!({"bool": {"filter": filter}});
-    let kept = crate::search::count(&targets, Some(&narrowed), None)?;
+    let kept = crate::esql::remote::checked_count(&targets, Some(&narrowed), None)?;
     // Each kept document joins at most this many lookup rows.
     let fanout = passing.values().map(|(_, n)| *n as u64).max().unwrap_or(0);
     if kept.saturating_mul(fanout) >= limit as u64 { return Ok(None); }
-    let all = crate::search::count(&targets, Some(query), None)?;
+    let all = crate::esql::remote::checked_count(&targets, Some(query), None)?;
     let mut skipped_values = 0u64;
     for column in &columns {
         let exists = json!({"exists": {"field": column.path}});
@@ -3015,9 +3057,9 @@ fn semi_join(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, left: &Table, l
         // Every document holds the key in doc values: one indexed before
         // the field was mapped has it in `_source` only, which the full
         // scan reads and the `terms` filter does not match.
-        let holding = crate::search::count(&targets, Some(&with(query)), None)?;
+        let holding = crate::esql::remote::checked_count(&targets, Some(&with(query)), None)?;
         if holding != all { return Ok(None); }
-        skipped_values += holding.saturating_sub(crate::search::count(&targets, Some(&with(&narrowed)), None)?);
+        skipped_values += holding.saturating_sub(crate::esql::remote::checked_count(&targets, Some(&with(&narrowed)), None)?);
     }
     #[cfg(test)]
     SEMI_JOINS.with(|n| n.set(n.get() + 1));
@@ -3073,12 +3115,12 @@ fn keyword_columns_single_and_covered(targets: &[crate::search::Target], query: 
         Ok(true)
     })?;
     if !single { return Ok(false); }
-    let all = crate::search::count(targets, Some(query), None)?;
+    let all = crate::esql::remote::checked_count(targets, Some(query), None)?;
     for (name, column) in columns {
         // The doc-values field's own path (a sub-field's name).
         let path = if multi_field { *name } else { column.path.as_str() };
         let holding = json!({"bool": {"filter": [query.clone(), {"exists": {"field": path}}]}});
-        if crate::search::count(targets, Some(&holding), None)? != all { return Ok(false); }
+        if crate::esql::remote::checked_count(targets, Some(&holding), None)? != all { return Ok(false); }
     }
     Ok(true)
 }
@@ -3460,7 +3502,7 @@ fn streamed_filtered_lookup(ctx: &mut Ctx, schema: &IndexSchema, query: &Value, 
     // A small lookup index (Rally joins `*_two_keys_where_one_matching_equals`:
     // 1,000 keys, a match in 1 of 1,000 source rows) was otherwise read again
     // for every chunk the filter scanned. Keyed and whole plans join alike.
-    let lookup_docs = match &keyed_schema { Some(lookup) => crate::search::count(&lookup.targets, None, None)? as usize, None => 0 };
+    let lookup_docs = match &keyed_schema { Some(lookup) => crate::esql::remote::checked_count(&lookup.targets, None, None)? as usize, None => 0 };
     let mut keyed_rows = 0usize;
     let mut whole: Option<LookupJoinPlan> = None;
     // Per distinct source key row (`filter_projection`'s columns), under a
@@ -4041,9 +4083,19 @@ pub(super) fn sql_column_rows(schema: &IndexSchema, wanted: &[bool], target: &cr
 /// front-coded term per doc replays its block: SQL's script and grouping
 /// queries over a keyword column (Rally sql over NOAA `station.name`) were
 /// about twice as slow as with the plain tables before (segment v30).
+///
+/// A dictionary of any size stays on doc values, as ES's ordinal block
+/// readers do: past the shared decoded table's bound
+/// (`rustic_core::segment::DECODED_TERMS_MAX`) only the batch's distinct
+/// ordinals are resolved, in ascending order (one forward pass over the
+/// front-coded blocks), so memory follows the batch, not the dictionary.
 fn keyword_terms_by_ordinal(segment: &rustic_core::segment::Segment, field: u16, reader: &rustic_core::codec::fastfields::KeywordReader<'_>, docs: &[rustic_core::types::DocId]) -> Vec<Option<String>> {
     const MISSING: u32 = rustic_core::codec::fastfields::MISSING_ORD;
-    if let Ok(Some(terms)) = segment.keyword_terms_decoded(field) {
+    #[cfg(test)]
+    let decoded = if LARGE_DICTIONARY_TEST.with(|c| c.get()) { None } else { segment.keyword_terms_decoded(field).ok().flatten() };
+    #[cfg(not(test))]
+    let decoded = segment.keyword_terms_decoded(field).ok().flatten();
+    if let Some(terms) = decoded {
         return docs.iter().map(|&doc| {
             let ord = reader.ord(doc);
             if ord == MISSING { return None; }
@@ -4053,28 +4105,34 @@ fn keyword_terms_by_ordinal(segment: &rustic_core::segment::Segment, field: u16,
             }
         }).collect();
     }
-    let mut memo: std::collections::HashMap<u32, Option<String>> = std::collections::HashMap::new();
-    docs.iter().map(|&doc| {
-        let ord = reader.ord(doc);
+    #[cfg(test)]
+    LARGE_DICTIONARY_BATCHES.with(|c| c.set(c.get() + 1));
+    let ords: Vec<u32> = docs.iter().map(|&doc| reader.ord(doc)).collect();
+    let mut wanted: Vec<u32> = ords.iter().copied().filter(|&o| o != MISSING).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let terms: Vec<Option<String>> = wanted.iter().map(|&ord| reader.term(ord).map(|t| t.into_owned())).collect();
+    ords.into_iter().map(|ord| {
         if ord == MISSING { return None; }
-        memo.entry(ord).or_insert_with(|| reader.term(ord).map(|t| t.into_owned())).clone()
+        wanted.binary_search(&ord).ok().and_then(|i| terms[i].clone())
     }).collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: treat every keyword dictionary as past the shared decoded
+    /// table's bound (a 100M-key lookup index's segments), and count the
+    /// batches resolved by ordinal on demand.
+    pub(super) static LARGE_DICTIONARY_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static LARGE_DICTIONARY_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Tests: batches [`direct_column_rows`] handed to `_source`.
+    pub(super) static SOURCE_FALLBACK_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The field id a column reads its doc values from in place of `_source`
 /// ([`direct_column_rows`]), when they give the same values: plain keyword
 /// (and with `sql` float / double, without it millisecond date) columns
 /// with no value-transforming mapping.
-/// Terms a keyword column's dictionary holds past which
-/// [`direct_column_rows`] reads its batch from `_source` instead.
-const HUGE_DICTIONARY_TERMS: usize = 4 << 20;
-
-#[cfg(test)]
-thread_local! {
-    /// Tests: [`HUGE_DICTIONARY_TERMS`] stand-in.
-    pub(super) static HUGE_DICTIONARY_TERMS_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(HUGE_DICTIONARY_TERMS) };
-}
-
 /// Columns past which [`direct_column_rows`] reads a batch that needs the
 /// sub-field or integer doc-value reads from `_source` instead.
 const WIDE_ROW_COLUMNS: usize = 32;
@@ -4090,13 +4148,6 @@ fn wide_row_columns() -> usize {
     return WIDE_ROW_COLUMNS_TEST.with(|c| c.get());
     #[cfg(not(test))]
     WIDE_ROW_COLUMNS
-}
-
-fn huge_dictionary_terms() -> usize {
-    #[cfg(test)]
-    return HUGE_DICTIONARY_TERMS_TEST.with(|c| c.get());
-    #[cfg(not(test))]
-    HUGE_DICTIONARY_TERMS
 }
 
 /// How [`direct_column_rows`] reads a column [`direct_field`] does not.
@@ -4267,24 +4318,15 @@ fn direct_column_rows(schema: &IndexSchema, wanted: &[bool], target: &crate::sea
     // column's dictionary at its own place; its stored document is one
     // read. Batches that only read doc values because of the sub-field and
     // integer reads ([`doc_value_field`]) read `_source` past
-    // [`WIDE_ROW_COLUMNS`] columns, as before them. Checked first: the dictionary check below opens
-    // every keyword column's terms, a cold read each.
+    // [`WIDE_ROW_COLUMNS`] columns, as before them.
     if extra.iter().any(|e| *e != Extra::No) && fields.iter().flatten().count() > wide_row_columns() {
         return source_rows(schema,wanted,target,lookup,leaf,docs);
     }
-    // A keyword column whose dictionary is too large to stay cached (a 100M
-    // key lookup index: Rally joins `100M_keys_where_limit1000`) reads each
-    // value by ordinal from a random place in it, one dictionary per column:
-    // the batch's stored documents, one read each, cost less.
-    if let rustic_core::query::LeafReader::Segment(segment) = leaf {
-        let limit = huge_dictionary_terms();
-        let huge = columns.iter().zip(&fields).zip(&extra).any(|((column, field), extra)| match (column, field) {
-            (SourceColumn::Read(column, _), Some(field)) if column.ty != "double" && column.ty != "date" && *extra != Extra::Integer =>
-                !segment.keyword_from_postings(*field) && segment.keyword_reader(*field).is_some_and(|reader| reader.num_terms() > limit),
-            _ => false,
-        });
-        if huge { return source_rows(schema,wanted,target,lookup,leaf,docs); }
-    }
+    // A keyword column of any dictionary size reads by ordinal (ES reads
+    // keyword doc values whatever the dictionary holds): a 100M-key lookup
+    // index's large segments stay on doc values (Rally joins
+    // `100M_keys_where_limit1000` read them from `_source`, 6 s vs ES's
+    // 130 ms). See [`keyword_terms_by_ordinal`].
     // Reader metadata must be admitted before bounds inspect lazy columns.
     for field in fields.iter().flatten() {
         memory.grow(leaf.field_reader_allocation_bound(*field),crate::esql::exec::ESQL_LABEL)?;
@@ -4852,6 +4894,8 @@ fn source_sparse_rows(schema:&IndexSchema,wanted:&[bool],target:&crate::search::
 
 /// The `_source` rows of `docs` (ascending), reading each store chunk once.
 pub(super) fn source_rows(schema: &IndexSchema, wanted: &[bool], t: &crate::search::Target, lookup: &crate::mapping::FieldLookup, leaf: &rustic_core::query::LeafReader<'_>, docs: &[rustic_core::types::DocId]) -> Result<(Vec<Vec<Val>>, u64, crate::memory::Reservation)> {
+    #[cfg(test)]
+    SOURCE_FALLBACK_BATCHES.with(|c| c.set(c.get() + 1));
     source_rows_guarded(schema,wanted,t,lookup,leaf,docs)
 }
 
@@ -5866,6 +5910,10 @@ fn simple(e: &Expr) -> bool {
 /// each conjunct that becomes an index query once `d` is replaced by its
 /// definition moves in front of the `EVAL`s (which still run). Returns the
 /// rewritten commands, or `None` when nothing moves.
+/// [`hoist_spatial_filters`]' stand-in for a computed column it cannot
+/// push down.
+const UNPUSHABLE: &str = "\u{0}unpushable";
+
 pub(super) fn hoist_spatial_filters(rest: &[Cmd], types: &HashMap<String, String>) -> Option<Vec<Cmd>> {
     if disabled() {
         return None;
@@ -5879,8 +5927,11 @@ pub(super) fn hoist_spatial_filters(rest: &[Cmd], types: &HashMap<String, String
             Cmd::Eval(fields) => {
                 for f in fields {
                     let def = subst(&f.expr, &defs);
-                    // An unsupported definition hides the index column it shadows.
-                    defs.push((f.name.clone(), if simple(&def) { def } else { Expr::Lit(Val::Null) }));
+                    // An unsupported definition hides the index column it
+                    // shadows: an unknown value (never a NULL literal, which
+                    // would push down as match_none), so predicates over it
+                    // stay in the row pipeline.
+                    defs.push((f.name.clone(), if simple(&def) { def } else { Expr::Col(UNPUSHABLE.into(), 0) }));
                 }
                 kept.push(rest[k].clone());
             }
@@ -5895,7 +5946,8 @@ pub(super) fn hoist_spatial_filters(rest: &[Cmd], types: &HashMap<String, String
                         col_names(x, &mut names);
                         names.iter().any(|n| defs.iter().any(|(d, _)| d == n))
                     };
-                    if defined(&c) && !matches!(s, Expr::Lit(Val::Null)) && simple_pred(&s) && spatial_dsl(&s, types).is_some() {
+                    let unknown = { let mut names = Vec::new(); col_names(&s, &mut names); names.iter().any(|n| n == UNPUSHABLE) };
+                    if defined(&c) && !unknown && !matches!(s, Expr::Lit(Val::Null)) && simple_pred(&s) && spatial_dsl(&s, types).is_some() {
                         hoisted.push(Cmd::Where(s, *pos));
                     } else {
                         left.push(c);
@@ -6823,9 +6875,11 @@ mod tests {
     }
 
     #[test]
-    fn huge_dictionary_columns_read_source_with_the_same_rows() {
-        // Every keyword dictionary "huge": batches read `_source`, with the
-        // rows, columns and warnings of the doc-value reads.
+    fn large_dictionary_columns_stay_on_doc_values_with_the_same_rows() {
+        // A dictionary past the shared decoded table (the 100M-key lookup
+        // index's multi-million-term segments) reads by ordinal, on doc
+        // values like a small one, with the rows, columns and warnings of
+        // the small-dictionary and `_source` reads.
         let tmp = tempfile::tempdir().unwrap();
         let node = Node::open(tmp.path()).unwrap();
         node.create_index("hd-left", &json!({"mappings":{"properties":{"k":{"type":"keyword"},"n":{"type":"long"}}}})).unwrap();
@@ -6843,23 +6897,35 @@ mod tests {
         }
         right.refresh().unwrap();
         right.flush().unwrap();
+        let counted = |large: bool, wide: bool, query: &str| {
+            super::LARGE_DICTIONARY_TEST.with(|c| c.set(large));
+            if wide { super::WIDE_ROW_COLUMNS_TEST.with(|c| c.set(0)); }
+            super::LARGE_DICTIONARY_BATCHES.with(|c| c.set(0));
+            super::SOURCE_FALLBACK_BATCHES.with(|c| c.set(0));
+            let r = run(&node, query, opts());
+            super::LARGE_DICTIONARY_TEST.with(|c| c.set(false));
+            super::WIDE_ROW_COLUMNS_TEST.with(|c| c.set(super::WIDE_ROW_COLUMNS));
+            (r.unwrap(), super::LARGE_DICTIONARY_BATCHES.with(|c| c.get()), super::SOURCE_FALLBACK_BATCHES.with(|c| c.get()))
+        };
         for query in [
             "FROM hd-left | LOOKUP JOIN hd-right ON k | LIMIT 300",
             "FROM hd-left | LOOKUP JOIN hd-right ON k | WHERE lookup_keyword_0 LIKE \"val 1*\" | LIMIT 30",
             "FROM hd-left | LOOKUP JOIN hd-right ON k | KEEP n, t, lookup_keyword_0, lookup_keyword_0.keyword | LIMIT 300",
+            "FROM hd-left | STATS c = COUNT(*) BY k | SORT k",
         ] {
-            let expected = run(&node, query, opts()).unwrap();
-            // Every dictionary "huge", then every row "wide": `_source`.
-            for gate in 0..2 {
-                if gate == 0 { super::HUGE_DICTIONARY_TERMS_TEST.with(|c| c.set(1)); } else { super::WIDE_ROW_COLUMNS_TEST.with(|c| c.set(0)); }
-                let actual = run(&node, query, opts());
-                super::HUGE_DICTIONARY_TERMS_TEST.with(|c| c.set(super::HUGE_DICTIONARY_TERMS));
-                super::WIDE_ROW_COLUMNS_TEST.with(|c| c.set(super::WIDE_ROW_COLUMNS));
-                let actual = actual.unwrap();
-                assert_eq!(actual.table.rows, expected.table.rows, "{gate} {query}");
+            let (expected, _, small_source) = counted(false, false, query);
+            let (large, large_ordinal_batches, large_source) = counted(true, false, query);
+            // The dictionary size no longer sends a batch to `_source`.
+            assert_eq!(large_source, small_source, "{query}");
+            let (source, _, _) = counted(false, true, query);
+            for (label, actual) in [("large dictionary", &large), ("_source", &source)] {
+                assert_eq!(actual.table.rows, expected.table.rows, "{label} {query}");
                 assert_eq!(actual.table.cols.iter().map(|c| (&c.name, &c.ty)).collect::<Vec<_>>(),
-                    expected.table.cols.iter().map(|c| (&c.name, &c.ty)).collect::<Vec<_>>(), "{gate} {query}");
-                assert_eq!(actual.warnings, expected.warnings, "{gate} {query}");
+                    expected.table.cols.iter().map(|c| (&c.name, &c.ty)).collect::<Vec<_>>(), "{label} {query}");
+                assert_eq!(actual.warnings, expected.warnings, "{label} {query}");
+            }
+            if !query.contains("STATS") {
+                assert!(large_ordinal_batches > 0, "the large dictionaries were read by ordinal: {query}");
             }
         }
     }
@@ -7828,7 +7894,7 @@ mod tests {
             json!({"geo_shape": {"loc": {"shape": poly, "relation": "disjoint"}}}),
             json!({"geo_bounding_box": {"loc": {"top_left": {"lat": 60.0, "lon": 0.0}, "bottom_right": {"lat": 45.0, "lon": 20.0}}}}),
         ] {
-            let want = crate::search::count(&targets, Some(&q), None).unwrap();
+            let want = crate::esql::remote::checked_count(&targets, Some(&q), None).unwrap();
             let got = crate::search::par_count(&targets, &q).unwrap();
             assert_eq!(got, want, "{q}");
             assert!(want > 0, "{q}");

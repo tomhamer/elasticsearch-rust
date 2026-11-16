@@ -445,7 +445,7 @@ fn post_event(node: &Node, req: &Req, name: &str, ty: &str) -> R {
         }
     }
     let event = Value::Object(event);
-    emit(node, &ds, &event);
+    emit(node, req, &ds, &event);
     let mut out = json!({"accepted": true});
     if req.flag("debug")? {
         out["event"] = event;
@@ -478,7 +478,7 @@ fn order_search(v: Value) -> Value {
 
 /// Append the event to the collection's data stream, shaped as ES's final
 /// pipeline leaves it (URLs split into parts, the client address dropped).
-fn emit(node: &Node, ds: &str, event: &Value) {
+fn emit(node: &Node, req: &Req, ds: &str, event: &Value) {
     let mut doc = event.clone();
     let uri = |v: &Value| -> Value {
         let s = v.as_str().unwrap_or("");
@@ -513,7 +513,21 @@ fn emit(node: &Node, ds: &str, event: &Value) {
         s.remove("ip");
         s.remove("user_agent");
     }
-    if let Ok(svc) = node.write_index(ds, false) {
-        let _ = svc.write(vec![WriteReq::Index { id: None, source: doc.to_string(), routing: None, cond: WriteCond::default() }], false);
+    // ES's emitter hands each event to a bulk processor: on a cluster the
+    // event goes through the coordinator to the data stream's write shard,
+    // wherever it is (finding 394). Delivery failures are logged, as the
+    // API acknowledges events asynchronously.
+    if let Some(rest) = req.internal_cluster_rest() {
+        let body = format!("{}\n{}\n", json!({"create": {}}), doc);
+        match (rest.0)("POST", &format!("/{ds}/_bulk"), Some(Value::String(body))) {
+            Ok(v) if v["errors"] == true => tracing::warn!("analytics event for [{ds}] was not stored: {}", v["items"][0]),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("analytics event for [{ds}] was not stored: {}", e.reason),
+        }
+        return;
+    }
+    let stored = node.write_index(ds, false).and_then(|svc| svc.write(vec![WriteReq::Index { id: None, source: doc.to_string(), routing: None, cond: WriteCond::default() }], false).remove(0));
+    if let Err(e) = stored {
+        tracing::warn!("analytics event for [{ds}] was not stored: {}", e.reason);
     }
 }

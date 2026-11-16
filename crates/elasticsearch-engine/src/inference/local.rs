@@ -1,24 +1,25 @@
-//! CPU-only local models for the `elasticsearch` / `elser` services.
+//! Built-in stand-ins for the `elasticsearch` / `elser` services' models.
 //!
-//! Built-in, dependency-free CPU encoders. No model weights are bundled, so
-//! the binary stays small and starts instantly; the encoders produce
-//! vectors/weights with the *same shapes and model ids* as the hosted models,
-//! so mappings, pipelines and clients work unchanged:
+//! These are NOT the models they stand in for: dependency-free lexical CPU
+//! encoders that produce output of the same *shape* (so mappings, pipelines
+//! and clients work) with different semantics. They run only when the node
+//! sets `xpack.inference.builtin_fallback: lexical` (see
+//! [`super::backend`]); otherwise a model that cannot run fails like an
+//! undeployed model in ES.
 //!
 //! * `.multilingual-e5-small` -> 384-d, L2-normalised, signed feature hashing
-//!   of lowercase word unigrams, bigrams and character trigrams (lexically
-//!   sensitive, deterministic; related texts land close together).
-//! * `.elser_model_2` -> `{token: weight}` learned-sparse stand-in: BM25-style
-//!   saturating term weights over the same word tokenisation, plus
-//!   light-stemmed expansion tokens.
+//!   of lowercase word unigrams, bigrams and character trigrams
+//!   (`hashing-fallback`: lexical similarity only, no cross-lingual or
+//!   semantic matching).
+//! * `.elser_model_2` -> `{token: weight}`: BM25-style saturating term
+//!   weights over the same word tokenisation plus light-stemmed tokens
+//!   (`lexical-fallback`: no learned expansion).
+//! * `.rerank-v1` -> token-overlap F-score (`lexical-fallback`).
 //!
-//! For model-quality embeddings, point an inference endpoint at an external
-//! service. [`BACKEND`] names the active implementation so it can be surfaced
-//! in stats.
+//! The chunkers here are used by every service.
 
 use serde_json::{json, Map, Value};
 
-pub const BACKEND: &str = "hashing-fallback";
 pub const E5_DIMS: usize = 384;
 
 /// Lowercase word tokens (alphanumeric runs).
@@ -177,6 +178,10 @@ pub fn word_chunks(text: &str, size: usize, overlap: usize) -> Vec<(usize, usize
     use rustic_core::analysis::tokenizer::StandardTokenizer;
     use rustic_core::analysis::Tokenizer;
     let size = size.max(1);
+    // Each window must start past the previous one: an overlap of the whole
+    // window would emit every growing prefix of the text (finding 126).
+    // Validated settings never get here ([`try_chunk`] refuses them).
+    let overlap = overlap.min(size - 1);
     let less = size.saturating_sub(overlap);
     let mut out = Vec::new();
     let (mut in_chunk, mut next_start, mut start, mut since_mark) = (0usize, 0usize, 0usize, 0usize);
@@ -201,6 +206,19 @@ pub fn word_chunks(text: &str, size: usize, overlap: usize) -> Vec<(usize, usize
         out.push((start, text.len()));
     }
     out
+}
+
+/// [`chunk`], refusing settings that cannot make progress: ES's
+/// `WordBoundaryChunker` rejects a word overlap above half the chunk size.
+pub fn try_chunk(text: &str, c: &Chunking) -> crate::error::Result<Vec<(usize, usize)>> {
+    if c.strategy == "word" && (c.max_chunk_size == 0 || c.overlap > c.max_chunk_size / 2) {
+        return Err(crate::error::EsError::illegal_argument(format!(
+            "Invalid chunking parameters, overlap [{}] must be < chunk size / 2 [{}]",
+            c.overlap,
+            c.max_chunk_size / 2
+        )));
+    }
+    Ok(chunk(text, c))
 }
 
 /// Split `text` into `(start, end)` byte offsets of chunks.
@@ -245,23 +263,15 @@ pub fn chunk(text: &str, c: &Chunking) -> Vec<(usize, usize)> {
         }
         return out;
     }
-    // sentence strategy: sentences packed up to max words, with
-    // sentence_overlap (0 or 1) sentences repeated at the start of the next.
-    let mut sentences: Vec<(usize, usize, usize)> = Vec::new(); // start, end, word count
-    let mut s_start = words[0].0;
-    let mut count = 0;
-    for (wi, &(ws, we)) in words.iter().enumerate() {
-        count += 1;
-        let w = &text[ws..we];
-        let ends = w.ends_with('.') || w.ends_with('!') || w.ends_with('?');
-        if ends || wi == words.len() - 1 {
-            sentences.push((s_start, we, count));
-            count = 0;
-            if let Some(n) = words.get(wi + 1) {
-                s_start = n.0;
-            }
-        }
-    }
+    // sentence strategy (ES `SentenceBoundaryChunker`): sentences packed
+    // up to max words, with sentence_overlap (0 or 1) sentences repeated
+    // at the start of the next. Words are counted as the standard
+    // tokenizer's tokens (each CJK ideograph is one, so unspaced Chinese
+    // or Japanese is not "one word"), sentences end at `.`/`!`/`?` before
+    // whitespace and at CJK full stops, and a sentence longer than the
+    // limit is split on word boundaries (finding 359), so no chunk
+    // exceeds `max_chunk_size` words.
+    let sentences = sentence_spans(text, max);
     let mut out = Vec::new();
     let mut i = 0;
     while i < sentences.len() {
@@ -280,12 +290,97 @@ pub fn chunk(text: &str, c: &Chunking) -> Vec<(usize, usize)> {
     out
 }
 
+/// `(start, end, words)` of each sentence of `text` (trimmed of
+/// surrounding whitespace), sentences over `max` words split into word
+/// windows of at most `max` words.
+fn sentence_spans(text: &str, max: usize) -> Vec<(usize, usize, usize)> {
+    use rustic_core::analysis::tokenizer::StandardTokenizer;
+    use rustic_core::analysis::Tokenizer;
+    let tokens = StandardTokenizer.tokenize(text);
+    // Sentence boundaries: byte offsets just past each terminator.
+    let mut bounds = Vec::new();
+    let mut it = text.char_indices().peekable();
+    while let Some((i, ch)) = it.next() {
+        let end = i + ch.len_utf8();
+        let ends = match ch {
+            '。' | '！' | '？' | '｡' => true,
+            '.' | '!' | '?' => it.peek().is_none_or(|(_, n)| n.is_whitespace()),
+            _ => false,
+        };
+        if ends {
+            bounds.push(end);
+        }
+    }
+    bounds.push(text.len());
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    let mut ti = 0usize;
+    for b in bounds {
+        if b <= from {
+            continue;
+        }
+        let raw = &text[from..b];
+        let lead = raw.len() - raw.trim_start().len();
+        let (s, e) = (from + lead, from + raw.trim_end().len());
+        from = b;
+        if s >= e {
+            continue;
+        }
+        let first = ti;
+        while ti < tokens.len() && (tokens[ti].offset_from as usize) < e {
+            ti += 1;
+        }
+        let words = ti - first;
+        if words <= max {
+            out.push((s, e, words));
+            continue;
+        }
+        // Too long for one chunk: word windows of the sentence (ES
+        // `splitLongSentence`), each at most `max` words.
+        let windows = word_chunks(&text[s..e], max, 0);
+        for (ws, we) in windows {
+            let (ws, we) = (s + ws, s + we);
+            let n = tokens[first..ti].iter().filter(|t| (t.offset_from as usize) >= ws && (t.offset_from as usize) < we).count();
+            let piece = &text[ws..we];
+            let lead = piece.len() - piece.trim_start().len();
+            out.push((ws + lead, ws + piece.trim_end().len(), n));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cos(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    /// Finding 126: word chunking whose overlap is the whole window is
+    /// refused (ES's `WordBoundaryChunker` check), and even when called
+    /// directly the chunker moves forward with bounded output; a valid
+    /// size 10 / overlap 5 window is unchanged.
+    #[test]
+    fn word_chunking_always_makes_progress() {
+        let words: Vec<String> = (0..1_000).map(|i| format!("w{i}")).collect();
+        let text = words.join(" ");
+        let bad = Chunking { strategy: "word".into(), max_chunk_size: 10, overlap: 10, sentence_overlap: 0 };
+        let e = try_chunk(&text, &bad).unwrap_err();
+        assert_eq!(e.reason, "Invalid chunking parameters, overlap [10] must be < chunk size / 2 [5]");
+        assert!(try_chunk(&text, &Chunking { overlap: 6, ..bad.clone() }).is_err());
+        for overlap in [10usize, 50, 9] {
+            let chunks = word_chunks(&text, 10, overlap);
+            assert!(chunks.windows(2).all(|w| w[1].0 > w[0].0), "overlap {overlap}: starts must advance");
+            let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+            assert!(total <= 12 * text.len(), "overlap {overlap}: {total} bytes of chunks for {} bytes", text.len());
+        }
+        let ok = Chunking { strategy: "word".into(), max_chunk_size: 10, overlap: 5, sentence_overlap: 0 };
+        let chunks: Vec<&str> = try_chunk(&text, &ok).unwrap().into_iter().map(|(s, e)| &text[s..e]).collect();
+        assert_eq!(chunks[0], words[..10].join(" "));
+        assert_eq!(chunks[1], format!(" {}", words[5..15].join(" ")));
+        assert_eq!(chunks.len(), 199);
+        assert_eq!(chunks, word_chunks(&text, 10, 5).into_iter().map(|(s, e)| &text[s..e]).collect::<Vec<_>>());
     }
 
     #[test]
@@ -318,6 +413,46 @@ mod tests {
         let c = Chunking { strategy: "sentence".into(), max_chunk_size: 4, overlap: 0, sentence_overlap: 0 };
         let ch: Vec<&str> = chunk(text, &c).into_iter().map(|(s, e)| &text[s..e]).collect();
         assert_eq!(ch, vec!["One two. Three four.", "Five six."]);
+    }
+
+    /// Finding 359: oversized sentences and unspaced CJK text are split so
+    /// that no chunk exceeds the word limit, and every word is covered.
+    #[test]
+    fn sentence_chunking_bounds_every_chunk() {
+        use rustic_core::analysis::tokenizer::StandardTokenizer;
+        use rustic_core::analysis::Tokenizer;
+        let words = |s: &str| StandardTokenizer.tokenize(s).len();
+        let c = Chunking::default();
+        let check = |text: &str, min_chunks: usize| {
+            let ch = chunk(text, &c);
+            assert!(ch.len() >= min_chunks, "{} chunks", ch.len());
+            for &(s, e) in &ch {
+                assert!(words(&text[s..e]) <= 250, "chunk of {} words", words(&text[s..e]));
+            }
+            // Every word is inside some chunk.
+            for t in StandardTokenizer.tokenize(text) {
+                assert!(ch.iter().any(|&(s, e)| s <= t.offset_from as usize && t.offset_to as usize <= e), "word at {} uncovered", t.offset_from);
+            }
+        };
+        // 600 words, no sentence punctuation.
+        let prose: Vec<String> = (0..600).map(|i| format!("w{i}")).collect();
+        check(&prose.join(" "), 3);
+        // 900 ideographs without whitespace: one sentence, then with full stops.
+        let cjk: String = "中文分词测试句子".chars().cycle().take(900).collect();
+        check(&cjk, 4);
+        let cjk_stops: String = (0..9).map(|_| format!("{}。", "日本語の文章です".chars().cycle().take(99).collect::<String>())).collect();
+        check(&cjk_stops, 4);
+        // Short ordinary sentences are unchanged.
+        let text = "One two. Three four! Five?";
+        let c3 = Chunking { strategy: "sentence".into(), max_chunk_size: 3, overlap: 0, sentence_overlap: 1 };
+        let ch: Vec<&str> = chunk(text, &c3).into_iter().map(|(s, e)| &text[s..e]).collect();
+        assert_eq!(ch, vec!["One two.", "Three four! Five?"]);
+        // A decimal point is not a sentence end.
+        let ch: Vec<&str> = chunk("Pi is 3.14 today. Yes.", &Chunking { strategy: "sentence".into(), max_chunk_size: 4, overlap: 0, sentence_overlap: 0 })
+            .into_iter()
+            .map(|(s, e)| &"Pi is 3.14 today. Yes."[s..e])
+            .collect();
+        assert_eq!(ch, vec!["Pi is 3.14 today.", "Yes."]);
     }
 
     #[test]

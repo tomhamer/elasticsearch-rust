@@ -5,6 +5,7 @@ use crate::{blocking, method_not_allowed, Req, Resp, R};
 use axum::http::Method;
 use elasticsearch_engine::error::EsError;
 use elasticsearch_engine::node::{Node, ES_VERSION};
+use elasticsearch_engine::security::{Authn, Permission, Principal};
 use elasticsearch_engine::transform;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -39,6 +40,13 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
     let m = req.method.clone();
     let n = segs.len();
     let svc = transform::service(&node);
+    install_source_access();
+    // On a cluster the elected master serves transforms from the internal
+    // index (loaded once per master term).
+    {
+        let svc = svc.clone();
+        blocking(move || svc.ensure_current().map(|_| Resp::ack())).await?;
+    }
     let ops = cluster_ops(&req);
     match (n, s(1), s(2)) {
         (1, _, _) => match m {
@@ -70,8 +78,12 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
         },
         (2, "set_upgrade_mode", _) => match m {
             Method::POST => {
-                svc.set_upgrade_mode(req.flag("enabled")?);
-                Ok(Resp::ack())
+                let enabled = req.flag("enabled")?;
+                blocking(move || {
+                    svc.set_upgrade_mode(enabled)?;
+                    Ok(Resp::ack())
+                })
+                .await
             }
             _ => method_not_allowed(&req, &["POST"]),
         },
@@ -85,7 +97,8 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
                         return Err(EsError::new(400, "parse_exception", "request body is required"));
                     }
                     let defer = req.flag("defer_validation")?;
-                    let w = svc.put(&node, &ops, &id, &body, defer).map_err(|e| fix_pos(&req, e))?;
+                    let auth = check_privileges(&node, &req, "create", &id, &body, !defer)?;
+                    let w = svc.put(&node, &ops, &id, &body, defer, auth.as_ref()).map_err(|e| fix_pos(&req, e))?;
                     Ok(with_warnings(Resp::ack(), w))
                 })
                 .await,
@@ -102,6 +115,9 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
             match (action, m.clone()) {
                 ("_preview", Method::GET | Method::POST) => blocking(move || preview(&node, &svc, &ops, &req, Some(&id))).await,
                 ("_start", Method::POST) => blocking(move || {
+                    if let Some(cfg) = svc.stored_config(&id) {
+                        check_privileges(&node, &req, "start", &id, &cfg, false)?;
+                    }
                     svc.start(&node, &ops, &id, req.param("from"))?;
                     Ok(Resp::ack())
                 })
@@ -127,7 +143,19 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
                 .await,
                 ("_update", Method::POST) => blocking(move || {
                     let body = body_obj(&req)?;
-                    let (cfg, w) = svc.update(&node, &ops, &id, &body, req.flag("defer_validation")?).map_err(|e| fix_pos(&req, e))?;
+                    let defer = req.flag("defer_validation")?;
+                    let auth = match svc.stored_config(&id) {
+                        Some(mut cfg) => {
+                            for k in ["source", "dest"] {
+                                if let Some(v) = body.get(k) {
+                                    cfg[k] = v.clone();
+                                }
+                            }
+                            check_privileges(&node, &req, "update", &id, &cfg, !defer)?
+                        }
+                        None => None,
+                    };
+                    let (cfg, w) = svc.update(&node, &ops, &id, &body, defer, auth.as_ref()).map_err(|e| fix_pos(&req, e))?;
                     Ok(with_warnings(Resp::ok(cfg), w))
                 })
                 .await,
@@ -158,13 +186,22 @@ fn get(svc: &transform::TransformService, req: &Req, id: &str) -> R {
 
 /// On a cluster, transform index work runs through the coordinator.
 fn cluster_ops(req: &Req) -> transform::Ops {
-    transform::Ops(req.extensions.get::<crate::ClusterRest>().map(|r| -> transform::RestCall { r.0.clone() }))
+    transform::Ops(req.extensions.get::<crate::ClusterRest>().map(|r| -> transform::RestCall { r.0.clone() }), None)
 }
 
 fn preview(node: &Node, svc: &transform::TransformService, ops: &transform::Ops, req: &Req, id: Option<&str>) -> R {
     // An absent body (`Null`) differs from `{}`: the latter is a config.
     let body = req.json()?;
-    let (v, w) = svc.preview(node, ops, id, &body).map_err(|e| fix_pos(req, e))?;
+    let cfg = match id {
+        Some(id) => svc.stored_config(id),
+        None => Some(body.clone()),
+    };
+    let auth = match &cfg {
+        Some(cfg) if cfg.is_object() => check_privileges(node, req, "preview", id.unwrap_or("_preview"), cfg, false)?,
+        _ => None,
+    };
+    let run_as = auth.map(|a| transform::RunAs::Identity(a.identity));
+    let (v, w) = svc.preview(node, ops, id, &body, run_as.as_ref()).map_err(|e| fix_pos(req, e))?;
     Ok(with_warnings(Resp::ok(v), w))
 }
 
@@ -269,6 +306,7 @@ fn fix_pos(req: &Req, mut e: EsError) -> EsError {
 /// Rows of `_cat/transforms`.
 pub(crate) fn cat_rows(node: &Node, req: &Req, id: Option<&str>) -> Result<Vec<Vec<String>>, EsError> {
     let svc = transform::service_ref(node);
+    svc.ensure_current()?;
     let anm = req.bool_param("allow_no_match")?.unwrap_or(true);
     let rows = svc.cat_rows(node, id, anm)?;
     let fmt_time = |ms: Option<i64>| ms.map(|m| elasticsearch_engine::date::DateFormatter::default().format(m, elasticsearch_engine::date::Tz::UTC)).unwrap_or_default();
@@ -319,4 +357,108 @@ pub(crate) fn cat_rows(node: &Node, req: &Req, id: Option<&str>) -> Result<Vec<V
         ]);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------- security
+
+/// The caller of a transform API when security is enabled: who they are
+/// (the run-as target when impersonating) and what they may do.
+fn caller(node: &Node, req: &Req) -> Option<(Authn, Permission)> {
+    if !node.security.enabled() {
+        return None;
+    }
+    let access = req.access.as_ref()?;
+    let user = access.user().clone();
+    let perm = node.security.permission(&user);
+    Some((user, perm))
+}
+
+/// Who a transform created or updated by `user` runs as (the whole
+/// authentication, as ES stores it: an API key keeps its own role
+/// descriptors and its owner's limit), and the `authorization` ES reports.
+fn caller_auth(user: &Authn) -> transform::CallerAuth {
+    let effective = user.run_as.as_deref().unwrap_or(user);
+    let authorization = match &effective.principal {
+        Principal::ApiKey { id, name, .. } => json!({"api_key": {"id": id, "name": name}}),
+        _ => json!({"roles": effective.roles}),
+    };
+    transform::CallerAuth { identity: elasticsearch_engine::security::owner::StoredAuthn::of(user), authorization }
+}
+
+/// The index names of a config's `source.index` (a string, comma lists
+/// included, or an array).
+fn source_names(cfg: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    match &cfg["source"]["index"] {
+        Value::String(s) => out.extend(s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)),
+        Value::Array(a) => {
+            for v in a.iter().filter_map(Value::as_str) {
+                out.extend(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// ES `TransformPrivilegeChecker`: the caller needs `read` and
+/// `view_index_metadata` on every source, and (`check_dest`) `read`,
+/// `index` and, for a new destination, `create_index` on the destination.
+/// Returns the identity the transform runs as (`None`: security disabled).
+fn check_privileges(node: &Node, req: &Req, verb: &str, id: &str, cfg: &Value, check_dest: bool) -> Result<Option<transform::CallerAuth>, EsError> {
+    let Some((user, perm)) = caller(node, req) else { return Ok(None) };
+    if !perm.is_superuser {
+        let mut missing: Vec<String> = Vec::new();
+        for s in source_names(cfg) {
+            let lacks: Vec<&str> = ["read", "view_index_metadata"].into_iter().filter(|p| !perm.has_index_privilege(&s, p)).collect();
+            if !lacks.is_empty() {
+                missing.push(format!("{s}:[{}]", lacks.join(", ")));
+            }
+        }
+        if check_dest {
+            if let Some(d) = cfg["dest"]["index"].as_str() {
+                let mut need = vec!["index", "read"];
+                if node.get_index(d).is_none() {
+                    need.insert(0, "create_index");
+                }
+                let lacks: Vec<&str> = need.into_iter().filter(|p| !perm.has_index_privilege(d, p)).collect();
+                if !lacks.is_empty() {
+                    missing.push(format!("{d}:[{}]", lacks.join(", ")));
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let name = user.run_as.as_deref().unwrap_or(&user).username.clone();
+            return Err(EsError::new(403, "security_exception", format!("Cannot {verb} transform [{id}] because user {name} lacks the required permissions [{}]", missing.join(", "))));
+        }
+    }
+    Ok(Some(caller_auth(&user)))
+}
+
+/// Standalone checkpoints read their sources as the transform's user:
+/// targets are limited to the indices the user may search, with the user's
+/// DLS/FLS stamped on them (a cluster runs those searches through its
+/// coordinator as the user instead).
+fn install_source_access() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        transform::set_source_access(Some(Arc::new(|node: &Node, subject: &transform::RunAs, names: &[String], targets| {
+            if !node.security.enabled() {
+                return Ok(targets);
+            }
+            let authn = match subject {
+                // The stored authentication: roles (an API key's descriptors
+                // limited by its owner's) resolve now, as ES resolves them.
+                transform::RunAs::Identity(stored) => stored.to_authn(),
+                transform::RunAs::User(user) => node.security.lookup_user(user).ok_or_else(|| EsError::new(403, "security_exception", format!("transform runs as user [{user}], who cannot be found")))?,
+            };
+            let perm = node.security.permission(&authn);
+            const SEARCH: &str = "indices:data/read/search";
+            let explicit: Vec<String> = names.iter().filter(|n| !n.contains('*')).cloned().collect();
+            let access = crate::security::access::ReadAccess::build(node, &authn, &perm, SEARCH, names)?;
+            access.authorize_names(node, SEARCH, &explicit)?;
+            let allowed: Vec<_> = targets.into_iter().filter(|t| perm.is_superuser || crate::security::authz::allowed(node, &perm, SEARCH, &t.svc.name)).collect();
+            access.apply(allowed)
+        })));
+    });
 }

@@ -168,6 +168,12 @@ impl PreparedFields {
         let leaves: Vec<_> = self.dimensions.iter().map(|l| Leaf { path: l.path.clone(), ty: l.ty, params: &l.params, nested: false, passthrough_dim: false, src: l.src.clone() }).collect();
         build_ids_from_leaves(m, s, src, &leaves)
     }
+    /// The routing hash an id-less write of `src` is routed by (see
+    /// [`routing_hash`]).
+    pub fn routing_hash(&self, m: &Mappings, s: &FlatSettings, src: &Value) -> Result<i32> {
+        let leaves: Vec<_> = self.dimensions.iter().map(|l| Leaf { path: l.path.clone(), ty: l.ty, params: &l.params, nested: false, passthrough_dim: false, src: l.src.clone() }).collect();
+        routing_hash_from_leaves(m, s, src, &leaves)
+    }
     pub fn check_positions(&self, src: &Value) -> Result<()> {
         check_position_paths(self.positions.iter().map(String::as_str), src)
     }
@@ -398,12 +404,22 @@ pub fn install_synthetic_id_codec() {
 
 /// The hidden fields a time series document carries besides its source:
 /// `_tsid` and, for a synthetic `_id`, its routing hash.
+///
+/// Each carries exactly the one generated value: any other value of those
+/// columns in the parsed document (the source parser rejects them as
+/// metadata fields; this guards every other path) is dropped first, since
+/// a second value would turn the single-valued identity column the
+/// synthetic `_id` is rebuilt and looked up from into a multi-valued one.
 pub fn push_hidden_fields(lookup: &crate::mapping::FieldLookup, ids: &TsIds, doc: &mut rustic_core::types::Document) {
     if let Some(field) = lookup.get(TSID_FIELD).and_then(|f| f.core_id) {
+        doc.fields.retain(|(f, _)| *f != field);
         doc.fields.push((field, rustic_core::FieldValue::Keyword(tsid_stored(&ids.tsid))));
     }
-    if let (Some(field), Some(rh)) = (lookup.get(ROUTING_HASH_FIELD).and_then(|f| f.core_id), routing_hash_of_id(&ids.id)) {
-        doc.fields.push((field, rustic_core::FieldValue::I64(rh as i64)));
+    if let Some(field) = lookup.get(ROUTING_HASH_FIELD).and_then(|f| f.core_id) {
+        doc.fields.retain(|(f, _)| *f != field);
+        if let Some(rh) = routing_hash_of_id(&ids.id) {
+            doc.fields.push((field, rustic_core::FieldValue::I64(rh as i64)));
+        }
     }
 }
 
@@ -665,8 +681,141 @@ pub fn synthetic_id(s: &FlatSettings) -> bool {
 /// what a coordinator routes an id-less write by.
 pub fn source_routing_hash(mappings: &Value, s: &FlatSettings, src: &Value) -> Result<i32> {
     let m = Mappings::parse(mappings, &crate::analysis::AnalysisRegistry::default())?;
-    let ids = build_ids(&m, s, src)?;
-    routing_hash_of_id(&ids.id).ok_or_else(|| EsError::internal("time series id without routing hash"))
+    routing_hash(&m, s, src)
+}
+
+/// The routing hash of an id-less write of `src` into a time series index
+/// (`IndexRouting.ExtractFromSource`): the `routing_path` values of the
+/// source, mapped or not yet mapped (a dimension a dynamic template maps
+/// only once the document is parsed on its shard routes the same as it
+/// will once mapped). Equals the routing hash of the `_id` the shard
+/// generates once those fields are mapped as dimensions.
+pub fn routing_hash(m: &Mappings, s: &FlatSettings, src: &Value) -> Result<i32> {
+    let mut leaves = Vec::new();
+    collect_selected::<true>(&m.root, &mut String::new(), false, false, &mut leaves);
+    routing_hash_from_leaves(m, s, src, &leaves)
+}
+
+fn routing_hash_from_leaves(m: &Mappings, s: &FlatSettings, src: &Value, leaves: &[Leaf<'_>]) -> Result<i32> {
+    let (dims, mut routing) = collect_identity(m, s, src, leaves)?;
+    if dims.is_empty() && routing.is_empty() {
+        return Err(EsError::illegal_argument("Error extracting routing: source didn't contain any routing fields"));
+    }
+    Ok(fold_routing(&mut routing))
+}
+
+type IdentityDims = std::collections::BTreeMap<Vec<u8>, Vec<DimVal>>;
+/// (name bytes, value hash, order) of the routing path matches.
+type RoutingHashes = Vec<(Vec<u8>, i32, usize)>;
+
+/// ES `RoutingHashBuilder.buildHash`: the matches sorted by name (then
+/// order), folded.
+fn fold_routing(routing: &mut RoutingHashes) -> i32 {
+    routing.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+    let mut rh: i32 = 0;
+    for (name, h, _) in routing.iter() {
+        rh = rh.wrapping_mul(31).wrapping_add((murmur3_32(name, 0) as i32) ^ h);
+    }
+    rh
+}
+
+/// Is `path` a mapped field or object (a flattened field's keys and a
+/// field's multi-fields included)? Keys may themselves be dotted.
+fn mapped_at(o: &ObjectMapping, path: &str) -> bool {
+    for (k, m) in &o.properties {
+        if path == k {
+            return true;
+        }
+        let Some(rest) = path.strip_prefix(k.as_str()).and_then(|r| r.strip_prefix('.')) else { continue };
+        let found = match m {
+            Mapper::Object(c) => mapped_at(c, rest),
+            Mapper::Field(f) => f.ty == EsType::Flattened || f.fields.contains_key(rest),
+        };
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Source values matching `routing_path` that no mapping covers yet,
+/// hashed as their text (`IndexRouting.ExtractFromSource` hashes every
+/// matching source value, mapped or not): a dynamic dimension routes the
+/// same before and after its mapping exists.
+fn add_unmapped_routing(root: &ObjectMapping, rp: &[String], v: &Value, path: &str, routing: &mut RoutingHashes) {
+    match v {
+        Value::Object(o) => {
+            for (k, x) in o {
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                add_unmapped_routing(root, rp, x, &p, routing);
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                add_unmapped_routing(root, rp, x, path, routing);
+            }
+        }
+        Value::Null => {}
+        scalar => {
+            if !path.is_empty() && rp.iter().any(|p| crate::mapping::wildcard_match(p, path)) && !mapped_at(root, path) {
+                let order = routing.len();
+                routing.push((path.as_bytes().to_vec(), murmur3_32(scalar_text(scalar).as_bytes(), 0) as i32, order));
+            }
+        }
+    }
+}
+
+/// Does `src` hold an explicit `null` (or only nulls) at `path` (dotted
+/// keys at any level)? Such a field indexes its `null_value`.
+fn explicit_null(src: &Value, path: &str) -> bool {
+    match src {
+        Value::Array(a) => a.iter().any(|x| explicit_null(x, path)),
+        Value::Object(o) => {
+            if let Some(x) = o.get(path) {
+                return match x {
+                    Value::Null => true,
+                    Value::Array(a) => !a.is_empty() && a.iter().all(Value::is_null),
+                    _ => false,
+                };
+            }
+            path.match_indices('.').any(|(i, _)| o.get(&path[..i]).is_some_and(|c| explicit_null(c, &path[i + 1..])))
+        }
+        _ => false,
+    }
+}
+
+/// The `@timestamp` value a time series `_id` encodes: in the field's own
+/// resolution (epoch nanos for `date_nanos`, as its indexed column holds
+/// them and synthetic ids are looked up and rebuilt from that column),
+/// else epoch millis.
+fn id_timestamp(m: &Mappings, src: &Value) -> Option<i64> {
+    let v = src.get("@timestamp")?;
+    match m.root.properties.get("@timestamp") {
+        Some(Mapper::Field(f)) if f.ty == EsType::DateNanos => {
+            use rustic_core::fieldtypes::numeric;
+            let fmt = DateFormatter::new(f.params.get("format").and_then(Value::as_str).unwrap_or(crate::date::DEFAULT_FORMAT)).ok()?;
+            match v {
+                Value::String(s) => {
+                    let ms = fmt.parse(s).ok()?;
+                    match numeric::fraction_nanos(s) {
+                        Some(frac) => numeric::nanos_from_parts(ms.div_euclid(1000), frac).ok(),
+                        None => numeric::nanos_from_millis(ms, 0).ok(),
+                    }
+                }
+                Value::Number(n) => {
+                    let x = n.as_f64()?;
+                    let ms = fmt.parse_number(x.trunc()).ok()?;
+                    numeric::nanos_from_millis(ms, ((x - x.trunc()) * 1e6).round() as u32).ok()
+                }
+                _ => None,
+            }
+        }
+        _ => match v {
+            Value::String(s) => DateFormatter::new(crate::date::DEFAULT_FORMAT).ok()?.parse(s).ok(),
+            Value::Number(n) => n.as_i64(),
+            _ => None,
+        },
+    }
 }
 
 pub fn build_ids(m: &Mappings, s: &FlatSettings, src: &Value) -> Result<TsIds> {
@@ -675,16 +824,20 @@ pub fn build_ids(m: &Mappings, s: &FlatSettings, src: &Value) -> Result<TsIds> {
     build_ids_from_leaves(m, s, src, &leaves)
 }
 fn build_ids_from_leaves(m: &Mappings, s: &FlatSettings, src: &Value, leaves: &[Leaf<'_>]) -> Result<TsIds> {
-    use base64::Engine;
-    use std::collections::BTreeMap;
+    let (dims, mut routing) = collect_identity(m, s, src, leaves)?;
+    build_ids_from_identity(m, s, src, dims, &mut routing)
+}
+
+/// The dimension values (`_tsid` input, in canonical indexed form) and the
+/// routing hashes of a time series document.
+fn collect_identity(m: &Mappings, s: &FlatSettings, src: &Value, leaves: &[Leaf<'_>]) -> Result<(IdentityDims, RoutingHashes)> {
     let rp = routing_path(s);
     if rp.iter().any(|p| p.contains('*')) {
         check_unmapped_routing(m, &rp, src)?;
     }
     let in_routing = |path: &str| rp.is_empty() || rp.iter().any(|p| crate::mapping::wildcard_match(p, path));
-    let mut dims: BTreeMap<Vec<u8>, Vec<DimVal>> = BTreeMap::new();
-    // (name bytes, value hash, order) of the routing path matches.
-    let mut routing: Vec<(Vec<u8>, i32, usize)> = Vec::new();
+    let mut dims: IdentityDims = IdentityDims::new();
+    let mut routing: RoutingHashes = Vec::new();
     for l in leaves {
         match l.ty {
             Some(EsType::Flattened) => {
@@ -727,14 +880,31 @@ fn build_ids_from_leaves(m: &Mappings, s: &FlatSettings, src: &Value, leaves: &[
                     }
                 }
             }
+            // The value the document indexes (`parse_integer`, the
+            // indexing parser: coercion truncates numeric strings and
+            // fractions, `null_value` stands in for null); a value it
+            // would not index is not part of the identity either.
             Some(t) if t.is_integer() => {
-                for v in crate::highlight::source_values(src, l.src.as_deref().unwrap_or(&l.path)) {
-                    let n = match v {
-                        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
-                        Value::String(x) => x.parse::<i64>().ok(),
-                        _ => None,
-                    };
-                    if let Some(n) = n {
+                let (min, max): (i64, i64) = match t {
+                    EsType::Byte => (i8::MIN as i64, i8::MAX as i64),
+                    EsType::Short => (i16::MIN as i64, i16::MAX as i64),
+                    EsType::Integer => (i32::MIN as i64, i32::MAX as i64),
+                    _ => (i64::MIN, i64::MAX),
+                };
+                let coerce = match l.params.get("coerce") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::String(x)) => x == "true",
+                    _ => true,
+                };
+                let path = l.src.as_deref().unwrap_or(&l.path);
+                let mut vals = crate::highlight::source_values(src, path);
+                if vals.is_empty() {
+                    if let Some(nv) = l.params.get("null_value").filter(|v| !v.is_null() && explicit_null(src, path)) {
+                        vals.push(nv);
+                    }
+                }
+                for v in vals {
+                    if let Ok(n) = crate::document::parse_integer(v, coerce, min, max, t) {
                         dims.entry(l.path.as_bytes().to_vec()).or_default().push(long_val(n));
                     }
                 }
@@ -756,6 +926,16 @@ fn build_ids_from_leaves(m: &Mappings, s: &FlatSettings, src: &Value, leaves: &[
             None => {}
         }
     }
+    // `routing_path` values no mapping covers yet (a dynamic dimension).
+    if !rp.is_empty() && rp.iter().any(|p| p.contains('*') || !mapped_at(&m.root, p)) {
+        add_unmapped_routing(&m.root, &rp, src, "", &mut routing);
+    }
+    Ok((dims, routing))
+}
+
+fn build_ids_from_identity(m: &Mappings, s: &FlatSettings, src: &Value, dims: IdentityDims, routing: &mut RoutingHashes) -> Result<TsIds> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     if dims.is_empty() {
         return Err(EsError::illegal_argument("Error extracting routing: source didn't contain any routing fields"));
     }
@@ -790,22 +970,9 @@ fn build_ids_from_leaves(m: &Mappings, s: &FlatSettings, src: &Value, leaves: &[
     let (v1, v2) = murmur3_128(&all, 0);
     out.extend_from_slice(&v1.to_le_bytes());
     out.extend_from_slice(&v2.to_le_bytes());
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let tsid = b64.encode(&out);
-    // routing hash
-    routing.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
-    let mut rh: i32 = 0;
-    for (name, h, _) in &routing {
-        rh = rh.wrapping_mul(31).wrapping_add((murmur3_32(name, 0) as i32) ^ h);
-    }
-    let ts_ms = src
-        .get("@timestamp")
-        .and_then(|v| match v {
-            Value::String(s) => DateFormatter::new(crate::date::DEFAULT_FORMAT).ok()?.parse(s).ok(),
-            Value::Number(n) => n.as_i64(),
-            _ => None,
-        })
-        .ok_or_else(|| EsError::illegal_argument("data stream timestamp field [@timestamp] is missing"))?;
+    let rh = fold_routing(routing);
+    let ts_ms = id_timestamp(m, src).ok_or_else(|| EsError::illegal_argument("data stream timestamp field [@timestamp] is missing"))?;
     if synthetic_id(s) {
         // `TsidExtractingIdFieldMapper.createSyntheticId`: _tsid bytes,
         // (Long.MAX_VALUE - timestamp) and the routing hash, big endian.
@@ -997,5 +1164,180 @@ mod selective_leaf_tests {
             assert_eq!(encode_id(build_ids(&m,&settings,&source)), encode_id(prepared.build_ids(&m,&settings,&source)));
             assert_eq!(check_position_fields(&m,&source).map_err(|e| e.to_string()), prepared.check_positions(&source).map_err(|e| e.to_string()));
         }
+    }
+}
+
+/// Review findings 137–140: a time series document's identity (routing,
+/// `_tsid`, `_id`) agrees with what it indexes and where it lands.
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::index::WriteReq;
+    use crate::node::Node;
+    use crate::shard::WriteCond;
+    use serde_json::json;
+
+    fn settings(routing_path: &[&str], extra: Value) -> FlatSettings {
+        let mut v = json!({"index.mode": "time_series", "index.routing_path": routing_path});
+        for (k, x) in extra.as_object().into_iter().flatten() {
+            v[k] = x.clone();
+        }
+        v.as_object().unwrap().iter().map(|(k, x)| (k.clone(), x.clone())).collect()
+    }
+
+    fn mappings(v: Value) -> Mappings {
+        Mappings::parse(&v, &crate::analysis::AnalysisRegistry::default()).unwrap()
+    }
+
+    fn ts_index(node: &Node, name: &str, shards: u32, extra: Value, mapping: Value) -> std::sync::Arc<crate::index::IndexService> {
+        let mut s = json!({"index.mode": "time_series", "index.number_of_shards": shards, "index.number_of_replicas": 0,
+            "index.time_series.start_time": "2026-01-01T00:00:00Z", "index.time_series.end_time": "2027-01-01T00:00:00Z"});
+        for (k, x) in extra.as_object().into_iter().flatten() {
+            s[k] = x.clone();
+        }
+        node.create_index(name, &json!({"settings": s, "mappings": mapping})).unwrap()
+    }
+
+    fn index(svc: &crate::index::IndexService, src: Value, create: bool) -> Result<crate::shard::WriteResult> {
+        let cond = WriteCond { create, ..Default::default() };
+        svc.write(vec![WriteReq::Index { id: None, source: src.to_string(), routing: None, cond }], true).pop().unwrap()
+    }
+
+    /// 137: with `routing_path: labels.*` and a dynamic template mapping
+    /// `labels.*` to keyword dimensions (none mapped yet), every first
+    /// write routes to the shard its final `_id` names: the id GETs, an
+    /// identical create conflicts. A partially mapped path (one mapped
+    /// dimension plus a new dynamic one) too. The source routing hash
+    /// before the mapping equals the `_id`'s once it is mapped.
+    #[test]
+    fn dynamic_routing_dimensions_route_where_their_id_does() {
+        let before = mappings(json!({"dynamic_templates": [{"labels": {"path_match": "labels.*", "mapping": {"type": "keyword", "time_series_dimension": true}}}],
+            "properties": {"@timestamp": {"type": "date"}}}));
+        let after = mappings(json!({"properties": {"@timestamp": {"type": "date"}, "labels": {"properties": {"host": {"type": "keyword", "time_series_dimension": true}}}}}));
+        let s = settings(&["labels.*"], json!({}));
+        for i in 0..8 {
+            let src = json!({"@timestamp": "2026-06-01T00:00:00Z", "labels": {"host": format!("h{i}")}});
+            let ids = build_ids(&after, &s, &src).unwrap();
+            assert_eq!(routing_hash(&before, &s, &src).unwrap(), routing_hash_of_id(&ids.id).unwrap(), "h{i}");
+            assert_eq!(routing_hash(&after, &s, &src).unwrap(), routing_hash_of_id(&ids.id).unwrap(), "h{i}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = ts_index(&node, "dyn", 4, json!({"index.routing_path": ["labels.*"]}), json!({
+            "dynamic_templates": [{"labels": {"path_match": "labels.*", "mapping": {"type": "keyword", "time_series_dimension": true}}}],
+            "properties": {"@timestamp": {"type": "date"}, "labels": {"properties": {"region": {"type": "keyword", "time_series_dimension": true}}}}}));
+        let mut shards = std::collections::BTreeSet::new();
+        for i in 0..16 {
+            // Even: only dynamic leaves; odd: a mapped one plus a new dynamic one.
+            let labels = if i % 2 == 0 { json!({format!("k{i}"): format!("v{i}")}) } else { json!({"region": "eu", format!("k{i}"): format!("v{i}")}) };
+            let src = json!({"@timestamp": "2026-06-01T00:00:00Z", "labels": labels, "v": i});
+            let w = index(&svc, src.clone(), false).unwrap_or_else(|e| panic!("doc {i}: {e:?}"));
+            shards.insert(svc.route(&w.id, None).unwrap());
+            assert!(svc.get(&w.id).unwrap().is_some(), "doc {i}: the acknowledged id [{}] GETs", w.id);
+            let again = index(&svc, src, true).expect_err("an identical create conflicts");
+            assert_eq!(again.status, 409, "doc {i}: {again:?}");
+        }
+        assert!(shards.iter().any(|s| *s != 0), "the fixture reaches a nonzero shard: {shards:?}");
+    }
+
+    /// 138: integer dimensions take the value the document indexes:
+    /// coerced "1.5" and "2.5" (indexed 1 and 2) are distinct series;
+    /// 1, "1", " 1 " and "1.5" (all indexed 1) are one; `null_value`
+    /// stands in for null.
+    #[test]
+    fn coerced_integer_dimensions_keep_series_apart() {
+        let m = mappings(json!({"properties": {"@timestamp": {"type": "date"}, "host": {"type": "keyword", "time_series_dimension": true},
+            "sensor": {"type": "long", "time_series_dimension": true, "coerce": true, "null_value": 7}}}));
+        let s = settings(&["host"], json!({}));
+        let tsid = |v: Value| build_ids(&m, &s, &json!({"@timestamp": "2026-06-01T00:00:00Z", "host": "a", "sensor": v})).unwrap().tsid;
+        assert_ne!(tsid(json!("1.5")), tsid(json!("2.5")));
+        let one = tsid(json!(1));
+        for v in [json!("1"), json!(" 1 "), json!("1.5"), json!(1.9)] {
+            assert_eq!(tsid(v.clone()), one, "{v}");
+        }
+        assert_eq!(tsid(Value::Null), tsid(json!(7)));
+        assert_ne!(tsid(json!(" 2 ")), one);
+        // End to end: the two coerced samples are two documents.
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = ts_index(&node, "coerce", 1, json!({"index.routing_path": ["host"]}), json!({"properties": {"@timestamp": {"type": "date"},
+            "host": {"type": "keyword", "time_series_dimension": true}, "sensor": {"type": "long", "time_series_dimension": true, "coerce": true}}}));
+        let a = index(&svc, json!({"@timestamp": "2026-06-01T00:00:00Z", "host": "a", "sensor": "1.5"}), true).unwrap();
+        let b = index(&svc, json!({"@timestamp": "2026-06-01T00:00:00Z", "host": "a", "sensor": "2.5"}), true).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!((a.result, b.result), ("created", "created"));
+        // "1" indexes as 1.5 did: the same series and timestamp conflicts.
+        assert_eq!(index(&svc, json!({"@timestamp": "2026-06-01T00:00:00Z", "host": "a", "sensor": "1"}), true).unwrap_err().status, 409);
+    }
+
+    /// 139: a `date_nanos` `@timestamp` is encoded in the id in nanos, as
+    /// the column holds it: samples of one series within a millisecond are
+    /// distinct documents, and every acknowledged synthetic id still GETs
+    /// after the segment is sealed (flushed).
+    #[test]
+    fn date_nanos_ids_encode_the_indexed_nanos() {
+        let m = mappings(json!({"properties": {"@timestamp": {"type": "date_nanos"}, "host": {"type": "keyword", "time_series_dimension": true}}}));
+        let s = settings(&["host"], json!({"index.mapping.synthetic_id": true}));
+        let id = |ts: &str| build_ids(&m, &s, &json!({"@timestamp": ts, "host": "a"})).unwrap().id;
+        let (a, b) = (id("2026-06-01T00:00:00.000000001Z"), id("2026-06-01T00:00:00.000000002Z"));
+        assert_ne!(a, b);
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&a).unwrap();
+        let rev = i64::from_be_bytes(raw[raw.len() - 12..raw.len() - 4].try_into().unwrap());
+        assert_eq!(i64::MAX - rev, 1_780_272_000_000_000_001, "the id carries epoch nanos");
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = ts_index(&node, "nanos", 1, json!({"index.routing_path": ["host"], "index.mapping.synthetic_id": true}),
+            json!({"properties": {"@timestamp": {"type": "date_nanos"}, "host": {"type": "keyword", "time_series_dimension": true}, "v": {"type": "long"}}}));
+        let w1 = index(&svc, json!({"@timestamp": "2026-06-01T00:00:00.000000001Z", "host": "a", "v": 1}), true).unwrap();
+        let w2 = index(&svc, json!({"@timestamp": "2026-06-01T00:00:00.000000002Z", "host": "a", "v": 2}), true).unwrap();
+        assert_ne!(w1.id, w2.id);
+        assert_eq!((w1.result, w2.result), ("created", "created"));
+        svc.refresh().unwrap();
+        svc.flush().unwrap();
+        for w in [&w1, &w2] {
+            assert!(svc.get(&w.id).unwrap().is_some(), "[{}] GETs after the seal", w.id);
+        }
+    }
+
+    /// 140: `_tsid` and `_ts_routing_hash` are metadata fields: a source
+    /// carrying either (alone or together) is refused before any write,
+    /// and earlier acknowledged ids still GET after a seal. The hidden
+    /// columns get exactly one value even if a parsed document had one.
+    #[test]
+    fn hidden_identity_fields_are_reserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = ts_index(&node, "hidden", 1, json!({"index.routing_path": ["host"], "index.mapping.synthetic_id": true}),
+            json!({"properties": {"@timestamp": {"type": "date"}, "host": {"type": "keyword", "time_series_dimension": true}}}));
+        let ok = index(&svc, json!({"@timestamp": "2026-06-01T00:00:00Z", "host": "a"}), true).unwrap();
+        for (bad, field) in [
+            (json!({"@timestamp": "2026-06-01T00:00:01Z", "host": "b", "_tsid": "x"}), "_tsid"),
+            (json!({"@timestamp": "2026-06-01T00:00:01Z", "host": "b", "_ts_routing_hash": 0}), "_ts_routing_hash"),
+            (json!({"@timestamp": "2026-06-01T00:00:01Z", "host": "b", "_tsid": "x", "_ts_routing_hash": 0}), "_ts"),
+        ] {
+            let e = index(&svc, bad, false).unwrap_err();
+            assert_eq!((e.status, e.kind.as_str()), (400, "document_parsing_exception"), "{e:?}");
+            assert!(e.reason.contains(&format!("Field [{field}")) && e.reason.contains("is a metadata field and cannot be added inside a document"), "{}", e.reason);
+        }
+        let after = index(&svc, json!({"@timestamp": "2026-06-01T00:00:02Z", "host": "c"}), true).unwrap();
+        assert_eq!(after.seq_no, ok.seq_no + 1, "the refused writes took no sequence number");
+        svc.refresh().unwrap();
+        svc.flush().unwrap();
+        for id in [&ok.id, &after.id] {
+            assert!(svc.get(id).unwrap().is_some(), "[{id}] GETs after the seal");
+        }
+        // Defensive: a pre-existing value of a hidden column is replaced.
+        let lookup = svc.lookup();
+        let tsid_field = lookup.get(TSID_FIELD).and_then(|f| f.core_id).unwrap();
+        let rh_field = lookup.get(ROUTING_HASH_FIELD).and_then(|f| f.core_id).unwrap();
+        let mut doc = rustic_core::types::Document::default();
+        doc.fields.push((tsid_field, rustic_core::FieldValue::Keyword("x".into())));
+        doc.fields.push((rh_field, rustic_core::FieldValue::I64(0)));
+        let m = svc.meta().mappings;
+        let ids = build_ids(&m, &svc.meta().settings, &json!({"@timestamp": "2026-06-01T00:00:00Z", "host": "a"})).unwrap();
+        push_hidden_fields(&lookup, &ids, &mut doc);
+        assert_eq!(doc.fields.iter().filter(|(f, _)| *f == tsid_field).count(), 1);
+        assert_eq!(doc.fields.iter().filter(|(f, _)| *f == rh_field).count(), 1);
     }
 }

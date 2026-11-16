@@ -218,20 +218,28 @@ pub(crate) fn build_memory_index(lookup: &FieldLookup, doc: &Value) -> Result<ru
 /// segment (index-time field scripts: sealing a one-document segment per
 /// indexed document cost more than parsing it).
 pub(crate) fn build_memory_index_sealed(lookup: &FieldLookup, doc: &Value, seal: bool) -> Result<rustic_core::Index> {
+    build_memory_index_root(lookup, doc, seal).map(|(mem, _)| mem)
+}
+
+/// [`build_memory_index_sealed`] and the root document's id in its one
+/// leaf: nested children are written before their parent, so the root is
+/// not doc 0 when the document has nested objects.
+pub(crate) fn build_memory_index_root(lookup: &FieldLookup, doc: &Value, seal: bool) -> Result<(rustic_core::Index, rustic_core::types::DocId)> {
     let mut lk = lookup.clone();
     lk.root_dynamic = Some(crate::mapping::Dynamic::False);
     let schema = lookup.core_schema();
     let mut mem = rustic_core::Index::new("_painless_execute", schema, IndexSettings::default());
     let m = Mappings::default();
+    let mut root = 0;
     if let crate::document::ParseOutcome::Doc(pd) = crate::document::parse_document(doc, "0", &m, &lk)? {
         let mut d = pd.doc;
         d.add_keyword(ID_FIELD, "0");
-        mem.add_document(&d).map_err(|e| EsError::internal(e.to_string()))?;
+        root = mem.add_document(&d).map_err(|e| EsError::internal(e.to_string()))?.doc_id;
     }
     if seal {
         mem.refresh().map_err(|e| EsError::internal(e.to_string()))?;
     }
-    Ok(mem)
+    Ok((mem, root))
 }
 
 /// Normalise and render the values a field script emitted, like the

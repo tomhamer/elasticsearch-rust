@@ -279,6 +279,9 @@ pub struct CoordinationSettings {
     /// default 30s). It lets a cluster whose only up-to-date node is excluded
     /// still elect a master (see `Coordinator`).
     pub excluded_node_election_fallback_ms: u64,
+    /// `cluster.indices.tombstones.size` (500): how many deleted indices the
+    /// index graveyard remembers (`crate::graveyard`).
+    pub tombstones_size: usize,
 }
 
 impl CoordinationSettings {
@@ -306,6 +309,7 @@ impl CoordinationSettings {
             no_master_block: NoMasterBlock::Write,
             max_voting_config_exclusions: MAX_VOTING_CONFIG_EXCLUSIONS,
             excluded_node_election_fallback_ms: 30_000,
+            tombstones_size: crate::graveyard::DEFAULT_SIZE,
         }
     }
 
@@ -337,6 +341,7 @@ impl CoordinationSettings {
                 "cluster.no_master_block" => s.no_master_block = NoMasterBlock::parse(v).ok_or_else(|| format!("invalid [{k}]: [{v}]"))?,
                 "cluster.election.excluded_node_fallback" => s.excluded_node_election_fallback_ms = parse_time_millis(v)?,
                 "cluster.max_voting_config_exclusions" => s.max_voting_config_exclusions = v.parse().map_err(|_| format!("invalid [{k}]: [{v}]"))?,
+                "cluster.indices.tombstones.size" => s.tombstones_size = v.parse().map_err(|_| format!("Failed to parse value [{v}] for setting [{k}]"))?,
                 _ => {}
             }
         }

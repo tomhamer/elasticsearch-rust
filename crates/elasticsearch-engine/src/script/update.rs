@@ -135,6 +135,8 @@ pub fn scripted_update(svc: &crate::index::IndexShard, id: &str, body: &Map<Stri
         let cur = svc.shard.get(id)?;
         let (req, created, outcome_src) = match &cur {
             Some(g) => {
+                // Before running the script: a scripted no-op still conflicts.
+                svc.check_update_cond(id, g.seq_no, g.primary_term, &cond)?;
                 let meta = DocMeta {
                     index: svc.name.clone(),
                     id: Some(id.to_string()),

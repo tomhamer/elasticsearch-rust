@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """EC2-only explicit supplemental coverage; immutable source, no automatic launch."""
-import argparse, fcntl, hashlib, json, os, pathlib, re, shlex, stat, subprocess, time
+import argparse, fcntl, hashlib, json, os, pathlib, platform, re, shlex, stat, subprocess, time
 from consolidated_correctness import idle, inventory, pinned, run, save, sha
+# rustc 1.99 crashes compiling candle-core for Graviton3 with SVE; keep native
+# tuning without SVE on aarch64, plus FP16 (RUSTFLAGS replaces .cargo/config.toml).
+NATIVE_RUSTFLAGS='-C target-cpu=native'+(' -C target-feature=+fp16,-sve,-sve2' if platform.machine()=='aarch64' else '')
 
 TESTS = (
  ('coordination-soak','elasticsearch-cluster','--lib','coordination::sim_scenarios::soak',{'COORD_SEEDS':'100000','COORD_FIRST_SEED':'1000000'}),
@@ -87,7 +90,7 @@ def main():
         for row in required:
             name,test=row['id'].split('::',1)
             assert re.search(r'^test '+re.escape(test)+r' \.\.\. ignored', (logs/name).read_text(errors='replace'),re.M),'Missing native ignored inventory'
-        env=dict(os.environ,HOME='/home/ubuntu',CARGO_TARGET_DIR=str(target),CARGO_BUILD_JOBS='24',RUSTFLAGS='-C target-cpu=native',RUSTUP_TOOLCHAIN='stable')
+        env=dict(os.environ,HOME='/home/ubuntu',CARGO_TARGET_DIR=str(target),CARGO_BUILD_JOBS='24',RUSTFLAGS=NATIVE_RUSTFLAGS,RUSTUP_TOOLCHAIN='stable')
         assert not any(env.get(k) for k in ('RUSTIC_PROFILE','RUSTIC_TRACING','ES_YAML_CLAIM_ALL','ES_TEST_S3_ENDPOINT','ES_TEST_S3_PATH_STYLE'))
         assert not any(value for key,value in env.items() if key.startswith('AWS_ENDPOINT_URL')), 'Custom AWS endpoints forbidden'
         s3=protected_s3(cfg['s3_environment'])

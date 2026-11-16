@@ -578,6 +578,36 @@ fn emulated_layout_is_migrated_on_open() {
     assert!(!path.join(MIGRATION_MARKER).exists());
 }
 
+/// Production review #410: a migration interrupted after shard-0 was
+/// trimmed (marker in its `trimming` phase) keeps the committed
+/// destination shards on restart: every document survives, repeatedly.
+#[test]
+fn interrupted_migration_after_the_trim_keeps_every_document() {
+    let (_t, node) = node();
+    let svc = node.create_index("leg2", &json!({"settings": {"number_of_shards": 3}})).unwrap();
+    svc.write((0..30).map(|i| idx(&format!("d{i}"), json!({"n": i}))).collect(), true);
+    svc.flush().unwrap();
+    let path = svc.path().to_path_buf();
+    drop(svc);
+    drop(node);
+    // The state an interruption leaves after the source trim: documents in
+    // their own shards, the marker still present.
+    std::fs::write(path.join(MIGRATION_MARKER), br#"{"phase":"trimming"}"#).unwrap();
+    for _ in 0..2 {
+        let node = Node::open(_t.path()).unwrap();
+        let svc = node.get_index("leg2").unwrap();
+        assert_eq!(svc.doc_count_realtime().0, 30, "every document survives the restart");
+        for i in 0..30 {
+            let id = format!("d{i}");
+            let want = svc.route(&id, None).unwrap();
+            for s in svc.local_shards() {
+                assert_eq!(s.shard.peek(&id).unwrap().is_some(), s.id == want, "{id}");
+            }
+        }
+        assert!(!path.join(MIGRATION_MARKER).exists());
+    }
+}
+
 // --------------------------------------------------------- equivalence
 
 // `hnsw`: exact scores (int8 scores depend on the segment layout, as in ES).
@@ -845,6 +875,29 @@ fn search_routing_and_slices_follow_shards() {
     }
 }
 
+/// Production review #20: the flood-stage block rejects document deletes
+/// like every other document write (429), a mixed batch included, and
+/// leaves the shard's history untouched; deleting the index is allowed.
+#[test]
+fn read_only_allow_delete_blocks_document_deletes() {
+    let (_t, node) = node();
+    let svc = node.create_index("flood", &json!({"settings": {"number_of_shards": 2, "number_of_replicas": 0}})).unwrap();
+    assert!(svc.write((0..4).map(|i| idx(&format!("d{i}"), json!({"n": i}))).collect(), true).iter().all(|r| r.is_ok()));
+    svc.put_settings(settings::normalize_index_settings(&json!({"index.blocks.read_only_allow_delete": true})), false).unwrap();
+    let max_seq = || svc.local_shards().iter().map(|s| s.shard.max_seq_no()).collect::<Vec<_>>();
+    let before = max_seq();
+    let del = |id: &str| WriteReq::Delete { id: id.into(), routing: None, cond: WriteCond::default() };
+    let blocked = |r: &Result<WriteResult>| matches!(r, Err(e) if e.status == 429 && e.kind == "cluster_block_exception");
+    let single = svc.write(vec![del("d0")], true);
+    assert!(blocked(&single[0]), "{:?}", single[0].as_ref().err());
+    let mixed = svc.write(vec![del("d1"), idx("d9", json!({"n": 9})), del("d2")], true);
+    assert!(mixed.iter().all(blocked), "{:?}", mixed.iter().map(|r| r.as_ref().err()).collect::<Vec<_>>());
+    assert_eq!(max_seq(), before, "a blocked delete reached the shard's history");
+    assert_eq!(svc.doc_count_realtime().0, 4);
+    node.delete_index("flood").unwrap();
+    assert!(node.get_index("flood").is_none());
+}
+
 #[test]
 fn split_shrink_clone_copy_segments_and_route() {
     let (_t, node) = node();
@@ -1062,6 +1115,30 @@ fn maintenance_flushes_busy_shards_by_age() {
     }
     node.maintenance();
     assert!(!pending(), "a busy shard past the flush age was not flushed");
+}
+
+/// ES `index.translog.flush_threshold_size` (dynamic): uncommitted
+/// translog beyond the index's threshold makes the periodic check flush;
+/// under it (default 10gb) nothing does before the age / idle triggers.
+#[test]
+fn maintenance_flushes_by_the_index_translog_size_threshold() {
+    let (_t, node) = node();
+    node.node_settings.write().insert("indices.memory.shard_inactive_time".into(), json!("10m"));
+    let svc = node.create_index("sized", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.translog.flush_threshold_age": "1h"}})).unwrap();
+    let sh = svc.local_shards().remove(0);
+    sh.shard.flush().unwrap();
+    let pending = || sh.shard.max_seq_no() > sh.shard.committed_seq_no();
+    for i in 0..50 {
+        svc.write(vec![idx(&format!("d{i}"), json!({"n": i, "pad": "x".repeat(200)}))], true).remove(0).unwrap();
+    }
+    assert!(sh.shard.uncommitted_translog_size() > 1024, "{}", sh.shard.uncommitted_translog_size());
+    node.maintenance();
+    assert!(pending(), "flushed under the default 10gb threshold");
+    // Lowered on the live index: the next periodic check flushes.
+    let flat: crate::settings::FlatSettings = [("index.translog.flush_threshold_size".to_string(), json!("1kb"))].into_iter().collect();
+    svc.put_settings(flat, false).unwrap();
+    node.maintenance();
+    assert!(!pending(), "uncommitted translog over the index's threshold was not flushed");
 }
 
 /// A policy-only force merge flushes first and merges after, then no write
@@ -3489,4 +3566,218 @@ fn seq_no_and_constant_dates_without_points_answer_like_standard() {
     check("refreshed");
     for svc in [&l, &s] { svc.force_merge(1, false).unwrap(); svc.refresh().unwrap(); }
     check("merged");
+}
+
+/// Production review #91: `_source.includes` / `excludes` filter the
+/// stored `_source`, never the operation. A crash before a flush replays
+/// the translog: the replayed documents must still match on the excluded
+/// (indexed) fields, while `_source` stays filtered. Single documents and
+/// batches (bulk shard requests) alike. The translog used to keep the
+/// filtered source, so the replayed copy lost every excluded value.
+#[test]
+fn source_filtering_keeps_excluded_fields_through_crash_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cases = [
+        ("excl", json!({"_source": {"excludes": ["secret", "inner.hidden"]}, "properties": {"secret": {"type": "keyword"}, "inner": {"properties": {"hidden": {"type": "long"}}}}})),
+        ("incl", json!({"_source": {"includes": ["open"]}, "properties": {"secret": {"type": "keyword"}, "open": {"type": "keyword"}, "inner": {"properties": {"hidden": {"type": "long"}}}}})),
+    ];
+    let doc = |i: usize| json!({"secret": format!("s{i}"), "open": format!("o{i}"), "inner": {"hidden": i}});
+    {
+        let node = Node::open(tmp.path()).unwrap();
+        for (name, mapping) in &cases {
+            let svc = node.create_index(name, &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "refresh_interval": "-1"}, "mappings": mapping})).unwrap();
+            svc.write(vec![idx("0", doc(0))], true).remove(0).unwrap();
+            let batch = (1..6).map(|i| idx(&i.to_string(), doc(i))).collect();
+            assert!(svc.write(batch, true).iter().all(|r| r.is_ok()));
+            // The translog holds the complete input.
+            svc.refresh().unwrap();
+            assert_eq!(exec(&svc, &parse(json!({"query": {"term": {"secret": "s3"}}}), &[]))["hits"]["total"]["value"], 1);
+        }
+        // Dropped without a flush or close: a crash.
+    }
+    let mut reopened = None;
+    for _ in 0..50 {
+        if let Ok(node) = Node::open(tmp.path()) {
+            if cases.iter().all(|(name, _)| node.get_index(name).and_then(|svc| svc.shard(0)).is_some()) { reopened = Some(node); break; }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let node = reopened.expect("the copies reopened");
+    for (name, _) in &cases {
+        let svc = node.get_index(name).unwrap();
+        svc.refresh().unwrap();
+        let total = |q: Value| exec(&svc, &parse(json!({"query": q, "track_total_hits": true}), &[]))["hits"]["total"]["value"].as_u64().unwrap();
+        assert_eq!(total(json!({"match_all": {}})), 6, "[{name}]");
+        assert_eq!(total(json!({"term": {"secret": "s0"}})), 1, "[{name}] single-document write replayed");
+        assert_eq!(total(json!({"term": {"secret": "s4"}})), 1, "[{name}] batch write replayed");
+        assert_eq!(total(json!({"range": {"inner.hidden": {"gte": 3}}})), 3, "[{name}]");
+        let got = svc.get("4").unwrap().unwrap();
+        let source: Value = serde_json::from_str(got.source.as_deref().unwrap()).unwrap();
+        assert_eq!(source["open"], "o4", "[{name}] {source}");
+        assert!(source.get("secret").is_none() && source["inner"].get("hidden").is_none(), "[{name}] the stored source stays filtered: {source}");
+    }
+}
+
+/// Production review #94: a changed partial update without `routing`
+/// keeps the routing the document was stored with (ES
+/// `UpdateHelper.calculateRouting`), also after a restart; an explicit
+/// routing, a no-op and a scripted update are controls.
+#[test]
+fn partial_updates_keep_the_stored_routing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let routing = |svc: &Arc<IndexService>, id: &str| svc.get(id).unwrap().unwrap().routing;
+    {
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("u", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}})).unwrap();
+        for id in ["changed", "noop", "explicit", "script"] {
+            svc.write(vec![WriteReq::Index { id: Some(id.into()), source: json!({"n": 1}).to_string(), routing: Some("r".into()), cond: WriteCond::default() }], true).remove(0).unwrap();
+        }
+        let (w, _) = svc.update("changed", &json!({"doc": {"n": 2}}), None, 0, WriteCond::default()).unwrap();
+        assert_eq!(w.result, "updated");
+        let (w, _) = svc.update("noop", &json!({"doc": {"n": 1}}), None, 0, WriteCond::default()).unwrap();
+        assert_eq!(w.result, "noop");
+        svc.update("explicit", &json!({"doc": {"n": 2}}), Some("r2".into()), 0, WriteCond::default()).unwrap();
+        svc.update("script", &json!({"script": {"source": "ctx._source.n += 1"}}), None, 0, WriteCond::default()).unwrap();
+        // The raw (lossless) update path too.
+        let raw = crate::source_json::update_request(r#"{"doc": {"n": 3}}"#).unwrap();
+        let (w, _) = svc.update_source("changed", &raw.0, raw.1.as_ref(), None, 0, WriteCond::default()).unwrap();
+        assert_eq!(w.result, "updated");
+        svc.refresh().unwrap();
+        for (id, want) in [("changed", Some("r")), ("noop", Some("r")), ("explicit", Some("r2")), ("script", Some("r"))] {
+            assert_eq!(routing(&svc, id).as_deref(), want, "{id}");
+        }
+        svc.flush().unwrap();
+    }
+    let node = Node::open(tmp.path()).unwrap();
+    let svc = node.get_index("u").unwrap();
+    svc.refresh().unwrap();
+    assert_eq!(routing(&svc, "changed").as_deref(), Some("r"), "after a restart");
+    let v = exec(&svc, &parse(json!({"query": {"term": {"_routing": "r"}}, "track_total_hits": true}), &[]));
+    assert_eq!(v["hits"]["total"]["value"], 3, "{v}");
+}
+
+/// Production review #231: a write past its block check when the write
+/// block is added keeps the block's drain waiting until it completes;
+/// after the drain no write can still apply.
+#[test]
+fn write_block_drain_waits_for_admitted_writes() {
+    let (_t, node) = node();
+    let svc = node.create_index("blk", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}})).unwrap();
+    let copy = svc.shard(0).unwrap();
+    let gate = Arc::new((parking_lot::Mutex::new((false, false)), parking_lot::Condvar::new()));
+    let probe: Arc<dyn Fn() + Send + Sync> = {
+        let gate = gate.clone();
+        Arc::new(move || {
+            let (m, cv) = &*gate;
+            let mut g = m.lock();
+            g.0 = true;
+            cv.notify_all();
+            while !g.1 {
+                cv.wait(&mut g);
+            }
+        })
+    };
+    copy.shard.probe_next_sequencing(Some(probe));
+    let writer = {
+        let svc = svc.clone();
+        std::thread::spawn(move || svc.write((0..1000).map(|i| idx(&format!("d{i}"), json!({"n": i}))).collect(), false))
+    };
+    {
+        let (m, cv) = &*gate;
+        let mut g = m.lock();
+        while !g.0 {
+            cv.wait(&mut g);
+        }
+    }
+    let mut flat = crate::settings::FlatSettings::new();
+    flat.insert("index.blocks.write".into(), json!("true"));
+    svc.put_settings(flat, false).unwrap();
+    assert!(!copy.drain_writes(std::time::Duration::from_millis(100)), "the admitted write is still in flight");
+    copy.shard.probe_next_sequencing(None);
+    {
+        let (m, cv) = &*gate;
+        m.lock().1 = true;
+        cv.notify_all();
+    }
+    assert!(copy.drain_writes(std::time::Duration::from_secs(30)), "drained once it completes");
+    assert!(writer.join().unwrap().iter().all(Result::is_ok), "admitted before the block");
+    let r = svc.write(vec![idx("late", json!({"n": 1}))], false);
+    assert!(r[0].is_err(), "blocked after");
+    svc.refresh().unwrap();
+    assert_eq!(copy.shard.get("d999").unwrap().is_some(), true);
+}
+
+/// Finding 434: on a synthetic-source index the translog keeps the input
+/// as indexed, so a crash replay re-indexes the same text (frequencies,
+/// positions) while fetches still see the canonical source.
+#[test]
+fn synthetic_source_replays_the_indexed_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mapping = json!({"properties": {"t": {"type": "text", "fields": {"raw": {"type": "keyword"}}}}});
+    let score = |svc: &Arc<IndexService>| exec(svc, &parse(json!({"query": {"term": {"t": "zebra"}}}), &[]))["hits"]["hits"][0]["_score"].as_f64().unwrap();
+    let phrase = |svc: &Arc<IndexService>| exec(svc, &parse(json!({"query": {"match_phrase": {"t": "zebra ant"}}, "track_total_hits": true}), &[]))["hits"]["total"]["value"].as_u64().unwrap();
+    let before;
+    {
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("s", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "refresh_interval": "-1", "index.mapping.source.mode": "synthetic"}, "mappings": mapping})).unwrap();
+        svc.write(vec![idx("1", json!({"t": ["zebra", "ant", "zebra"]})), idx("2", json!({"t": "ant"}))], true).into_iter().for_each(|r| { r.unwrap(); });
+        svc.refresh().unwrap();
+        before = (score(&svc), phrase(&svc));
+        // Dropped without a flush or close: a crash.
+    }
+    let mut reopened = None;
+    for _ in 0..50 {
+        if let Ok(node) = Node::open(tmp.path()) {
+            if node.get_index("s").and_then(|svc| svc.shard(0)).is_some() { reopened = Some(node); break; }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let node = reopened.expect("the copy reopened");
+    let svc = node.get_index("s").unwrap();
+    svc.refresh().unwrap();
+    assert_eq!((score(&svc), phrase(&svc)), before);
+    let hits = exec(&svc, &parse(json!({"query": {"ids": {"values": ["1"]}}}), &[]));
+    assert_eq!(hits["hits"]["hits"][0]["_source"]["t"], json!(["ant", "zebra"]), "{hits}");
+}
+
+/// Production review #493: field-id adoption fences every local copy
+/// before it finds them empty, so a write that lands at that moment is
+/// refused (closed copy, retried by the cluster), never acknowledged and
+/// then deleted with the reopened store.
+#[test]
+fn field_id_adoption_never_deletes_an_acknowledged_write() {
+    let (_t, node) = node();
+    let src = node.create_index("grown2", &json!({"settings": {"number_of_shards": 1}})).unwrap();
+    assert!(src.write((0..5).map(|i| idx(&format!("z{i}"), json!({"z": i}))).collect(), true).iter().all(|r| r.is_ok()));
+    assert!(src.write((0..5).map(|i| idx(&format!("a{i}"), json!({"a": "w"}))).collect(), true).iter().all(|r| r.is_ok()));
+    let ids = src.meta().mappings.core_ids;
+    let meta = json!({"settings": {"index.number_of_shards": "2"}, "mappings": src.meta().mappings.to_json()});
+    let copy = node.create_index_sparse("copy2", "copyUuid493", &meta).unwrap();
+    copy.open_shard(1, spec(true, 1, RecoverySource::Empty)).unwrap();
+    let user: std::collections::BTreeMap<String, u16> = ids.iter().filter(|(_, id)| **id >= crate::mapping::FIRST_USER_FIELD).map(|(k, id)| (k.clone(), *id)).collect();
+    let acked = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (writer, a, r) = (copy.clone(), acked.clone(), refused.clone());
+    crate::index::IndexService::adopt_hook(Some(Arc::new(move || {
+        for i in 0..10 {
+            let id = format!("late{i}");
+            match writer.write(vec![idx(&id, json!({"z": 1}))], true).remove(0) {
+                Ok(_) => a.lock().push(id),
+                Err(e) if e.kind == "index_shard_closed_exception" => {
+                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(_) => {}
+            }
+        }
+    })));
+    let adopted = copy.adopt_core_ids(&user);
+    crate::index::IndexService::adopt_hook(None);
+    assert!(adopted.unwrap());
+    let acked = acked.lock().clone();
+    let held = copy.shard(1).unwrap().doc_count_realtime().0 as usize;
+    assert_eq!(held, acked.len(), "acknowledged writes {acked:?} must survive the adoption");
+    assert!(acked.is_empty() && refused.load(std::sync::atomic::Ordering::SeqCst) > 0, "the copy was fenced during the check");
+    // Reopened under the new ids: writes are accepted again.
+    let ok = (0..10).map(|i| copy.write(vec![idx(&format!("after{i}"), json!({"z": 2}))], true).remove(0)).filter(|r| r.is_ok()).count();
+    assert!(ok > 0, "the adopted copy takes writes again");
 }

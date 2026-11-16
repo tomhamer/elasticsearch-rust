@@ -14,15 +14,21 @@ deploy/
 │   ├── Dockerfile.operator         operator image (distroless)
 │   ├── elasticsearch.yml           image default config (cluster.name: docker-cluster, network.host: 0.0.0.0)
 │   ├── docker-entrypoint.sh        tini-supervised entrypoint (settings.d -> -E key=value)
-│   ├── docker-compose.yml          3-node cluster es01..es03
+│   ├── docker-compose.yml          3-node cluster es01..es03, security on (setup service: CA, certificates, password)
+│   ├── docker-compose.insecure.yml the same without TLS or authentication: DEVELOPMENT ONLY
+│   ├── LICENSE.txt                 /usr/share/elasticsearch/LICENSE.txt (Apache-2.0 + the line stock ECK checks for)
 │   └── bin/                        helpers baked into the image:
 │       ├── es-readiness            readiness probe (official chart semantics)
 │       ├── es-prestop              graceful stop: node shutdown API, voting exclusions on scale-down
 │       ├── es-zone-init            init container: node label -> node.attr.zone
-│       └── es-cluster-cleanup      post-upgrade: clear voting exclusions, stale shutdown records
+│       ├── es-cluster-cleanup      post-upgrade: clear voting exclusions, stale shutdown records
+│       ├── es-healthcheck          container healthcheck (verified TLS + credentials when configured)
+│       ├── es-certgen              CA / certificate generator (OpenSSL), like elasticsearch-certutil
+│       └── es-http-lib             shared by the scripts above: HTTPS, CA trust, credentials
 ├── helm/elasticsearch/             Helm chart (values.yaml, values-production.yaml, values.schema.json)
 ├── k8s/
 │   ├── base/, overlays/{single-node,three-node}/   kustomize manifests
+│   ├── create-secrets.sh           certificates + elastic password Secrets for the overlays
 │   ├── kind-config.yaml            kind cluster: 3 workers in zones zone-a/b/c
 │   └── e2e.sh                      end-to-end test on kind
 └── operator/
@@ -70,7 +76,8 @@ Image layout, following the official image:
 | user | `elasticsearch`, uid 1000, gid 0 (group-writable, so arbitrary UIDs work) |
 | PID 1 | `tini -g` forwards SIGTERM to the node |
 | ports | 9200 (HTTP), 9300 (transport) |
-| healthcheck | `curl /_cluster/health?local=true` |
+| healthcheck | `es-healthcheck`: `/_cluster/health?local=true`, verified TLS + credentials when `ES_CA_CERT` / `ELASTIC_PASSWORD[_FILE]` are set |
+| security | on by default, as in ES 8/9 (see below) |
 
 Ways to set settings, from lowest to highest precedence:
 1. `elasticsearch.yml`, with `${VAR}` substitution.
@@ -80,15 +87,25 @@ Ways to set settings, from lowest to highest precedence:
    file becomes `-E <filename>=<content>`.
 4. `-E key=value` arguments, for example `docker run IMAGE -E node.attr.rack=r1`.
 
+`ELASTIC_PASSWORD` (or `ELASTIC_PASSWORD_FILE`, a file holding it, as in
+ES's image) sets the `elastic` user's bootstrap password; `KEYSTORE_PASSWORD`
+/ `KEYSTORE_PASSWORD_FILE` unlock a password-protected keystore.
+
 ## 2. Single node in Docker
+
+Security is on, as in ES 8/9: on its first start a single node generates a
+CA and certificates under `config/certs/` and serves HTTPS (the node's
+security auto-configuration).
 
 ```sh
 docker run -d --name es -p 9200:9200 \
   -e discovery.type=single-node \
+  -e ELASTIC_PASSWORD=changeme \
   -v esdata:/usr/share/elasticsearch/data \
   --ulimit nofile=65535:65535 \
   elasticsearch-rs:dev
-curl localhost:9200/_cluster/health?pretty
+docker cp es:/usr/share/elasticsearch/config/certs/http_ca.crt .
+curl --cacert http_ca.crt -u elastic:changeme https://localhost:9200/_cluster/health?pretty
 docker stop es     # SIGTERM -> graceful shutdown (default 10 s; use -t 120 for big nodes)
 ```
 
@@ -97,24 +114,39 @@ docker stop es     # SIGTERM -> graceful shutdown (default 10 s; use -t 120 for 
 ```sh
 sudo sysctl -w vm.max_map_count=262144   # bootstrap check; see below
 cd cluster/deploy/docker
-docker compose up -d --build
-curl 'localhost:9200/_cat/nodes?v'
+docker compose up -d --build             # ELASTIC_PASSWORD=... (env or .env) to choose the password
+docker compose cp es01:/usr/share/elasticsearch/config/certs/ca/ca.crt .
+PASSWORD=$(docker compose exec es01 cat config/certs/elastic-password)
+curl --cacert ca.crt -u "elastic:$PASSWORD" 'https://localhost:9200/_cat/nodes?v'
 docker compose down        # keeps the named volumes; `down -v` wipes data
 ```
 
-This is Elastic's documented compose example without the certificate and
-Kibana services: es01 to es03, `discovery.seed_hosts` pointing at the peers, and
-`cluster.initial_master_nodes=es01,es02,es03`. Each node has a named volume, and
-only es01 publishes port 9200. After the cluster has formed once, you may
+This is Elastic's documented compose example without Kibana: a one-shot
+`setup` service creates a CA and one certificate per node with `es-certgen`
+(the image's equivalent of `elasticsearch-certutil`), and the `elastic`
+password (`ELASTIC_PASSWORD` if set, else random), in the `certs` volume.
+es01 to es03 then start with authentication, HTTPS and transport TLS
+(`verification_mode: certificate`), `discovery.seed_hosts` pointing at the
+peers, and `cluster.initial_master_nodes=es01,es02,es03`. Each node has a
+named volume, and only es01 publishes port 9200. The healthchecks make
+verified, authenticated requests. After the cluster has formed once, you may
 remove `cluster.initial_master_nodes`. A formed cluster ignores it.
+
+`docker-compose.insecure.yml` is the same cluster with
+`xpack.security.enabled=false`: no TLS and no authentication, for local
+development only (`docker compose -f docker-compose.insecure.yml up -d`; a
+separate compose project, so it never shares volumes with the secure one).
 
 ## 4. Helm
 
 ```sh
-# development: 3 master+data nodes
+# 3 master+data nodes, security on (the default)
 helm install es cluster/deploy/helm/elasticsearch -n search --create-namespace \
   --set image.repository=elasticsearch-rs --set image.tag=dev
-kubectl -n search port-forward svc/elasticsearch 9200
+PASSWORD=$(kubectl -n search get secret elasticsearch-credentials -o go-template='{{.data.password | base64decode}}')
+kubectl -n search get secret elasticsearch-certs -o go-template='{{index .data "ca.crt" | base64decode}}' > ca.crt
+kubectl -n search port-forward svc/elasticsearch 9200 &
+curl --cacert ca.crt -u "elastic:$PASSWORD" https://localhost:9200/_cluster/health?pretty
 helm test es -n search
 
 # production: 3 dedicated masters + 6 data + 2 coordinating nodes over 3 zones
@@ -124,6 +156,27 @@ helm install prod cluster/deploy/helm/elasticsearch -n search --create-namespace
 
 What the chart creates:
 
+* **Security (on by default, like Elastic's chart and ECK).** Authentication
+  is required, HTTP is served over TLS and transport uses TLS with
+  `verification_mode: certificate`. The `elastic` password comes from
+  `security.elasticPassword.existingSecret`, or the chart generates it in the
+  Secret `<clusterName>-credentials`; it reaches the nodes as their bootstrap
+  password (`ELASTIC_PASSWORD`). Certificates come from
+  `security.tls.http.secretName` / `security.tls.transport.secretName`
+  (Secrets with `tls.crt`, `tls.key`, `ca.crt`), or from
+  `security.tls.provider`: `generate` (default; the chart creates a CA and
+  certificates in `<clusterName>-certs`, kept across upgrades through
+  `lookup`) or `cert-manager` (Certificates from your issuer, or from a
+  per-cluster CA the chart sets up; renewed automatically, and the nodes
+  reload renewed files without a restart). The probes, the preStop hook, the
+  cleanup Job, `helm test` and the metrics exporter use HTTPS, verify the
+  certificate against the client Service name and authenticate.
+  `security.enabled: false` turns all of it off, for development only.
+  Changing the security mode of a running cluster needs a full restart
+  (delete all pods at once): nodes with and without transport TLS cannot form
+  one cluster. With offline rendering (`helm template`, Argo CD, Flux) use
+  `existingSecret` and `cert-manager` or `secretName`: `lookup` cannot see
+  existing Secrets there, so generated ones would change on every render.
 * **One StatefulSet per entry of `nodeGroups`**, named `<clusterName>-<group>`.
   Each group sets its own `replicas`, `roles`, `resources`, `persistence`
   (size/class), `nodeSelector`, `tolerations`, `affinity`, `config`
@@ -179,11 +232,12 @@ What the chart creates:
 * *Add data nodes:* increase `replicas` and run `helm upgrade`.
 * *Remove data nodes:* drain the leaving pods (the highest ordinals) first, then shrink:
   ```sh
-  curl -XPUT localhost:9200/_cluster/settings -H 'Content-Type: application/json' \
+  es() { curl --cacert ca.crt -u "elastic:$PASSWORD" "$@"; }   # see "What the chart creates: Security"
+  es -XPUT https://localhost:9200/_cluster/settings -H 'Content-Type: application/json' \
     -d '{"persistent":{"cluster.routing.allocation.exclude._name":"prod-data-5"}}'
-  curl 'localhost:9200/_cat/shards?h=node' | grep -c prod-data-5   # wait for 0
+  es 'https://localhost:9200/_cat/shards?h=node' | grep -c prod-data-5   # wait for 0
   helm upgrade ... --set ...replicas=5
-  curl -XPUT localhost:9200/_cluster/settings -H 'Content-Type: application/json' \
+  es -XPUT https://localhost:9200/_cluster/settings -H 'Content-Type: application/json' \
     -d '{"persistent":{"cluster.routing.allocation.exclude._name":null}}'
   ```
   The preStop `remove` shutdown is a safety net bounded by the grace period, not a substitute for draining.
@@ -193,13 +247,18 @@ What the chart creates:
 ## 5. Plain manifests (kustomize)
 
 ```sh
+cluster/deploy/k8s/create-secrets.sh elasticsearch          # once: certificates + elastic password
 kubectl apply -k cluster/deploy/k8s/overlays/single-node   # 1 node, discovery.type=single-node
 kubectl apply -k cluster/deploy/k8s/overlays/three-node    # 3 master+data nodes
 ```
 
 The base is the same design as the chart with one group: StatefulSet
 `elasticsearch`, Services `elasticsearch` and `elasticsearch-headless`, a PDB,
-a ServiceAccount with a Role, and the same probes and hooks. The three-node
+a ServiceAccount with a Role, and the same probes and hooks. Security is on:
+the pods need the Secrets `elasticsearch-certs` (`tls.crt`, `tls.key`,
+`ca.crt`; one certificate for HTTP and transport that names the
+`elasticsearch` Service) and `elasticsearch-credentials` (`password`), which
+`create-secrets.sh` creates. The three-node
 overlay ships the `elasticsearch-bootstrap` ConfigMap. Delete it and drop it
 from the overlay once the cluster has formed. Set the image with
 `kustomize edit set image elasticsearch-rs=<repo>:<tag>`.
@@ -214,7 +273,10 @@ The operator implements the ECK
 kubectl apply -k cluster/deploy/operator                    # CRD + operator in elastic-system
 kubectl apply -f cluster/deploy/operator/examples/quickstart.yaml
 kubectl get es -w                                           # HEALTH NODES VERSION PHASE AGE
-kubectl port-forward svc/quickstart-es-http 9200
+PASSWORD=$(kubectl get secret quickstart-es-elastic-user -o go-template='{{.data.elastic | base64decode}}')
+kubectl get secret quickstart-es-http-certs-public -o go-template='{{index .data "ca.crt" | base64decode}}' > ca.crt
+kubectl port-forward svc/quickstart-es-http 9200 &
+curl --cacert ca.crt -u "elastic:$PASSWORD" https://localhost:9200/_cluster/health?pretty
 ```
 
 `elasticsearch-operator crd` prints the CRD; `cluster/deploy/operator/crd.yaml` must match it.
@@ -225,12 +287,36 @@ image is `<repo>:<spec.version>` unless `spec.image` is set), `--es-timeout-secs
 
 Supported spec fields are `version` and `image`. Each entry of `nodeSets[]` takes
 `name`, `count`, `config`, `podTemplate` and `volumeClaimTemplates`. Top-level
-`updateStrategy.changeBudget` takes `maxSurge` and `maxUnavailable`, and there is a
-`podDisruptionBudget` field. The status reports `health`, `phase`, `availableNodes`,
+`updateStrategy.changeBudget` takes `maxSurge` and `maxUnavailable`, there is a
+`podDisruptionBudget` field, and `http.tls` takes ECK's
+`selfSignedCertificate.subjectAltNames` and `certificate.secretName`. The status reports `health`, `phase`, `availableNodes`,
 `version`, `observedGeneration` and `conditions`.
 
 What the operator manages, using ECK naming:
 
+* **Security, as ECK.** Every cluster runs with authentication, HTTPS and
+  transport TLS; plain-text HTTP is not offered
+  (`http.tls.selfSignedCertificate.disabled: true` is rejected as invalid,
+  and `xpack.security.*` TLS settings in `nodeSets[].config` are ignored).
+  The operator generates the `elastic` password in `<name>-es-elastic-user`
+  (key `elastic`; the nodes get it as `ELASTIC_PASSWORD`), an HTTP CA
+  (`<name>-es-http-ca-internal`) and certificate (`<name>-es-http-certs-internal`,
+  naming `<name>-es-http[.<ns>[.svc]]`, every pod through its headless Service,
+  localhost and your `subjectAltNames`), the client trust bundle
+  `<name>-es-http-certs-public`, and a transport CA
+  (`<name>-es-transport-ca-internal`) and certificate (`<name>-es-transport-certs`,
+  one shared by all nodes; `verification_mode: certificate`). With
+  `http.tls.certificate.secretName` your `tls.crt`/`tls.key`/`ca.crt` replace
+  the generated HTTP certificate; it must name `<name>-es-http.<ns>.svc`.
+  Certificates last a year and are re-issued 30 days before expiry, CAs last
+  five years and roll over with the previous CA kept in the trust bundle; the
+  nodes reload changed files without a restart. The operator talks to the
+  cluster only over HTTPS, trusting only the cluster CA (the platform roots
+  for a user certificate without `ca.crt`), as `elastic`; the readiness probe
+  does the same against the local node. Clusters created by operator versions
+  before this one ran without security: after upgrading the operator, delete
+  all of their pods at once (a one-by-one restart cannot mix TLS and plain
+  transport), or recreate them.
 * **Objects.** Each nodeSet gets a StatefulSet `<name>-es-<nodeSet>` with
   `updateStrategy: OnDelete` and `podManagementPolicy: Parallel`, a headless
   Service of the same name, and a ConfigMap `<name>-es-<nodeSet>-es-config`
@@ -272,8 +358,8 @@ KEEP_CLUSTER=1 IMAGE=elasticsearch-rs:dev BUILD_IMAGE=0 cluster/deploy/k8s/e2e.s
 The script runs these steps:
 
 1. Creates a kind cluster with 3 workers labelled `zone-a`, `zone-b` and `zone-c`.
-2. Loads the image and installs the chart with 3 dedicated masters, 2 data nodes and zone awareness.
-3. Waits for green and checks that every node has `node.attr.zone`.
+2. Loads the image and installs the chart (security on, chart-generated certificates and password) with 3 dedicated masters, 2 data nodes and zone awareness.
+3. Waits for green and checks that every node has `node.attr.zone`, then checks security: the client speaks HTTPS with the chart's CA and the generated password; anonymous requests, wrong passwords and plain HTTP are refused; transport requires TLS.
 4. Indexes 3×300 documents.
 5. Force-kills the elected master. It checks that a different master is elected and that the cluster returns to green with an unchanged document count.
 6. Scales data nodes 2→3→2, draining before the shrink.
@@ -288,6 +374,18 @@ the kind cluster, unless you set `KEEP_CLUSTER=1`.
 ---
 
 ## Production checklist
+
+**Security.** Keep the defaults: authentication, HTTPS and transport TLS
+(Helm `security.*`, the operator always). Prefer cert-manager or your own
+certificate Secrets for production and GitOps, and a pre-created password
+Secret. Change the `elastic` password after installation with
+`POST _security/user/elastic/_password` (or `elasticsearch-reset-password`)
+and then update the Secret the probes read, or create dedicated users and
+roles for applications. Only `docker-compose.insecure.yml` and
+`security.enabled: false` run without security, for development.
+
+The `curl` examples below omit the TLS and credential options for brevity:
+add `--cacert ca.crt -u "elastic:$PASSWORD"` and use `https://`.
 
 **Memory sizing (there is no JVM heap).** Ignore `-Xms`/`-Xmx` and the
 "50% of RAM for heap" rule. The node is a native process. Its memory has two parts:
@@ -401,6 +499,37 @@ pod restarts.
 **Network exposure.** Keep the client Service `ClusterIP` and restrict access
 with NetworkPolicies. Expose the Ingress or a `LoadBalancer` only with security
 (TLS and authentication) enabled.
+
+**Remote clusters (cross-cluster search and replication).** A cluster reaches
+another one over the remote cluster's *transport* port (9300), so that port
+must be reachable from every node of the querying (or following) cluster with
+the `remote_cluster_client` role (on by default; keep it on the coordinating
+and data nodes). Configure the remote with dynamic cluster settings, as in
+Elasticsearch:
+
+```sh
+curl -XPUT -H 'content-type: application/json' https://es:9200/_cluster/settings -d '{
+  "persistent": {"cluster.remote.leader": {"seeds": ["leader-transport.example:9300"], "skip_unavailable": false}}
+}'
+# or behind a load balancer / proxy:
+#   {"cluster.remote.leader": {"mode": "proxy", "proxy_address": "leader-lb.example:9300"}}
+curl https://es:9200/_remote/info
+```
+
+In sniff mode the gateway nodes the seed reports (every node that is not a
+dedicated master, or those with `node.attr.<cluster.remote.node.attr>: true`)
+must be reachable at their published transport addresses; behind NAT or a
+single load balancer use proxy mode. Security follows Elasticsearch's
+certificate-based remote cluster model: both clusters run transport TLS
+and trust each other's transport CA (`xpack.security.transport.ssl.certificate_authorities`
+lists both CAs; narrow it with `trust_restrictions`); the remote cluster
+authorizes each request as the calling user, by its own definitions of the
+user's role names, so define the roles (for example `read` and
+`read_cross_cluster` on the indices searched, `read_ccr` and `monitor` +
+`read` on leader indices) on the remote cluster under the same names. API key
+based remote clusters (`cluster.remote.<alias>.credentials`, the remote
+cluster server port 9443) are not supported: an alias with credentials does
+not connect.
 
 ---
 

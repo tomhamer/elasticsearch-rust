@@ -145,6 +145,19 @@ impl ReplicationTracker {
         t
     }
 
+    /// A new primary whose global checkpoint starts at `proven` (what every
+    /// in-sync copy is known to hold: a promoted replica's global
+    /// checkpoint, or nothing), not recomputed from the primary alone: its
+    /// in-sync copies are applied afterwards and may lag, and a recompute
+    /// only ever raises the value (production review #435: a new primary
+    /// advertised its own maximum and replicas then skipped the divergent
+    /// tail comparison).
+    pub fn new_primary(primary_allocation_id: &str, primary_term: u64, primary_local_checkpoint: i64, proven: i64) -> Self {
+        let mut copies = BTreeMap::new();
+        copies.insert(primary_allocation_id.to_string(), CopyCheckpointState { local_checkpoint: primary_local_checkpoint, in_sync: true, tracked: true });
+        Self { primary_allocation_id: primary_allocation_id.to_string(), primary_term, copies, global_checkpoint: proven.min(primary_local_checkpoint).max(UNASSIGNED_SEQ_NO), routing: None }
+    }
+
     pub fn primary_allocation_id(&self) -> &str {
         &self.primary_allocation_id
     }
@@ -374,6 +387,28 @@ mod tests {
                 assert_eq!(t.has_processed(s), seen.contains(&s));
             }
         }
+    }
+
+    /// Production review #435: two concurrent ops, seq0 on R2 only and
+    /// seq1 on R1 only; R1 is promoted (max 1). Its new tracker must not
+    /// advertise 1 before R2 proves it holds it.
+    #[test]
+    fn a_new_primary_never_advertises_an_unproved_checkpoint() {
+        let mut t = ReplicationTracker::new_primary("r1", 2, 1, -1);
+        assert_eq!(t.global_checkpoint(), -1, "nothing proven yet");
+        t.update_from_cluster_state(["r1", "r2"], []);
+        assert_eq!(t.global_checkpoint(), -1, "r2 has not reported");
+        t.update_local_checkpoint("r2", 0);
+        assert_eq!(t.global_checkpoint(), 0);
+        t.update_local_checkpoint("r2", 1);
+        assert_eq!(t.global_checkpoint(), 1);
+        // A proven previous checkpoint is kept, never exceeded.
+        assert_eq!(ReplicationTracker::new_primary("p", 3, 9, 4).global_checkpoint(), 4);
+        assert_eq!(ReplicationTracker::new_primary("p", 3, 2, 4).global_checkpoint(), 2);
+        // Alone in the in-sync set, the primary's own checkpoint is proof.
+        let mut solo = ReplicationTracker::new_primary("p", 1, 7, -1);
+        solo.update_from_cluster_state(["p"], []);
+        assert_eq!(solo.global_checkpoint(), 7);
     }
 
     #[test]

@@ -2,7 +2,10 @@
 """Reviewed external launcher for an immutable candidate; EC2 execution only.
 No work on import. Never infers unknown artifact hashes or clears failed owners.
 """
-import argparse, fcntl, getpass, hashlib, json, os, pathlib, re, shutil, signal, socket, subprocess, time, urllib.request
+import argparse, fcntl, getpass, hashlib, json, os, pathlib, platform, re, shutil, signal, socket, subprocess, time, urllib.request
+# rustc 1.99 crashes compiling candle-core for Graviton3 with SVE; keep native
+# tuning without SVE on aarch64, plus FP16 (RUSTFLAGS replaces .cargo/config.toml).
+NATIVE_RUSTFLAGS='-C target-cpu=native'+(' -C target-feature=+fp16,-sve,-sve2' if platform.machine()=='aarch64' else '')
 
 def readable_ec2_identity():
     """Unreadable DMI fields are not evidence; require a readable EC2 identity."""
@@ -154,7 +157,7 @@ def main():
             # the materialized corpus path for the product source root.
             assert (pathlib.Path.home()/'es955-yaml').resolve()==pathlib.Path(cfg['yaml_root']).resolve(),'YAML launcher HOME would select a different fixture corpus'
             assert all((pathlib.Path(cfg['yaml_root'])/suite/sub).is_dir() for suite in ('oss','main','sec','plug') for sub in ('api','test'))
-            env=dict(os.environ,HOME='/home/ubuntu',CARGO_TARGET_DIR=str(target),CARGO_BUILD_JOBS='24',RUSTFLAGS='-C target-cpu=native',PATH='/home/ubuntu/.cargo/bin:'+os.environ['PATH'])
+            env=dict(os.environ,HOME='/home/ubuntu',CARGO_TARGET_DIR=str(target),CARGO_BUILD_JOBS='24',RUSTFLAGS=NATIVE_RUSTFLAGS,PATH='/home/ubuntu/.cargo/bin:'+os.environ['PATH'])
             old=os.getcwd();os.chdir(source)
             try:code=run(['cargo','+stable','build','--locked','--profile','fast','-p','es-cluster-yaml','-p','elasticsearch-faults'],out/'helpers-build.log',env)
             finally:os.chdir(old)

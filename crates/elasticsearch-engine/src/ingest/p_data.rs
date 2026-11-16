@@ -1074,7 +1074,9 @@ fn fp_bytes(v: &Value) -> Result<Vec<u8>> {
             if n.is_f64() {
                 n.as_f64().unwrap_or(0.0).to_le_bytes().to_vec()
             } else {
-                let i = n.as_i64().unwrap_or(0);
+                // An integer beyond a Java long is a BigInteger, which ES's
+                // `FingerprintProcessor.toBytes` refuses (never zero bytes).
+                let i = n.as_i64().ok_or_else(|| ia("cannot convert object of type [java.math.BigInteger] to bytes"))?;
                 if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
                     (i as i32).to_le_bytes().to_vec()
                 } else {
@@ -1192,6 +1194,22 @@ mod tests {
         let mut r = CsvRun { p: &p, line: line.encode_utf16().collect(), state: CsvState::Start, builder: Vec::new(), start: 0, cur: 0, header: 0, out: Vec::new() };
         r.run().map_err(|e| e.reason)?;
         Ok(r.out.into_iter().filter_map(|(k,v)| if v.is_empty() { p.empty_value.clone().map(|v|(k,v)) } else { Some((k,Value::String(String::from_utf16(&v).unwrap()))) }).collect())
+    }
+
+    /// Finding 242: integers beyond a Java long are refused (ES throws for
+    /// BigInteger), never hashed as zero; longs and ints keep their bytes.
+    #[test]
+    fn fingerprint_big_integers_are_refused() {
+        let big: Value = serde_json::from_str("9223372036854775808").unwrap();
+        assert_eq!(fp_bytes(&big).unwrap_err().reason, "cannot convert object of type [java.math.BigInteger] to bytes");
+        assert_eq!(fp_bytes(&json!(0)).unwrap(), 0i32.to_le_bytes().to_vec());
+        assert_eq!(fp_bytes(&json!(i64::MAX)).unwrap(), i64::MAX.to_le_bytes().to_vec());
+        let p = FingerprintP { fields: vec!["id".into()], target: "fp".into(), salt: Vec::new(), method: "SHA-1".into(), ignore_missing: false };
+        let store = super::super::IngestService::in_memory();
+        let cx = PipelineContext::new(&store);
+        let mut doc = IngestDocument::new(json!({"id": big}).as_object().unwrap().clone(), "i", None, None, "now".into());
+        assert!(p.process(&mut doc, &cx).is_err());
+        assert!(doc.get("fp").unwrap().is_none());
     }
 
     #[test]

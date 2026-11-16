@@ -54,7 +54,8 @@ impl TopKCollector {
     pub fn new(k: usize) -> Self {
         Self {
             k,
-            heap: BinaryHeap::with_capacity(k),
+            // `k` can be a caller's unbounded row limit: grow as filled.
+            heap: BinaryHeap::with_capacity(k.min(1 << 16)),
         }
     }
 

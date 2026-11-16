@@ -121,7 +121,7 @@ static CLOSED_CLIENTS: LazyLock<Mutex<ClosedClients>> = LazyLock::new(Default::d
 #[derive(Clone, Debug)]
 pub struct HttpConnection(Arc<HttpConnectionState>);
 #[derive(Debug)]
-struct HttpConnectionState { id: u64 }
+struct HttpConnectionState { id: u64, remote_ip: Option<std::net::IpAddr> }
 impl Drop for HttpConnectionState {
     fn drop(&mut self) { close_client(self.id); }
 }
@@ -146,12 +146,17 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crat
 impl HttpConnection {
     fn open(local_address: String, remote_address: String) -> Self {
         let id = HTTP_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let remote_ip = remote_address.parse::<std::net::SocketAddr>().ok().map(|a| a.ip());
         HTTP_CURRENT.fetch_add(1, Ordering::Relaxed);
         lock(&HTTP_CLIENTS[id as usize % CLIENT_SHARDS]).clients.insert(id, HttpClient {
             id, opened: elasticsearch_engine::date::now_millis(), local_address, remote_address,
             ..Default::default()
         });
-        Self(Arc::new(HttpConnectionState { id }))
+        Self(Arc::new(HttpConnectionState { id, remote_ip }))
+    }
+    /// The client's address (failed-authentication limiting).
+    pub fn remote_ip(&self) -> Option<std::net::IpAddr> {
+        self.0.remote_ip
     }
 }
 fn close_client(id: u64) {
@@ -2945,25 +2950,57 @@ fn add_block(node: &Node, req: &Req, index: &str) -> R {
     o.expand_closed = true;
     let targets = node.resolve(index, o)?;
     let key = format!("index.blocks.{block}");
+    let timeout = req.param("timeout").and_then(elasticsearch_engine::date::parse_time_value).filter(|t| *t >= 0).map(|t| std::time::Duration::from_millis(t as u64)).unwrap_or(std::time::Duration::from_secs(30));
+    let blocks_writes = matches!(block.as_str(), "write" | "read_only" | "read_only_allow_delete");
+    // The drain leg of a cluster add-block (the block is published by the
+    // master): wait until this node sees the block, then for its in-flight
+    // writes.
+    if add && req.headers.contains_key(BLOCK_DRAIN_HEADER) {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut drained = true;
+        for t in &targets {
+            while t.svc.setting(&key).as_deref() != Some("true") && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drained &= t.svc.setting(&key).as_deref() == Some("true");
+            for copy in t.svc.local_shards() {
+                drained &= copy.drain_writes(deadline.saturating_duration_since(std::time::Instant::now()));
+            }
+        }
+        return Ok(Resp::ok(json!({"drained": drained})));
+    }
     let mut list = Vec::new();
+    let mut drained = true;
     for t in &targets {
         let mut flat = settings::FlatSettings::new();
         flat.insert(key.clone(), if add { json!("true") } else { Value::Null });
         t.svc.put_settings(flat, false)?;
+        // ES `TransportVerifyShardIndexBlockAction`: shards are acknowledged
+        // only once every write admitted before the block has completed
+        // (production review #231).
+        if add && blocks_writes {
+            for copy in t.svc.local_shards() {
+                drained &= copy.drain_writes(timeout);
+            }
+        }
         list.push(if add { json!({"name": t.svc.name, "blocked": true}) } else { json!({"name": t.svc.name, "unblocked": true}) });
     }
     if add {
-        Ok(Resp::ok(json!({"acknowledged": true, "shards_acknowledged": true, "indices": list})))
+        Ok(Resp::ok(json!({"acknowledged": true, "shards_acknowledged": drained, "indices": list})))
     } else {
         Ok(Resp::ok(json!({"acknowledged": true, "indices": list})))
     }
 }
+
+/// Header of the per-node drain leg of a cluster add-block (internal).
+pub const BLOCK_DRAIN_HEADER: &str = "x-rustic-internal-block-drain";
 
 fn reload_search_analyzers(node: &Node, req: &Req, index: &str) -> R {
     let targets = node.resolve(index, opts(req))?;
     // `?resource=`: only filters loading that resource (synonyms set / file) reload.
     let resource = req.param("resource").filter(|r| !r.is_empty());
     let mut details = Vec::new();
+    let mut failures = Vec::new();
     for t in &targets {
         let s = t.svc.meta().settings;
         let uses_resource = |f: &str| match resource {
@@ -2989,10 +3026,28 @@ fn reload_search_analyzers(node: &Node, req: &Req, index: &str) -> R {
                 reloaded.push(name.to_string());
             }
         }
+        // Rebuild them (ES `TransportReloadAnalyzersAction`): a shard whose
+        // analyzers no longer build keeps its current ones and is reported
+        // as failed, never as reloaded (production review #232: the
+        // details were reported without rebuilding anything).
+        if !reloaded.is_empty() {
+            if let Err(e) = t.svc.reload_search_analyzers() {
+                let mut reason = e.to_json()["error"].clone();
+                if let Some(o) = reason.as_object_mut() {
+                    o.remove("root_cause");
+                }
+                failures.push(json!({"shard": 0, "index": t.svc.name, "status": elasticsearch_engine::search_ext::rest_status_name(e.status), "reason": reason}));
+                continue;
+            }
+        }
         details.push(json!({"index": t.svc.name, "reloaded_analyzers": reloaded, "reloaded_node_ids": if reloaded.is_empty() { json!([]) } else { json!([NODE_ID]) }}));
     }
     let n = targets.len();
-    Ok(Resp::ok(json!({"_shards": {"total": n, "successful": n, "failed": 0}, "reload_details": details})))
+    let mut shards = json!({"total": n, "successful": n - failures.len(), "failed": failures.len()});
+    if !failures.is_empty() {
+        shards["failures"] = Value::Array(failures);
+    }
+    Ok(Resp::ok(json!({"_shards": shards, "reload_details": details})))
 }
 
 // ---------------------------------------------------------------------------

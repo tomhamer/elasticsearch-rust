@@ -197,13 +197,10 @@ pub fn circle_polygon(c: Pt, radius: f64, geo: bool) -> Geometry {
             let (lat1, lon1) = (c.1.to_radians(), c.0.to_radians());
             let lat2 = (lat1.sin() * d.cos() + lat1.cos() * d.sin() * a.cos()).clamp(-1.0, 1.0).asin();
             let lon2 = lon1 + (a.sin() * d.sin() * lat1.cos()).atan2(d.cos() - lat1.sin() * lat2.sin());
-            let mut lon = lon2.to_degrees();
-            while lon > 180.0 {
-                lon -= 360.0;
-            }
-            while lon < -180.0 {
-                lon += 360.0;
-            }
+            // Constant time: a finite longitude far out of range would make
+            // repeated +/-360 steps round back to itself and never finish.
+            let lon = lon2.to_degrees();
+            let lon = if (-180.0..=180.0).contains(&lon) || !lon.is_finite() { lon } else { centered_modulus(lon, 360.0) };
             r.push((lon, lat2.to_degrees()));
         } else {
             r.push((c.0 + radius * a.cos(), c.1 + radius * a.sin()));
@@ -215,13 +212,50 @@ pub fn circle_polygon(c: Pt, radius: f64, geo: bool) -> Geometry {
 
 /// Parse GeoJSON (object) or WKT (string).
 pub fn parse(v: &Value, o: &ParseOpts) -> R<Geometry> {
+    parse_oriented(v, o, true)
+}
+
+/// `GeoJson.orientationFromString`: `true` for the right-hand rule.
+pub fn orientation_right(s: &str) -> R<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "right" | "counterclockwise" | "ccw" => Ok(true),
+        "left" | "clockwise" | "cw" => Ok(false),
+        _ => Err(format!("Unknown orientation [{s}]")),
+    }
+}
+
+/// [`parse`] with the field's `orientation` (`right`: ES's
+/// `rightOrientation`) as the default of GeoJSON polygons. ES's GeoJSON
+/// parser reads a left-oriented ring backwards (`asLineComponents`), so
+/// the right-hand rule then decides a ring crossing the dateline; a
+/// polygon's own `orientation` overrides the default, and other types
+/// refuse one. WKT has no orientation (`GeometryParserFormat.WKT`).
+pub fn parse_oriented(v: &Value, o: &ParseOpts, right: bool) -> R<Geometry> {
     match v {
         Value::String(s) => parse_wkt(s, o),
         Value::Object(m) => {
             let ty = m.get("type").and_then(Value::as_str).ok_or_else(|| "shape type not included".to_string())?.to_ascii_lowercase();
+            let own = match m.get("orientation") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(orientation_right(s)?),
+                Some(other) => return Err(format!("Unknown orientation [{other}]")),
+            };
+            if own.is_some() && !matches!(ty.as_str(), "polygon" | "multipolygon") {
+                return Err(format!("parameter orientation is not supported for type {}", ty.to_ascii_uppercase()));
+            }
             if ty == "geometrycollection" {
                 let gs = m.get("geometries").and_then(Value::as_array).ok_or_else(|| "geometries not included".to_string())?;
-                return Ok(Geometry::Collection(gs.iter().map(|g| parse(g, o)).collect::<R<_>>()?));
+                return Ok(Geometry::Collection(gs.iter().map(|g| parse_oriented(g, o, right)).collect::<R<_>>()?));
+            }
+            if !own.unwrap_or(right) {
+                let reverse = |rs: Vec<Vec<Pt>>| rs.into_iter().map(|mut r| { r.reverse(); r }).collect::<Vec<_>>();
+                let mut plain = m.clone();
+                plain.remove("orientation");
+                return Ok(match parse_oriented(&Value::Object(plain), o, true)? {
+                    Geometry::Polygon(rs) => Geometry::Polygon(reverse(rs)),
+                    Geometry::MultiPolygon(ps) => Geometry::MultiPolygon(ps.into_iter().map(reverse).collect()),
+                    other => other,
+                });
             }
             let c = m.get("coordinates").ok_or_else(|| format!("coordinates not included"))?;
             Ok(match ty.as_str() {
@@ -449,6 +483,42 @@ fn wkt_pts(v: &[Pt]) -> String {
 }
 
 impl Geometry {
+    /// Every coordinate through `f` (shape unchanged).
+    pub fn map_points(&self, f: &dyn Fn(Pt) -> Pt) -> Geometry {
+        let ring = |r: &Vec<Pt>| r.iter().map(|p| f(*p)).collect::<Vec<Pt>>();
+        match self {
+            Geometry::Point(p) => Geometry::Point(f(*p)),
+            Geometry::MultiPoint(ps) => Geometry::MultiPoint(ring(ps)),
+            Geometry::LineString(ps) => Geometry::LineString(ring(ps)),
+            Geometry::MultiLineString(ls) => Geometry::MultiLineString(ls.iter().map(ring).collect()),
+            Geometry::Polygon(rs) => Geometry::Polygon(rs.iter().map(ring).collect()),
+            Geometry::MultiPolygon(ps) => Geometry::MultiPolygon(ps.iter().map(|rs| rs.iter().map(ring).collect()).collect()),
+            Geometry::Collection(gs) => Geometry::Collection(gs.iter().map(|g| g.map_points(f)).collect()),
+            Geometry::Envelope { min_x, max_x, max_y, min_y } => {
+                let (a, b) = (f((*min_x, *min_y)), f((*max_x, *max_y)));
+                Geometry::Envelope { min_x: a.0, max_x: b.0, max_y: b.1, min_y: a.1 }
+            }
+        }
+    }
+
+    /// The Cartesian (`point` / `shape`) encoding: every coordinate as the
+    /// single-precision float ES indexes and queries (`XYEncodingUtils`,
+    /// `PointFieldMapper`). A coordinate beyond the float range is refused.
+    pub fn to_xy_float(&self) -> Result<Geometry, String> {
+        let bad = std::cell::Cell::new(None);
+        let g = self.map_points(&|(x, y)| {
+            let (fx, fy) = (x as f32, y as f32);
+            if bad.get().is_none() && (!fx.is_finite() || !fy.is_finite()) {
+                bad.set(Some(if fx.is_finite() { y } else { x }));
+            }
+            (fx as f64, fy as f64)
+        });
+        match bad.get() {
+            Some(v) => Err(format!("invalid value [{v}] for a float coordinate: it is outside the single-precision range")),
+            None => Ok(g),
+        }
+    }
+
     /// WKT of the geometry.
     pub fn to_wkt(&self) -> String {
         match self {
@@ -1223,7 +1293,66 @@ pub fn intersects(a: &Prims, b: &Prims) -> bool {
     sa.iter().any(|(p, q)| sb.iter().any(|(r, s)| segments_intersect(*p, *q, *r, *s)))
 }
 
-/// Is every point of `a` in `b` (boundary included)?
+/// The parameters along `p`→`q` (0 and 1 included) where it meets any of
+/// `segs` (crossings, touches at a vertex, ends of a collinear overlap),
+/// sorted: between two consecutive ones the segment is wholly inside or
+/// wholly outside any area bounded by `segs`.
+fn split_params(p: Pt, q: Pt, segs: &[(Pt, Pt)]) -> Vec<f64> {
+    let d = (q.0 - p.0, q.1 - p.1);
+    let len2 = d.0 * d.0 + d.1 * d.1;
+    let mut ts = vec![0.0, 1.0];
+    if len2 == 0.0 {
+        return ts;
+    }
+    let along = |r: Pt| ((r.0 - p.0) * d.0 + (r.1 - p.1) * d.1) / len2;
+    for (r, s) in segs {
+        if !segments_intersect(p, q, *r, *s) {
+            continue;
+        }
+        let e = (s.0 - r.0, s.1 - r.1);
+        let den = d.0 * e.1 - d.1 * e.0;
+        if den.abs() > 1e-300 && sgn(orient(p, q, *r)) * sgn(orient(p, q, *s)) <= 0 && !(sgn(orient(p, q, *r)) == 0 && sgn(orient(p, q, *s)) == 0) {
+            let t = ((r.0 - p.0) * e.1 - (r.1 - p.1) * e.0) / den;
+            ts.push(t.clamp(0.0, 1.0));
+        } else {
+            // Collinear (or touching at an end): the overlap's ends.
+            ts.push(along(*r).clamp(0.0, 1.0));
+            ts.push(along(*s).clamp(0.0, 1.0));
+        }
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ts.dedup_by(|a, b| (*a - *b).abs() <= 1e-15);
+    ts
+}
+
+/// A point strictly inside a polygon (just off one of its outer edges),
+/// if one is found.
+fn interior_point(poly: &[Vec<Pt>]) -> Option<Pt> {
+    let outer = poly.first()?;
+    for w in outer.windows(2) {
+        let (p, q) = (w[0], w[1]);
+        let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len == 0.0 {
+            continue;
+        }
+        let m = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+        let eps = len * 1e-6;
+        for side in [1.0, -1.0] {
+            let c = (m.0 - side * dy / len * eps, m.1 + side * dx / len * eps);
+            if polygon_position(c, poly) == 1 {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Is every point of `a` in `b` (boundary included)? Every edge of `a`
+/// is cut where it meets `b`'s boundary and each piece tested (an edge
+/// entering a hole at a vertex is caught); for an area of `a`, no part of
+/// `b`'s boundary may lie strictly inside it (a hole or the outside of `b`
+/// there), and a point inside it must be in `b` (an area equal to a hole).
 pub fn within(a: &Prims, b: &Prims) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
@@ -1232,23 +1361,31 @@ pub fn within(a: &Prims, b: &Prims) -> bool {
         return false;
     }
     let sb = b.segments();
-    // Edges of `a` must not cross `b`'s boundary.
     for (p, q) in a.segments() {
-        if sb.iter().any(|(r, s)| segments_cross(p, q, *r, *s)) {
-            return false;
-        }
-        // Midpoint check catches edges leaving a concave polygon through vertices.
-        let m = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
-        if !point_in(m, b) {
-            return false;
+        let ts = split_params(p, q, &sb);
+        for w in ts.windows(2) {
+            let t = (w[0] + w[1]) / 2.0;
+            let m = (p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t);
+            if !point_in(m, b) {
+                return false;
+            }
         }
     }
-    // A hole of `b` (or any part of b's boundary) strictly inside `a`'s area
-    // means `a` is not within `b`.
     if !a.polys.is_empty() {
-        for poly in &b.polys {
-            for h in poly.iter().skip(1) {
-                if h.iter().any(|v| a.polys.iter().any(|ap| polygon_position(*v, ap) == 1)) {
+        let sa = a.segments();
+        for (r, s) in &sb {
+            let ts = split_params(*r, *s, &sa);
+            for w in ts.windows(2) {
+                let t = (w[0] + w[1]) / 2.0;
+                let m = (r.0 + (s.0 - r.0) * t, r.1 + (s.1 - r.1) * t);
+                if a.polys.iter().any(|ap| polygon_position(m, ap) == 1) {
+                    return false;
+                }
+            }
+        }
+        for ap in &a.polys {
+            if let Some(ip) = interior_point(ap) {
+                if !point_in(ip, b) {
                     return false;
                 }
             }
@@ -1359,21 +1496,45 @@ fn split_polygon(rings: &[Vec<Pt>]) -> Vec<Vec<Vec<Pt>>> {
     }
     let u = unwrap_lon(outer);
     let (min_x, max_x) = u.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+    // Holes in the exterior's unwrapped frame: each made continuous, then
+    // moved by whole turns to lie within the exterior's longitude span.
+    let mid = (min_x + max_x) / 2.0;
+    let holes: Vec<Vec<Pt>> = rings[1..]
+        .iter()
+        .map(|h| {
+            let h = unwrap_lon(h);
+            let (lo, hi) = h.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+            let turns = ((mid - (lo + hi) / 2.0) / 360.0).round();
+            shift(&h, turns * 360.0)
+        })
+        .collect();
+    // Each piece keeps the parts of the holes on its side of the cut.
+    let piece = |clip: &dyn Fn(&[Pt]) -> Vec<Pt>, dx: f64| -> Option<Vec<Vec<Pt>>> {
+        let ext = clip(&u);
+        if ext.is_empty() {
+            return None;
+        }
+        let mut rs = vec![shift(&ext, dx)];
+        for h in &holes {
+            let c = clip(h);
+            if !c.is_empty() {
+                rs.push(shift(&c, dx));
+            }
+        }
+        Some(rs)
+    };
     let mut out = Vec::new();
-    let main = clip_ring(&clip_ring(&u, 180.0, true), -180.0, false);
-    if !main.is_empty() {
-        out.push(vec![main]);
+    if let Some(p) = piece(&|r: &[Pt]| clip_ring(&clip_ring(r, 180.0, true), -180.0, false), 0.0) {
+        out.push(p);
     }
     if max_x > 180.0 {
-        let e = clip_ring(&u, 180.0, false);
-        if !e.is_empty() {
-            out.push(vec![shift(&e, -360.0)]);
+        if let Some(p) = piece(&|r: &[Pt]| clip_ring(r, 180.0, false), -360.0) {
+            out.push(p);
         }
     }
     if min_x < -180.0 {
-        let w = clip_ring(&u, -180.0, true);
-        if !w.is_empty() {
-            out.push(vec![shift(&w, 360.0)]);
+        if let Some(p) = piece(&|r: &[Pt]| clip_ring(r, -180.0, true), 360.0) {
+            out.push(p);
         }
     }
     out
@@ -1618,6 +1779,96 @@ mod tests {
         // Points on an area's boundary are contained.
         assert!(relate(&env, &pt, SpatialRelation::Contains));
         assert!(relate(&poly, &pt, SpatialRelation::Contains));
+    }
+
+    /// #326: a dateline-crossing polygon keeps its holes, on either side of
+    /// the antimeridian and across it.
+    #[test]
+    fn dateline_polygon_keeps_its_holes() {
+        let ext = json!([[170, -10], [-170, -10], [-170, 10], [170, 10], [170, -10]]);
+        let east = json!([[175, -2], [175, 2], [178, 2], [178, -2], [175, -2]]);
+        let west = json!([[-178, -2], [-178, 2], [-175, 2], [-175, -2], [-178, -2]]);
+        let across = json!([[178, 5], [178, 8], [-178, 8], [-178, 5], [178, 5]]);
+        let poly = gj(json!({"type": "Polygon", "coordinates": [ext, east, west, across]}));
+        let inside = |lon: f64, lat: f64| relate(&q(&format!("POINT ({lon} {lat})")), &poly, SpatialRelation::Intersects);
+        for (lon, lat) in [(176.5, 0.0), (-176.5, 0.0), (179.5, 6.5), (-179.5, 6.5)] {
+            assert!(!inside(lon, lat), "({lon} {lat}) lies in a hole");
+        }
+        for (lon, lat) in [(172.0, 0.0), (-172.0, 0.0), (179.5, 0.0), (-179.5, -6.0)] {
+            assert!(inside(lon, lat), "({lon} {lat}) lies in the polygon");
+        }
+        // A non-crossing control with a hole.
+        let plain = gj(json!({"type": "Polygon", "coordinates": [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]], [[4, 4], [6, 4], [6, 6], [4, 6], [4, 4]]]}));
+        assert!(!relate(&q("POINT (5 5)"), &plain, SpatialRelation::Intersects));
+        assert!(relate(&q("POINT (2 2)"), &plain, SpatialRelation::Intersects));
+    }
+
+    /// #330: a circle centred at a far out-of-range (finite) longitude is
+    /// wrapped in constant time (repeated 360-degree steps would never move
+    /// it), as one at an ordinary wrapped longitude.
+    #[test]
+    fn circle_longitude_wraps_in_constant_time() {
+        let started = std::time::Instant::now();
+        for lon in [1e18, -1e18, 1e300, 725.0, -905.0] {
+            let c = parse_query_shape(&json!({"type": "circle", "coordinates": [lon, 0], "radius": "10km"})).unwrap();
+            let Geometry::Polygon(r) = c else { panic!("a polygon") };
+            assert!(r[0].iter().all(|p| (-180.0..=180.0).contains(&p.0)), "{lon}");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let a = parse_query_shape(&json!({"type": "circle", "coordinates": [725.0, 0], "radius": "10km"})).unwrap();
+        let b = parse_query_shape(&json!({"type": "circle", "coordinates": [5.0, 0], "radius": "10km"})).unwrap();
+        let (Geometry::Polygon(a), Geometry::Polygon(b)) = (a, b) else { panic!() };
+        for (p, q) in a[0].iter().zip(&b[0]) {
+            assert!((p.0 - q.0).abs() < 1e-6 && (p.1 - q.1).abs() < 1e-6, "{p:?} {q:?}");
+        }
+    }
+
+    /// Review finding 548: a left-oriented GeoJSON polygon (the mapping's
+    /// default or its own `orientation`) is read backwards, so the
+    /// right-hand rule then gives the wide region; right-oriented gives the
+    /// dateline strip; WKT has no orientation.
+    #[test]
+    fn geojson_orientation_selects_the_polygon_area() {
+        let o = ParseOpts::default();
+        let ring = json!([[-170, -10], [-170, 10], [170, 10], [170, -10], [-170, -10]]);
+        let poly = json!({"type": "Polygon", "coordinates": [ring.clone()]});
+        let area = |g: &Geometry| Prims::of(&normalize_geo(g));
+        let inside = |g: &Geometry, x: f64| point_in((x, 0.0), &area(g));
+        let right = parse_oriented(&poly, &o, true).unwrap();
+        assert!(inside(&right, 179.0) && !inside(&right, 0.0), "right: the dateline strip");
+        let left = parse_oriented(&poly, &o, false).unwrap();
+        assert!(inside(&left, 0.0) && !inside(&left, 179.0), "left: the wide region");
+        let own_left = parse_oriented(&json!({"type": "Polygon", "orientation": "cw", "coordinates": [ring.clone()]}), &o, true).unwrap();
+        assert!(inside(&own_left, 0.0) && !inside(&own_left, 179.0), "the polygon's own orientation overrides");
+        let own_right = parse_oriented(&json!({"type": "Polygon", "orientation": "right", "coordinates": [ring]}), &o, false).unwrap();
+        assert!(inside(&own_right, 179.0));
+        let wkt = parse_oriented(&json!("POLYGON ((-170 -10, -170 10, 170 10, 170 -10, -170 -10))"), &o, false).unwrap();
+        assert!(inside(&wkt, 179.0), "WKT ignores orientation (GeometryParserFormat.WKT)");
+        assert!(parse_oriented(&json!({"type": "Point", "orientation": "left", "coordinates": [0, 0]}), &o, true).is_err());
+    }
+
+    /// Review finding 549: containment is not sampled at endpoints and
+    /// midpoints. A line entering and leaving a hole at its vertices is not
+    /// within; a polygon equal to a hole is not within; the reverse
+    /// CONTAINS likewise; a line or polygon clear of the hole still is.
+    #[test]
+    fn cartesian_containment_respects_holes() {
+        let o = ParseOpts { geo: false, coerce: false, ignore_z: true };
+        let p = |w: &str| Prims::of(&parse_wkt(w, &o).unwrap());
+        let holed = p("POLYGON ((-1 -1, 11 -1, 11 1, -1 1, -1 -1), (1 0, 2 0.5, 3 0, 2 -0.5, 1 0))");
+        let line = p("LINESTRING (0 0, 10 0)");
+        assert!(!relate(&line, &holed, SpatialRelation::Within));
+        assert!(!relate(&holed, &line, SpatialRelation::Contains));
+        let hole = p("POLYGON ((1 0, 2 0.5, 3 0, 2 -0.5, 1 0))");
+        assert!(!relate(&hole, &holed, SpatialRelation::Within));
+        assert!(!relate(&holed, &hole, SpatialRelation::Contains));
+        // Clear of the hole.
+        assert!(relate(&p("LINESTRING (0 0.8, 10 0.8)"), &holed, SpatialRelation::Within));
+        assert!(relate(&p("POLYGON ((4 -0.5, 9 -0.5, 9 0.5, 4 0.5, 4 -0.5))"), &holed, SpatialRelation::Within));
+        // A polygon around the hole is not within (the hole is inside it).
+        assert!(!relate(&p("POLYGON ((0 -0.8, 4 -0.8, 4 0.8, 0 0.8, 0 -0.8))"), &holed, SpatialRelation::Within));
+        // On the boundary only: within (boundary included).
+        assert!(relate(&p("LINESTRING (-1 -1, 11 -1)"), &holed, SpatialRelation::Within));
     }
 
     #[test]

@@ -70,11 +70,13 @@ LABEL org.opencontainers.image.title="elasticsearch" \
 
 # tini: PID 1, reaps zombies and forwards SIGTERM to the node (with -g, to
 # its whole process group). curl + jq: healthcheck, probes and the k8s
-# helper scripts. netcat-openbsd: `nc`, which ECK's readiness probe runs
-# (`nc -z -v -w5 127.0.0.1 8080`, the `readiness.port` service); ECK's
-# pre-stop hook also needs curl and GNU coreutils (`date --iso-8601`).
+# helper scripts. openssl: `es-certgen` (certificates for the compose setup
+# service and plain Kubernetes manifests). netcat-openbsd: `nc`, which ECK's
+# readiness probe runs (`nc -z -v -w5 127.0.0.1 8080`, the `readiness.port`
+# service); ECK's pre-stop hook also needs curl and GNU coreutils
+# (`date --iso-8601`).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini curl jq ca-certificates netcat-openbsd \
+ && apt-get install -y --no-install-recommends tini curl jq ca-certificates openssl netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*
 
 ENV ES_HOME=/usr/share/elasticsearch \
@@ -97,6 +99,9 @@ COPY --from=binaries /out/elasticsearch-reset-password /usr/share/elasticsearch/
 COPY --from=binaries /out/elasticsearch-keystore /usr/share/elasticsearch/bin/elasticsearch-keystore
 COPY --from=binaries /out/elasticsearch-create-enrollment-token /usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token
 COPY cluster/deploy/docker/elasticsearch.yml /usr/share/elasticsearch/config/elasticsearch.yml
+# Stock ECK's init container refuses images without this file (exit 42,
+# unsupported_distribution); see the note inside it.
+COPY cluster/deploy/docker/LICENSE.txt /usr/share/elasticsearch/LICENSE.txt
 COPY cluster/deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY cluster/deploy/docker/bin/ /usr/share/elasticsearch/bin/
 
@@ -109,13 +114,13 @@ USER 1000:0
 EXPOSE 9200 9300
 VOLUME ["/usr/share/elasticsearch/data"]
 
-# Security is on by default (as in ES 8/9): on first start the node
-# auto-configures HTTPS, so the check accepts an HTTPS or HTTP answer, and
-# 401 (authentication required) counts as up.
+# Security is on by default (as in ES 8/9). With ES_CA_CERT and a password
+# (ELASTIC_PASSWORD[_FILE]) set, es-healthcheck makes a verified,
+# authenticated request; a bare `docker run` (HTTPS auto-configured on first
+# start, no credentials in the probe) counts an HTTPS or HTTP answer,
+# 401 included, as up.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=6 \
-  CMD code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 2 "https://127.0.0.1:9200/_cluster/health?local=true" || true)"; \
-      if [ "$code" = 000 ]; then code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:9200/_cluster/health?local=true" || true)"; fi; \
-      case "$code" in 200|401) exit 0 ;; *) exit 1 ;; esac
+  CMD ["/usr/share/elasticsearch/bin/es-healthcheck"]
 
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/docker-entrypoint.sh"]

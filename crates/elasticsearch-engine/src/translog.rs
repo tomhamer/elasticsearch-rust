@@ -4,10 +4,14 @@
 //! `u32 len | u32 crc32 | body`. The body is a legacy `bincode(op)` or
 //! `TLZ\x01 | LZ4-size-prefixed(original frames)` for a large batch.
 //! Replay walks every generation in order. A torn frame or failed outer
-//! checksum ends the recoverable prefix; [`Translog::open`] truncates that
-//! tail of the newest generation (the only one a crash can tear) and fails
-//! on one in an older generation (corruption). A complete, checksum-valid
-//! body with an unsupported format or invalid contents fails without truncation.
+//! checksum ends the recoverable prefix. [`Translog::open`] tells a crash
+//! tail from corruption of durable data ([`classify_tail`]): only a tail of
+//! the newest generation past its durable checkpoint's (fsynced) offset
+//! ([`CHECKPOINT_FILE`]) was never acknowledged and is truncated; a bad
+//! frame at or below it fails the open (ES
+//! `TranslogCorruptedException`: the shard is failed and recovered from
+//! another copy, never silently cut back). A complete, checksum-valid body
+//! with an unsupported format or invalid contents fails without truncation.
 //!
 //! Durability: `append` issues a `write(2)` per record so a process exit
 //! (not a power loss) loses nothing; [`Translog::fsync`] gives the stronger
@@ -354,11 +358,193 @@ pub fn decode_admitted_record(body: &[u8], breakers: &'static crate::memory::Bre
     Ok(AdmittedRecord { ops: ops.into_iter(), owner: Arc::new(reservation) })
 }
 
+/// The translog checkpoint file (ES `translog.ckp`): the generation and
+/// byte offset up to which that generation is fsynced.
+pub const CHECKPOINT_FILE: &str = "translog.ckp";
+const CHECKPOINT_MAGIC: &[u8; 4] = b"TCK\x02";
+const CHECKPOINT_LEN: usize = 40;
+/// The two slots a checkpoint alternates between: a write torn by a crash
+/// leaves the other, the previous durable point, readable.
+const CHECKPOINT_SLOTS: [u64; 2] = [0, 4096];
+
+/// A durable point of a log generation: every byte of generation
+/// `generation` below `offset` was fsynced. `file_id` names the file the
+/// offset was taken on ([`file_identity`]): a generation file replaced
+/// since (a recovery or restore writing new files under the same names)
+/// does not inherit an offset it never had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncedOffset {
+    pub generation: u64,
+    pub file_id: u64,
+    pub offset: u64,
+}
+
+impl SyncedOffset {
+    fn encode(&self, seq: u64) -> [u8; CHECKPOINT_LEN] {
+        let mut out = [0u8; CHECKPOINT_LEN];
+        out[..4].copy_from_slice(CHECKPOINT_MAGIC);
+        out[4..12].copy_from_slice(&seq.to_le_bytes());
+        out[12..20].copy_from_slice(&self.generation.to_le_bytes());
+        out[20..28].copy_from_slice(&self.file_id.to_le_bytes());
+        out[28..36].copy_from_slice(&self.offset.to_le_bytes());
+        let crc = crc32(&out[..36]);
+        out[36..].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// The point and its write sequence number.
+    fn decode(bytes: &[u8]) -> Option<(u64, SyncedOffset)> {
+        if bytes.len() < CHECKPOINT_LEN || &bytes[..4] != CHECKPOINT_MAGIC { return None; }
+        if crc32(&bytes[..36]) != u32::from_le_bytes(bytes[36..40].try_into().unwrap()) { return None; }
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        Some((word(4), SyncedOffset { generation: word(12), file_id: word(20), offset: word(28) }))
+    }
+}
+
+/// Identity of an open file: inode and birth time. Two files that ever
+/// held the same name compare different (a deleted generation's inode
+/// number can be reused, its birth time is not).
+pub fn file_identity(file: &File) -> u64 {
+    let Ok(meta) = file.metadata() else { return 0 };
+    let born = meta.created().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let ino = { use std::os::unix::fs::MetadataExt; meta.ino() };
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    ino.rotate_left(32) ^ born
+}
+
+struct CheckpointState {
+    file: Option<File>,
+    /// The newest point written, and its sequence number.
+    last: Option<SyncedOffset>,
+    seq: u64,
+}
+
+/// The checkpoint file of a log directory (ES `Checkpoint`): written and
+/// fsynced after each group sync's data fsync, with the offset that fsync
+/// covered (ES `TranslogWriter.syncUpTo` writes and fsyncs `translog.ckp`
+/// once per sync, whatever the number of writes it covers). Everything
+/// below the recorded offset was acknowledged as durable; everything past
+/// it was not ([`classify_tail`]).
+pub struct Checkpoint {
+    inner: parking_lot::Mutex<CheckpointState>,
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl Checkpoint {
+    /// The checkpoint of `dir` (file `name`), opened on its first advance.
+    pub fn new(dir: &Path, name: &str) -> Arc<Checkpoint> {
+        let seq = Self::read_slots(&dir.join(name)).map_or(0, |(seq, _)| seq);
+        Arc::new(Checkpoint { inner: parking_lot::Mutex::new(CheckpointState { file: None, last: None, seq }), dir: dir.to_path_buf(), path: dir.join(name) })
+    }
+
+    fn read_slots(path: &Path) -> Option<(u64, SyncedOffset)> {
+        let bytes = std::fs::read(path).ok()?;
+        CHECKPOINT_SLOTS.iter()
+            .filter_map(|at| bytes.get(*at as usize..).and_then(SyncedOffset::decode))
+            .max_by_key(|(seq, _)| *seq)
+    }
+
+    /// The durable point recorded under `dir`, if any is readable.
+    pub fn read(dir: &Path, name: &str) -> Option<SyncedOffset> {
+        Self::read_slots(&dir.join(name)).map(|(_, at)| at)
+    }
+
+    /// Durably record `at` (write + fsync) unless a later point is
+    /// recorded already. An error fails the sync it follows (ES: a failed
+    /// checkpoint write is a translog tragic event).
+    pub fn advance(&self, at: SyncedOffset) -> std::io::Result<()> {
+        let mut inner = self.inner.lock();
+        if let Some(cur) = inner.last {
+            if at.generation < cur.generation
+                || (at.generation == cur.generation && at.file_id == cur.file_id && at.offset <= cur.offset) {
+                return Ok(());
+            }
+        }
+        if inner.file.is_none() {
+            let created = !self.path.exists();
+            let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&self.path)?;
+            if created {
+                file.sync_all()?;
+                rustic_core::platform::sync_dir(&self.dir).map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            inner.file = Some(file);
+        }
+        let seq = inner.seq + 1;
+        let bytes = at.encode(seq);
+        {
+            let mut f = inner.file.as_ref().unwrap();
+            f.seek(SeekFrom::Start(CHECKPOINT_SLOTS[(seq % 2) as usize]))?;
+            f.write_all(&bytes)?;
+            f.sync_data()?;
+        }
+        inner.seq = seq;
+        inner.last = Some(at);
+        Ok(())
+    }
+}
+
+/// How a log generation's readable prefix ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    /// End of the last whole, checksum-valid frame.
+    pub good: u64,
+    /// File length.
+    pub len: u64,
+}
+
+/// Whether the end of a log generation's readable prefix (`prefix`) is a
+/// tail that may be cut off, or corruption of durable data (ES
+/// `TranslogCorruptedException`). Every byte below `synced` (the durable
+/// checkpoint's offset for this file) was fsynced and acknowledged: a
+/// prefix ending before it, or a file shorter than it, is corruption.
+/// Everything past it was never acknowledged as durable (ES reads a
+/// generation only up to its checkpoint): a bad or partial frame there,
+/// and anything after it, is a discardable tail.
+pub fn classify_tail(what: &str, path: &Path, prefix: Prefix, synced: u64) -> Result<()> {
+    if prefix.good >= synced { return Ok(()); }
+    Err(EsError::new(500, "translog_corrupted_exception", format!(
+        "{what} [{}] is corrupted: the readable prefix ends at byte [{}] of [{}] but [{synced}] bytes were fsynced",
+        path.display(), prefix.good, prefix.len)))
+}
+
+/// A translog generation file being appended to, with the frame-aligned
+/// length of its successful appends: a sync records what it covered in the
+/// [`Checkpoint`] ([`TranslogFile::sync_data_checkpointed`]).
+pub struct TranslogFile {
+    file: File,
+    generation: u64,
+    id: u64,
+    written: std::sync::atomic::AtomicU64,
+    checkpoint: Arc<Checkpoint>,
+}
+
+impl std::ops::Deref for TranslogFile {
+    type Target = File;
+    fn deref(&self) -> &File { &self.file }
+}
+
+impl TranslogFile {
+    /// `sync_data`, then record the bytes it covered as durable.
+    pub fn sync_data_checkpointed(&self) -> std::io::Result<()> {
+        // Taken before the sync: every whole frame below it is covered.
+        let offset = self.written.load(std::sync::atomic::Ordering::Acquire);
+        self.file.sync_data()?;
+        self.checkpoint.advance(SyncedOffset { generation: self.generation, file_id: self.id, offset })
+    }
+}
+
 /// The write-ahead log for one shard.
 pub struct Translog {
     dir: PathBuf,
     generation: u64,
-    file: Arc<File>,
+    file: Arc<TranslogFile>,
+    checkpoint: Arc<Checkpoint>,
     /// Appends so far (all generations): the mark [`Translog::sync_point`]
     /// hands out.
     appended: u64,
@@ -400,38 +586,54 @@ impl Translog {
     /// `generation` (the commit's). A crash can tear (or zero-fill) only
     /// the newest generation on disk (a roll fsyncs the previous one
     /// before creating the next, and an open truncates and syncs before
-    /// creating its own): that one keeps its readable prefix. A bad frame
-    /// in any older generation from `generation` on is media corruption,
-    /// not a tear: the open fails (ES `TranslogCorruptedException`)
-    /// instead of dropping acknowledged ops behind it. Appends then go to
-    /// a fresh generation above every one on disk, never after another
-    /// file's tail.
+    /// creating its own), and only past what was fsynced: that tail is cut
+    /// back to the last whole frame. A bad frame in any older generation
+    /// from `generation` on, or in the newest one below its checkpointed
+    /// (fsynced) offset, is corruption of
+    /// durable data, not a tear ([`classify_tail`]): the open fails (ES
+    /// `TranslogCorruptedException`) and the files are left as they are,
+    /// instead of dropping acknowledged ops behind it; the copy is failed
+    /// and recovered from another copy. Appends then go to a fresh
+    /// generation above every one on disk, never after another file's
+    /// tail.
     pub fn open(dir: &Path, generation: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let mut highest: Option<u64> = None;
         let generations: Vec<(u64, PathBuf)> = list_generations(dir)?.into_iter().filter(|(g, _)| *g >= generation).collect();
         let newest = generations.last().map(|(g, _)| *g);
+        let synced = Checkpoint::read(dir, CHECKPOINT_FILE);
         for (g, path) in generations {
-            let good_len = validate_file(&path)?;
-            let len = std::fs::metadata(&path)?.len();
-            if len != good_len as u64 && Some(g) != newest {
+            let prefix = validate_file(&path)?;
+            if prefix.good != prefix.len && Some(g) != newest {
                 return Err(EsError::new(500, "translog_corrupted_exception", format!(
-                    "translog generation [{g}] at {} is corrupted at byte [{good_len}] of [{len}] and is not the newest generation",
-                    path.display())));
+                    "translog generation [{g}] at {} is corrupted at byte [{}] of [{}] and is not the newest generation",
+                    path.display(), prefix.good, prefix.len)));
             }
-            if len != good_len as u64 {
-                let f = OpenOptions::new().write(true).open(&path)?;
-                f.set_len(good_len as u64)?;
-                f.sync_all()?;
+            if Some(g) == newest {
+                // The checkpoint's offset counts only for the file it was
+                // taken on.
+                let offset = match synced {
+                    Some(at) if at.generation == g && at.file_id == File::open(&path).map(|f| file_identity(&f)).unwrap_or(0) => at.offset,
+                    _ => 0,
+                };
+                classify_tail("translog generation", &path, prefix, offset)?;
+                if prefix.good != prefix.len {
+                    tracing::warn!("translog generation [{g}] at {}: cutting off a torn tail at byte [{}] of [{}]", path.display(), prefix.good, prefix.len);
+                    let f = OpenOptions::new().write(true).open(&path)?;
+                    f.set_len(prefix.good)?;
+                    f.sync_all()?;
+                }
             }
             highest = Some(highest.map_or(g, |h| h.max(g)));
         }
         let next = highest.map_or(generation, |h| h + 1);
-        let file = Self::create_generation(dir, next)?;
+        let checkpoint = Checkpoint::new(dir, CHECKPOINT_FILE);
+        let file = Self::create_generation(dir, next, &checkpoint)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             generation: next,
             file: Arc::new(file),
+            checkpoint,
             appended: 0,
             fail_appends: 0,
             tear_next: false,
@@ -444,10 +646,11 @@ impl Translog {
 
     /// Create generation `next` (it must not exist: appends never follow
     /// another file's bytes) and make its directory entry durable.
-    fn create_generation(dir: &Path, next: u64) -> Result<File> {
+    fn create_generation(dir: &Path, next: u64, checkpoint: &Arc<Checkpoint>) -> Result<TranslogFile> {
         let file = OpenOptions::new().create_new(true).append(true).read(true).open(dir.join(file_name(next)))?;
         rustic_core::platform::sync_dir(dir)?;
-        Ok(file)
+        let id = file_identity(&file);
+        Ok(TranslogFile { file, generation: next, id, written: std::sync::atomic::AtomicU64::new(0), checkpoint: checkpoint.clone() })
     }
 
     /// Current generation number.
@@ -502,14 +705,15 @@ impl Translog {
     fn write_frames(&mut self, bytes: &[u8]) -> Result<()> {
         self.check_failed()?;
         let written = if std::mem::take(&mut self.tear_next) {
-            (&*self.file).write_all(&bytes[..bytes.len() / 2])
+            (&self.file.file).write_all(&bytes[..bytes.len() / 2])
                 .and_then(|_| Err(std::io::Error::other("injected partial translog write")))
         } else {
-            (&*self.file).write_all(bytes)
+            (&self.file.file).write_all(bytes)
         };
         match written {
             Ok(()) => {
                 self.len += bytes.len() as u64;
+                self.file.written.store(self.len, std::sync::atomic::Ordering::Release);
                 self.appended += 1;
                 Ok(())
             }
@@ -617,14 +821,14 @@ impl Translog {
     /// The current generation's file and the append mark: once that file
     /// is `sync_data`'d, every append up to the mark is durable (a roll
     /// fsyncs the generation it leaves).
-    pub fn sync_point(&self) -> (Arc<File>, u64) {
+    pub fn sync_point(&self) -> (Arc<TranslogFile>, u64) {
         (self.file.clone(), self.appended)
     }
 
     /// Flush the current generation to stable storage.
     pub fn fsync(&mut self) -> Result<()> {
         self.check_failed()?;
-        let synced = if std::mem::take(&mut self.fail_fsync) { Err(std::io::Error::other("injected translog fsync failure")) } else { self.file.sync_data() };
+        let synced = if std::mem::take(&mut self.fail_fsync) { Err(std::io::Error::other("injected translog fsync failure")) } else { self.file.sync_data_checkpointed() };
         if let Err(e) = synced {
             self.failed = Some(e.to_string());
             return Err(e.into());
@@ -637,7 +841,7 @@ impl Translog {
     pub fn roll(&mut self) -> Result<u64> {
         self.fsync()?;
         let next = self.generation + 1;
-        self.file = Arc::new(Self::create_generation(&self.dir, next)?);
+        self.file = Arc::new(Self::create_generation(&self.dir, next, &self.checkpoint)?);
         self.generation = next;
         self.len = 0;
         Ok(next)
@@ -691,6 +895,12 @@ impl Translog {
     /// Total bytes across all generation files.
     pub fn size_bytes(&self) -> u64 {
         let mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        // A directory changed less than a second ago may change again within
+        // the same (coarse, kernel-tick) mtime: its listing is not cached
+        // ("racy" timestamps, as git treats them). The cache serves the
+        // steady state.
+        let settled = |t: std::time::SystemTime| std::time::SystemTime::now().duration_since(t).is_ok_and(|age| age >= std::time::Duration::from_secs(1));
+        let mtime = mtime.filter(|t| settled(*t));
         if let Some(t) = mtime {
             let cached = *self.older_bytes.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((at, generation, older)) = cached {
@@ -845,7 +1055,7 @@ pub(crate) fn list_generations(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
 /// Validate one physical frame at a time without materializing owned document
 /// strings. Admission failures and checksum-valid malformed records propagate:
 /// neither may be mistaken for a crash tail eligible for truncation.
-fn validate_file(path: &Path) -> Result<u64> {
+fn validate_file(path: &Path) -> Result<Prefix> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut pos = 0u64;
@@ -867,7 +1077,42 @@ fn validate_file(path: &Path) -> Result<u64> {
         visit_record(&body, |_| Ok(()))?;
         pos = end;
     }
-    Ok(pos)
+    Ok(Prefix { good: pos, len: file_len })
+}
+
+/// For a reader of a log still being appended to: whether the frame at
+/// `pos` of `path` is corrupt rather than still being written. It is when
+/// a whole frame follows it (appends are sequential, so it was written in
+/// full first) and it still fails its checksum when read again.
+pub fn bad_frame_followed_at(path: &Path, pos: u64) -> Result<bool> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len.saturating_sub(pos) < HEADER_LEN as u64 { return Ok(false); }
+    file.seek(SeekFrom::Start(pos))?;
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as u64;
+    let Some(end) = pos.checked_add(HEADER_LEN as u64).and_then(|n| n.checked_add(len)) else { return Ok(false) };
+    if len == 0 || end > file_len || !whole_frame_at(&mut file, end, file_len)? { return Ok(false); }
+    Ok(!whole_frame_at(&mut file, pos, file_len)?)
+}
+
+/// Whether a whole, checksum-valid, non-empty frame starts at `pos`.
+fn whole_frame_at(file: &mut File, pos: u64, file_len: u64) -> Result<bool> {
+    if file_len.saturating_sub(pos) < HEADER_LEN as u64 { return Ok(false); }
+    file.seek(SeekFrom::Start(pos))?;
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as u64;
+    let crc = u32::from_le_bytes(header[4..].try_into().unwrap());
+    let Some(end) = pos.checked_add(HEADER_LEN as u64).and_then(|n| n.checked_add(len)) else { return Ok(false) };
+    if len == 0 || end > file_len { return Ok(false); }
+    let _frame = crate::memory::breakers().reserve_request(len, "translog validation frame")?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(len as usize).map_err(allocation_error)?;
+    body.resize(len as usize, 0);
+    file.read_exact(&mut body)?;
+    Ok(crc32(&body) == crc)
 }
 
 /// Framed admitted scan. Encoded storage is bounded to the actual file frame;
@@ -1505,8 +1750,9 @@ mod tests {
             log.fsync().unwrap();
             assert_eq!(log.roll().unwrap(), 2);
             log.append(&index("b", 2)).unwrap();
-            log.append(&index("c", 3)).unwrap();
             log.fsync().unwrap();
+            // Written, never fsynced: the only bytes a crash can tear.
+            log.append(&index("c", 3)).unwrap();
             drop(log);
             let second = tmp.path().join(file_name(2));
             let mut expected = vec![index("a", 1), index("b", 2)];
@@ -1546,8 +1792,8 @@ mod tests {
         log.append(&index("b", 2)).unwrap();
         log.roll().unwrap();
         log.append(&index("c", 3)).unwrap();
-        log.append(&index("d", 4)).unwrap();
         log.fsync().unwrap();
+        log.append(&index("d", 4)).unwrap();
         drop(log);
         // Flip a byte in the first record's body of generation 1.
         let first = tmp.path().join(file_name(1));
@@ -1600,8 +1846,32 @@ mod tests {
         read_file(&path).unwrap().1 as u64
     }
 
+    /// Flip a byte inside the body of record `n` (0-based) of `path`.
+    fn corrupt_record(path: &Path, n: usize) -> Vec<u8> {
+        let mut data = std::fs::read(path).unwrap();
+        let mut pos = 0;
+        for _ in 0..n {
+            pos += HEADER_LEN + u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        }
+        data[pos + HEADER_LEN + 2] ^= 0xFF;
+        std::fs::write(path, &data).unwrap();
+        data
+    }
+
+    fn assert_corrupted(tmp: &Path, path: &Path, data: &[u8]) {
+        let error = Translog::open(tmp, 1).err().expect("corrupted durable translog data was cut back");
+        assert_eq!(error.kind, "translog_corrupted_exception", "{error}");
+        assert!(error.to_string().contains("is corrupted"), "{error}");
+        assert_eq!(std::fs::read(path).unwrap(), data, "the corrupted generation was changed");
+        // Every later open fails the same way: nothing was dropped.
+        assert!(Translog::open(tmp, 1).is_err());
+    }
+
+    /// A/B/C fsynced (acknowledged) with B corrupted: never "A only". The
+    /// open fails with `translog_corrupted_exception` and leaves the file
+    /// as it is (the shard is failed and recovered from another copy).
     #[test]
-    fn corrupt_record_stops_replay() {
+    fn a_corrupted_middle_record_fails_the_open_instead_of_truncating() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(file_name(1));
         {
@@ -1609,15 +1879,130 @@ mod tests {
             log.append(&index("a", 1)).unwrap();
             log.append(&index("b", 2)).unwrap();
             log.append(&index("c", 3)).unwrap();
+            log.fsync().unwrap();
         }
-        // Flip a byte inside the second record's body.
-        let mut data = std::fs::read(&path).unwrap();
-        let first_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        let second_body = HEADER_LEN + first_len + HEADER_LEN + 2;
-        data[second_body] ^= 0xFF;
-        std::fs::write(&path, &data).unwrap();
+        let data = corrupt_record(&path, 1);
+        assert_corrupted(tmp.path(), &path, &data);
+    }
+
+    /// Past the durable checkpoint nothing was acknowledged (ES reads a
+    /// generation only up to its checkpoint): a bad record there is cut off
+    /// with everything after it, even whole records, as a power loss can
+    /// persist unsynced pages out of order.
+    #[test]
+    fn a_bad_record_past_the_checkpoint_is_a_discardable_tail_even_with_records_after_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(file_name(1));
+        {
+            let mut log = Translog::open(tmp.path(), 1).unwrap();
+            log.append(&index("a", 1)).unwrap();
+            log.fsync().unwrap();
+            log.append(&index("b", 2)).unwrap();
+            log.append(&index("c", 3)).unwrap();
+        }
+        let synced = Checkpoint::read(tmp.path(), CHECKPOINT_FILE).unwrap().offset;
+        corrupt_record(&path, 1);
         let log = Translog::open(tmp.path(), 1).unwrap();
         assert_eq!(log.replay(0).unwrap(), vec![index("a", 1)]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), synced);
+    }
+
+    /// A checkpoint write torn by a crash leaves the previous durable point
+    /// (the other slot) readable.
+    #[test]
+    fn a_torn_checkpoint_write_falls_back_to_the_previous_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = Translog::open(tmp.path(), 1).unwrap();
+        log.append(&index("a", 1)).unwrap();
+        log.fsync().unwrap();
+        let first = Checkpoint::read(tmp.path(), CHECKPOINT_FILE).unwrap();
+        log.append(&index("b", 2)).unwrap();
+        log.fsync().unwrap();
+        let second = Checkpoint::read(tmp.path(), CHECKPOINT_FILE).unwrap();
+        assert!(second.offset > first.offset);
+        drop(log);
+        // The newest write went to slot 0 (sequence 2): tear it.
+        let ckp = tmp.path().join(CHECKPOINT_FILE);
+        let mut bytes = std::fs::read(&ckp).unwrap();
+        bytes[30] ^= 0xFF;
+        std::fs::write(&ckp, &bytes).unwrap();
+        assert_eq!(Checkpoint::read(tmp.path(), CHECKPOINT_FILE), Some(first));
+    }
+
+    /// The last record fsynced and then corrupted (no frame after it): the
+    /// checkpoint shows it was durable, so it is corruption, not a tear.
+    #[test]
+    fn a_corrupted_last_record_below_the_checkpoint_fails_the_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(file_name(1));
+        {
+            let mut log = Translog::open(tmp.path(), 1).unwrap();
+            log.append(&index("a", 1)).unwrap();
+            log.append(&index("b", 2)).unwrap();
+            log.fsync().unwrap();
+        }
+        let synced = Checkpoint::read(tmp.path(), CHECKPOINT_FILE).expect("a checkpoint");
+        assert_eq!((synced.generation, synced.offset), (1, std::fs::metadata(&path).unwrap().len()));
+        let data = corrupt_record(&path, 1);
+        assert_corrupted(tmp.path(), &path, &data);
+        // Cut short below the checkpoint (a lost fsynced tail): corruption too.
+        corrupt_record(&path, 1); // B repaired
+        let len = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 3).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        assert_corrupted(tmp.path(), &path, &data);
+    }
+
+    /// The unsynced last record garbled (a crash after its write reached
+    /// the file's length but not all its pages): a torn tail, cut off; the
+    /// fsynced records survive.
+    #[test]
+    fn a_garbled_unsynced_last_record_is_a_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(file_name(1));
+        {
+            let mut log = Translog::open(tmp.path(), 1).unwrap();
+            log.append(&index("a", 1)).unwrap();
+            log.append(&index("b", 2)).unwrap();
+            log.fsync().unwrap();
+            log.append(&index("c", 3)).unwrap();
+        }
+        let synced = Checkpoint::read(tmp.path(), CHECKPOINT_FILE).unwrap().offset;
+        corrupt_record(&path, 2);
+        let log = Translog::open(tmp.path(), 1).unwrap();
+        assert_eq!(log.replay(0).unwrap(), vec![index("a", 1), index("b", 2)]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), synced);
+    }
+
+    /// A checkpoint names the file it was taken on: a generation file
+    /// replaced since (recovered or restored under the same name) is
+    /// judged on its own frames.
+    #[test]
+    fn a_checkpoint_of_a_replaced_generation_file_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(file_name(1));
+        {
+            let mut log = Translog::open(tmp.path(), 1).unwrap();
+            log.append(&index("a", 1)).unwrap();
+            log.append(&index("b", 2)).unwrap();
+            log.fsync().unwrap();
+        }
+        let data = std::fs::read(&path).unwrap();
+        let first = HEADER_LEN + u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, &data[..first]).unwrap();
+        let log = Translog::open(tmp.path(), 1).unwrap();
+        assert_eq!(log.replay(0).unwrap(), vec![index("a", 1)]);
+    }
+
+    #[test]
+    fn checkpoint_encoding_round_trips_and_rejects_torn_bytes() {
+        let at = SyncedOffset { generation: 7, file_id: 0xdead_beef, offset: 1234 };
+        let mut bytes = at.encode(5);
+        assert_eq!(SyncedOffset::decode(&bytes), Some((5, at)));
+        bytes[21] ^= 1;
+        assert_eq!(SyncedOffset::decode(&bytes), None);
+        assert_eq!(SyncedOffset::decode(&[0u8; CHECKPOINT_LEN]), None);
     }
 }
 

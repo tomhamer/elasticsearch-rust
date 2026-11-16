@@ -5,6 +5,7 @@
 //! * [`crd`] — the custom resource types and CRD generation;
 //! * [`names`] — ECK-compatible object names, labels, annotations;
 //! * [`settings`] — spec validation and `elasticsearch.yml` rendering;
+//! * [`security`] — the `elastic` user, CAs and TLS certificates (ECK's Secrets);
 //! * [`resources`] — pure builders for StatefulSets, Services, ConfigMaps, PDB;
 //! * [`es_client`] — the [`es_client::EsClient`] trait (+ reqwest implementation);
 //! * [`scale`] — upscale / safe-downscale planner (pure);
@@ -21,6 +22,7 @@ pub mod names;
 pub mod resources;
 pub mod rolling;
 pub mod scale;
+pub mod security;
 pub mod settings;
 pub mod status;
 

@@ -24,7 +24,7 @@ pub mod util;
 
 pub use error::{Result, SnapshotError};
 pub use repository::{Repository, RepositoryContext, RepositoryMetadata, S3ClientSettings};
-pub use restore::{ExistingIndex, RestoreIndexPlan, RestorePlan, RestoreRequest};
+pub use restore::{ExistingIndex, RestoreDataStreamPlan, RestoreIndexPlan, RestorePlan, RestoreRequest};
 pub use service::{
     CreateSnapshotParams, CreateSnapshotRequest, GetSnapshotsRequest, IndexSnapshotInput, RemoteShard, RemoteShardRequest,
     RemoteShardSnapshots, RemoteUploader, ShardSnapshotInput, SnapshotsService, SortBy,

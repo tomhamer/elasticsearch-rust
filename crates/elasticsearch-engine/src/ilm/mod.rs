@@ -24,6 +24,8 @@ pub mod policy;
 pub mod resize;
 pub mod runner;
 pub mod slm;
+pub mod snapshot_steps;
+pub mod frozen;
 
 use crate::error::{EsError, Result};
 use crate::node::Node;
@@ -90,6 +92,9 @@ pub struct DlmRunStats {
     pub time_between_starts: Option<i64>,
     /// backing index name → error (rendered in explain + stats).
     pub errors: HashMap<String, String>,
+    /// backing index name → error of its `frozen_after` conversion
+    /// ([`frozen::run`], every lifecycle pass), shown like `errors`.
+    pub frozen_errors: HashMap<String, String>,
 }
 
 pub struct IlmService {
@@ -109,8 +114,16 @@ pub struct IlmService {
     /// Serializes [`IlmService::persist`].
     persist_lock: Mutex<()>,
     started: AtomicBool,
-    cluster_slm_health: RwLock<Option<(String, usize)>>,
+    /// The cluster's SLM metadata (`snapshot_lifecycle` custom), replicated
+    /// by the host; `None` on a standalone node (the local catalog is then
+    /// authoritative).
+    cluster_slm: RwLock<Option<ClusterSlm>>,
     pub(crate) dlm_stats: Mutex<DlmRunStats>,
+    /// Backing indices whose `frozen_after` conversion was submitted by a
+    /// transition scan and advances on every pass until it ends
+    /// (`DLMFrozenTransitionExecutor`'s submitted transitions; a new master
+    /// starts empty and resubmits on its first scan).
+    pub(crate) frozen_submitted: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl IlmService {
@@ -135,8 +148,9 @@ impl IlmService {
             run_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             started: AtomicBool::new(false),
-            cluster_slm_health: RwLock::new(None),
+            cluster_slm: RwLock::new(None),
             dlm_stats: Mutex::new(DlmRunStats::default()),
+            frozen_submitted: Mutex::new(Default::default()),
         };
         if fresh {
             let _ = svc.persist();
@@ -169,17 +183,39 @@ impl IlmService {
         self.st.read().policies.len()
     }
 
-    /// Cluster SLM is executed by the coordinator; mirror only its health inputs.
-    pub fn restore_cluster_slm_health(&self, mode: String, policies: usize) {
-        *self.cluster_slm_health.write() = Some((mode, policies));
+    /// Replicate the cluster's SLM metadata (the coordinator executes SLM
+    /// and records each policy's last success there): ILM's
+    /// `wait_for_snapshot` validation and step read it, not the local
+    /// catalog.
+    pub fn restore_cluster_slm(&self, slm: ClusterSlm) {
+        *self.cluster_slm.write() = Some(slm);
     }
 
     fn slm_health_state(&self) -> (String, usize) {
-        if let Some(state) = self.cluster_slm_health.read().as_ref() {
-            return state.clone();
+        if let Some(state) = self.cluster_slm.read().as_ref() {
+            return (state.mode.clone(), state.policies.len());
         }
         let state = self.st.read();
         (state.slm_mode.clone(), state.slm.len())
+    }
+
+    /// An SLM policy's last successful snapshot (`None`: no such policy;
+    /// `Some(None)`: none yet), from the authoritative SLM metadata: the
+    /// cluster's when the host replicates it, else the local catalog.
+    pub fn slm_last_success(&self, policy: &str) -> Option<Option<SlmSuccess>> {
+        if let Some(cluster) = self.cluster_slm.read().as_ref() {
+            return cluster.policies.get(policy).cloned();
+        }
+        let st = self.st.read();
+        let p = st.slm.get(policy)?;
+        let repository = p.policy["repository"].as_str().unwrap_or_default().to_string();
+        Some(p.last_success.as_ref().and_then(|s| {
+            Some(SlmSuccess {
+                repository: repository.clone(),
+                snapshot_name: s["snapshot_name"].as_str().unwrap_or_default().to_string(),
+                start_time: s["start_time"].as_i64().or_else(|| s["time"].as_i64())?,
+            })
+        }))
     }
 
     pub fn slm_policy_count(&self) -> usize {
@@ -211,9 +247,13 @@ impl IlmService {
                 "policy [{name}] defines the [searchable_snapshot] action but the current license is non-compliant for [searchable-snapshots]"
             )));
         }
+        // The `searchable_snapshot` action is stored as ES does (`PUT` /
+        // `GET _ilm/policy` round-trip it). ILM here does not snapshot,
+        // mount and swap: an index that reaches the action stops in ERROR
+        // there (`branch-check-prerequisites`), never skipping it.
         for (pn, p) in &phases {
             if let Some(slm_policy) = p["actions"]["wait_for_snapshot"]["policy"].as_str() {
-                if !self.st.read().slm.contains_key(slm_policy) {
+                if self.slm_last_success(slm_policy).is_none() {
                     return Err(EsError::illegal_argument(format!(
                         "no such snapshot lifecycle policy [{slm_policy}], the snapshot lifecycle policy referenced by the [wait_for_snapshot] action in the [{pn}] phase must exist before it can be referenced by an ILM policy"
                     )));
@@ -273,6 +313,12 @@ impl IlmService {
 
 /// `indices.lifecycle.*` / `data_streams.lifecycle.*` cluster settings
 /// (transient wins over persistent), as strings.
+/// Whether `svc` is in its lifecycle's `frozen` phase (ES
+/// `FrozenExistenceDeciderService.isFrozenPhase`).
+pub fn frozen_phase(node: &Node, svc: &crate::index::IndexService) -> bool {
+    runner::load(node, svc).ilm.phase.as_deref() == Some("frozen")
+}
+
 pub fn cluster_setting(node: &Node, key: &str) -> Option<String> {
     let cs = node.cluster_settings.read();
     let get = |m: &serde_json::Map<String, Value>| -> Option<String> {
@@ -297,6 +343,35 @@ fn setting_millis(node: &Node, key: &str, default: i64) -> i64 {
     cluster_setting(node, key).and_then(|s| parse_time_millis(&s)).filter(|v| *v > 0).unwrap_or(default)
 }
 
+/// The `searchable_snapshot` ILM action (and so the `frozen` phase) is not
+/// supported: refused at `PUT _ilm/policy`, and an index whose stored
+/// policy has it stops in the ERROR step there instead of skipping it.
+pub fn searchable_snapshot_unsupported(policy: &str, phase: &str) -> EsError {
+    EsError::illegal_argument(format!(
+        "policy [{policy}] defines the [searchable_snapshot] action in the [{phase}] phase, but the [searchable_snapshot] action is not supported by this cluster"
+    ))
+}
+
+/// A snapshot lifecycle policy's last successful execution
+/// (`SnapshotInvocationRecord`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlmSuccess {
+    /// The policy's repository (`WaitForSnapshotStep` looks the snapshot
+    /// up there).
+    pub repository: String,
+    pub snapshot_name: String,
+    /// When the snapshot started (`snapshot_start_timestamp`).
+    pub start_time: i64,
+}
+
+/// The cluster's SLM metadata as ILM reads it: the operation mode and, per
+/// policy, its last success.
+#[derive(Clone, Debug, Default)]
+pub struct ClusterSlm {
+    pub mode: String,
+    pub policies: BTreeMap<String, Option<SlmSuccess>>,
+}
+
 /// An index's lifecycle execution state and rollover info (what ES keeps in
 /// the index metadata of the cluster state: `LifecycleExecutionState`,
 /// `rollover_info`), as JSON; `None` when the index has none. A cluster
@@ -313,6 +388,90 @@ pub fn index_lifecycle_state(node: &Node, svc: &crate::index::IndexService) -> O
 /// (0 = never changed in this process). O(1): no state is serialized.
 pub fn index_lifecycle_generation(node: &Node, svc: &crate::index::IndexService) -> u64 {
     node.ilm.exec_gen.lock().get(&svc.uuid).copied().unwrap_or(0)
+}
+
+/// ES `LifecycleExecutionState` keys of the index metadata custom `ilm`
+/// (string values) for the `ExecState` fields; the lifecycle date is
+/// ES's `creation_date` key.
+const ES_ILM_KEYS: &[(&str, &str)] = &[
+    ("phase", "phase"), ("action", "action"), ("step", "step"), ("failed_step", "failed_step"),
+    ("is_auto_retryable_error", "is_auto_retryable_error"), ("failed_step_retry_count", "failed_step_retry_count"),
+    ("step_info", "step_info"), ("previous_step_info", "previous_step_info"), ("phase_definition", "phase_definition"),
+    ("lifecycle_date", "creation_date"), ("phase_time", "phase_time"), ("action_time", "action_time"), ("step_time", "step_time"),
+    ("snapshot_repository", "snapshot_repository"), ("snapshot_name", "snapshot_name"), ("shrink_index_name", "shrink_index_name"),
+];
+
+/// An index's lifecycle state (as [`index_lifecycle_state`] returns it) in
+/// the shape ES stores with the index metadata in a snapshot: the `ilm`
+/// custom (every value a string; objects as JSON text) and
+/// `rollover_info`. Either may be absent.
+pub fn lifecycle_snapshot_fields(state: &Value) -> (Option<Value>, Option<Value>) {
+    let ilm = state.get("ilm").and_then(Value::as_object).map(|o| {
+        let mut out = serde_json::Map::new();
+        for (ours, es) in ES_ILM_KEYS {
+            let text = match o.get(*ours) {
+                None | Some(Value::Null) => continue,
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+            };
+            out.insert((*es).to_string(), Value::String(text));
+        }
+        out
+    }).filter(|o| !o.is_empty()).map(Value::Object);
+    let rollover = state.get("rollover_info").filter(|r| r.as_object().is_some_and(|o| !o.is_empty())).cloned();
+    (ilm, rollover)
+}
+
+/// The lifecycle state of an index restored from a snapshot whose index
+/// metadata is `metadata` (ES `IndexMetadata` JSON: the `ilm` custom,
+/// `rollover_info`, `settings`, `creation_date`), as
+/// [`restore_index_lifecycle_state`] takes it. ES restores both with the
+/// index: its phases continue where they were, aged from the original
+/// lifecycle date. A managed index the snapshot holds no execution state
+/// for (its lifecycle had not started) keeps its original creation date as
+/// the lifecycle date. `None`: nothing to restore.
+pub fn lifecycle_from_snapshot(metadata: &Value) -> Option<Value> {
+    let mut ilm = serde_json::Map::new();
+    if let Some(o) = metadata.get("ilm").and_then(Value::as_object) {
+        for (ours, es) in ES_ILM_KEYS {
+            let Some(v) = o.get(*es).filter(|v| !v.is_null()) else { continue };
+            let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            let value = match *ours {
+                "lifecycle_date" | "phase_time" | "action_time" | "step_time" | "failed_step_retry_count" => match text.parse::<i64>() {
+                    Ok(n) => json!(n),
+                    Err(_) => continue,
+                },
+                "is_auto_retryable_error" => json!(text == "true"),
+                "step_info" | "previous_step_info" | "phase_definition" => match v {
+                    Value::Object(_) => v.clone(),
+                    _ => match serde_json::from_str::<Value>(&text) {
+                        Ok(parsed) => parsed,
+                        Err(_) => continue,
+                    },
+                },
+                _ => Value::String(text),
+            };
+            ilm.insert((*ours).to_string(), value);
+        }
+    }
+    let settings = &metadata["settings"];
+    let setting = |k: &str| settings.get(k).or_else(|| settings.pointer(&format!("/{}", k.replace('.', "/")))).and_then(|v| v.as_str().map(str::to_string).or_else(|| (!v.is_null()).then(|| v.to_string())));
+    let managed = setting("index.lifecycle.name").is_some_and(|p| !p.is_empty());
+    if managed && !ilm.contains_key("lifecycle_date") {
+        let created = metadata.get("creation_date").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .or_else(|| setting("index.creation_date").and_then(|s| s.parse().ok()))
+            .filter(|ms| *ms > 0);
+        if let Some(ms) = created {
+            ilm.insert("lifecycle_date".into(), json!(ms));
+        }
+    }
+    let rollover = metadata.get("rollover_info").and_then(Value::as_object).filter(|o| !o.is_empty()).cloned();
+    if ilm.is_empty() && rollover.is_none() {
+        return None;
+    }
+    let state = json!({"ilm": ilm, "rollover_info": rollover.unwrap_or_default()});
+    // Only what the execution state can hold.
+    serde_json::from_value::<runner::IndexLifecycle>(state).ok().and_then(|lc| serde_json::to_value(lc).ok())
 }
 
 /// Make an index's lifecycle state the published one (`None`: no state).
@@ -360,6 +519,90 @@ pub trait ClusterLifecycleSteps: Send + Sync {
     fn holds_all_docs(&self, source: &str, target: &str) -> StepProgress;
     /// Index ILM history documents.
     fn write_history(&self, items: Vec<Value>);
+    /// ILM `check-allocation` (`migrate == false`, ES
+    /// `AllocationRoutedStep`) or `check-migration` (`migrate == true`,
+    /// `DataTierMigrationRoutedStep`) judged on the cluster's routing
+    /// table: every shard copy active and started on a node the index's
+    /// allocation filters / tier preference allow. `settings`: the index's
+    /// `index.routing.allocation.*` and `index.number_of_replicas` as this
+    /// lifecycle pass sees them (the preceding `allocate` / `migrate` step
+    /// may have just changed them); the routing is judged only once the
+    /// cluster state carries them.
+    fn allocation_routed(&self, index: &str, settings: &BTreeMap<String, String>, migrate: bool) -> StepProgress;
+    /// Data stream lifecycle downsampling: downsample `source` (write
+    /// blocked) into `target` (`body`: the `_downsample` request body),
+    /// reading every source shard copy. `Done` once the target holds the
+    /// downsampled documents.
+    fn downsample(&self, source: &str, target: &str, body: &Value) -> StepProgress;
+    /// `WaitForSnapshotStep`'s snapshot check: `snapshot` of `repository`
+    /// (SLM policy `policy`'s last success) still exists, succeeded and includes
+    /// `index`. `Done` once verified; otherwise `Pending` with the reason as
+    /// step info (`Failed` is read the same way: the step keeps waiting).
+    fn snapshot_includes(&self, policy: &str, repository: &str, snapshot: &str, index: &str) -> StepProgress;
+    /// Clone `source` (write blocked) into `target` (`body`: the `_clone`
+    /// request body), documents included. `Done` once `target` is the
+    /// completed clone of this `source` incarnation (see
+    /// [`snapshot_steps::clone_index`]).
+    fn clone_index(&self, source: &str, target: &str, body: &Value) -> StepProgress;
+    /// Snapshot `index` alone into `repository` as `snapshot` (`body`: the
+    /// create-snapshot body) and wait for it. A snapshot already there
+    /// under the name that completed with `index` is kept; one that failed
+    /// or is partial is deleted and taken again; one in progress is waited
+    /// for. `Done` once a complete snapshot is there (see
+    /// [`snapshot_steps::snapshot_index`]).
+    fn snapshot_index(&self, repository: &str, snapshot: &str, index: &str, body: &Value) -> StepProgress;
+    /// Mount `snapshot` of `repository` as a searchable snapshot (`body`:
+    /// the `_mount` request body; `partial`: `storage=shared_cache`), waiting
+    /// for the restore. `Done` once every shard was restored.
+    fn mount_snapshot(&self, repository: &str, snapshot: &str, body: &Value, partial: bool) -> StepProgress;
+    /// Delete `snapshot` of `repository` (one already gone is `Done`).
+    fn delete_snapshot(&self, repository: &str, snapshot: &str) -> StepProgress;
+    /// ILM `unfollow` (ES `UnfollowAction`) on follower `index`: `step` is
+    /// `wait-for-follow-shard-tasks` (every follow task caught up with its
+    /// leader shard), `pause-follower-index`, `close-follower-index`,
+    /// `unfollow-follower-index` or `open-follower-index`. A follower that
+    /// is already paused or converted counts as done.
+    fn unfollow_step(&self, index: &str, step: &str) -> StepProgress {
+        StepProgress::Failed(format!("[{step}] of [{index}] is not supported on this node"))
+    }
+    /// Delete the snapshots of `repository` matching `pattern` that
+    /// `select` picks from their info (see
+    /// [`snapshot_steps::delete_snapshots_matching`]).
+    fn delete_snapshots_matching(&self, repository: &str, pattern: &str, select: snapshot_steps::SnapshotSelect) -> StepProgress;
+}
+
+/// `WaitForSnapshotStep`: judge a `GET _snapshot/{repository}/{snapshot}`
+/// listing (`snapshots`: the snapshot objects found, each with `state` and
+/// `indices`) for SLM policy `policy`'s last successful snapshot. `Ok` when
+/// exactly that snapshot was found, it succeeded and it includes `index`;
+/// else the reason the index is not yet backed up (ES's messages).
+pub fn verify_snapshot_listing(snapshots: &[Value], policy: &str, repository: &str, snapshot: &str, index: &str) -> std::result::Result<(), String> {
+    let found: Vec<&Value> = snapshots.iter().filter(|s| s["snapshot"].as_str().is_none_or(|n| n == snapshot)).collect();
+    if found.len() != 1 {
+        return Err(format!("unexpected number of snapshots retrieved for repository '{repository}' and snapshot '{snapshot}' (expected 1, found {})", found.len()));
+    }
+    let snap = found[0];
+    let state = snap["state"].as_str().unwrap_or_default();
+    if state != "SUCCESS" {
+        return Err(format!("the last successful snapshot [{snapshot}] of policy '{policy}' in repository '{repository}' is in state [{state}], not [SUCCESS]"));
+    }
+    let included = snap["indices"].as_array().is_some_and(|a| a.iter().any(|i| i.as_str() == Some(index)));
+    if !included {
+        return Err(format!("the last successful snapshot of policy '{policy}' does not include index '{index}'"));
+    }
+    Ok(())
+}
+
+/// A setting value as a string (lists comma-joined, spaces around the
+/// commas dropped): how lifecycle steps compare an engine's settings with
+/// the published ones.
+pub fn setting_string(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::String(s) => Some(s.split(',').map(str::trim).collect::<Vec<_>>().join(",")),
+        Value::Array(a) => Some(a.iter().filter_map(setting_string).collect::<Vec<_>>().join(",")),
+        other => Some(other.to_string()),
+    }
 }
 
 /// When the lifecycle executor last ran its periodic ILM and data stream
@@ -367,12 +610,41 @@ pub trait ClusterLifecycleSteps: Send + Sync {
 pub struct TickClock {
     last_ilm_poll: Instant,
     last_dlm_poll: Instant,
+    /// The `frozen_after` transition and cleanup scans
+    /// (`dlm.frozen.transition.poll_interval`, `dlm.frozen.cleanup.poll_interval`).
+    last_frozen_poll: Instant,
+    last_frozen_cleanup: Instant,
+    frozen_cleanup_ran: bool,
 }
 
 impl Default for TickClock {
     fn default() -> Self {
-        TickClock { last_ilm_poll: Instant::now(), last_dlm_poll: Instant::now() }
+        let now = Instant::now();
+        TickClock { last_ilm_poll: now, last_dlm_poll: now, last_frozen_poll: now, last_frozen_cleanup: now, frozen_cleanup_ran: false }
     }
+}
+
+/// The frozen transition service's scans that are due on this tick (ES
+/// schedules them on the master with these node settings: the transition
+/// scan every `dlm.frozen.transition.poll_interval` (5m, first after one
+/// interval), the orphan cleanup every `dlm.frozen.cleanup.poll_interval`
+/// (1d, first after min(5m, interval))); submitted conversions advance on
+/// every tick in between.
+fn frozen_tick(node: &Node, clock: &mut TickClock) {
+    let transition_every = frozen::node_time_setting(node, "dlm.frozen.transition.poll_interval", 300_000) as u128;
+    let transition_due = clock.last_frozen_poll.elapsed().as_millis() >= transition_every;
+    if transition_due {
+        clock.last_frozen_poll = Instant::now();
+    }
+    let cleanup_every = frozen::node_time_setting(node, "dlm.frozen.cleanup.poll_interval", 86_400_000) as u128;
+    // First run after min(5m, interval), then every interval.
+    let wait = if clock.frozen_cleanup_ran { cleanup_every } else { cleanup_every.min(300_000) };
+    let cleanup_due = clock.last_frozen_cleanup.elapsed().as_millis() >= wait;
+    if cleanup_due {
+        clock.last_frozen_cleanup = Instant::now();
+        clock.frozen_cleanup_ran = true;
+    }
+    frozen::tick(node, transition_due, cleanup_due);
 }
 
 /// One iteration of the lifecycle executor (the `es-lifecycle` thread runs
@@ -391,6 +663,7 @@ pub fn tick(node: &Node, clock: &mut TickClock) {
         clock.last_dlm_poll = Instant::now();
         dlm::run(node);
     }
+    frozen_tick(node, clock);
     slm::tick(node);
 }
 
@@ -419,6 +692,7 @@ pub fn tick_lifecycle(node: &Node, clock: &mut TickClock) {
         clock.last_dlm_poll = Instant::now();
         dlm::run(node);
     }
+    frozen_tick(node, clock);
 }
 
 impl IlmService {
@@ -627,6 +901,61 @@ pub fn error_json(e: &EsError) -> Value {
     Value::Object(m)
 }
 
+/// A policy body's `_meta.version` (ES `IndexTemplateRegistry`
+/// `isUpgradeRequired`: the profiling registry's versioned policy).
+fn meta_version(policy: &Value) -> Option<i64> {
+    policy["_meta"]["version"].as_i64()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: extra built-ins (a versioned one, as profiling's).
+    static TEST_EXTRA_BUILTINS: std::cell::RefCell<Vec<(&'static str, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl IlmService {
+    /// ES `IndexTemplateRegistry.addIndexLifecyclePoliciesIfMissing`, on
+    /// every reconcile (not only on a fresh data directory, as before): a
+    /// built-in policy missing from the cluster is installed (a policy a
+    /// later release added reaches existing clusters), and one whose
+    /// `_meta.version` is older than the built-in's is upgraded. A present
+    /// policy without a newer version is left alone. Returns whether
+    /// anything changed.
+    pub fn ensure_builtins(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut wanted = builtin_policies();
+        #[cfg(test)]
+        TEST_EXTRA_BUILTINS.with(|e| wanted.extend(e.borrow().iter().cloned()));
+        let mut changed = false;
+        {
+            let mut st = self.st.write();
+            let now = crate::date::now_millis();
+            for (name, body) in wanted {
+                match st.policies.get_mut(name) {
+                    None => {
+                        st.policies.insert(name.to_string(), PolicyMeta { policy: body, version: 1, modified_date: now });
+                        changed = true;
+                    }
+                    Some(cur) if meta_version(&body).is_some_and(|want| meta_version(&cur.policy).is_none_or(|have| want > have)) => {
+                        cur.policy = body;
+                        cur.version += 1;
+                        cur.modified_date = now;
+                        changed = true;
+                    }
+                    Some(_) => {}
+                }
+            }
+            st.builtins_installed = true;
+        }
+        if changed {
+            if let Err(e) = self.persist() {
+                tracing::warn!("persisting built-in lifecycle policies failed: {e}");
+            }
+        }
+        changed
+    }
+}
+
 /// The policies ES 8.19 installs on a fresh cluster (stack + x-pack
 /// template registries), dumped verbatim from a reference node.
 fn builtin_policies() -> Vec<(&'static str, Value)> {
@@ -676,6 +1005,68 @@ pub fn health_indicator(node: &Node, name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Built-in policies on an existing (older) install: a missing one
+    /// (`ml-size-based-ilm-policy`, added later) is installed; a versioned
+    /// one older than the built-in is upgraded; an unversioned one a user
+    /// changed is left alone (ES `IndexTemplateRegistry`).
+    #[test]
+    fn builtin_policies_upgrade_from_an_older_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("_state")).unwrap();
+        let mine = json!({"phases": {"hot": {"min_age": "0ms", "actions": {"rollover": {"max_age": "1d"}}}}});
+        let old = IlmState {
+            policies: [
+                ("logs".to_string(), PolicyMeta { policy: mine.clone(), version: 3, modified_date: 1 }),
+                ("profiling-like".to_string(), PolicyMeta { policy: json!({"phases": {}, "_meta": {"managed": true, "version": 14}}), version: 2, modified_date: 1 }),
+            ].into_iter().collect(),
+            builtins_installed: true,
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("_state/ilm.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let newer = json!({"phases": {"hot": {"min_age": "0ms", "actions": {"rollover": {"max_age": "30d"}}}}, "_meta": {"managed": true, "version": 15}});
+        TEST_EXTRA_BUILTINS.with(|e| e.borrow_mut().push(("profiling-like", newer.clone())));
+        let svc = IlmService::load(tmp.path());
+        assert!(svc.policy("ml-size-based-ilm-policy").is_none(), "an older install lacks it");
+        assert!(svc.ensure_builtins());
+        let builtins: BTreeMap<&str, Value> = builtin_policies().into_iter().collect();
+        assert_eq!(svc.policy("ml-size-based-ilm-policy").map(|p| p.policy), Some(builtins["ml-size-based-ilm-policy"].clone()));
+        let up = svc.policy("profiling-like").unwrap();
+        assert_eq!((up.version, up.policy), (3, newer), "a newer _meta.version upgrades it");
+        let logs = svc.policy("logs").unwrap();
+        assert_eq!((logs.version, logs.policy), (3, mine), "no newer version: left alone");
+        assert!(!svc.ensure_builtins(), "nothing left to do");
+        // A deleted built-in comes back on the next reconcile (ES).
+        svc.st.write().policies.remove("ml-size-based-ilm-policy");
+        assert!(svc.ensure_builtins());
+        TEST_EXTRA_BUILTINS.with(|e| e.borrow_mut().clear());
+    }
+
+    #[test]
+    fn lifecycle_state_round_trips_through_snapshot_metadata() {
+        let state = json!({
+            "ilm": {"phase": "warm", "action": "complete", "step": "complete", "lifecycle_date": 1_700_000_000_000i64,
+                "phase_time": 1_700_000_100_000i64, "action_time": 1_700_000_200_000i64, "step_time": 1_700_000_300_000i64,
+                "phase_definition": {"policy": "p", "phase_definition": {"min_age": "0ms", "actions": {}}, "version": 3, "modified_date_in_millis": 5},
+                "step_info": {"message": "m"}, "failed_step_retry_count": 2, "is_auto_retryable_error": true},
+            "rollover_info": {"logs": {"met_conditions": {"max_docs": 1}, "time": 1_700_000_050_000i64}},
+        });
+        let (ilm, rollover) = lifecycle_snapshot_fields(&state);
+        let ilm = ilm.expect("ilm custom");
+        assert_eq!(ilm["creation_date"], "1700000000000");
+        assert_eq!(ilm["phase"], "warm");
+        assert!(ilm["phase_definition"].is_string() && ilm.as_object().unwrap().values().all(Value::is_string), "{ilm}");
+        let metadata = json!({"settings": {"index.lifecycle.name": "p"}, "creation_date": 1_600_000_000_000i64, "ilm": ilm, "rollover_info": rollover});
+        let back = lifecycle_from_snapshot(&metadata).expect("restored state");
+        let want = serde_json::to_value(serde_json::from_value::<runner::IndexLifecycle>(state).unwrap()).unwrap();
+        assert_eq!(back, want);
+        // Never-started lifecycle: aged from the original creation date.
+        let fresh = lifecycle_from_snapshot(&json!({"settings": {"index": {"lifecycle": {"name": "p"}}}, "creation_date": 1_600_000_000_000i64})).unwrap();
+        assert_eq!(fresh["ilm"]["lifecycle_date"], 1_600_000_000_000i64);
+        assert!(fresh["ilm"].get("phase").is_none(), "{fresh}");
+        // Unmanaged, nothing recorded: nothing to restore.
+        assert!(lifecycle_from_snapshot(&json!({"settings": {}, "creation_date": 1})).is_none());
+    }
 
     /// Concurrent policy PUTs persist without sharing a temp file (cmb1: a
     /// rename found the shared `ilm.json.tmp` gone, "No such file or

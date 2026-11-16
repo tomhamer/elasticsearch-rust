@@ -20,13 +20,15 @@
 #    The record of a restart is deleted by es-readiness when the node is
 #    back.
 #
-# Env: ES_URL, ES_DRAIN_ON_SHUTDOWN, ES_SHUTDOWN_TYPE (restart|remove, the
+# Env: ES_DRAIN_ON_SHUTDOWN, ES_SHUTDOWN_TYPE (restart|remove, the
 #      type used for restarts; default restart), ES_SHUTDOWN_ALLOCATION_DELAY
 #      (default 5m), ES_SHUTDOWN_TIMEOUT (seconds, default 100),
-#      ES_VOTING_EXCLUSIONS (default true), POD_NAME, POD_NAMESPACE.
+#      ES_VOTING_EXCLUSIONS (default true), POD_NAME, POD_NAMESPACE, and the
+#      connection settings of es-http-lib (ES_URL, ES_CA_CERT,
+#      ES_CONNECT_TO, ES_USERNAME, ES_PASSWORD[_FILE]).
 set -uo pipefail
-
-ES_URL="${ES_URL:-http://127.0.0.1:9200}"
+# shellcheck source=es-http-lib
+. "$(dirname "$0")/es-http-lib"
 TIMEOUT="${ES_SHUTDOWN_TIMEOUT:-100}"
 deadline=$(( $(date +%s) + TIMEOUT ))
 log() { echo "es-prestop: $*" >&2; }
@@ -47,7 +49,7 @@ if [[ -r "$SA/token" && "$ORDINAL" =~ ^[0-9]+$ ]]; then
 fi
 log "pod=${POD} statefulset=${STS} removing=${removing}"
 
-local_node="$(curl -s --max-time 5 "${ES_URL}/_nodes/_local" 2>/dev/null || true)"
+local_node="$(es_curl -s --max-time 5 "${ES_URL}/_nodes/_local" 2>/dev/null || true)"
 id="$(jq -r '.nodes | keys[0] // empty' <<< "$local_node" 2>/dev/null || true)"
 is_master="$(jq -r '[.nodes[].roles[]?] | index("master") != null' <<< "$local_node" 2>/dev/null || echo false)"
 if [[ -z "$id" ]]; then
@@ -57,7 +59,7 @@ fi
 
 if [[ "$removing" == "true" && "$is_master" == "true" && "${ES_VOTING_EXCLUSIONS:-true}" == "true" ]]; then
   log "master-eligible node is being removed: adding voting config exclusion"
-  curl -s -o /dev/null --max-time 30 -X POST "${ES_URL}/_cluster/voting_config_exclusions?node_names=${POD}&timeout=30s" \
+  es_curl -s -o /dev/null --max-time 30 -X POST "${ES_URL}/_cluster/voting_config_exclusions?node_names=${POD}&timeout=30s" \
     || log "voting config exclusion failed"
 fi
 
@@ -73,11 +75,11 @@ else
   body="{\"type\":\"remove\",\"reason\":\"preStop ${POD}\"}"
 fi
 log "registering ${type} shutdown for node ${id}"
-curl -s -o /dev/null --max-time 10 -X PUT -H 'Content-Type: application/json' -d "$body" "${ES_URL}/_nodes/${id}/shutdown" \
+es_curl -s -o /dev/null --max-time 10 -X PUT -H 'Content-Type: application/json' -d "$body" "${ES_URL}/_nodes/${id}/shutdown" \
   || { log "shutdown registration failed"; exit 0; }
 
 while [[ $(date +%s) -lt $deadline ]]; do
-  status="$(curl -s --max-time 5 "${ES_URL}/_nodes/${id}/shutdown" | jq -r '.nodes[0].status // empty' 2>/dev/null || true)"
+  status="$(es_curl -s --max-time 5 "${ES_URL}/_nodes/${id}/shutdown" | jq -r '.nodes[0].status // empty' 2>/dev/null || true)"
   if [[ "$status" == "COMPLETE" ]]; then
     log "shutdown preparation COMPLETE"
     exit 0

@@ -249,6 +249,67 @@ pub fn resolve_host(spec: &str) -> Result<Vec<IpAddr>, ConfigError> {
     }
 }
 
+/// The addresses listeners bind for a (possibly list-valued) bind setting
+/// `key` (ES `NetworkService.resolveBindHostAddresses`): every address each
+/// entry resolves to, one listener each. A wildcard must be the only
+/// address, as in ES.
+fn bind_addresses(key: &str, specs: &[String]) -> Result<Vec<IpAddr>, ConfigError> {
+    let mut addrs: Vec<IpAddr> = Vec::new();
+    for spec in specs {
+        for ip in resolve_host(spec)? {
+            if !addrs.contains(&ip) { addrs.push(ip); }
+        }
+    }
+    if addrs.len() > 1 {
+        if let Some(any) = addrs.iter().find(|ip| ip.is_unspecified()) {
+            return err(format!("[{key}] bind address: {{{any}}} is wildcard, but multiple addresses specified: this makes no sense"));
+        }
+    }
+    if addrs.is_empty() {
+        addrs = resolve_host("_local_")?;
+    }
+    Ok(addrs)
+}
+
+/// ES `NetworkUtils.sortAddresses` preference: global, site-local,
+/// link-local, loopback; IPv4 before IPv6.
+fn publish_rank(ip: &IpAddr) -> (u8, u8) {
+    let scope = match ip {
+        IpAddr::V4(v4) if v4.is_loopback() => 3,
+        IpAddr::V4(v4) if v4.is_link_local() => 2,
+        IpAddr::V4(v4) if v4.is_private() => 1,
+        IpAddr::V6(v6) if v6.is_loopback() => 3,
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => 2,
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00 => 1,
+        _ => 0,
+    };
+    (scope, u8::from(ip.is_ipv6()))
+}
+
+/// The address published for a (possibly list-valued) publish setting (ES
+/// `resolvePublishHostAddresses`): the most preferred of the resolved
+/// addresses; a wildcard publishes the address outbound traffic uses.
+fn publish_address(specs: &[String]) -> Result<IpAddr, ConfigError> {
+    let mut addrs: Vec<IpAddr> = Vec::new();
+    for spec in specs {
+        addrs.extend(resolve_host(spec)?);
+    }
+    let ip = addrs.iter().min_by_key(|ip| publish_rank(ip)).copied().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    Ok(publish_ip(ip))
+}
+
+/// `http.publish_port` / `transport.publish_port`: `-1` (the default) or
+/// absent publishes the bound port.
+fn publish_port(settings: &Settings, key: &str) -> Result<Option<u16>, ConfigError> {
+    let Some(v) = settings.get(key) else { return Ok(None) };
+    let raw = match v { Value::Null => return Ok(None), Value::String(x) => x.trim().to_string(), other => other.to_string() };
+    if raw == "-1" { return Ok(None); }
+    match raw.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(Some(port)),
+        _ => err(format!("failed to parse value [{raw}] for setting [{key}]: must be a port in 1-65535, or -1")),
+    }
+}
+
 /// The local IP used for outbound connections (no packets are sent).
 fn outbound_ip() -> Option<IpAddr> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -272,12 +333,22 @@ pub struct NodeConfig {
     pub data_path: PathBuf,
     pub logs_path: PathBuf,
     pub repo_paths: Vec<PathBuf>,
+    /// The first of [`http_binds`](Self::http_binds).
     pub http_bind: IpAddr,
+    /// Every address the HTTP listeners bind (one listener each).
+    pub http_binds: Vec<IpAddr>,
     pub http_publish: IpAddr,
     pub http_ports: Vec<u16>,
+    /// The first of [`transport_binds`](Self::transport_binds).
     pub transport_bind: IpAddr,
+    pub transport_binds: Vec<IpAddr>,
     pub transport_publish: IpAddr,
     pub transport_ports: Vec<u16>,
+    /// `http.publish_port` / `transport.publish_port`: the port advertised
+    /// when it differs from the bound one (a mapped port); `None`: the
+    /// bound port (ES default `-1`).
+    pub http_publish_port: Option<u16>,
+    pub transport_publish_port: Option<u16>,
     /// `discovery.seed_hosts` entries (`host` or `host:port`; default port 9300).
     pub seed_hosts: Vec<String>,
     pub initial_master_nodes: Vec<String>,
@@ -338,22 +409,35 @@ impl NodeConfig {
             return err("setting [cluster.initial_master_nodes] is not allowed when [discovery.type] is set to [single-node]");
         }
 
-        let host_of = |specific: &str, fallback: &str| -> Result<IpAddr, ConfigError> {
-            let spec = get_str(&settings, specific).or_else(|| get_str(&settings, fallback)).or_else(|| get_str(&settings, "network.host")).unwrap_or("_local_");
-            Ok(resolve_host(spec)?[0])
+        // ES precedence (`TransportSettings` / `HttpTransportSettings` over
+        // `NetworkService`): `<p>.bind_host`, `<p>.host`, `network.bind_host`,
+        // `network.host`, `_local_`; publish: `<p>.publish_host`, `<p>.host`,
+        // `network.publish_host`, `network.host`, else from the bind address.
+        // Each may be a list (YAML array, `a,b` or `[a, b]`).
+        let first_set = |keys: &[&str]| -> Option<(String, Vec<String>)> {
+            keys.iter().find_map(|k| { let v = get_list(&settings, k); (!v.is_empty()).then(|| (k.to_string(), v)) })
         };
-        let http_bind = host_of("http.bind_host", "http.host")?;
-        let transport_bind = host_of("transport.bind_host", "transport.host")?;
-        let http_publish = match get_str(&settings, "http.publish_host").or_else(|| get_str(&settings, "network.publish_host")) {
-            Some(h) => resolve_host(h)?[0],
-            None => publish_ip(http_bind),
+        let bind_of = |p: &str| -> Result<Vec<IpAddr>, ConfigError> {
+            match first_set(&[&format!("{p}.bind_host"), &format!("{p}.host"), "network.bind_host", "network.host"]) {
+                Some((key, specs)) => bind_addresses(&key, &specs),
+                None => resolve_host("_local_"),
+            }
         };
-        let transport_publish = match get_str(&settings, "transport.publish_host").or_else(|| get_str(&settings, "network.publish_host")) {
-            Some(h) => resolve_host(h)?[0],
-            None => publish_ip(transport_bind),
+        let publish_of = |p: &str, bind: IpAddr| -> Result<IpAddr, ConfigError> {
+            match first_set(&[&format!("{p}.publish_host"), &format!("{p}.host"), "network.publish_host", "network.host"]) {
+                Some((_, specs)) => publish_address(&specs),
+                None => Ok(publish_ip(bind)),
+            }
         };
+        let http_binds = bind_of("http")?;
+        let transport_binds = bind_of("transport")?;
+        let (http_bind, transport_bind) = (http_binds[0], transport_binds[0]);
+        let http_publish = publish_of("http", http_bind)?;
+        let transport_publish = publish_of("transport", transport_bind)?;
         let http_ports = parse_port_range(get_str(&settings, "http.port").unwrap_or("9200-9300"))?;
         let transport_ports = parse_port_range(get_str(&settings, "transport.port").unwrap_or("9300-9400"))?;
+        let http_publish_port = publish_port(&settings, "http.publish_port")?;
+        let transport_publish_port = publish_port(&settings, "transport.publish_port")?;
 
         let data_path = PathBuf::from(get_str(&settings, "path.data").unwrap_or("data"));
         let logs_path = PathBuf::from(get_str(&settings, "path.logs").unwrap_or("logs"));
@@ -381,11 +465,15 @@ impl NodeConfig {
             logs_path,
             repo_paths,
             http_bind,
+            http_binds,
             http_publish,
             http_ports,
             transport_bind,
+            transport_binds,
             transport_publish,
             transport_ports,
+            http_publish_port,
+            transport_publish_port,
             seed_hosts,
             initial_master_nodes,
             single_node,
@@ -540,6 +628,55 @@ mod tests {
         assert!(c.roles.contains(&Role::Data) && !c.roles.contains(&Role::Index) && !c.roles.contains(&Role::Search));
         let c = NodeConfig::from_settings(base(&[("stateless.enabled", "true")])).unwrap();
         assert!(c.roles.contains(&Role::Index) && c.roles.contains(&Role::Master) && !c.roles.contains(&Role::Data) && !c.roles.contains(&Role::Search));
+    }
+
+    /// #411: ES bind/publish precedence (`<p>.bind_host`, `<p>.host`,
+    /// `network.bind_host`, `network.host`; publish likewise) and list
+    /// values (YAML arrays, `a,b`).
+    #[test]
+    fn bind_and_publish_hosts_follow_es_precedence_and_lists() {
+        use std::net::Ipv4Addr;
+        let cfg = |yaml: &str| NodeConfig::from_settings(parse_yaml(yaml).unwrap());
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let c = cfg("network.bind_host: 0.0.0.0\nnetwork.publish_host: 10.1.2.3\n").unwrap();
+        assert!(c.transport_bind.is_unspecified() && c.http_bind.is_unspecified(), "network.bind_host ignored");
+        assert_eq!((c.transport_publish, c.http_publish), (ip("10.1.2.3"), ip("10.1.2.3")));
+        // Protocol-specific settings win over the network ones.
+        let c = cfg("network.bind_host: 0.0.0.0\ntransport.bind_host: 127.0.0.1\ntransport.host: 127.0.0.2\nnetwork.publish_host: 10.1.2.3\n").unwrap();
+        assert_eq!(c.transport_bind, ip("127.0.0.1"));
+        assert!(c.http_bind.is_unspecified());
+        assert_eq!(c.transport_publish, ip("127.0.0.2"), "transport.host comes before network.publish_host");
+        // Lists: one element, duplicates, several addresses (all bound).
+        let c = cfg("transport.bind_host: [127.0.0.1]\n").unwrap();
+        assert_eq!(c.transport_binds, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        let c = cfg("network.host: \"127.0.0.1,127.0.0.1\"\n").unwrap();
+        assert_eq!(c.transport_binds, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        let c = cfg("network.bind_host: [127.0.0.1, 127.0.0.2]\n").unwrap();
+        assert_eq!(c.transport_binds, vec![ip("127.0.0.1"), ip("127.0.0.2")]);
+        assert_eq!(c.http_binds, vec![ip("127.0.0.1"), ip("127.0.0.2")]);
+        // A wildcard must be alone (ES).
+        let e = cfg("http.bind_host: [\"127.0.0.1\", \"0.0.0.0\"]\n").unwrap_err();
+        assert!(e.0.contains("is wildcard, but multiple addresses specified"), "{}", e.0);
+        // A publish list prefers a routable address; a wildcard publish host
+        // is never advertised as such.
+        let c = cfg("network.publish_host: [127.0.0.1, 10.1.2.3]\n").unwrap();
+        assert_eq!(c.transport_publish, ip("10.1.2.3"));
+        let c = cfg("network.host: 0.0.0.0\n").unwrap();
+        assert!(!c.transport_publish.is_unspecified());
+    }
+
+    /// #412: publish ports parse (string or number; `-1` = the bound port)
+    /// and are validated.
+    #[test]
+    fn publish_ports_are_kept() {
+        let cfg = |yaml: &str| NodeConfig::from_settings(parse_yaml(yaml).unwrap());
+        let c = cfg("transport.publish_port: 19300\nhttp.publish_port: \"19200\"\n").unwrap();
+        assert_eq!((c.transport_publish_port, c.http_publish_port), (Some(19300), Some(19200)));
+        let c = cfg("transport.publish_port: -1\n").unwrap();
+        assert_eq!((c.transport_publish_port, c.http_publish_port), (None, None));
+        for bad in ["transport.publish_port: 70000\n", "http.publish_port: x\n", "http.publish_port: 0\n"] {
+            assert!(cfg(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

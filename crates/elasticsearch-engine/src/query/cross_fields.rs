@@ -174,7 +174,9 @@ pub fn build(text: &Value, fields: &[(String, f32)], opts: &MatchOpts, tie: f32,
             match &opts.analyzer {
                 Some(a) => ("_query_analyzer".to_string(), a.clone()),
                 None => (
-                    format!("text:{}", f.index_analyzer_name.clone().unwrap_or_default()),
+                    // Fields analyzed alike at search time form one group
+                    // (ES groups by the search analyzer).
+                    format!("text:{}", f.search_analyzer_name.clone().unwrap_or_default()),
                     f.search_analyzer.clone().unwrap_or_else(|| Arc::new(Analyzer::standard())),
                 ),
             }

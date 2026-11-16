@@ -3,8 +3,10 @@
 //!
 //! One reconcile pass:
 //! 1. validate the spec (`Invalid` phase on error, nothing touched);
-//! 2. observe Elasticsearch through the HTTP service; record the cluster
-//!    UUID annotation the first time the cluster answers (bootstrap done);
+//! 2. provision the `elastic` user and the TLS certificates (Secrets, see
+//!    [`crate::security`]); observe Elasticsearch through the HTTP service
+//!    over HTTPS as `elastic`; record the cluster UUID annotation the first
+//!    time the cluster answers (bootstrap done);
 //! 3. apply services; plan topology changes ([`crate::scale`]) and run the
 //!    Elasticsearch side of the plan; apply ConfigMaps + StatefulSets with
 //!    the planned replica counts; delete removed nodeSets once drained;
@@ -20,11 +22,12 @@ use crate::names::{self, *};
 use crate::resources;
 use crate::rolling::{self, PodView};
 use crate::scale::{self, NodeSetScale};
+use crate::security::{self, EsConnection, SecretData};
 use crate::settings;
 use crate::status::{self, StatusInputs};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
@@ -48,7 +51,7 @@ pub enum Error {
     Build(String),
 }
 
-pub type EsClientFactory = Arc<dyn Fn(&Elasticsearch) -> Result<Arc<dyn EsClient>, EsError> + Send + Sync>;
+pub type EsClientFactory = Arc<dyn Fn(&Elasticsearch, &EsConnection) -> Result<Arc<dyn EsClient>, EsError> + Send + Sync>;
 
 pub struct Context {
     pub client: Client,
@@ -56,12 +59,85 @@ pub struct Context {
     pub es_client: EsClientFactory,
 }
 
-/// Default factory: `http://<name>-es-http.<ns>.svc:9200`.
-pub fn http_es_client_factory(timeout: Duration) -> EsClientFactory {
-    Arc::new(move |es: &Elasticsearch| {
-        let ns = es.namespace().unwrap_or_else(|| "default".into());
-        let url = format!("http://{}.{ns}.svc:{HTTP_PORT}", names::http_service(&es.name_any()));
-        Ok(Arc::new(HttpEsClient::new(url, timeout, None)?) as Arc<dyn EsClient>)
+/// Default factory: HTTPS to `https://<name>-es-http.<ns>.svc:9200`,
+/// trusting the cluster's HTTP CA, as `elastic`.
+pub fn https_es_client_factory(timeout: Duration) -> EsClientFactory {
+    Arc::new(move |_es: &Elasticsearch, conn: &EsConnection| Ok(Arc::new(HttpEsClient::connect(conn, timeout)?) as Arc<dyn EsClient>))
+}
+
+fn secret_data(s: &Secret) -> SecretData {
+    SecretData {
+        data: s.data.as_ref().map(|d| d.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect()).unwrap_or_default(),
+        annotations: s.metadata.annotations.clone().unwrap_or_default(),
+    }
+}
+
+async fn get_secret(api: &Api<Secret>, name: &str) -> Result<Option<SecretData>, kube::Error> {
+    Ok(api.get_opt(name).await?.as_ref().map(secret_data))
+}
+
+/// Write `planned` if `Some`, return the Secret's content either way.
+async fn put_secret(api: &Api<Secret>, es: &Elasticsearch, name: &str, existing: Option<SecretData>, planned: Option<SecretData>) -> Result<SecretData, Error> {
+    match planned {
+        Some(d) => {
+            info!(cluster = %es.name_any(), secret = %name, "writing secret");
+            apply(api, &resources::secret(es, name, &d)).await?;
+            Ok(d)
+        }
+        None => existing.ok_or_else(|| Error::Build(format!("secret {name} missing"))),
+    }
+}
+
+/// Provision the `elastic` user and the TLS certificates (see
+/// [`crate::security`]) and return how to reach the cluster.
+async fn reconcile_security(es: &Elasticsearch, ns: &str, secret_api: &Api<Secret>) -> Result<EsConnection, Error> {
+    let name = es.name_any();
+    let now = chrono::Utc::now();
+    let build = Error::Build;
+
+    let user_name = security::elastic_user_secret(&name);
+    let existing = get_secret(secret_api, &user_name).await?;
+    let planned = security::plan_elastic_user(existing.as_ref());
+    let user = put_secret(secret_api, es, &user_name, existing, planned).await?;
+    let password = String::from_utf8(user.get(security::ELASTIC_USER_KEY).unwrap_or_default().to_vec()).map_err(|_| build("elastic password is not UTF-8".into()))?;
+
+    // Transport: CA + shared node certificate.
+    let ca_name = security::transport_ca_secret(&name);
+    let existing = get_secret(secret_api, &ca_name).await?;
+    let planned = security::plan_ca(existing.as_ref(), &security::transport_ca_cn(&name), now).map_err(build)?;
+    let ca = put_secret(secret_api, es, &ca_name, existing, planned).await?;
+    let leaf_name = security::transport_certs_secret(&name);
+    let existing = get_secret(secret_api, &leaf_name).await?;
+    let planned = security::plan_leaf(existing.as_ref(), &ca, &security::transport_ca_cn(&name), &security::transport_leaf_spec(&name, ns), now).map_err(build)?;
+    put_secret(secret_api, es, &leaf_name, existing, planned).await?;
+
+    // HTTP: the user's certificate, or CA + generated certificate.
+    let internal_name = security::http_certs_internal_secret(&name);
+    let existing_internal = get_secret(secret_api, &internal_name).await?;
+    let planned = match security::custom_http_secret(es) {
+        Some(user_secret) => {
+            let user = get_secret(secret_api, &user_secret).await?.ok_or_else(|| build(format!("spec.http.tls.certificate.secretName: secret {user_secret} not found")))?;
+            security::plan_custom_http(&user, existing_internal.as_ref(), &user_secret).map_err(build)?
+        }
+        None => {
+            let ca_name = security::http_ca_secret(&name);
+            let existing = get_secret(secret_api, &ca_name).await?;
+            let planned = security::plan_ca(existing.as_ref(), &security::http_ca_cn(&name), now).map_err(build)?;
+            let ca = put_secret(secret_api, es, &ca_name, existing, planned).await?;
+            security::plan_leaf(existing_internal.as_ref(), &ca, &security::http_ca_cn(&name), &security::http_leaf_spec(&name, ns, &es.spec), now).map_err(build)?
+        }
+    };
+    let internal = put_secret(secret_api, es, &internal_name, existing_internal, planned).await?;
+    let public_name = security::http_certs_public_secret(&name);
+    let existing = get_secret(secret_api, &public_name).await?;
+    let planned = security::plan_http_public(&internal, existing.as_ref());
+    put_secret(secret_api, es, &public_name, existing, planned).await?;
+
+    Ok(EsConnection {
+        url: security::http_url(&name, ns),
+        ca_pem: internal.get(security::CA_CRT).map(<[u8]>::to_vec),
+        username: security::ELASTIC_USER.into(),
+        password,
     })
 }
 
@@ -107,6 +183,7 @@ pub async fn reconcile(es: Arc<Elasticsearch>, ctx: Arc<Context>) -> Result<Acti
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &ns);
     let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), &ns);
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let secret_api: Api<Secret> = Api::namespaced(client.clone(), &ns);
     let prev_status = es.status.clone();
 
     if es.meta().deletion_timestamp.is_some() {
@@ -122,8 +199,10 @@ pub async fn reconcile(es: Arc<Elasticsearch>, ctx: Arc<Context>) -> Result<Acti
         return Ok(Action::requeue(Duration::from_secs(300)));
     }
 
-    // 2. observe Elasticsearch
-    let esc = (ctx.es_client)(&es)?;
+    // 2. security (elastic user, certificates), then observe Elasticsearch
+    //    over HTTPS as `elastic`
+    let conn = reconcile_security(&es, &ns, &secret_api).await?;
+    let esc = (ctx.es_client)(&es, &conn)?;
     let obs = match es_client::observe(esc.as_ref()).await {
         Ok(o) => o,
         Err(e) => {
@@ -161,7 +240,13 @@ pub async fn reconcile(es: Arc<Elasticsearch>, ctx: Arc<Context>) -> Result<Acti
         .map(|n| {
             let sts = names::statefulset(&name, &n.name);
             let r = settings::node_set_roles(n);
-            NodeSetScale { current: existing.get(&sts).map(replicas_of).unwrap_or(0), sts, desired: n.count, master: r.master, data: r.data, in_spec: true }
+            // The roles the existing pods may still hold count until they
+            // have moved (production review #286).
+            let labels = existing.get(&sts).and_then(|s| s.spec.as_ref()).and_then(|x| x.template.metadata.as_ref()).and_then(|m| m.labels.clone());
+            let pod_prefix = format!("{sts}-");
+            let observed: Vec<&str> = obs.nodes.iter().filter(|nd| nd.name.strip_prefix(&pod_prefix).is_some_and(|o| o.parse::<i32>().is_ok())).map(|nd| nd.roles.as_str()).collect();
+            let (master, data) = scale::conservative_roles(r.master, r.data, labels.as_ref(), &observed);
+            NodeSetScale { current: existing.get(&sts).map(replicas_of).unwrap_or(0), sts, desired: n.count, master, data, in_spec: true }
         })
         .collect();
     for (sts_name, s) in &existing {

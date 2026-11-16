@@ -22,8 +22,11 @@ pub mod lite;
 pub mod processors;
 pub mod util;
 pub mod geoip;
+pub mod geoip_download;
 pub mod useragent;
 pub mod attachment;
+mod attachment_office;
+mod attachment_pdf;
 pub mod inference;
 
 use crate::error::{EsError, Result};
@@ -310,6 +313,32 @@ impl Script {
 thread_local! {
     /// The pipeline running the current script (for error messages).
     static INGEST_PIPELINE: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The field access pattern of the pipeline running on this thread
+    /// (the top of ES's `IngestDocument.accessPatternStack`): `true` for
+    /// `flexible`. Outside a pipeline, classic.
+    static FLEXIBLE_ACCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether document field paths resolve with ES's flexible access pattern
+/// now (the running pipeline's `field_access_pattern: flexible`).
+pub fn flexible_access() -> bool {
+    FLEXIBLE_ACCESS.with(|c| c.get())
+}
+
+/// A pipeline's field access pattern for the duration of its run (nested
+/// pipelines push their own; the caller's is restored on drop).
+pub(crate) struct AccessPattern(bool);
+
+impl AccessPattern {
+    pub(crate) fn enter(flexible: bool) -> AccessPattern {
+        AccessPattern(FLEXIBLE_ACCESS.with(|c| c.replace(flexible)))
+    }
+}
+
+impl Drop for AccessPattern {
+    fn drop(&mut self) {
+        FLEXIBLE_ACCESS.with(|c| c.set(self.0));
+    }
 }
 
 /// Whether a script value graph contains a reference cycle.
@@ -494,6 +523,9 @@ pub struct Pipeline {
     pub version: Option<i64>,
     pub processors: Vec<ProcessorNode>,
     pub on_failure: Vec<ProcessorNode>,
+    /// `field_access_pattern: flexible` (ES 9 `IngestPipelineFieldAccessPattern`):
+    /// processors resolve field paths flexibly while this pipeline runs.
+    pub flexible: bool,
     /// Execution counters (`_nodes/stats` ingest pipeline stats).
     pub stats: IngestMetric,
     /// Source bytes of documents this pipeline ran on first / produced.
@@ -699,7 +731,23 @@ fn compile_pipeline_source_inner(id: &str, config: &Value, raw: Option<&crate::s
             return Err(EsError::new(400, "parse_exception", format!("[_meta] property isn't a map, but of type [{}]", doc::type_name(m))).with("property_name", "_meta"));
         }
     }
-    Ok(Pipeline { id: id.to_string(), description: o.get("description").and_then(Value::as_str).map(str::to_string), version, processors, on_failure, stats: IngestMetric::default(), ingested_bytes: Default::default(), produced_bytes: Default::default() })
+    let flexible = field_access_pattern(id, o.get("field_access_pattern"))?;
+    Ok(Pipeline { id: id.to_string(), description: o.get("description").and_then(Value::as_str).map(str::to_string), version, processors, on_failure, flexible, stats: IngestMetric::default(), ingested_bytes: Default::default(), produced_bytes: Default::default() })
+}
+
+/// `field_access_pattern` (ES `Pipeline.create`): `classic` (the default)
+/// or `flexible`; returns whether it is flexible.
+fn field_access_pattern(id: &str, v: Option<&Value>) -> Result<bool> {
+    let name = match v {
+        None | Some(Value::Null) => return Ok(false),
+        Some(Value::String(s)) => s.as_str(),
+        Some(other) => return Err(EsError::new(400, "parse_exception", format!("[field_access_pattern] property isn't a string, but of type [{}]", doc::type_name(other))).with("property_name", "field_access_pattern")),
+    };
+    match name {
+        "classic" => Ok(false),
+        "flexible" => Ok(true),
+        other => Err(EsError::new(400, "parse_exception", format!("pipeline [{id}] doesn't support value of [{other}] for parameter [field_access_pattern]"))),
+    }
 }
 
 // ------------------------------------------------------------ execution
@@ -1004,6 +1052,7 @@ pub fn run_pipeline(p: &Pipeline, doc: &mut IngestDocument, cx: &PipelineContext
         }
     }
     let timer = if cx.count_stats.get() { Some(p.stats.pre()) } else { None };
+    let _access = AccessPattern::enter(p.flexible);
     cx.stack.borrow_mut().push(p.id.clone());
     cx.executed.borrow_mut().push(p.id.clone());
     let prev_pipeline = INGEST_PIPELINE.with(|c| c.replace(p.id.clone()));
@@ -1306,6 +1355,122 @@ pub struct IngestRequest<'a> {
     pub source: &'a str,
     /// `?pipeline=` / bulk `pipeline` (`_none` disables the default pipeline).
     pub pipeline: Option<&'a str>,
+    /// The write's version and concurrency conditions as requested: the
+    /// pipelines see them (`_version`, `_version_type`) and may change them.
+    pub cond: WriteMeta,
+}
+
+/// The version and concurrency metadata of a write that ingest pipelines
+/// read and set (`_version`, `_version_type`, `_if_seq_no`,
+/// `_if_primary_term`). ES's `IngestService` builds the document from the
+/// request's version and version type, and after the pipelines writes all
+/// four back into the request (`updateIndexRequestMetadata`): a pipeline
+/// that sets an external version or a sequence/term condition makes the
+/// write conditional, and a conflict fails it with 409.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteMeta {
+    /// `None`: ES's `Versions.MATCH_ANY` (`-3`).
+    pub version: Option<u64>,
+    /// `None`: not requested (internal).
+    pub version_type: Option<crate::shard::VersionType>,
+    pub if_seq_no: Option<i64>,
+    pub if_primary_term: Option<u64>,
+}
+
+/// ES `Versions.MATCH_ANY`, the `_version` of a write without one.
+pub const MATCH_ANY: i64 = -3;
+
+impl WriteMeta {
+    pub fn of(cond: &crate::shard::WriteCond) -> WriteMeta {
+        WriteMeta { version: cond.version, version_type: cond.version_type, if_seq_no: cond.if_seq_no, if_primary_term: cond.if_primary_term }
+    }
+
+    /// The bulk action metadata's conditions (`version`, `version_type`,
+    /// `if_seq_no`, `if_primary_term`); malformed values are left to the
+    /// write's own validation.
+    pub fn of_action(meta: &Map<String, Value>) -> WriteMeta {
+        let int = |k: &str| meta.get(k).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+        WriteMeta {
+            version: int("version").and_then(|v| u64::try_from(v).ok()),
+            version_type: meta.get("version_type").and_then(Value::as_str).and_then(|s| crate::shard::VersionType::parse(s).ok()),
+            if_seq_no: int("if_seq_no"),
+            if_primary_term: int("if_primary_term").and_then(|v| u64::try_from(v).ok()),
+        }
+    }
+
+    /// Apply to a write's conditions.
+    pub fn apply(&self, cond: &mut crate::shard::WriteCond) {
+        cond.version = self.version;
+        cond.version_type = self.version_type;
+        cond.if_seq_no = self.if_seq_no;
+        cond.if_primary_term = self.if_primary_term;
+    }
+
+    /// Write into a bulk item's action metadata (absent values removed).
+    pub fn to_action(&self, meta: &mut Map<String, Value>) {
+        let mut put = |k: &str, v: Option<Value>| match v {
+            Some(v) => { meta.insert(k.into(), v); }
+            None => { meta.remove(k); }
+        };
+        put("version", self.version.map(|v| json!(v)));
+        put("version_type", self.version_type.map(|t| json!(version_type_name(t))));
+        put("if_seq_no", self.if_seq_no.map(|v| json!(v)));
+        put("if_primary_term", self.if_primary_term.map(|v| json!(v)));
+    }
+
+    /// The `?version=&version_type=&if_seq_no=&if_primary_term=` of a
+    /// single-document write (`None`: remove the parameter).
+    pub fn url_params(&self) -> [(&'static str, Option<String>); 4] {
+        [
+            ("version", self.version.map(|v| v.to_string())),
+            ("version_type", self.version_type.map(|t| version_type_name(t).to_string())),
+            ("if_seq_no", self.if_seq_no.map(|v| v.to_string())),
+            ("if_primary_term", self.if_primary_term.map(|v| v.to_string())),
+        ]
+    }
+
+    /// What the pipelines left in the document's metadata, over the
+    /// request's own conditions (`self`): `_version` (always present;
+    /// `-3` is none), `_version_type` (null keeps the request's), and
+    /// `_if_seq_no` / `_if_primary_term` when set.
+    pub(crate) fn after_pipelines(&self, meta: &Map<String, Value>) -> Result<WriteMeta> {
+        let mut out = *self;
+        if let Some(v) = meta.get("_version").filter(|v| !v.is_null()) {
+            let n = v.as_i64().or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64));
+            out.version = match n {
+                Some(MATCH_ANY) => None,
+                Some(n) if n >= 0 => Some(n as u64),
+                _ => {
+                    let kind = match out.version_type { Some(crate::shard::VersionType::External) => "EXTERNAL", Some(crate::shard::VersionType::ExternalGte) => "EXTERNAL_GTE", _ => "INTERNAL" };
+                    return Err(EsError::action_validation(&[&format!("illegal version value [{}] for version type [{kind}]", doc::value_to_string(v))]));
+                }
+            };
+        }
+        if let Some(t) = meta.get("_version_type").and_then(Value::as_str) {
+            let t = crate::shard::VersionType::parse(t)?;
+            // The document starts with `internal` for a request without a
+            // version type: leaving it so changes nothing.
+            if !(t == crate::shard::VersionType::Internal && out.version_type.is_none()) {
+                out.version_type = Some(t);
+            }
+        }
+        if let Some(n) = meta.get("_if_seq_no").and_then(Value::as_i64) {
+            out.if_seq_no = Some(n);
+        }
+        if let Some(n) = meta.get("_if_primary_term").and_then(Value::as_i64) {
+            out.if_primary_term = Some(n.max(0) as u64);
+        }
+        Ok(out)
+    }
+}
+
+/// `VersionType.toString`: the lowercase name pipelines see.
+pub fn version_type_name(t: crate::shard::VersionType) -> &'static str {
+    match t {
+        crate::shard::VersionType::Internal => "internal",
+        crate::shard::VersionType::External => "external",
+        crate::shard::VersionType::ExternalGte => "external_gte",
+    }
 }
 
 /// A failed ingest run (see [`Node::run_ingest_ext`]).
@@ -1331,6 +1496,9 @@ pub enum IngestOutcome {
         source: String,
         /// `_dynamic_templates` set by the pipelines (path -> template name).
         dynamic_templates: Option<std::collections::HashMap<String, String>>,
+        /// The write's version and concurrency conditions after the
+        /// pipelines (the request's own unless a pipeline changed them).
+        cond: WriteMeta,
     },
 }
 
@@ -1550,7 +1718,7 @@ impl Node {
             let idx = doc.meta_str("_index").unwrap_or_default();
             let id = doc.meta_str("_id");
             let cx = PipelineContext { substitutions: Some(&subs), ..PipelineContext::new(&store) };
-            let req = IngestRequest { index: &idx, id: id.as_deref(), routing: None, source: "", pipeline };
+            let req = IngestRequest { index: &idx, id: id.as_deref(), routing: None, source: "", pipeline, cond: WriteMeta::default() };
             let mut entry = Map::new();
             let mut error: Option<EsError> = None;
             let mut final_doc: Option<IngestDocument> = None;

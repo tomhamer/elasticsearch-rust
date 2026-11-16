@@ -1373,6 +1373,10 @@ pub struct LiteScript {
 
 impl LiteScript {
     pub fn compile(src: &str) -> Result<LiteScript, EsError> {
+        crate::parse_depth::guarded(|| Self::compile_unguarded(src))
+    }
+
+    fn compile_unguarded(src: &str) -> Result<LiteScript, EsError> {
         let toks = lex(src)?;
         let mut p = Parser { t: toks, i: 0, src, nest: crate::parse_depth::Nesting::new(512) };
         let prog = p.program()?;

@@ -745,3 +745,116 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(&strip_raw(raw, &names).unwrap()).unwrap(), v);
     }
 }
+
+// ---- `_recovery_source` without a second copy of the vectors -------------
+
+/// The indexed `dense_vector` fields of a root document (outside nested
+/// scopes) whose values the vector store holds (`has`): what a rebuild
+/// from the document can take from there, as ES rebuilds vectors from
+/// their vector values (`SourceLoader.SyntheticVectors`). Independent of
+/// `index.mapping.exclude_source_vectors`.
+fn rebuildable_vectors<'a>(lk: &'a FieldLookup, has: &dyn Fn(u16) -> bool) -> Vec<&'a ResolvedField> {
+    if !lk.may_have_vector_fields {
+        return Vec::new();
+    }
+    lk.fields.values().map(|f| f.as_ref())
+        .filter(|f| f.declared == EsType::DenseVector && f.nested_path.is_none() && is_synthetic_vector(f) && f.core_id.is_some_and(has))
+        .collect()
+}
+
+/// `src` without the dense vectors the parsed document `doc` indexed (the
+/// vector store keeps them): the form `_recovery_source` keeps, and the one
+/// two sources are compared in to tell whether a filtered `_source` lost
+/// anything a rebuild could not take back from the vector store.
+pub fn without_rebuildable_vectors<'a>(src: &'a Value, lk: &FieldLookup, doc: &rustic_core::types::Document) -> std::borrow::Cow<'a, Value> {
+    let indexed = |id: u16| doc.fields.iter().any(|(f, v)| *f == id && matches!(v, rustic_core::types::FieldValue::Vector(_)));
+    let fields = rebuildable_vectors(lk, &indexed);
+    if fields.is_empty() {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+    let mut out = src.clone();
+    remove_walk(&mut out, "", &names);
+    std::borrow::Cow::Owned(out)
+}
+
+fn remove_walk(v: &mut Value, prefix: &str, names: &[&str]) {
+    match v {
+        Value::Array(a) => a.iter_mut().for_each(|x| remove_walk(x, prefix, names)),
+        Value::Object(m) => {
+            let path = |k: &str| if prefix.is_empty() { k.to_string() } else { format!("{prefix}.{k}") };
+            let gone: Vec<String> = m.iter().filter(|(k, c)| !c.is_null() && names.contains(&path(k).as_str())).map(|(k, _)| k.clone()).collect();
+            for k in gone {
+                m.shift_remove(&k);
+            }
+            for (k, c) in m.iter_mut() {
+                let p = path(k);
+                if is_parent_of(&p, names) {
+                    remove_walk(c, &p, names);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Upper bound of the memory [`with_rebuilt_vectors`] adds for one
+/// document (every rebuildable vector rendered as JSON text and parsed).
+pub fn rebuilt_vectors_peak(lk: &FieldLookup) -> u64 {
+    if !lk.may_have_vector_fields {
+        return 0;
+    }
+    lk.fields.values().filter(|f| f.declared == EsType::DenseVector && f.nested_path.is_none() && is_synthetic_vector(f))
+        .map(|f| (f.dims.unwrap_or(4096) as u64).saturating_mul(64).saturating_add(f.name.len() as u64 + 256))
+        .fold(0u64, u64::saturating_add)
+}
+
+/// `raw` (a document's `_recovery_source`, or its stored `_source` when it
+/// needed none) with every dense vector the vector store holds for the
+/// document (`vector`) and `raw` lacks put back, in its indexed form at
+/// the end of its object. `None` when nothing is added.
+pub fn with_rebuilt_vectors(raw: &str, lk: &FieldLookup, vector: &dyn Fn(u16) -> Option<Vec<f32>>) -> Option<String> {
+    if !lk.may_have_vector_fields {
+        return None;
+    }
+    let candidates = rebuildable_vectors(lk, &|_| true);
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut src: Value = if raw.trim().is_empty() { Value::Object(Map::new()) } else { serde_json::from_str(raw).ok()? };
+    let mut changed = false;
+    for f in candidates {
+        if contains_path(&src, "", &f.name) {
+            continue;
+        }
+        let Some(row) = f.core_id.and_then(vector) else { continue };
+        let value = dense_value(f, row, f.dims.unwrap_or(0));
+        let segments: Vec<&str> = f.name.split('.').collect();
+        changed |= insert_path(&mut src, &segments, value);
+    }
+    changed.then(|| src.to_string())
+}
+
+/// Put `value` at `segs` in `v`, creating missing objects; `false` when a
+/// non-object is in the way.
+fn insert_path(v: &mut Value, segs: &[&str], value: Value) -> bool {
+    let Value::Object(m) = v else { return false };
+    if segs.len() == 1 {
+        m.insert(segs[0].to_string(), value);
+        return true;
+    }
+    let child = m.entry(segs[0].to_string()).or_insert_with(|| Value::Object(Map::new()));
+    insert_path(child, &segs[1..], value)
+}
+
+/// Whether `v` holds a value at `name` (nested objects or dotted keys).
+fn contains_path(v: &Value, prefix: &str, name: &str) -> bool {
+    match v {
+        Value::Array(a) => a.iter().any(|x| contains_path(x, prefix, name)),
+        Value::Object(m) => m.iter().any(|(k, c)| {
+            let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            path == name || (name.len() > path.len() && name.starts_with(path.as_str()) && name.as_bytes()[path.len()] == b'.' && contains_path(c, &path, name))
+        }),
+        _ => false,
+    }
+}

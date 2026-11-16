@@ -56,6 +56,23 @@ if [[ $# -eq 0 || "$1" == "eswrapper" || "$1" == -* ]]; then
     extra+=("--enrollment-token" "${ENROLLMENT_TOKEN}")
   fi
 
+  # As ES's image: `<VAR>_FILE` names a file holding the value of <VAR>
+  # (Docker / Kubernetes secrets mounted as files). Setting both is an error.
+  for var in ELASTIC_PASSWORD KEYSTORE_PASSWORD; do
+    file_var="${var}_FILE"
+    [[ -n "${!file_var:-}" ]] || continue
+    if [[ -n "${!var:-}" ]]; then
+      echo "elasticsearch: both ${var} and ${file_var} are set; set only one" >&2
+      exit 1
+    fi
+    if [[ ! -r "${!file_var}" ]]; then
+      echo "elasticsearch: ${file_var} names [${!file_var}], which is not a readable file" >&2
+      exit 1
+    fi
+    export "${var}=$(tr -d '\r\n' < "${!file_var}")"
+    unset "${file_var}"
+  done
+
   # As ES's image: `ELASTIC_PASSWORD` becomes the keystore's
   # `bootstrap.password` (a secure setting: never in elasticsearch.yml), and a
   # password-protected keystore's password is fed to the node from

@@ -199,9 +199,56 @@ fn valid_point(lat: f64, lon: f64) -> Option<(f64, f64)> {
     }
 }
 
+/// `GeoUtils.normalizePoint`: latitudes beyond a pole are reflected
+/// (moving the longitude half way round) and longitudes wrapped into
+/// [-180, 180].
+pub fn normalize_point(lat: f64, lon: f64) -> Option<(f64, f64)> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    let centered = |x: f64, d: f64| {
+        let mut r = x % d;
+        if r <= 0.0 {
+            r += d;
+        }
+        if r > d / 2.0 {
+            r -= d;
+        }
+        r
+    };
+    let (mut lat, mut lon) = (lat, lon);
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        lat = centered(lat, 360.0);
+        let mut shift = true;
+        if lat < -90.0 {
+            lat = -180.0 - lat;
+        } else if lat > 90.0 {
+            lat = 180.0 - lat;
+        } else {
+            shift = false;
+        }
+        if shift {
+            lon += 180.0;
+        }
+        lon = centered(lon, 360.0);
+    }
+    Some((lat, lon))
+}
+
 /// Parse one geo point in any ES form: `{lat, lon}`, `"lat,lon"`,
 /// geohash, `[lon, lat]`, `POINT (lon lat)`, GeoJSON `{type: Point, coordinates}`.
 pub fn parse_geo_point(v: &Value) -> Option<(f64, f64)> {
+    parse_geo_point_with(v, valid_point)
+}
+
+/// [`parse_geo_point`] for a field with `ignore_malformed`: out-of-range
+/// coordinates are normalized, not refused (ES `GeoPointFieldMapper`,
+/// finding 457).
+pub fn parse_geo_point_normalized(v: &Value) -> Option<(f64, f64)> {
+    parse_geo_point_with(v, normalize_point)
+}
+
+fn parse_geo_point_with(v: &Value, valid_point: fn(f64, f64) -> Option<(f64, f64)>) -> Option<(f64, f64)> {
     match v {
         Value::Object(m) => {
             if let (Some(lat), Some(lon)) = (m.get("lat"), m.get("lon")) {
@@ -213,7 +260,7 @@ pub fn parse_geo_point(v: &Value) -> Option<(f64, f64)> {
             }
             // `{"location": "POINT (lon lat)"}` or `{"location": "lat,lon"}`.
             if let Some(loc) = m.get("location") {
-                return parse_geo_point(loc);
+                return parse_geo_point_with(loc, valid_point);
             }
             None
         }
@@ -225,6 +272,12 @@ pub fn parse_geo_point(v: &Value) -> Option<(f64, f64)> {
                 let mut it = inner.split_whitespace();
                 let lon: f64 = it.next()?.parse().ok()?;
                 let lat: f64 = it.next()?.parse().ok()?;
+                // ES reads WKT through `GeographyValidator`, which refuses
+                // out-of-range coordinates: never normalized, even with
+                // ignore_malformed (the value is malformed).
+                if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+                    return None;
+                }
                 return valid_point(lat, lon);
             }
             if let Some((a, b)) = t.split_once(',') {
@@ -351,30 +404,86 @@ pub fn to_float(v: f64) -> f64 {
     v as f32 as f64
 }
 
-/// Round to IEEE half precision (ES `half_float`).
+/// Round to IEEE half precision (ES `half_float`, Lucene
+/// `HalfFloatPoint`): the input as a float, then to the nearest binary16
+/// value, ties to even, including into and out of the subnormal range
+/// (production review #452: values between 2^-25 and 2^-24 were flushed to
+/// zero instead of rounding up to the smallest subnormal).
 pub fn to_half_float(v: f64) -> f64 {
     let f = v as f32;
     if f == 0.0 || !f.is_finite() {
         return f as f64;
     }
-    let bits = f.to_bits();
-    let exp = ((bits >> 23) & 0xff) as i32 - 127;
-    if exp < -24 {
-        return 0.0f64.copysign(v);
+    let x = (f as f64).abs();
+    // The unit in the last place of the binade (subnormals: 2^-24).
+    let e = x.log2().floor() as i32;
+    let ulp = 2f64.powi(e.max(-14) - 10);
+    let r = (x / ulp).round_ties_even() * ulp;
+    let r = if r > 65504.0 { f64::INFINITY } else { r };
+    r.copysign(v)
+}
+
+/// The binary16 bit pattern of a value [`to_half_float`] returns.
+fn half_bits(h: f64) -> u16 {
+    let sign = if h.is_sign_negative() { 0x8000u16 } else { 0 };
+    let x = h.abs();
+    if x == 0.0 {
+        return sign;
     }
-    if exp > 15 {
-        return f64::INFINITY.copysign(v);
+    if x.is_infinite() {
+        return sign | 0x7c00;
     }
-    let shift = if exp < -14 { 13 + (-14 - exp) } else { 13 };
-    let shift = shift.min(23) as u32;
-    let mask = (1u32 << shift) - 1;
-    let half = 1u32 << (shift - 1);
-    let mut m = bits & !mask;
-    let rem = bits & mask;
-    if rem > half || (rem == half && (bits >> shift) & 1 == 1) {
-        m += 1 << shift;
+    if x < 2f64.powi(-14) {
+        return sign | (x / 2f64.powi(-24)) as u16;
     }
-    f32::from_bits(m) as f64
+    let e = x.log2().floor() as i32;
+    let m = ((x / 2f64.powi(e) - 1.0) * 1024.0) as u16;
+    sign | (((e + 15) as u16) << 10) | m
+}
+
+fn half_from_bits(b: u16) -> f64 {
+    let sign = if b & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = ((b >> 10) & 0x1f) as i32;
+    let m = (b & 0x3ff) as f64;
+    sign * match e {
+        0 => m * 2f64.powi(-24),
+        31 => f64::INFINITY,
+        _ => (1.0 + m / 1024.0) * 2f64.powi(e - 15),
+    }
+}
+
+/// The half float right above half value `h` (Lucene `HalfFloatPoint.nextUp`).
+fn half_next_up(h: f64) -> f64 {
+    if h == f64::INFINITY {
+        return h;
+    }
+    if h == 0.0 {
+        return 2f64.powi(-24);
+    }
+    let b = half_bits(h);
+    let r = half_from_bits(if h > 0.0 { b + 1 } else { b - 1 });
+    if r == 0.0 { 0.0 } else { r }
+}
+
+/// The half float right below half value `h`.
+fn half_next_down(h: f64) -> f64 {
+    -half_next_up(-h)
+}
+
+/// The range bound of a `half_float` field (ES `HALF_FLOAT.rangeQuery`):
+/// the smallest half value on the requested side of the (float) bound, so
+/// a bound between two half floats never rounds to the wrong side
+/// (production review #451). `lower`: the bound's side is above it.
+pub fn half_float_bound(v: f64, lower: bool, inclusive: bool) -> f64 {
+    let x = v as f32 as f64;
+    let h = to_half_float(x);
+    if lower {
+        let ceil = if h >= x { h } else { half_next_up(h) };
+        if inclusive || ceil > x { ceil } else { half_next_up(ceil) }
+    } else {
+        let floor = if h <= x { h } else { half_next_down(h) };
+        if inclusive || floor < x { floor } else { half_next_down(floor) }
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +508,15 @@ mod tests {
     fn geo_forms() {
         let want = (41.12, -71.34);
         assert_eq!(parse_geo_point(&json!({"lat": 41.12, "lon": -71.34})), Some(want));
+        // Finding 457: normalized with ignore_malformed, refused otherwise.
+        assert_eq!(parse_geo_point(&json!({"lat": 10.0, "lon": 190.0})), None);
+        assert_eq!(parse_geo_point_normalized(&json!({"lat": 10.0, "lon": 190.0})), Some((10.0, -170.0)));
+        assert_eq!(parse_geo_point_normalized(&json!([-190.0, 95.0])), Some((85.0, -10.0)));
+        assert_eq!(parse_geo_point_normalized(&json!("-100,0")), Some((-80.0, 180.0)));
+        assert_eq!(parse_geo_point_normalized(&json!({"lat": 1.0, "lon": 2.0})), Some((1.0, 2.0)));
+        // WKT is validated, never normalized (ES GeographyValidator).
+        assert_eq!(parse_geo_point_normalized(&json!("POINT (-77.03653 1000)")), None);
+        assert_eq!(parse_geo_point_normalized(&json!("POINT (-71.34 41.12)")), Some((41.12, -71.34)));
         assert_eq!(parse_geo_point(&json!("41.12,-71.34")), Some(want));
         assert_eq!(parse_geo_point(&json!([-71.34, 41.12])), Some(want));
         assert_eq!(parse_geo_point(&json!("POINT (-71.34 41.12)")), Some(want));
@@ -417,6 +535,30 @@ mod tests {
         assert_eq!(to_float(1.1), 1.100000023841858);
         assert_eq!(to_half_float(1.1), 1.099609375);
         assert_eq!(to_half_float(65504.0), 65504.0);
+        // Production review #452: between 2^-25 and 2^-24 rounds up to the
+        // smallest subnormal; 2^-25 itself ties to even (zero).
+        assert_eq!(to_half_float(0.00000004), 2f64.powi(-24));
+        assert_eq!(to_half_float(-0.00000004), -2f64.powi(-24));
+        assert_eq!(to_half_float(2f64.powi(-25)), 0.0);
+        assert_eq!(to_half_float(1.5 * 2f64.powi(-24)), 2.0 * 2f64.powi(-24));
+        assert_eq!(to_half_float(2f64.powi(-14) - 2f64.powi(-26)), 2f64.powi(-14));
+        assert_eq!(to_half_float(65519.0), 65504.0);
+        assert_eq!(to_half_float(65520.0), f64::INFINITY);
+        for b in [1u16, 2, 0x3ff, 0x400, 0x3c00, 0x3c01, 0x7bff] {
+            assert_eq!(half_bits(half_from_bits(b)), b);
+            assert_eq!(to_half_float(half_from_bits(b)), half_from_bits(b));
+        }
+        // Production review #451: bounds between adjacent half floats.
+        let next = 1.0009765625;
+        assert_eq!(half_float_bound(1.0001, true, true), next);
+        assert_eq!(half_float_bound(1.0008, true, false), next);
+        assert_eq!(half_float_bound(1.0, true, false), next);
+        assert_eq!(half_float_bound(1.0, true, true), 1.0);
+        assert_eq!(half_float_bound(1.0008, false, true), 1.0);
+        assert_eq!(half_float_bound(1.0001, false, false), 1.0);
+        assert_eq!(half_float_bound(next, false, false), 1.0);
+        assert_eq!(half_float_bound(next, false, true), next);
+        assert_eq!(half_float_bound(0.0, true, false), 2f64.powi(-24));
         assert_eq!(num_value(3.0, true), json!(3));
         assert_eq!(num_value(3.5, true), json!(3.5));
     }

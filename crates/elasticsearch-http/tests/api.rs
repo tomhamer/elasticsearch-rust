@@ -996,3 +996,493 @@ async fn fleet_partial_search_preserves_raw_source_with_failed_checkpoint() {
     assert_eq!(shards["failed"], 1);
     assert_eq!(shards["failures"][0]["shard"], 1 - good_shard);
 }
+
+/// Production review #36: a bulk update with stale `if_seq_no` /
+/// `if_primary_term` conflicts (409) even when it would be a no-op: an
+/// identical partial document and a script setting `ctx.op = 'noop'`.
+/// Current conditions still answer the no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_conditional_noop_updates_check_their_conditions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/cnd/_doc/1?refresh=true", json!({"n": 1})).await;
+    assert_eq!(st, 201, "{v}");
+    let (seq, term) = (v["_seq_no"].as_i64().unwrap(), v["_primary_term"].as_i64().unwrap());
+    let (st, v) = es.put("/cnd/_doc/1", json!({"n": 1, "m": 2})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/cnd/_doc/1", json!({"n": 1})).await;
+    assert_eq!(st, 200, "{v}");
+    let (cur_seq, cur_term) = (v["_seq_no"].as_i64().unwrap(), v["_primary_term"].as_i64().unwrap());
+    assert!(cur_seq > seq);
+    let noop_doc = json!({"doc": {"n": 1}});
+    let noop_script = json!({"script": {"source": "ctx.op = 'noop'"}});
+    for body in [&noop_doc, &noop_script] {
+        // Stale: 409 in the bulk item and on the single endpoint.
+        let (st, v) = es.ndjson("/_bulk", &[json!({"update": {"_index": "cnd", "_id": "1", "if_seq_no": seq, "if_primary_term": term}}), body.clone()]).await;
+        assert_eq!(st, 200, "{v}");
+        let item = &v["items"][0]["update"];
+        assert_eq!((item["status"].as_u64(), item["error"]["type"].as_str()), (Some(409), Some("version_conflict_engine_exception")), "{body}: {v}");
+        let (st, v) = es.post(&format!("/cnd/_update/1?if_seq_no={seq}&if_primary_term={term}"), body.clone()).await;
+        assert_eq!((st, v["error"]["type"].as_str()), (409, Some("version_conflict_engine_exception")), "{body}: {v}");
+        // Current: the no-op.
+        let (st, v) = es.ndjson("/_bulk", &[json!({"update": {"_index": "cnd", "_id": "1", "if_seq_no": cur_seq, "if_primary_term": cur_term}}), body.clone()]).await;
+        assert_eq!(st, 200, "{v}");
+        let item = &v["items"][0]["update"];
+        assert_eq!((item["status"].as_u64(), item["result"].as_str()), (Some(200), Some("noop")), "{body}: {v}");
+    }
+}
+
+/// Production review #37: a bulk request's URL `routing` applies to every
+/// item without its own, exactly as item routing: required-routing
+/// mappings accept it, the document is stored with that `_routing`
+/// (readable only with it), and a reindex keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_url_routing_is_the_items_routing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    for (index, required) in [("rreq", true), ("ropt", false)] {
+        let (st, v) = es.put(&format!("/{index}"), json!({"settings": {"number_of_shards": 3}, "mappings": {"_routing": {"required": required}, "properties": {"n": {"type": "long"}}}})).await;
+        assert_eq!(st, 200, "{v}");
+        // URL routing, item routing: the same outcome.
+        let (st, v) = es.ndjson(&format!("/{index}/_bulk?routing=r1&refresh=true"), &[json!({"index": {"_id": "u"}}), json!({"n": 1}), json!({"create": {"_id": "u2"}}), json!({"n": 2})]).await;
+        assert_eq!((st, &v["errors"]), (200, &json!(false)), "{index}: {v}");
+        let (st, v) = es.ndjson(&format!("/{index}/_bulk?refresh=true"), &[json!({"index": {"_id": "i", "routing": "r1"}}), json!({"n": 1})]).await;
+        assert_eq!((st, &v["errors"]), (200, &json!(false)), "{index}: {v}");
+        // The item's own routing wins over the URL's.
+        let (st, v) = es.ndjson(&format!("/{index}/_bulk?routing=r1&refresh=true"), &[json!({"index": {"_id": "o", "routing": "r2"}}), json!({"n": 3})]).await;
+        assert_eq!((st, &v["errors"]), (200, &json!(false)), "{index}: {v}");
+        for (id, r) in [("u", "r1"), ("u2", "r1"), ("i", "r1"), ("o", "r2")] {
+            let (st, v) = es.get(&format!("/{index}/_doc/{id}?routing={r}")).await;
+            assert_eq!((st, v["_routing"].as_str()), (200, Some(r)), "{index}/{id}: {v}");
+        }
+        // Update and delete items take the URL routing too.
+        let (st, v) = es.ndjson(&format!("/{index}/_bulk?routing=r1&refresh=true"), &[json!({"update": {"_id": "u"}}), json!({"doc": {"n": 10}}), json!({"delete": {"_id": "u2"}})]).await;
+        assert_eq!((st, &v["errors"]), (200, &json!(false)), "{index}: {v}");
+        let (_, v) = es.get(&format!("/{index}/_doc/u?routing=r1")).await;
+        assert_eq!(v["_source"]["n"], 10, "{v}");
+        let (st, _) = es.get(&format!("/{index}/_doc/u2?routing=r1")).await;
+        assert_eq!(st, 404);
+        // A reindex keeps each document's routing.
+        let dest = format!("{index}-copy");
+        let (st, v) = es.put(&format!("/{dest}"), json!({"settings": {"number_of_shards": 3}, "mappings": {"_routing": {"required": required}}})).await;
+        assert_eq!(st, 200, "{v}");
+        let (st, v) = es.post("/_reindex?refresh=true", json!({"source": {"index": index}, "dest": {"index": dest}})).await;
+        assert_eq!((st, v["created"].as_u64(), v["failures"].as_array().map(Vec::len)), (200, Some(3), Some(0)), "{v}");
+        for (id, r) in [("u", "r1"), ("i", "r1"), ("o", "r2")] {
+            let (st, v) = es.get(&format!("/{dest}/_doc/{id}?routing={r}")).await;
+            assert_eq!((st, v["_routing"].as_str()), (200, Some(r)), "{dest}/{id}: {v}");
+        }
+    }
+}
+
+/// Production review #135: a delete without the routing a
+/// `_routing.required` mapping demands is refused before it is sequenced,
+/// singly and in bulk, on one shard and on several: the document keeps its
+/// source, version and seq_no. With its routing it deletes.
+#[tokio::test(flavor = "multi_thread")]
+async fn deletes_without_required_routing_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    for (index, shards) in [("rq1", 1), ("rq3", 3)] {
+        let (st, v) = es.put(&format!("/{index}"), json!({"settings": {"number_of_shards": shards}, "mappings": {"_routing": {"required": true}}})).await;
+        assert_eq!(st, 200, "{v}");
+        for id in ["1", "2"] {
+            let (st, v) = es.put(&format!("/{index}/_doc/{id}?routing=tenant-a&refresh=true"), json!({"n": 1})).await;
+            assert_eq!(st, 201, "{v}");
+        }
+        let (_, before) = es.get(&format!("/{index}/_doc/1?routing=tenant-a")).await;
+        let (st, v) = es.delete(&format!("/{index}/_doc/1")).await;
+        assert_eq!((st, v["error"]["type"].as_str()), (400, Some("routing_missing_exception")), "{index}: {v}");
+        let (st, v) = es.ndjson(&format!("/{index}/_bulk?refresh=true"), &[json!({"delete": {"_id": "1"}}), json!({"delete": {"_id": "2", "routing": "tenant-a"}})]).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!((v["items"][0]["delete"]["status"].as_u64(), v["items"][0]["delete"]["error"]["type"].as_str()), (Some(400), Some("routing_missing_exception")), "{index}: {v}");
+        assert_eq!(v["items"][1]["delete"]["result"].as_str(), Some("deleted"), "{index}: {v}");
+        let (st, after) = es.get(&format!("/{index}/_doc/1?routing=tenant-a")).await;
+        assert_eq!(st, 200, "{index}: {after}");
+        for k in ["_source", "_version", "_seq_no", "_primary_term"] {
+            assert_eq!(after[k], before[k], "{index}: {k}");
+        }
+        let (st, v) = es.delete(&format!("/{index}/_doc/1?routing=tenant-a")).await;
+        assert_eq!((st, v["result"].as_str()), (200, Some("deleted")), "{index}: {v}");
+    }
+}
+
+/// Production review #136: bulk `if_seq_no` / `if_primary_term` /
+/// `version` given as JSON strings are numbers (ES `BulkRequestParser`
+/// reads them with a coercing `longValue()`): a stale quoted condition
+/// conflicts for index, delete and update, a current one applies, and an
+/// unparsable one fails the item before it writes. Integers still work.
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_quoted_numeric_conditions_are_enforced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/q/_doc/1?refresh=true", json!({"n": 1})).await;
+    assert_eq!(st, 201, "{v}");
+    let (st, v) = es.put("/q/_doc/1?refresh=true", json!({"n": 2})).await;
+    assert_eq!(st, 200, "{v}");
+    let (seq, term) = (v["_seq_no"].as_i64().unwrap(), v["_primary_term"].as_i64().unwrap());
+    let stale = (seq - 1).to_string();
+    let item = |v: &Value, op: &str| (v["items"][0][op]["status"].as_u64(), v["items"][0][op]["error"]["type"].as_str().map(str::to_string));
+    let conflict = (Some(409), Some("version_conflict_engine_exception".to_string()));
+    for (op, body) in [("index", Some(json!({"n": 9}))), ("update", Some(json!({"doc": {"n": 9}}))), ("delete", None)] {
+        let mut lines = vec![json!({op: {"_index": "q", "_id": "1", "if_seq_no": stale, "if_primary_term": term.to_string()}})];
+        lines.extend(body.clone());
+        let (st, v) = es.ndjson("/_bulk?refresh=true", &lines).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(item(&v, op), conflict, "{op}: {v}");
+        // Unparsable: refused, nothing written.
+        let mut lines = vec![json!({op: {"_index": "q", "_id": "1", "if_seq_no": "zero", "if_primary_term": term.to_string()}})];
+        lines.extend(body.clone());
+        let (st, v) = es.ndjson("/_bulk?refresh=true", &lines).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(item(&v, op).0, Some(400), "{op}: {v}");
+        let (_, doc) = es.get("/q/_doc/1").await;
+        assert_eq!((doc["_source"]["n"].as_i64(), doc["_seq_no"].as_i64()), (Some(2), Some(seq)), "{op}: unchanged");
+    }
+    // External version as a string: stale conflicts.
+    let (st, v) = es.ndjson("/_bulk?refresh=true", &[json!({"index": {"_index": "q", "_id": "e", "version": "5", "version_type": "external"}}), json!({"n": 1})]).await;
+    assert_eq!((st, v["items"][0]["index"]["_version"].as_u64()), (200, Some(5)), "{v}");
+    let (_, v) = es.ndjson("/_bulk", &[json!({"index": {"_index": "q", "_id": "e", "version": "4", "version_type": "external"}}), json!({"n": 2})]).await;
+    assert_eq!(item(&v, "index"), conflict, "{v}");
+    // Current quoted conditions apply; integer conditions still do.
+    let (_, v) = es.ndjson("/_bulk?refresh=true", &[json!({"update": {"_index": "q", "_id": "1", "if_seq_no": seq.to_string(), "if_primary_term": term.to_string()}}), json!({"doc": {"n": 3}})]).await;
+    assert_eq!(v["items"][0]["update"]["result"].as_str(), Some("updated"), "{v}");
+    let seq = v["items"][0]["update"]["_seq_no"].as_i64().unwrap();
+    let (_, v) = es.ndjson("/_bulk?refresh=true", &[json!({"index": {"_index": "q", "_id": "1", "if_seq_no": seq - 1, "if_primary_term": term}}), json!({"n": 4})]).await;
+    assert_eq!(item(&v, "index"), conflict, "{v}");
+    let (_, v) = es.ndjson("/_bulk?refresh=true", &[json!({"delete": {"_index": "q", "_id": "1", "if_seq_no": seq, "if_primary_term": term}})]).await;
+    assert_eq!(v["items"][0]["delete"]["result"].as_str(), Some("deleted"), "{v}");
+}
+
+/// Production review #191, #199, #241 (standalone reindex): the script's
+/// metadata changes apply over the destination request. A cleared `_id`
+/// generates ids (no overwrite of the destination's `1`, both sources
+/// copied); a scripted `_routing` wins over `dest.routing: discard`; a
+/// scripted delete keeps the external version condition.
+#[tokio::test(flavor = "multi_thread")]
+async fn reindex_script_metadata_applies_over_the_destination_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    for (index, body) in [("s1", json!({"t": "a"})), ("s2", json!({"t": "b"})), ("dst", json!({"keep": true}))] {
+        let (st, v) = es.put(&format!("/{index}/_doc/1?refresh=true"), body).await;
+        assert_eq!(st, 201, "{v}");
+    }
+    let (st, v) = es.post("/_reindex?refresh=true", json!({"source": {"index": ["s1", "s2"]}, "dest": {"index": "dst"}, "script": {"source": "ctx._id = null"}})).await;
+    assert_eq!((st, v["created"].as_u64()), (200, Some(2)), "{v}");
+    let (_, v) = es.get("/dst/_doc/1").await;
+    assert_eq!((v["_source"].clone(), v["_version"].as_u64()), (json!({"keep": true}), Some(1)), "{v}");
+    let (_, v) = es.get("/dst/_count").await;
+    assert_eq!(v["count"], 3, "{v}");
+    // Scripted routing over `dest.routing: discard`.
+    let (st, v) = es.put("/rsrc/_doc/1?routing=old&refresh=true", json!({"tenant": "t1"})).await;
+    assert_eq!(st, 201, "{v}");
+    let (st, v) = es.put("/rdst", json!({"settings": {"number_of_shards": 3}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.post("/_reindex?refresh=true", json!({"source": {"index": "rsrc"}, "dest": {"index": "rdst", "routing": "discard"}, "script": {"source": "ctx._routing = ctx._source.tenant"}})).await;
+    assert_eq!((st, v["created"].as_u64()), (200, Some(1)), "{v}");
+    let (st, v) = es.get("/rdst/_doc/1?routing=t1").await;
+    assert_eq!((st, v["_routing"].as_str()), (200, Some("t1")), "{v}");
+    // Scripted delete with external versioning: source 3, destination 4.
+    let (st, v) = es.put("/vsrc/_doc/1?version=3&version_type=external&refresh=true", json!({"n": 1})).await;
+    assert_eq!(st, 201, "{v}");
+    let (st, v) = es.put("/vdst/_doc/1?version=4&version_type=external&refresh=true", json!({"n": "newer"})).await;
+    assert_eq!(st, 201, "{v}");
+    let body = json!({"conflicts": "proceed", "source": {"index": "vsrc"}, "dest": {"index": "vdst", "version_type": "external"}, "script": {"source": "ctx.op = 'delete'"}});
+    let (st, v) = es.post("/_reindex?refresh=true", body.clone()).await;
+    assert_eq!((st, v["deleted"].as_u64(), v["version_conflicts"].as_u64()), (200, Some(0), Some(1)), "{v}");
+    let (st, v) = es.get("/vdst/_doc/1").await;
+    assert_eq!((st, v["_version"].as_u64()), (200, Some(4)), "the newer destination stays: {v}");
+    // Destination at the source's version: deleted.
+    let (st, v) = es.put("/vdst2/_doc/1?version=3&version_type=external&refresh=true", json!({"n": 1})).await;
+    assert_eq!(st, 201, "{v}");
+    let mut body = body;
+    body["dest"]["index"] = json!("vdst2");
+    let (st, v) = es.post("/_reindex?refresh=true", body.clone()).await;
+    assert_eq!((st, v["deleted"].as_u64()), (200, Some(1)), "{v}");
+    let (st, _) = es.get("/vdst2/_doc/1").await;
+    assert_eq!(st, 404);
+    // An older destination copy conflicts too (ES internal version equality).
+    let (st, v) = es.put("/vdst3/_doc/1?version=2&version_type=external&refresh=true", json!({"n": "older"})).await;
+    assert_eq!(st, 201, "{v}");
+    body["dest"]["index"] = json!("vdst3");
+    let (st, v) = es.post("/_reindex?refresh=true", body).await;
+    assert_eq!((st, v["deleted"].as_u64(), v["version_conflicts"].as_u64()), (200, Some(0), Some(1)), "{v}");
+    let (st, v) = es.get("/vdst3/_doc/1").await;
+    assert_eq!((st, v["_version"].as_u64()), (200, Some(2)), "{v}");
+}
+
+/// Production review #186: quoted `_seq_no` range bounds are numbers (ES
+/// `SeqNoFieldMapper` parses strings with `Long.parseLong`): they select
+/// exactly what the numeric bounds do, and a malformed bound fails the
+/// query (and a by-query mutation) instead of disappearing.
+#[tokio::test(flavor = "multi_thread")]
+async fn quoted_seq_no_range_bounds_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let lines: Vec<Value> = (0..6).flat_map(|i| [json!({"index": {"_index": "sq", "_id": i.to_string()}}), json!({"n": i})]).collect();
+    let (st, v) = es.ndjson("/_bulk?refresh=true", &lines).await;
+    assert_eq!((st, &v["errors"]), (200, &json!(false)), "{v}");
+    let count = |range: Value| {
+        let es = &es;
+        async move {
+            let (st, v) = es.post("/sq/_search", json!({"query": {"range": {"_seq_no": range}}, "size": 0})).await;
+            (st, v["hits"]["total"]["value"].as_u64())
+        }
+    };
+    assert_eq!(count(json!({"gte": 2})).await, (200, Some(4)));
+    assert_eq!(count(json!({"gte": "2"})).await, (200, Some(4)));
+    assert_eq!(count(json!({"gte": "2", "lt": "4"})).await, (200, Some(2)));
+    assert_eq!(count(json!({"gt": "2", "lte": 4})).await, (200, Some(2)));
+    let (st, v) = es.post("/sq/_search", json!({"query": {"range": {"_seq_no": {"gte": "two"}}}})).await;
+    assert_eq!(st, 400, "{v}");
+    let (st, v) = es.post("/sq/_delete_by_query?refresh=true", json!({"query": {"range": {"_seq_no": {"gte": "x", "lt": "4"}}}})).await;
+    assert!(st >= 400, "{st} {v}");
+    let (_, v) = es.get("/sq/_count").await;
+    assert_eq!(v["count"], 6, "a malformed bound deletes nothing: {v}");
+    let (st, v) = es.post("/sq/_delete_by_query?refresh=true", json!({"query": {"range": {"_seq_no": {"gte": "4"}}}})).await;
+    assert_eq!((st, v["deleted"].as_u64()), (200, Some(2)), "{v}");
+    let (_, v) = es.get("/sq/_count").await;
+    assert_eq!(v["count"], 4, "{v}");
+}
+
+/// Production review #192: metadata keys in an ingested source never take
+/// over the write's metadata (ES `CtxMap` rejects them): an id-less bulk
+/// `index` whose source carries `_id` fails instead of overwriting that
+/// document, with or without a pipeline; `_routing` likewise.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_source_metadata_cannot_take_over_a_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/_ingest/pipeline/tag", json!({"processors": [{"set": {"field": "tagged", "value": true}}]})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/ing/_doc/victim?refresh=true", json!({"owner": "me"})).await;
+    assert_eq!(st, 201, "{v}");
+    for (pipeline, source) in [("?pipeline=tag", json!({"_id": "victim", "owner": "attacker"})), ("?pipeline=tag", json!({"_routing": "r9", "owner": "x"})), ("", json!({"_id": "victim", "owner": "attacker"}))] {
+        let (st, v) = es.ndjson(&format!("/ing/_bulk{pipeline}"), &[json!({"index": {}}), source.clone()]).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["items"][0]["index"]["status"].as_u64(), Some(400), "{pipeline} {source}: {v}");
+    }
+    let (_, v) = es.get("/ing/_doc/victim").await;
+    assert_eq!((v["_source"].clone(), v["_version"].as_u64()), (json!({"owner": "me"}), Some(1)), "{v}");
+    // Without metadata keys an id-less pipeline write gets a generated id.
+    let (_, v) = es.ndjson("/ing/_bulk?pipeline=tag&refresh=true", &[json!({"index": {}}), json!({"owner": "new"})]).await;
+    assert_eq!(v["items"][0]["index"]["status"].as_u64(), Some(201), "{v}");
+    assert_ne!(v["items"][0]["index"]["_id"], json!("victim"));
+}
+
+/// Production review #193: `index.routing_partition_size` and
+/// `index.mapping.exclude_source_vectors` are final (ES): a closed index
+/// or a `reopen` update rejects them and keeps settings and documents.
+#[tokio::test(flavor = "multi_thread")]
+async fn final_routing_and_vector_source_settings_cannot_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/fin", json!({"settings": {"number_of_shards": 4, "routing_partition_size": 2}, "mappings": {"_routing": {"required": true}, "properties": {"emb": {"type": "dense_vector", "dims": 2, "similarity": "l2_norm"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/fin/_doc/1?routing=r&refresh=true", json!({"emb": [1.0, 2.0], "n": 1})).await;
+    assert_eq!(st, 201, "{v}");
+    for setting in [json!({"index.routing_partition_size": 3}), json!({"index.mapping.exclude_source_vectors": false})] {
+        let (st, v) = es.put("/fin/_settings?reopen=true", setting.clone()).await;
+        assert_eq!(st, 400, "reopen {setting}: {v}");
+        es.post0("/fin/_close").await;
+        let (st, v) = es.put("/fin/_settings", setting.clone()).await;
+        assert_eq!((st, v["error"]["type"].as_str()), (400, Some("illegal_argument_exception")), "closed {setting}: {v}");
+        assert!(v["error"]["reason"].as_str().unwrap_or("").contains("final index setting"), "{v}");
+        es.post0("/fin/_open").await;
+    }
+    let (_, v) = es.get("/fin/_settings?flat_settings=true").await;
+    assert_eq!(v["fin"]["settings"]["index.routing_partition_size"], json!("2"), "{v}");
+    assert!(v["fin"]["settings"].get("index.mapping.exclude_source_vectors").is_none(), "{v}");
+    let (st, v) = es.get("/fin/_doc/1?routing=r").await;
+    assert_eq!((st, v["_source"]["n"].as_i64()), (200, Some(1)), "{v}");
+}
+
+/// Production review #194: when a composable template matches, legacy
+/// templates do not apply at all (ES): no legacy pipeline, source pruning
+/// or alias leaks into the new index. Without a composable match the
+/// legacy template still applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn composable_templates_exclude_legacy_templates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/_ingest/pipeline/drop-all", json!({"processors": [{"drop": {}}]})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/_template/old", json!({"index_patterns": ["*"], "order": 0, "settings": {"index.default_pipeline": "drop-all"}, "mappings": {"_source": {"excludes": ["secret"]}}, "aliases": {"legacy-alias": {}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/_index_template/events", json!({"index_patterns": ["events-*"], "priority": 100, "template": {"mappings": {"properties": {"msg": {"type": "keyword"}}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/events-1/_doc/1?refresh=true", json!({"msg": "hello", "secret": "kept"})).await;
+    assert_eq!((st, v["result"].as_str()), (201, Some("created")), "{v}");
+    let (_, v) = es.get("/events-1/_doc/1").await;
+    assert_eq!(v["_source"], json!({"msg": "hello", "secret": "kept"}), "{v}");
+    let (_, v) = es.get("/events-1").await;
+    assert!(v["events-1"]["settings"]["index"].get("default_pipeline").is_none(), "{v}");
+    assert_eq!(v["events-1"]["aliases"], json!({}), "{v}");
+    assert!(v["events-1"]["mappings"].get("_source").is_none(), "{v}");
+    // Legacy-only control.
+    let (st, v) = es.put("/other", json!({})).await;
+    assert_eq!(st, 200, "{v}");
+    let (_, v) = es.get("/other").await;
+    assert_eq!(v["other"]["settings"]["index"]["default_pipeline"], json!("drop-all"), "{v}");
+    assert!(v["other"]["aliases"].get("legacy-alias").is_some(), "{v}");
+}
+
+/// Production review #195: an alias never gets a second write index (ES
+/// `IndexAbstraction.Alias`): adding one through `_aliases` or index
+/// creation fails and changes nothing; an atomic swap moves writes; a
+/// rollover still moves the write index.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_has_at_most_one_write_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/logs-000001", json!({"aliases": {"live": {"is_write_index": true}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/logs-000002", json!({})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.post("/_aliases", json!({"actions": [{"add": {"index": "logs-000002", "alias": "live", "is_write_index": true}}]})).await;
+    assert_eq!((st, v["error"]["type"].as_str()), (500, Some("illegal_state_exception")), "{v}");
+    assert!(v["error"]["reason"].as_str().unwrap_or("").contains("more than one write index"), "{v}");
+    let (_, v) = es.get("/logs-000002/_alias").await;
+    assert_eq!(v["logs-000002"]["aliases"], json!({}), "unchanged: {v}");
+    let (st, v) = es.put("/logs-000003", json!({"aliases": {"live": {"is_write_index": true}}})).await;
+    assert!(st >= 400, "{v}");
+    let (st, _) = es.get("/logs-000003").await;
+    assert_eq!(st, 404);
+    // Atomic swap: writes now land in the new index only.
+    let (st, v) = es.post("/_aliases", json!({"actions": [
+        {"add": {"index": "logs-000001", "alias": "live", "is_write_index": false}},
+        {"add": {"index": "logs-000002", "alias": "live", "is_write_index": true}}]})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.post("/live/_doc?refresh=true", json!({"n": 1})).await;
+    assert_eq!((st, v["_index"].as_str()), (201, Some("logs-000002")), "{v}");
+    // Rollover moves the write index.
+    let (st, v) = es.post0("/live/_rollover").await;
+    assert_eq!((st, v["rolled_over"].as_bool()), (200, Some(true)), "{v}");
+    let (st, v) = es.post("/live/_doc?refresh=true", json!({"n": 2})).await;
+    assert_eq!((st, v["_index"].as_str()), (201, Some("logs-000003")), "{v}");
+}
+
+/// Production review #232: `_reload_search_analyzers` rebuilds the search
+/// analyzers it reports (a synonyms set updated with `refresh=false`
+/// takes effect only then).
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_search_analyzers_rebuilds_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/_synonyms/vs", json!({"synonyms_set": [{"id": "r", "synonyms": "vehicle => car"}]})).await;
+    assert!(st == 200 || st == 201, "{v}");
+    let (st, v) = es.put("/syn", json!({
+        "settings": {"analysis": {"filter": {"f": {"type": "synonym_graph", "synonyms_set": "vs", "updateable": true}},
+            "analyzer": {"s": {"tokenizer": "standard", "filter": ["lowercase", "f"]}}}},
+        "mappings": {"properties": {"t": {"type": "text", "analyzer": "standard", "search_analyzer": "s"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let lines = vec![json!({"index": {"_index": "syn", "_id": "car"}}), json!({"t": "car"}), json!({"index": {"_index": "syn", "_id": "truck"}}), json!({"t": "truck"})];
+    let (st, _) = es.ndjson("/_bulk?refresh=true", &lines).await;
+    assert_eq!(st, 200);
+    let hit = || {
+        let es = &es;
+        async move {
+            let (_, v) = es.post("/syn/_search?request_cache=false", json!({"query": {"match": {"t": "vehicle"}}})).await;
+            v["hits"]["hits"].as_array().map(|a| a.iter().map(|h| h["_id"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>()).unwrap_or_default()
+        }
+    };
+    assert_eq!(hit().await, vec!["car".to_string()]);
+    let (st, v) = es.put("/_synonyms/vs?refresh=false", json!({"synonyms_set": [{"id": "r", "synonyms": "vehicle => truck"}]})).await;
+    assert!(st == 200 || st == 201, "{v}");
+    assert_eq!(hit().await, vec!["car".to_string()], "refresh=false defers the change");
+    let (st, v) = es.post0("/syn/_reload_search_analyzers").await;
+    assert_eq!((st, v["_shards"]["failed"].as_u64()), (200, Some(0)), "{v}");
+    assert_eq!(v["reload_details"][0]["reloaded_analyzers"], json!(["s"]), "{v}");
+    assert_eq!(hit().await, vec!["truck".to_string()], "the reported reload took effect");
+}
+
+/// Production review #230: a stored percolator `query_string` without
+/// fields searches the percolator index's `index.query.default_field`, as
+/// the same query on that index would.
+#[tokio::test(flavor = "multi_thread")]
+async fn percolator_query_string_uses_the_index_default_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/rules", json!({"settings": {"index.query.default_field": ["message"]}, "mappings": {"properties": {"q": {"type": "percolator"}, "message": {"type": "text"}, "tag": {"type": "text"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/rules/_doc/default?refresh=true", json!({"q": {"query_string": {"query": "danger"}}})).await;
+    assert_eq!(st, 201, "{v}");
+    let (st, v) = es.put("/rules/_doc/tagged?refresh=true", json!({"q": {"query_string": {"query": "danger", "fields": ["tag"]}}})).await;
+    assert_eq!(st, 201, "{v}");
+    let matched = |doc: Value| {
+        let es = &es;
+        async move {
+            let (st, v) = es.post("/rules/_search", json!({"query": {"percolate": {"field": "q", "document": doc}}})).await;
+            assert_eq!(st, 200, "{v}");
+            let mut ids: Vec<String> = v["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect();
+            ids.sort();
+            ids
+        }
+    };
+    assert_eq!(matched(json!({"message": "safe", "tag": "danger"})).await, vec!["tagged".to_string()]);
+    assert_eq!(matched(json!({"message": "danger", "tag": "safe"})).await, vec!["default".to_string()]);
+}
+
+/// Production review #367: a component template still composed into an
+/// index template, and an index template that is the only one a live data
+/// stream matches, cannot be deleted (ES); optional components can; and a
+/// create never silently drops a missing required component.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_templates_cannot_be_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, v) = es.put("/_component_template/req", json!({"template": {"mappings": {"properties": {"amount": {"type": "long"}}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/_component_template/opt", json!({"template": {"settings": {"index.number_of_replicas": 0}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/_index_template/ev", json!({"index_patterns": ["ev-*"], "data_stream": {}, "priority": 10, "composed_of": ["req", "opt"], "ignore_missing_component_templates": ["opt"]})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.req(Method::PUT, "/_data_stream/ev-1", None).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.delete("/_component_template/req").await;
+    assert_eq!((st, v["error"]["type"].as_str()), (400, Some("illegal_argument_exception")), "{v}");
+    assert!(v["error"]["reason"].as_str().unwrap().contains("component templates [req] cannot be removed as they are still in use by index templates [ev]"), "{v}");
+    let (st, _) = es.get("/_component_template/req").await;
+    assert_eq!(st, 200, "kept");
+    let (st, v) = es.delete("/_component_template/opt").await;
+    assert_eq!(st, 200, "an optional component can go: {v}");
+    let (st, v) = es.delete("/_index_template/ev").await;
+    assert_eq!(st, 400, "{v}");
+    assert!(v["error"]["reason"].as_str().unwrap().contains("unable to remove composable templates [ev] as they are in use by a data streams [ev-1]"), "{v}");
+    // Rollover keeps the required mapping.
+    let (st, v) = es.post0("/ev-1/_rollover").await;
+    assert_eq!(st, 200, "{v}");
+    let (_, v) = es.get("/ev-1/_mapping").await;
+    assert!(v.as_object().unwrap().values().all(|m| m["mappings"]["properties"]["amount"]["type"] == json!("long")), "{v}");
+    // Once the stream is gone, both can be deleted.
+    let (st, v) = es.delete("/_data_stream/ev-1").await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.delete("/_index_template/ev").await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.delete("/_component_template/req").await;
+    assert_eq!(st, 200, "{v}");
+}
+
+/// Production review #429: `if_seq_no` / `if_primary_term` in an update
+/// body are conditions (ES `UpdateRequest` body fields): a stale one
+/// conflicts and leaves the newer revision; a current one applies; URL
+/// conditions still work.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_body_concurrency_conditions_are_enforced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (es, _node) = start(tmp.path()).await;
+    let (st, a) = es.put("/u/_doc/1?refresh=true", json!({"f": "a", "g": 1})).await;
+    assert_eq!(st, 201, "{a}");
+    let (st, b) = es.post("/u/_update/1", json!({"doc": {"g": 2}})).await;
+    assert_eq!(st, 200, "{b}");
+    let stale = json!({"doc": {"f": "stale"}, "if_seq_no": a["_seq_no"], "if_primary_term": a["_primary_term"]});
+    let (st, v) = es.post("/u/_update/1", stale).await;
+    assert_eq!((st, v["error"]["type"].as_str()), (409, Some("version_conflict_engine_exception")), "{v}");
+    let (_, doc) = es.get("/u/_doc/1").await;
+    assert_eq!(doc["_source"], json!({"f": "a", "g": 2}), "revision B unchanged");
+    let current = json!({"doc": {"f": "c"}, "if_seq_no": b["_seq_no"], "if_primary_term": b["_primary_term"]});
+    let (st, v) = es.post("/u/_update/1", current).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.post(&format!("/u/_update/1?if_seq_no={}&if_primary_term={}", b["_seq_no"], b["_primary_term"]), json!({"doc": {"f": "d"}})).await;
+    assert_eq!(st, 409, "URL conditions still checked: {v}");
+}

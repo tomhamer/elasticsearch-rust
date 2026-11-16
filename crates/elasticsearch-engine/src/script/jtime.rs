@@ -1097,6 +1097,62 @@ fn time_with(nod: i64, f: F, v: i64) -> SResult<i64> {
     })
 }
 /// `LocalTime.plusNanos` (wraps around midnight).
+/// Deepest optional-section nesting a formatter pattern may have.
+const MAX_OPTIONAL_DEPTH: usize = 128;
+
+/// The CLDR pattern of a localized `FormatStyle` (0 FULL .. 3 SHORT) for
+/// `locale` (the JDK's default CLDR provider): English (US) unless the
+/// locale is British English, German or French.
+fn localized_pattern(date: Option<u8>, time: Option<u8>, locale: &Locale) -> String {
+    #[derive(PartialEq)]
+    enum L { Us, Gb, De, Fr }
+    let l = match (locale.lang.as_str(), locale.country.as_str()) {
+        ("en", "GB") => L::Gb,
+        ("de", _) => L::De,
+        ("fr", _) => L::Fr,
+        _ => L::Us,
+    };
+    let dp = date.map(|s| match (&l, s) {
+        (L::Us, 0) => "EEEE, MMMM d, y",
+        (L::Us, 1) => "MMMM d, y",
+        (L::Us, 2) => "MMM d, y",
+        (L::Us, _) => "M/d/yy",
+        (L::Gb | L::Fr, 0) => "EEEE d MMMM y",
+        (L::Gb | L::Fr, 1) => "d MMMM y",
+        (L::Gb | L::Fr, 2) => "d MMM y",
+        (L::Gb | L::Fr, _) => "dd/MM/y",
+        (L::De, 0) => "EEEE, d. MMMM y",
+        (L::De, 1) => "d. MMMM y",
+        (L::De, 2) => "dd.MM.y",
+        (L::De, _) => "dd.MM.yy",
+    });
+    let tp = time.map(|s| match (&l, s) {
+        (L::Us, 0) => "h:mm:ss\u{202f}a zzzz",
+        (L::Us, 1) => "h:mm:ss\u{202f}a z",
+        (L::Us, 2) => "h:mm:ss\u{202f}a",
+        (L::Us, _) => "h:mm\u{202f}a",
+        (_, 0) => "HH:mm:ss zzzz",
+        (_, 1) => "HH:mm:ss z",
+        (_, 2) => "HH:mm:ss",
+        (_, _) => "HH:mm",
+    });
+    match (dp, tp) {
+        (Some(d), Some(t)) => {
+            let long = matches!(date, Some(0) | Some(1));
+            match l {
+                L::Us | L::Gb if long => format!("{d} 'at' {t}"),
+                L::De if long => format!("{d} 'um' {t}"),
+                L::Fr if long => format!("{d} 'à' {t}"),
+                L::Fr if date == Some(3) => format!("{d} {t}"),
+                _ => format!("{d}, {t}"),
+            }
+        }
+        (Some(d), None) => d.to_string(),
+        (None, Some(t)) => t.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
 fn time_plus(nod: i64, nanos: i128) -> i64 {
     ((nod as i128 + nanos).rem_euclid(NPD as i128)) as i64
 }
@@ -3178,18 +3234,23 @@ const FR_MONTHS: [&str; 12] = ["janvier", "février", "mars", "avril", "mai", "j
 const FR_MONTHS_S: [&str; 12] = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
 const FR_DAYS: [&str; 7] = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
 const FR_DAYS_S: [&str; 7] = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."];
-const DE_MONTHS: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
-const DE_MONTHS_S: [&str; 12] = ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."];
-const DE_DAYS: [&str; 7] = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"];
-const DE_DAYS_S: [&str; 7] = ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."];
-const ES_MONTHS: [&str; 12] = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
-const ES_MONTHS_S: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"];
-const ES_DAYS: [&str; 7] = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"];
-const ES_DAYS_S: [&str; 7] = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"];
-const IT_MONTHS: [&str; 12] = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
-const IT_MONTHS_S: [&str; 12] = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"];
-const IT_DAYS: [&str; 7] = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"];
-const IT_DAYS_S: [&str; 7] = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"];
+pub(crate) const DE_MONTHS: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
+pub(crate) const DE_MONTHS_S: [&str; 12] = ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."];
+pub(crate) const DE_DAYS: [&str; 7] = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"];
+pub(crate) const DE_DAYS_S: [&str; 7] = ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."];
+pub(crate) const ES_MONTHS: [&str; 12] = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+pub(crate) const ES_MONTHS_S: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"];
+pub(crate) const ES_DAYS: [&str; 7] = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"];
+pub(crate) const ES_DAYS_S: [&str; 7] = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"];
+pub(crate) const IT_MONTHS: [&str; 12] = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+pub(crate) const IT_MONTHS_S: [&str; 12] = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"];
+pub(crate) const IT_DAYS: [&str; 7] = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"];
+pub(crate) const IT_DAYS_S: [&str; 7] = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"];
+
+/// The localized name tables, shared with mapped date formats.
+pub(crate) mod names {
+    pub(crate) use super::{DE_DAYS, DE_DAYS_S, DE_MONTHS, DE_MONTHS_S, ES_DAYS, ES_DAYS_S, ES_MONTHS, ES_MONTHS_S, IT_DAYS, IT_DAYS_S, IT_MONTHS, IT_MONTHS_S};
+}
 
 /// Style: 0 FULL, 1 FULL_STANDALONE, 2 SHORT, 3 SHORT_STANDALONE, 4 NARROW, 5 NARROW_STANDALONE.
 fn month_name(m: u8, style: u8, locale: &Locale) -> String {
@@ -3703,6 +3764,13 @@ impl Fmt {
                     }
                 }
                 '[' => {
+                    // Optional sections nest in the formatter tree, which
+                    // formatting, parsing and sizing walk recursively: bound
+                    // the nesting before building it (a pattern is data, not
+                    // script grammar, so no parser nesting check sees it).
+                    if stack.len() > MAX_OPTIONAL_DEPTH {
+                        return Err(illegal_arg(format!("Pattern nests optional sections deeper than {MAX_OPTIONAL_DEPTH}")));
+                    }
                     stack.push(Builder { els: Vec::new(), active: None });
                     i += 1;
                 }
@@ -3731,38 +3799,25 @@ impl Fmt {
         Ok(f)
     }
 
-    /// Localized `FormatStyle` formatter (English CLDR patterns).
+    /// Localized `FormatStyle` formatter (Java `ofLocalizedDate/Time/DateTime`):
+    /// the pattern of the formatter's locale, resolved again whenever the
+    /// locale changes ([`Self::with_locale`]), as Java selects it lazily.
     fn localized(date: Option<u8>, time: Option<u8>) -> SResult<Fmt> {
-        let dp = date.map(|s| match s {
-            0 => "EEEE, MMMM d, y",
-            1 => "MMMM d, y",
-            2 => "MMM d, y",
-            _ => "M/d/yy",
-        });
-        let tp = time.map(|s| match s {
-            0 => "h:mm:ss\u{202f}a zzzz",
-            1 => "h:mm:ss\u{202f}a z",
-            2 => "h:mm:ss\u{202f}a",
-            _ => "h:mm\u{202f}a",
-        });
-        let pat = match (dp, tp) {
-            (Some(d), Some(t)) => {
-                if matches!(date, Some(0) | Some(1)) {
-                    format!("{d} 'at' {t}")
-                } else {
-                    format!("{d}, {t}")
-                }
-            }
-            (Some(d), None) => d.to_string(),
-            (None, Some(t)) => t.to_string(),
-            (None, None) => String::new(),
-        };
-        let inner = Fmt::of_pattern(&pat, Locale::en())?;
+        let locale = Locale::en();
+        let inner = Fmt::of_pattern(&localized_pattern(date, time, &locale), locale)?;
         Ok(Fmt::new(vec![El::Localized(date, time, inner.els)]))
     }
 
     fn with_locale(&self, l: Locale) -> Fmt {
-        Fmt { els: self.els.clone(), locale: l, zone: self.zone.clone(), resolver: self.resolver }
+        // Localized styles take the new locale's field order and clock.
+        let els = self.els.iter().map(|e| match e {
+            El::Localized(d, t, inner) => match Fmt::of_pattern(&localized_pattern(*d, *t, &l), l.clone()) {
+                Ok(f) => El::Localized(*d, *t, f.els),
+                Err(_) => El::Localized(*d, *t, inner.clone()),
+            },
+            other => other.clone(),
+        }).collect();
+        Fmt { els, locale: l, zone: self.zone.clone(), resolver: self.resolver }
     }
     fn with_zone(&self, z: Option<Zone>) -> Fmt {
         Fmt { els: self.els.clone(), locale: self.locale.clone(), zone: z, resolver: self.resolver }
@@ -5386,7 +5441,9 @@ impl T {
             }
             T::OT(n, o) => {
                 let (en, eo) = conv_otime(end)?;
-                let en = time_plus(en, (*o as i64 - eo as i64) as i128 * NPS as i128);
+                // Java `OffsetTime.until`: the difference of the two
+                // UTC-relative nanos, never wrapped into a day.
+                let en = en + (*o as i64 - eo as i64) * NPS;
                 let d = en - n;
                 Ok(match unit {
                     U_NANOS => d,

@@ -44,6 +44,31 @@ impl CleanupResult {
     }
 }
 
+/// Marks a snapshot as a clone source while it lives.
+struct CloneSourcePin<'a> {
+    repo: &'a Repository,
+    name: String,
+}
+
+impl<'a> CloneSourcePin<'a> {
+    fn new(repo: &'a Repository, name: &str) -> Self {
+        *repo.clone_sources.lock().entry(name.to_string()).or_default() += 1;
+        Self { repo, name: name.to_string() }
+    }
+}
+
+impl Drop for CloneSourcePin<'_> {
+    fn drop(&mut self) {
+        let mut s = self.repo.clone_sources.lock();
+        if let Some(c) = s.get_mut(&self.name) {
+            *c -= 1;
+            if *c == 0 {
+                s.remove(&self.name);
+            }
+        }
+    }
+}
+
 /// Metadata identifier: content hash, so identical metadata is stored once.
 fn metadata_identifier(index_id: &str, metadata: &Value) -> String {
     let bytes = serde_json::to_vec(metadata).unwrap_or_default();
@@ -62,6 +87,13 @@ impl Repository {
 
     pub(crate) fn register_in_progress(&self, name: &str, uuid: &str) -> Result<()> {
         let mut ip = self.in_progress.lock();
+        if *self.cleanup_running.lock() {
+            return Err(SnapshotError::concurrent_snapshot_execution(
+                self.name(),
+                name,
+                format!("cannot snapshot while a repository cleanup is in-progress in [{}]", self.name()),
+            ));
+        }
         if ip.contains_key(name) {
             return Err(SnapshotError::invalid_snapshot_name(
                 self.name(),
@@ -166,6 +198,18 @@ impl Repository {
                 return Err(SnapshotError::snapshot_missing(self.name(), u));
             }
         }
+        // Clones register their source under the finalize lock, so a clone
+        // either sees this delete's result or blocks it here.
+        {
+            let sources = self.clone_sources.lock();
+            if let Some(s) = data.snapshots.iter().find(|s| uuids.contains(&s.uuid) && sources.contains_key(&s.name)) {
+                return Err(SnapshotError::concurrent_snapshot_execution(
+                    self.name(),
+                    &s.name,
+                    "cannot delete snapshot while it is being cloned",
+                ));
+            }
+        }
         let deleted_names: BTreeSet<String> =
             data.snapshots.iter().filter(|s| uuids.contains(&s.uuid)).map(|s| s.name.clone()).collect();
         let (mut new_data, removed_indices) = data.without_snapshots(uuids);
@@ -184,6 +228,7 @@ impl Repository {
         }
         let mut shard_cleanups = Vec::new();
         let mut guards = Vec::new();
+        let mut staged_gens = Vec::new();
         for (name, entry) in new_data.indices.iter_mut() {
             let old = &data.indices[name];
             if !old.snapshots.iter().any(|u| uuids.contains(u)) {
@@ -212,7 +257,11 @@ impl Repository {
                 let new_gen = random_base64_uuid();
                 self.write_meta(&self.shard_container(&entry.id, shard), &format!("{INDEX_FILE_PREFIX}{new_gen}"), &idx, true)
                     .await?;
-                self.pending_shard_gens.lock().insert((entry.id.clone(), shard), new_gen.clone());
+                // Not current until the root index-N commits (below): a
+                // failed publication leaves the committed generation, still
+                // listing the snapshots this delete did not remove, current
+                // for the next snapshot (production review #133).
+                staged_gens.push(((entry.id.clone(), shard), new_gen.clone()));
                 entry.shard_generations[shard as usize] = Some(new_gen);
                 let mut blobs: Vec<String> = before.difference(&after).cloned().collect();
                 for (_, u) in &removed_entries {
@@ -228,6 +277,9 @@ impl Repository {
             }
         }
         new_data.generation = self.write_repository_data(&new_data, data.generation).await?;
+        // Committed: the pruned generations are current, published before
+        // the shard locks are released.
+        self.pending_shard_gens.lock().extend(staged_gens);
         drop(guards);
 
         // Unreferenced blobs are only removed after the new index-N is durable.
@@ -299,7 +351,25 @@ impl Repository {
     pub async fn clone_snapshot(&self, source_name: &str, target_name: &str, indices: &[String]) -> Result<SnapshotInfo> {
         self.ensure_writable("clone snapshot")?;
         crate::repository::settings::validate_snapshot_name(self.name(), target_name)?;
-        let data = self.repository_data().await?;
+        // Registered first: a running cleanup rejects the clone here
+        // instead of the clone waiting behind it.
+        let target_uuid = random_base64_uuid();
+        self.register_in_progress(target_name, &target_uuid)?;
+        let result = self.clone_registered(source_name, target_name, &target_uuid, indices).await;
+        self.unregister_in_progress(target_name);
+        result
+    }
+
+    async fn clone_registered(&self, source_name: &str, target_name: &str, target_uuid: &str, indices: &[String]) -> Result<SnapshotInfo> {
+        // Pin the source against deletion before reading the catalog, under
+        // the finalize lock: a delete holds that lock throughout, so this
+        // clone sees either the source deleted or a source no delete can
+        // remove until the clone has finished.
+        let (_pin, data) = {
+            let _g = self.finalize_lock.lock().await;
+            let pin = CloneSourcePin::new(self, source_name);
+            (pin, self.repository_data().await?)
+        };
         let src = data
             .snapshot_by_name(source_name)
             .ok_or_else(|| SnapshotError::snapshot_missing(self.name(), source_name))?
@@ -316,14 +386,15 @@ impl Repository {
         if selected.is_empty() {
             return Err(SnapshotError::illegal_argument(format!(
                 "No indices in the source snapshot [{}] matched requested pattern [{}]",
-format!("{}/{}", source_name, src.uuid),
+                format!("{}/{}", source_name, src.uuid),
                 indices.join(", ")
             )));
         }
-        let target_uuid = random_base64_uuid();
-        self.register_in_progress(target_name, &target_uuid)?;
-        let result = self.clone_inner(&data, &src, &src_info, target_name, &target_uuid, &selected).await;
-        self.unregister_in_progress(target_name);
+        // The index directories the clone references stay through finalization.
+        let ids: Vec<String> = selected.iter().filter_map(|n| data.indices.get(n).map(|e| e.id.clone())).collect();
+        self.acquire_index_ids(&ids);
+        let result = self.clone_inner(&data, &src, &src_info, target_name, target_uuid, &selected).await;
+        self.release_index_ids(&ids);
         result
     }
 
@@ -337,6 +408,23 @@ format!("{}/{}", source_name, src.uuid),
         selected: &[String],
     ) -> Result<SnapshotInfo> {
         let start = crate::util::now_millis();
+        // A clone advertising data streams must carry their definitions:
+        // without them the clone restores none of its streams. A failed
+        // read fails the clone before it writes anything, never becomes an
+        // empty metadata blob under SUCCESS (production review #134).
+        let required_global = if src_info.data_streams.is_empty() {
+            None
+        } else {
+            let g = self.read_global_metadata(&src.uuid).await.map_err(|e| {
+                SnapshotError::snapshot(self.name(), target_name, format!("failed to read the metadata of source snapshot [{}]: {}", src.name, e.reason))
+            })?;
+            for ds in &src_info.data_streams {
+                if !g["customs"][crate::restore::DATA_STREAMS_CUSTOM][ds.as_str()].is_object() {
+                    return Err(SnapshotError::snapshot(self.name(), target_name, format!("data stream [{ds}] is not described by the metadata of source snapshot [{}]", src.name)));
+                }
+            }
+            Some(g)
+        };
         let mut finalize_indices = Vec::new();
         let mut obsolete = Vec::new();
         let mut total_shards = 0;
@@ -396,7 +484,13 @@ format!("{}/{}", source_name, src.uuid),
             );
             finalize_indices.push(FinalizeIndex { name: name.clone(), index_id: ie.id.clone(), metadata, shard_count });
         }
-        let global = self.read_global_metadata(&src.uuid).await.ok();
+        // Without data streams the clone never restores global state
+        // (`include_global_state: false`): its metadata is best effort.
+        let global = match required_global {
+            Some(g) => Some(g),
+            None => self.read_global_metadata(&src.uuid).await.ok(),
+        };
+        self.test_hook("clone_metadata_read").await;
         let end = crate::util::now_millis();
         let info = SnapshotInfo {
             repository: self.name().to_string(),
@@ -433,12 +527,27 @@ format!("{}/{}", source_name, src.uuid),
     pub async fn cleanup(&self) -> Result<CleanupResult> {
         self.ensure_writable("clean up")?;
         let _g = self.finalize_lock.lock().await;
-        if !self.in_progress.lock().is_empty() {
-            return Err(SnapshotError::illegal_state(format!(
-                "Cannot cleanup [{}] - a snapshot is currently running",
-                self.name()
-            )));
+        // Admission: no snapshot or clone is running, and none can register
+        // until this cleanup finishes (checked and set under one lock).
+        {
+            let ip = self.in_progress.lock();
+            let mut running = self.cleanup_running.lock();
+            if !ip.is_empty() || *running {
+                return Err(SnapshotError::illegal_state(format!(
+                    "Cannot cleanup [{}] - a snapshot is currently running",
+                    self.name()
+                )));
+            }
+            *running = true;
         }
+        struct Admitted<'a>(&'a Repository);
+        impl Drop for Admitted<'_> {
+            fn drop(&mut self) {
+                *self.0.cleanup_running.lock() = false;
+            }
+        }
+        let _admitted = Admitted(self);
+        self.test_hook("cleanup_admitted").await;
         let data = self.repository_data().await?;
         let mut res = DeleteResult::default();
         let uuids: BTreeSet<&str> = data.snapshots.iter().map(|s| s.uuid.as_str()).collect();
@@ -474,7 +583,12 @@ format!("{}/{}", source_name, src.uuid),
         let live_ids: BTreeMap<&str, (&String, &super::IndexEntry)> =
             data.indices.iter().map(|(n, e)| (e.id.as_str(), (n, e))).collect();
         let live_blobs: BTreeSet<&String> = data.index_metadata_identifiers.values().collect();
+        // Never remove what a running operation pins or has reserved.
+        let pinned: BTreeSet<String> = self.active_index_ids.lock().keys().cloned().collect();
         for id in indices_c.children().await? {
+            if pinned.contains(&id) {
+                continue;
+            }
             let Some((_, entry)) = live_ids.get(id.as_str()) else {
                 res.add(indices_c.child(&id).delete().await?);
                 continue;

@@ -5,6 +5,7 @@ use crate::{blocking, method_not_allowed, not_found_handler, Req, Resp, R};
 use axum::http::Method;
 use elasticsearch_engine::error::EsError;
 use elasticsearch_engine::node::Node;
+use elasticsearch_engine::security::owner::StoredAuthn;
 use elasticsearch_engine::watcher::api::{self, PutParams};
 use elasticsearch_engine::watcher::model;
 use serde_json::{json, Value};
@@ -30,12 +31,13 @@ fn with_warnings(mut r: Resp, warnings: Vec<String>) -> Resp {
     r
 }
 
-/// The effective user of the request (security on), as watcher records it.
-fn caller(node: &Node, req: &Req) -> Option<String> {
+/// The authenticated subject of the request (security on), as watcher
+/// stores it with a watch and runs executions as it.
+fn caller(node: &Node, req: &Req) -> Option<StoredAuthn> {
     if !node.security.enabled() {
         return None;
     }
-    req.access.as_ref().map(|a| a.user().effective().username.clone())
+    req.access.as_ref().map(|a| StoredAuthn::of(a.user()))
 }
 
 fn body_or_empty(req: &Req) -> Result<Value, EsError> {
@@ -47,8 +49,12 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
     if !elasticsearch_engine::watcher::watcher_enabled(&node) {
         return not_found_handler(&req);
     }
-    // On a cluster, watches read and write indices through the coordinator.
-    elasticsearch_engine::watcher::set_remote(req.extensions.get::<crate::ClusterRest>().map(|r| -> elasticsearch_engine::watcher::RestCall { r.0.clone() }));
+    // On a cluster, watches read and write indices through the coordinator,
+    // each call as the identity it names (never this request's credentials).
+    elasticsearch_engine::watcher::set_rest_factory(req.extensions.get::<crate::ClusterRestAs>().map(|f| -> elasticsearch_engine::watcher::RestFactory {
+        let f = f.0.clone();
+        Arc::new(move |identity: Option<&StoredAuthn>| f(identity).map(|r| -> elasticsearch_engine::watcher::RestCall { r.0 }))
+    }));
     let b = req.seg(1).to_string();
     let c = req.seg(2).to_string();
     let d = req.seg(3).to_string();
@@ -93,7 +99,7 @@ pub async fn handle(node: Arc<Node>, req: Req) -> R {
                             version: num(&req, "version")?,
                             if_seq_no: num(&req, "if_seq_no")?,
                             if_primary_term: num(&req, "if_primary_term")?.map(|x| x as u64),
-                            user: caller(&node, &req),
+                            identity: caller(&node, &req),
                         };
                         blocking(move || {
                             let body = req.json()?;

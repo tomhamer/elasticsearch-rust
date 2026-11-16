@@ -6,6 +6,7 @@
 
 use crate::crd::{ElasticsearchSpec, NodeSet};
 use crate::names;
+use crate::security;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -113,7 +114,7 @@ pub fn node_set_roles(ns: &NodeSet) -> NodeSetRoles {
 
 /// Validate the spec before touching any object. Returns human-readable errors.
 pub fn validate(cluster: &str, spec: &ElasticsearchSpec) -> Vec<String> {
-    let mut errs = Vec::new();
+    let mut errs = security::validate(spec);
     if spec.version.trim().is_empty() {
         errs.push("spec.version must be set".into());
     }
@@ -202,7 +203,7 @@ pub fn render(cluster: &str, namespace: &str, ns: &NodeSet, initial_masters: Opt
     let mut out = FlatSettings::new();
     let mut ignored = Vec::new();
     for (k, v) in user {
-        if MANAGED_SETTINGS.contains(&k.as_str()) {
+        if MANAGED_SETTINGS.contains(&k.as_str()) || security::MANAGED_SECURITY_SETTINGS.contains(&k.as_str()) {
             ignored.push(k);
         } else {
             out.insert(k, v);
@@ -220,6 +221,11 @@ pub fn render(cluster: &str, namespace: &str, ns: &NodeSet, initial_masters: Opt
     // The cluster-wide transport service is headless with
     // publishNotReadyAddresses: its name resolves to every pod's IP.
     out.insert("discovery.seed_hosts".into(), Value::Array(vec![s(&format!("{}.{namespace}.svc", names::transport_service(cluster)))]));
+    // Security is always on: authentication, HTTPS and transport TLS with
+    // the certificates the operator mounts (see `security`).
+    for (k, v) in security::security_settings() {
+        out.insert(k.into(), v);
+    }
 
     let hash = {
         let yaml = serde_yaml::to_string(&out).map_err(|e| e.to_string())?;
@@ -228,14 +234,6 @@ pub fn render(cluster: &str, namespace: &str, ns: &NodeSet, initial_masters: Opt
     };
     if let Some(m) = initial_masters {
         out.insert(INITIAL_MASTER_NODES.into(), Value::Array(m.iter().map(|x| s(x)).collect()));
-    }
-    // The node binary defaults `xpack.security.enabled` to true (ES 8+), but
-    // the operator's probes and client speak plain HTTP without credentials
-    // and it provisions no transport certificates: keep security off unless
-    // the nodeSet config sets it. (Outside the hash: an operator upgrade
-    // alone does not roll existing clusters.)
-    if !out.contains_key("xpack.security.enabled") {
-        out.insert("xpack.security.enabled".into(), s("false"));
     }
     let header = "# Managed by elasticsearch-operator; edit spec.nodeSets[].config instead.\n";
     let yaml = format!("{header}{}", serde_yaml::to_string(&out).map_err(|e| e.to_string())?);
@@ -290,6 +288,19 @@ mod tests {
         assert_eq!(parsed["node.name"], json!("${POD_NAME}"));
         assert_eq!(parsed["discovery.seed_hosts"], json!(["prod-es-transport.ns1.svc"]));
         assert_eq!(parsed["node.roles"], json!(["data"]));
+        // security is on, with the mounted certificates
+        assert_eq!(parsed["xpack.security.enabled"], json!("true"));
+        assert_eq!(parsed["xpack.security.http.ssl.enabled"], json!("true"));
+        assert_eq!(parsed["xpack.security.http.ssl.certificate"], json!("/usr/share/elasticsearch/certs/http/tls.crt"));
+        assert_eq!(parsed["xpack.security.transport.ssl.enabled"], json!("true"));
+        assert_eq!(parsed["xpack.security.transport.ssl.verification_mode"], json!("certificate"));
+        assert_eq!(parsed["xpack.security.transport.ssl.certificate_authorities"], json!(["/usr/share/elasticsearch/certs/transport/ca.crt"]));
+        // ... and cannot be switched off from nodeSets[].config
+        let off = render("prod", "ns1", &ns("data", 2, json!({"xpack.security.enabled": false, "xpack": {"security": {"http": {"ssl": {"enabled": false}}}}})), None).unwrap();
+        let parsed: BTreeMap<String, Value> = serde_yaml::from_str(&off.yaml).unwrap();
+        assert_eq!(parsed["xpack.security.enabled"], json!("true"));
+        assert_eq!(parsed["xpack.security.http.ssl.enabled"], json!("true"));
+        assert_eq!(off.ignored, vec!["xpack.security.enabled".to_string(), "xpack.security.http.ssl.enabled".to_string()]);
         // a user config change changes the hash
         let changed = render("prod", "ns1", &ns("data", 2, json!({"node.roles": ["data", "ingest"]})), None).unwrap();
         assert_ne!(changed.hash, after.hash);

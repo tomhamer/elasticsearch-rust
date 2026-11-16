@@ -69,6 +69,7 @@ fn ensure_registered(node: &Arc<ClusterNode>) {
                 continue;
             }
             ops::resume_orphans(&node).await;
+            crate::resize::tick(&node).await;
             slm::tick(&node).await;
         }
     });

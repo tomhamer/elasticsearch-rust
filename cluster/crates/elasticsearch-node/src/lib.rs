@@ -33,10 +33,14 @@ pub mod security_autoconfig;
 pub mod settings_validation;
 pub mod stats_shards;
 pub mod reindex_multi;
+pub mod bulk_by_scroll_ack;
 pub mod rest;
+pub mod remote_cluster;
+pub mod ccr;
 pub mod shard_engines;
 pub mod shards;
 pub mod store_records;
+pub mod transforms;
 mod control_memory;
 pub mod snapshot_api;
 pub mod stateless;
@@ -86,10 +90,8 @@ pub async fn run(config: config::NodeConfig) -> Result<(), Box<dyn std::error::E
     );
     if portsfile_enabled(&node.config.settings)? {
         let http_bound = http.local_addr()?;
-        let transport_port = node.local.transport_address.parse::<std::net::SocketAddr>()
-            .map(|a| a.port())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("transport address [{}]: {e}", node.local.transport_address)))?;
-        let transport_bound = std::net::SocketAddr::new(node.config.transport_bind, transport_port);
+        // The bound ports (the published ones may be mapped elsewhere).
+        let transport_bound = node.transport.bound_address();
         write_ports_file(&node.config.logs_path, "transport", transport_bound)?;
         write_ports_file(&node.config.logs_path, "http", http_bound)?;
     }
@@ -141,4 +143,6 @@ fn write_ports_file(dir: &std::path::Path, kind: &str, addr: std::net::SocketAdd
 }
 
 pub mod shared_sequence;
+pub mod watcher_sched;
+pub mod geoip_sched;
 mod telemetry_owned;

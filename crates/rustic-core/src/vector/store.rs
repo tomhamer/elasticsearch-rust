@@ -1125,8 +1125,9 @@ pub struct MutablePressure {
 /// One field's checkpoint at its capture point.
 #[cfg(feature = "mutable-hnsw-poc")]
 pub(crate) enum PendingFieldCheckpoint {
-    /// Field id, construction threads, the pending capture.
-    Capture(u16, usize, super::hnsw::PendingMutableCheckpoint),
+    /// Field id, construction threads, the pending capture, and the durable
+    /// chain it may extend incrementally (its entry and mutation generation).
+    Capture(u16, usize, super::hnsw::PendingMutableCheckpoint, Option<(MutableFieldManifest, u64)>),
     /// Unchanged since the last commit: its entry and mutation generation.
     Unchanged(MutableFieldManifest, u64),
 }
@@ -1135,7 +1136,7 @@ pub(crate) enum PendingFieldCheckpoint {
 #[cfg(feature = "mutable-hnsw-poc")]
 pub(crate) fn finish_mutable_checkpoint(pending: Vec<PendingFieldCheckpoint>) -> Result<Vec<CapturedFieldCheckpoint>> {
     pending.into_iter().map(|pending| Ok(match pending {
-        PendingFieldCheckpoint::Capture(field, threads, capture) => CapturedFieldCheckpoint::Captured(field, threads, capture.finish()?),
+        PendingFieldCheckpoint::Capture(field, threads, capture, chain) => CapturedFieldCheckpoint::Captured(field, threads, capture.finish()?, chain),
         PendingFieldCheckpoint::Unchanged(entry, generation) => CapturedFieldCheckpoint::Unchanged(entry, generation),
     })).collect()
 }
@@ -1144,8 +1145,9 @@ pub(crate) fn finish_mutable_checkpoint(pending: Vec<PendingFieldCheckpoint>) ->
 /// construction threads, the owned graph/rows snapshot.
 #[cfg(feature = "mutable-hnsw-poc")]
 pub(crate) enum CapturedFieldCheckpoint {
-    /// Field id, construction threads, the owned graph/rows snapshot.
-    Captured(u16, usize, super::hnsw::MutableVectorCheckpoint),
+    /// Field id, construction threads, the owned graph/rows snapshot, the
+    /// durable chain it may extend.
+    Captured(u16, usize, super::hnsw::MutableVectorCheckpoint, Option<(MutableFieldManifest, u64)>),
     /// Unchanged since the last commit: its entry and mutation generation.
     Unchanged(MutableFieldManifest, u64),
 }
@@ -1242,7 +1244,7 @@ pub fn is_code_log_file(name: &str) -> bool {
 
 /// Durable reference to one shard-field graph/source pair. Present even in
 /// builds without the backend so they can reject unsupported commits explicitly.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MutableFieldManifest {
     pub field: u16,
     pub generation: u64,
@@ -1251,17 +1253,76 @@ pub(crate) struct MutableFieldManifest {
     /// ([`is_code_log_file`]); empty for checkpoints that embed every row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_files: Vec<String>,
+    /// Incremental checkpoints written over the full one since, oldest
+    /// first (their commit generations: `mutable_<g>_<field>.rmvd`, written
+    /// at segment format v39, [`crate::codec::GRAPH_DELTA_SINCE`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deltas: Vec<u64>,
+    /// The full checkpoint may be extended incrementally (written by a
+    /// build that references only full code log chunks from it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chainable: bool,
+    /// Bytes of the full checkpoint, and of the deltas over it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub base_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub delta_bytes: u64,
 }
+fn is_zero(value: &u64) -> bool { *value == 0 }
+
+/// Incremental checkpoints a chain holds at most before a full save (link
+/// logs, written at every save and small, more).
+const MAX_GRAPH_DELTAS: usize = 16;
+const MAX_GRAPH_LINK_LOGS: usize = 256;
+/// A chain's deltas reach at most this fraction of its full checkpoint
+/// before a full save (`RUSTIC_GRAPH_DELTA_RATIO`, 0.5).
+fn graph_delta_ratio() -> f64 {
+    static RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RATIO.get_or_init(|| std::env::var("RUSTIC_GRAPH_DELTA_RATIO").ok().and_then(|v| v.parse().ok()).filter(|r: &f64| r.is_finite() && *r >= 0.0).unwrap_or(0.5))
+}
+
+/// A chain's link logs reach at most this multiple of its full checkpoint
+/// before a full save (`RUSTIC_GRAPH_LINK_LOG_RATIO`, 1.0): a full graph
+/// rewrite about every 30% of growth, and a reopen replays at most a full
+/// checkpoint's worth of edits.
+fn graph_link_log_ratio() -> f64 {
+    static RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RATIO.get_or_init(|| std::env::var("RUSTIC_GRAPH_LINK_LOG_RATIO").ok().and_then(|v| v.parse().ok()).filter(|r: &f64| r.is_finite() && *r >= 0.0).unwrap_or(1.0))
+}
+
 impl MutableFieldManifest {
     pub(crate) fn filename(&self) -> String {
         format!("mutable_{:016x}_{:04x}.rmvc", self.generation, self.field)
     }
-    /// Every file this entry references: the checkpoint and its code files.
+    /// The incremental checkpoint written at commit generation `generation`.
+    pub(crate) fn delta_filename(&self, generation: u64) -> String {
+        format!("mutable_{:016x}_{:04x}.rmvd", generation, self.field)
+    }
+    /// The chain's incremental checkpoints, oldest first.
+    pub(crate) fn delta_files(&self) -> Vec<String> {
+        self.deltas.iter().map(|generation| self.delta_filename(*generation)).collect()
+    }
+    /// The newest file of the chain (the one a commit that wrote this entry
+    /// wrote).
+    pub(crate) fn latest_file(&self) -> String {
+        self.deltas.last().map_or_else(|| self.filename(), |generation| self.delta_filename(*generation))
+    }
+    /// Every file this entry references: the checkpoint, its deltas and its
+    /// code files.
     pub(crate) fn files(&self) -> Vec<String> {
-        let mut files = Vec::with_capacity(1 + self.code_files.len());
+        let mut files = Vec::with_capacity(1 + self.deltas.len() + self.code_files.len());
         files.push(self.filename());
+        files.extend(self.delta_files());
         files.extend(self.code_files.iter().cloned());
         files
+    }
+    /// Whether a capture with `threads` may be saved as a delta over this
+    /// chain (the cluster reads deltas; the chain is not due a full save).
+    fn extendable(&self, threads: usize) -> bool {
+        self.chainable && self.threads == threads
+            && crate::codec::write_version() >= crate::codec::GRAPH_DELTA_SINCE
+            && self.deltas.len() < if crate::codec::write_version() >= crate::codec::GRAPH_LINK_LOG_SINCE { MAX_GRAPH_LINK_LOGS } else { MAX_GRAPH_DELTAS }
+            && (self.delta_bytes as f64) <= if crate::codec::write_version() >= crate::codec::GRAPH_LINK_LOG_SINCE { graph_link_log_ratio() } else { graph_delta_ratio() } * self.base_bytes as f64
     }
 }
 #[cfg(feature = "mutable-hnsw-poc")]
@@ -1279,6 +1340,19 @@ pub(crate) struct MutableCommitState {
     /// similarity, parameters).
     pub rebuilds: Vec<(u16, u32, Similarity, HnswParams)>,
     pub metadata_memory: Option<crate::admission::Reservation>,
+}
+
+/// A retired graph whose last copy into its registered successor failed,
+/// and the points copied so far (`VectorStore::migration_repairs`).
+#[cfg(feature = "mutable-hnsw-poc")]
+type MigrationRepair = (Arc<super::mutable_ingest::MutableIngestField>, std::collections::HashSet<u64>);
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once in `migrate_field` between the preliminary
+    /// catch-up and the retirement's last copy (writes landing there are
+    /// what that copy takes).
+    pub(crate) static BEFORE_RETIRE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A scheduled `index_options` migration ([`VectorStore::request_migration`]).
@@ -1315,6 +1389,12 @@ pub struct VectorStore {
     /// ([`VectorStore::run_migrations`]).
     #[cfg(feature = "mutable-hnsw-poc")]
     migrations: Mutex<BTreeMap<u16, Migration>>,
+    /// Migrations whose new graph is registered but whose last copy from
+    /// the retired graph failed: that graph (it still holds every point it
+    /// admitted) and the points already copied, for the next pass to finish
+    /// the copy from (#294). The migration stays scheduled until it does.
+    #[cfg(feature = "mutable-hnsw-poc")]
+    migration_repairs: Mutex<BTreeMap<u16, MigrationRepair>>,
     #[cfg(feature = "mutable-hnsw-poc")]
     mutable_read_only: bool,
     #[cfg(feature = "mutable-hnsw-poc")]
@@ -1660,9 +1740,13 @@ impl VectorStore {
         let fields: Vec<_> = self.mutable_fields.lock().iter().map(|(&id, owner)| (id, owner.clone())).collect();
         let mut manifest = Vec::with_capacity(fields.len());
         for (field, owner) in fields {
-            let mut entry = MutableFieldManifest { field, generation, threads: owner.construction_threads(), code_files: Vec::new() };
+            let mut entry = MutableFieldManifest { field, generation, threads: owner.construction_threads(), ..Default::default() };
             match owner.write_checkpoint(dir, &entry.filename()) {
-                Ok(code_files) => entry.code_files = code_files,
+                Ok(code_files) => {
+                    entry.code_files = code_files;
+                    entry.chainable = crate::codec::write_version() >= crate::codec::RMVC2_SINCE;
+                    entry.base_bytes = dir.open_read(&entry.filename()).map_or(0, |file| file.len() as u64);
+                }
                 Err(error) => {
                     for prior in &manifest {
                         let prior: &MutableFieldManifest = prior;
@@ -1686,9 +1770,16 @@ impl VectorStore {
         let fields: Vec<_> = self.mutable_fields.lock().iter().map(|(&id, owner)| (id, owner.clone())).collect();
         let mut captured = Vec::with_capacity(fields.len());
         for (field, owner) in fields {
-            captured.push(CapturedFieldCheckpoint::Captured(field, owner.construction_threads(), owner.capture_checkpoint()?));
+            captured.push(CapturedFieldCheckpoint::Captured(field, owner.construction_threads(), owner.capture_checkpoint()?, None));
         }
         Ok(captured)
+    }
+
+    /// The next graph checkpoint of every mutable field is a full one (a
+    /// force merge folds the incremental saves, as ES rewrites its graphs).
+    #[cfg(feature = "mutable-hnsw-poc")]
+    pub(crate) fn request_full_graph_saves(&self) {
+        for field in self.mutable_fields.lock().values() { field.request_full_save(); }
     }
 
     /// Code log files of every registered mutable graph (written or
@@ -1726,7 +1817,11 @@ impl VectorStore {
                     continue;
                 }
             }
-            pending.push(PendingFieldCheckpoint::Capture(field, threads, owner.begin_capture_checkpoint()?));
+            // A chain not due a full save may be extended incrementally
+            // (unless a full one was asked for: force merge).
+            let full = owner.take_full_save_request();
+            let chain = committed.get(&field).filter(|(entry, _)| !full && entry.extendable(threads)).cloned();
+            pending.push(PendingFieldCheckpoint::Capture(field, threads, owner.begin_capture_checkpoint()?, chain));
         }
         Ok(pending)
     }
@@ -1745,18 +1840,47 @@ impl VectorStore {
         let mut manifest: Vec<WrittenField> = Vec::with_capacity(captured.len());
         for capture in captured {
             match capture {
-                CapturedFieldCheckpoint::Captured(field, threads, checkpoint) => {
-                    let mut entry = MutableFieldManifest { field: *field, generation, threads: *threads, code_files: Vec::new() };
-                    match checkpoint.write_file(dir, &entry.filename()) {
+                CapturedFieldCheckpoint::Captured(field, threads, checkpoint, chain) => {
+                    let started = std::time::Instant::now();
+                    // Incremental over the durable chain when it may be
+                    // extended and this capture's changes are relative to it;
+                    // else a full checkpoint, starting a new chain.
+                    let delta = chain.as_ref().filter(|(_, chain_generation)| checkpoint.delta_eligible(*chain_generation));
+                    let (mut entry, name) = match delta {
+                        Some((chain, _)) => { let name = chain.delta_filename(generation); (chain.clone(), name) }
+                        None => {
+                            let entry = MutableFieldManifest { field: *field, generation, threads: *threads, ..Default::default() };
+                            let name = entry.filename();
+                            (entry, name)
+                        }
+                    };
+                    let version = crate::codec::write_version();
+                    tracing::info!(target: "graph_save", field = *field, kind = if delta.is_some() { "delta" } else { "full" }, file = %name, "graph checkpoint writing");
+                    let written = if delta.is_some() { checkpoint.write_delta_file(dir, &name, version) } else { checkpoint.write_file_versioned(dir, &name, version) };
+                    match written {
                         Ok(code_files) => entry.code_files = code_files,
                         Err(error) => {
                             for prior in manifest.iter().filter(|prior| prior.fresh) {
-                                let _ = dir.delete(&prior.entry.filename());
+                                let _ = dir.delete(&prior.entry.latest_file());
                             }
-                            let _ = dir.delete(&entry.filename());
+                            let _ = dir.delete(&name);
                             return Err(error);
                         }
                     }
+                    let bytes = dir.open_read(&name).map_or(0, |file| file.len() as u64);
+                    if delta.is_some() {
+                        entry.deltas.push(generation);
+                        entry.delta_bytes = entry.delta_bytes.saturating_add(bytes);
+                    } else {
+                        // A format 2 checkpoint references only full code log
+                        // chunks: deltas may extend it.
+                        entry.chainable = version >= crate::codec::RMVC2_SINCE;
+                        entry.base_bytes = bytes;
+                    }
+                    let (graph_records, rows) = checkpoint.delta_size();
+                    tracing::info!(target: "graph_save", field = *field, kind = if delta.is_some() { "delta" } else { "full" }, bytes,
+                        chain_deltas = entry.deltas.len(), chain_bytes = entry.base_bytes.saturating_add(entry.delta_bytes),
+                        graph_records, rows, elapsed_ms = started.elapsed().as_millis() as u64, "graph checkpoint written");
                     manifest.push(WrittenField { entry, mutation_generation: Some(checkpoint.mutation_generation()), fresh: true });
                 }
                 CapturedFieldCheckpoint::Unchanged(entry, mutation_generation) => {
@@ -1785,7 +1909,7 @@ impl VectorStore {
             if restored.contains_key(&entry.field) || rebuilds.iter().any(|r: &(_, _, _, _)| r.0 == entry.field) {
                 return Err(crate::error::RusticError::Corrupted("invalid mutable field manifest".into()));
             }
-            match super::mutable_ingest::MutableIngestField::open_checkpoint(self.clone(), entry.field, dir, &entry.filename(), entry.threads)? {
+            match super::mutable_ingest::MutableIngestField::open_checkpoint(self.clone(), entry.field, dir, &entry.filename(), &entry.delta_files(), entry.threads)? {
                 super::mutable_ingest::OpenedCheckpoint::Restored(field) => {
                     // The file is durable (this commit point references it).
                     field.checkpoint_durable(field.mutation_generation());
@@ -1940,6 +2064,17 @@ impl VectorStore {
             self.retire_mutable_field(field);
             return Ok(());
         }
+        // A registered graph whose last copy failed: finish that copy from
+        // the retired graph (and the committed rows) before anything else.
+        let repair = self.migration_repairs.lock().remove(&field);
+        if let (Some((from, mut copied)), Some(current)) = (repair, previous.as_ref()) {
+            let repaired = current.catch_up_from(&from, &mut copied).and_then(|_| current.insert_missing_committed_points());
+            if let Err(error) = repaired {
+                self.migration_repairs.lock().insert(field, (from, copied));
+                return Err(error);
+            }
+            return Ok(());
+        }
         let fresh = super::mutable_ingest::MutableIngestField::new(self.clone(), field, migration.dim, migration.similarity, migration.params)?;
         match previous {
             Some(previous) => {
@@ -1949,15 +2084,29 @@ impl VectorStore {
                 for _ in 0..4 {
                     if fresh.catch_up_from(&previous, &mut copied)? < 1024 { break; }
                 }
+                #[cfg(test)]
+                if let Some(hook) = BEFORE_RETIRE.with(|hook| hook.borrow_mut().take()) { hook(); }
                 // Once retired, `previous` forwards every admission to
                 // `fresh`: it is registered whatever the last copy returned,
                 // and a failed copy is repaired from the committed rows.
                 let retired = previous.retire_into(&fresh, &mut copied);
                 self.mutable_commit.lock().checkpointed.remove(&field);
                 self.mutable_fields.lock().insert(field, fresh.clone());
-                if let Err(error) = retired {
-                    tracing::warn!(field, "vector field migration's last copy failed; repairing from the committed rows: {error}");
-                    fresh.insert_missing_committed_points()?;
+                // A failed last copy is retried from the retired graph,
+                // which still holds every point it admitted (sealed or not;
+                // the committed rows alone miss unsealed ones). Insertion is
+                // backfill: the failed attempt may have issued those keys.
+                let copied_all = retired.or_else(|error| {
+                    tracing::warn!(field, "vector field migration's last copy failed; retrying it from the retired graph: {error}");
+                    fresh.catch_up_from(&previous, &mut copied).map(|_| ())
+                });
+                // The migration completes only once the new graph holds
+                // every point the retired one did and every committed point.
+                // Otherwise it stays scheduled, with the retired graph kept
+                // for the next pass to finish the copy from.
+                if let Err(error) = copied_all.and_then(|()| fresh.insert_missing_committed_points().map(|_| ())) {
+                    self.migration_repairs.lock().insert(field, (previous, copied));
+                    return Err(error);
                 }
             }
             None => {
@@ -1990,6 +2139,7 @@ impl VectorStore {
     /// next commit's manifest no longer lists a checkpoint for it.
     #[cfg(feature = "mutable-hnsw-poc")]
     pub(crate) fn retire_mutable_field(&self, field: u16) {
+        self.migration_repairs.lock().remove(&field);
         self.mutable_commit.lock().checkpointed.remove(&field);
         self.mutable_fields.lock().remove(&field);
     }
@@ -2062,6 +2212,8 @@ impl VectorStore {
             #[cfg(feature = "mutable-hnsw-poc")]
             migrations: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "mutable-hnsw-poc")]
+            migration_repairs: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "mutable-hnsw-poc")]
             mutable_commit: Mutex::new(MutableCommitState::default()),
             #[cfg(feature = "mutable-hnsw-poc")]
             mutable_read_only: true,
@@ -2129,6 +2281,8 @@ impl VectorStore {
             warmed_projections: Mutex::new(Default::default()),
             #[cfg(feature = "mutable-hnsw-poc")]
             migrations: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "mutable-hnsw-poc")]
+            migration_repairs: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "mutable-hnsw-poc")]
             mutable_commit: Mutex::new(MutableCommitState::default()),
             #[cfg(feature = "mutable-hnsw-poc")]
@@ -3683,10 +3837,14 @@ impl VectorStore {
         #[cfg(not(feature = "mutable-hnsw-poc"))]
         let graph_holds = |_: u64| false;
         // Reserve ordinal/point workspace before checkpoint sets and the
-        // retained row list grow. The encoding peak has its own shared guard;
+        // retained row list grow. The encoding peak has its own guard;
         // overlapping shard optimizers cannot each spend the entire cap.
+        // Background work (ES gates no merge on memory): admitted against
+        // the background share, waiting for it, not refused by resident
+        // data filling the budget (that refusal kept chunks unsealed).
         let points=sources.iter().fold(0u64, |n, source| n.saturating_add(source.len() as u64));
-        let _workspace=crate::admission::shared().reserve(points.saturating_mul(128).saturating_add(4096), "vector optimizer rows")?;
+        let _workspace=crate::admission::shared().reserve_background(points.saturating_mul(128).saturating_add(4096), "vector optimizer rows",
+            std::time::Duration::from_secs(30))?;
         let pinned = self.checkpoint_pinned_points(sources[0].field);
         let pinned = |p: u64| pinned.as_ref().is_some_and(|pinned| pinned.contains(&p));
         let mut rows: Vec<(u64, &[f32])> = Vec::new();

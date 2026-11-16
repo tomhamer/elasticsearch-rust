@@ -379,6 +379,10 @@ fn escape_lucene(v: &str) -> String {
 
 /// `{"kql": {...}}` body → query DSL object.
 pub fn rewrite(body: &Value, ctx: &QueryContext) -> Result<Value> {
+    crate::parse_depth::guarded(|| rewrite_unguarded(body, ctx))
+}
+
+fn rewrite_unguarded(body: &Value, ctx: &QueryContext) -> Result<Value> {
     let o = body.as_object().ok_or_else(|| EsError::parsing("[kql] query malformed, no start_object after query name"))?;
     let q = o.get("query").and_then(Value::as_str).ok_or_else(|| EsError::parsing("[kql] requires a [query]"))?;
     let default_fields = match o.get("default_field").and_then(Value::as_str) {

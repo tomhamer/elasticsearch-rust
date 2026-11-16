@@ -70,6 +70,10 @@ fn write_admitted_json<T: Serialize>(directory: &dyn Directory, name: &str, valu
 struct MetaSegment {
     id: u32,
     num_docs: u32,
+    /// Deleted docs of the committed deletion file (0: none, no file);
+    /// absent in older commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deleted: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -317,9 +321,25 @@ impl SealJob {
             }
         }
         let encode = |ordinal: usize, w: &Arc<SegmentWriter>, published: bool| -> Result<(Segment, Option<crate::admission::Allocation<Vec<DocId>>>)> {
+            // An index-sorted memtable is sorted in memory and encoded once,
+            // as Lucene sorts a flushed segment's postings and doc values
+            // through a doc map: writing it unsorted and sort-merging the
+            // segment wrote every byte twice.
+            if let Some(sort) = self.sort.as_ref().filter(|_| self.coalesce_id.is_none()) {
+                if let Some(sealed) = sorted_one_pass(std::slice::from_ref(&self.mems[ordinal]), sort, self.sorted_ids[ordinal], dir, store) {
+                    let (segment, map) = sealed?;
+                    let map = map.map(|map| {
+                        let (mut maps, memory) = map.into_parts();
+                        crate::admission::Allocation::new(maps.pop().unwrap_or_default(), memory)
+                    });
+                    return Ok((segment, map));
+                }
+            }
             let segment = w.write_to_store_ref(dir, Some(store), !published)?;
             // A coalesced job sorts once, over all its memtables (below).
             let Some(sort) = self.sort.as_ref().filter(|_| self.coalesce_id.is_none()) else { return Ok((segment, None)); };
+            // Only memtables `sorted_one_pass` does not take (vectors) are
+            // written unsorted and sort-merged here.
             let input = Arc::new(segment);
             let mut memory = sort.reserve_workspace(std::slice::from_ref(&input))?;
             let leaf = LeafReader::Segment(&input);
@@ -487,7 +507,9 @@ fn sorted_one_pass(mems: &[(Arc<SegmentWriter>, bool)], sort: &crate::index_sort
         return None;
     }
     let writers: Vec<&SegmentWriter> = mems.iter().map(|(w, _)| &**w).collect();
-    if writers.len() < 2 || !SegmentWriter::sorted_union_supported(&writers) {
+    // One memtable too: its docs sorted in memory (a single-memtable flush
+    // of a sorted index, see `SealJob::run`).
+    if writers.is_empty() || !SegmentWriter::sorted_union_supported(&writers) {
         return None;
     }
     let docs: u64 = writers.iter().map(|w| w.num_docs() as u64).sum();
@@ -499,10 +521,22 @@ fn sorted_one_pass(mems: &[(Arc<SegmentWriter>, bool)], sort: &crate::index_sort
         Err(_) => return None,
     };
     let leaves: Vec<LeafReader<'_>> = writers.iter().map(|w| LeafReader::Memtable(w, None)).collect();
-    let roots: Vec<(usize, DocId)> = writers.iter().enumerate().flat_map(|(i, w)| (0..w.num_docs()).map(move |d| (i, d))).collect();
+    // Roots are sorted; a nested block moves with its root (its children
+    // stay right before it).
+    let roots: Vec<(usize, DocId)> = leaves.iter().enumerate().flat_map(|(i, leaf)| (0..writers[i].num_docs()).filter(move |&d| leaf.is_root(d)).map(move |d| (i, d))).collect();
     let t0 = std::time::Instant::now();
-    let order = sort.sort_docs(&leaves, roots);
+    let sorted = sort.sort_docs(&leaves, roots);
     drop(leaves);
+    let order: Vec<(usize, DocId)> = if writers.iter().any(|w| w.nested_info().is_some()) {
+        let mut order = Vec::with_capacity(docs as usize);
+        for (i, root) in sorted {
+            let begin = writers[i].nested_info().map_or(root, |n| n.block_start(root));
+            order.extend((begin..=root).map(|d| (i, d)));
+        }
+        order
+    } else {
+        sorted
+    };
     let t1 = std::time::Instant::now();
     // On the encode pool (as every seal's encoding): `sorted_union`'s
     // joins on the global pool queued behind the parallel bulk writes
@@ -621,6 +655,12 @@ impl MergeJob {
         self.visible.iter().zip(&self.chosen).map(|(d, s)| (s.num_docs - d.count().min(s.num_docs)) as u64).sum()
     }
 
+    /// The inputs' bytes (Lucene `OneMerge.totalBytesSize`: ES's
+    /// `merges.current_size_in_bytes` while the merge runs).
+    pub fn input_bytes(&self) -> u64 {
+        self.chosen.iter().map(|s| s.segment_bytes()).sum()
+    }
+
     // Compute sorting outside the index lock, against the same deletion
     // snapshot used by encoding and the later concurrent-delete remapping.
     fn order(&self) -> Result<&Option<crate::admission::Allocation<Vec<(usize, DocId)>>>> {
@@ -717,6 +757,9 @@ impl VectorOptimizer {
     /// Callers must release the index guard before running this work.
     pub fn force_merge(&self, max_segments: usize, only_expunge_deletes: bool) -> Result<OptimizeReport> {
         let _admission = self.admission.enter();
+        // The next graph checkpoints fold their incremental saves.
+        #[cfg(feature = "mutable-hnsw-poc")]
+        self.store.request_full_graph_saves();
         if only_expunge_deletes {
             self.store.expunge_deletes(&*self.directory, &self.policy)
         } else {
@@ -888,11 +931,13 @@ impl CommitJob {
         let mut mutable_commit = self.vectors.mutable_commit.lock();
         #[cfg(feature = "mutable-hnsw-poc")]
         let _registry_memory = self.vectors.checkpoint_registry_memory()?;
+        let mut deleted: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         for segment in self.segments.iter().chain(&self.hidden) {
-            match self.deletions_at.as_ref().and_then(|at| at.get(&segment.id)) {
+            let n = match self.deletions_at.as_ref().and_then(|at| at.get(&segment.id)) {
                 Some(bits) => segment.write_deletions_of(&*self.directory, bits)?,
                 None => segment.write_deletions(&*self.directory)?,
-            }
+            };
+            deleted.insert(segment.id, n);
         }
         #[cfg(feature = "mutable-hnsw-poc")]
         let (written_fields, next_mutable_generation) = {
@@ -917,7 +962,7 @@ impl CommitJob {
             Ok(memory) => memory,
             Err(error) => {
                 #[cfg(feature = "mutable-hnsw-poc")]
-                for written in written_fields.iter().filter(|written| written.fresh) { let _ = self.directory.delete(&written.entry.filename()); }
+                for written in written_fields.iter().filter(|written| written.fresh) { let _ = self.directory.delete(&written.entry.latest_file()); }
                 return Err(error);
             }
         };
@@ -929,13 +974,13 @@ impl CommitJob {
             Ok(vp) => vp,
             Err(error) => {
                 #[cfg(feature = "mutable-hnsw-poc")]
-                for written in written_fields.iter().filter(|written| written.fresh) { let _ = self.directory.delete(&written.entry.filename()); }
+                for written in written_fields.iter().filter(|written| written.fresh) { let _ = self.directory.delete(&written.entry.latest_file()); }
                 return Err(error);
             }
         };
         let meta = Meta {
             name: self.name, schema: self.schema, settings: self.settings,
-            segments: self.segments.iter().chain(&self.hidden).map(|s| MetaSegment { id: s.id, num_docs: s.num_docs }).collect(),
+            segments: self.segments.iter().chain(&self.hidden).map(|s| MetaSegment { id: s.id, num_docs: s.num_docs, deleted: deleted.get(&s.id).copied() }).collect(),
             next_segment_id: self.next_segment_id,
             vector_store: MetaVectorStore { next_point_id: vp.next_point_id, next_segment_id: vp.next_segment_id,
                 segments: vp.segments, mutable_fields, next_mutable_generation, ivf_fields: vp.ivf },
@@ -975,7 +1020,7 @@ impl CommitJob {
             Ok(prepared) => prepared,
             Err(error) => {
                 #[cfg(feature = "mutable-hnsw-poc")]
-                for written in written_fields.iter().filter(|written| written.fresh) { let _ = self.directory.delete(&written.entry.filename()); }
+                for written in written_fields.iter().filter(|written| written.fresh) { let _ = self.directory.delete(&written.entry.latest_file()); }
                 self.vectors.restore_obsolete(vp.obsolete);
                 self.vectors.restore_obsolete_files(vp.obsolete_files);
                 return Err(error);
@@ -1278,8 +1323,25 @@ impl Index {
         };
         index.sync_vector_field_options();
         index.view_slot.set_committed(crate::reader_view::ViewSlot::prepare_committed(meta.segments.iter().map(|s| (s.id, u64::from(s.num_docs))))?);
+        let mut ids = std::collections::HashSet::new();
         for seg in &meta.segments {
-            index.segments.push(Arc::new(Segment::open_with_store(&*index.directory, seg.id, &index.vectors)?));
+            // The commit's own record of each segment: unique ids below the
+            // next id to allocate, the doc count and committed deletions
+            // its files hold (a lost or damaged deletion file must not
+            // bring deleted docs back).
+            if !ids.insert(seg.id) || seg.id >= meta.next_segment_id {
+                return Err(RusticError::Corrupted(format!("commit lists segment {} twice or at/after its next segment id {}", seg.id, meta.next_segment_id)));
+            }
+            let segment = Segment::open_with_store(&*index.directory, seg.id, &index.vectors)?;
+            if segment.num_docs != seg.num_docs {
+                return Err(RusticError::Corrupted(format!("segment {} holds {} docs, its commit {}", seg.id, segment.num_docs, seg.num_docs)));
+            }
+            if let Some(expected) = seg.deleted {
+                if segment.num_deleted() != expected {
+                    return Err(RusticError::Corrupted(format!("segment {} has {} committed deletions, its commit {expected}", seg.id, segment.num_deleted())));
+                }
+            }
+            index.segments.push(Arc::new(segment));
         }
         #[cfg(feature = "mutable-hnsw-poc")]
         {
@@ -1835,6 +1897,8 @@ impl Index {
 
     /// Merge every sealed segment into one.
     pub fn force_merge(&mut self) -> Result<()> {
+        #[cfg(feature = "mutable-hnsw-poc")]
+        self.vectors.request_full_graph_saves();
         if self.segments.len() > 1 {
             let ids: Vec<u32> = self.segments.iter().map(|s| s.id).collect();
             self.merge_segments(&ids)?;
@@ -2551,6 +2615,65 @@ impl Index {
     pub const MAX_PARALLEL_SEALS: usize = 4;
 
     fn seal_writers(&mut self, writers: Vec<Arc<SegmentWriter>>, hidden: bool) -> Result<Vec<Arc<Segment>>> {
+        #[cfg(test)]
+        if !writers.is_empty() && FAIL_SEAL_WRITES.with(|n| { let left = n.get(); if left > 0 { n.set(left - 1); } left > 0 }) {
+            return Err(RusticError::Io(std::io::Error::other("injected segment write failure")));
+        }
+        if writers.is_empty() || self.index_sort.is_none() {
+            return self.seal_writers_written(writers, hidden);
+        }
+        // An index-sorted memtable is sorted in memory and written once
+        // (Lucene sorts a flushed segment through a doc map); only those
+        // `sorted_one_pass` does not take are written, then sort-merged.
+        let mut sealed: Vec<Option<Arc<Segment>>> = Vec::with_capacity(writers.len());
+        for w in &writers {
+            sealed.push(self.seal_sorted_one_pass(w, hidden).transpose()?.map(Arc::new));
+        }
+        let rest: Vec<Arc<SegmentWriter>> = writers.iter().zip(&sealed).filter(|(_, s)| s.is_none()).map(|(w, _)| w.clone()).collect();
+        let mut rest = self.seal_writers_written(rest, hidden)?.into_iter();
+        Ok(sealed.into_iter().map(|s| s.or_else(|| rest.next()).expect("a segment per memtable")).collect())
+    }
+
+    /// [`Index::seal_writers`] of an index-sorted memtable in one pass: its
+    /// docs sorted in memory ([`sorted_one_pass`]) and encoded once, its
+    /// deletions (as [`SegmentWriter::write_to_store_as`] keeps them)
+    /// renumbered. `None`: this path does not apply (vectors, or its
+    /// workspace was refused).
+    fn seal_sorted_one_pass(&self, w: &Arc<SegmentWriter>, hidden: bool) -> Option<Result<Segment>> {
+        let sort = self.index_sort.as_ref()?;
+        if w.has_vectors() || w.num_docs() == 0 {
+            return None;
+        }
+        #[cfg(feature = "mutable-hnsw-poc")]
+        if w.mutable_vector_store().is_some() {
+            return None;
+        }
+        let dir = &*self.directory;
+        let sealed = sorted_one_pass(&[(w.clone(), !hidden)], sort, w.id, dir, &self.vectors)?;
+        Some((|| {
+            let (segment, map) = sealed?;
+            let latest = w.latest_deletions_admitted()?;
+            let any_deleted = !latest.is_empty();
+            let map = map.map(|m| m.into_parts().0.pop().unwrap_or_default()).unwrap_or_default();
+            // The masks sized to the segment (the union memtable it was
+            // written from has none).
+            let remap = |mask: crate::postings::BitSet| {
+                let mut sorted = crate::postings::BitSet::new(segment.num_docs);
+                for old in mask.iter_set_bits() { sorted.set(map[old as usize]); }
+                sorted
+            };
+            let visible = if hidden { None } else { w.visible_deletions_admitted()?.map(remap) };
+            segment.set_deletions(remap(latest), visible)?;
+            if any_deleted {
+                segment.write_deletions(dir)?;
+            }
+            Ok(segment)
+        })())
+    }
+
+    /// [`Index::seal_writers`] writing each memtable as it is (then, in an
+    /// index-sorted index, sort-merging it).
+    fn seal_writers_written(&mut self, writers: Vec<Arc<SegmentWriter>>, hidden: bool) -> Result<Vec<Arc<Segment>>> {
         if writers.is_empty() {
             return Ok(Vec::new());
         }
@@ -3419,7 +3542,15 @@ impl Index {
         if frozen.is_empty() {
             return Ok(());
         }
-        let segs = self.seal_writers(frozen, false)?;
+        // A failed seal keeps its memtables (production review #571): their
+        // documents stay where they were until a later seal succeeds.
+        let segs = match self.seal_writers(frozen.clone(), false) {
+            Ok(s) => s,
+            Err(e) => {
+                self.frozen.extend(frozen);
+                return Err(e);
+            }
+        };
         self.segments.extend(segs);
         self.publish_view()?;
         Ok(())
@@ -3540,11 +3671,22 @@ impl Index {
         self.seal_frozen()?;
         let (busy, parked): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked).into_iter().partition(|w| self.sealing.contains(&w.id));
         self.parked = busy;
-        let segs = self.seal_writers(parked, true)?;
-        self.hidden.extend(segs);
+        match self.seal_writers(parked.clone(), true) {
+            Ok(segs) => self.hidden.extend(segs),
+            Err(e) => {
+                self.parked.extend(parked);
+                return Err(e);
+            }
+        }
+        // Closed (unpublished) memtables that fail to seal stay parked.
         let writers = self.close_writers();
-        let segs = self.seal_writers(writers, true)?;
-        self.hidden.extend(segs);
+        match self.seal_writers(writers.clone(), true) {
+            Ok(segs) => self.hidden.extend(segs),
+            Err(e) => {
+                self.parked.extend(writers);
+                return Err(e);
+            }
+        }
         // Searchable leaves unchanged; the stats counts of the view moved.
         self.publish_view()?;
         Ok(())
@@ -3561,8 +3703,16 @@ impl Index {
         #[cfg(feature = "mutable-hnsw-poc")]
         self.vectors.drain_mutable_deletes()?;
         self.seal_frozen()?;
+        // Published (closed) memtables that fail to seal stay frozen.
         let writers = self.close_writers();
-        let segs = self.seal_writers(writers, false)?;
+        let segs = match self.seal_writers(writers.clone(), false) {
+            Ok(s) => s,
+            Err(e) => {
+                self.frozen.extend(writers);
+                let _ = self.publish_view();
+                return Err(e);
+            }
+        };
         self.segments.extend(segs);
         self.publish_view()?;
         Ok(())
@@ -4339,7 +4489,7 @@ mod tests {
         for batch in 0..4 {
             for i in 0..500 {
                 let mut doc = Document::new();
-                doc.add_text(0, &format!("item {} widgets b{batch} {:x}", batch * 500 + i, (batch * 500 + i) as u64 * 0x9E37_79B9_7F4A_7C15));
+                doc.add_text(0, &format!("item {} widgets b{batch} {:x}", batch * 500 + i, (batch * 500 + i) as u64 * 0x9E37_79B9));
                 doc.add_f64(1, (batch * 500 + i) as f64);
                 index.add_document(&doc).unwrap();
             }
@@ -4684,6 +4834,45 @@ mod tests {
         assert!(!index.leaves()[0].is_deleted(a.doc_id));
         index.publish().unwrap();
         assert_eq!(hits(&index, "foo"), 0);
+    }
+
+    /// #571: a failed seal (segment write) keeps its memtables in the
+    /// core: every document stays readable, published visibility is
+    /// unchanged, and a retry seals them all; a reopen after commit keeps
+    /// them too.
+    #[test]
+    fn failed_seal_keeps_its_memtables() {
+        let mut index = nrt_index();
+        for i in 0..3 {
+            index.add_document(&text_doc("foo", i)).unwrap();
+        }
+        index.publish().unwrap();
+        for i in 3..5 {
+            index.add_document(&text_doc("foo", i)).unwrap();
+        }
+        FAIL_SEAL_WRITES.with(|n| n.set(1));
+        assert!(index.seal().is_err());
+        assert_eq!(live_latest(&index), 5, "no document lost");
+        assert_eq!(hits(&index, "foo"), 3, "published visibility unchanged");
+        // The unpublished memtable failing after the published one sealed.
+        FAIL_SEAL_WRITES.with(|n| n.set(0));
+        index.add_document(&text_doc("foo", 5)).unwrap();
+        index.seal().unwrap();
+        assert_eq!(live_latest(&index), 6);
+        index.publish().unwrap();
+        assert_eq!(hits(&index, "foo"), 6);
+        for i in 0..6 {
+            assert!(find_rank(&index, i).is_some(), "rank {i}");
+        }
+        // refresh path (published memtables) keeps them too.
+        index.add_document(&text_doc("foo", 6)).unwrap();
+        FAIL_SEAL_WRITES.with(|n| n.set(2));
+        assert!(index.refresh().is_err());
+        FAIL_SEAL_WRITES.with(|n| n.set(0));
+        assert_eq!(live_latest(&index), 7);
+        index.refresh().unwrap();
+        assert_eq!(hits(&index, "foo"), 7);
+        assert_eq!(index.num_closed_memtables() + index.num_open_memtables(), 0);
     }
 
     #[test]
@@ -6294,10 +6483,11 @@ mod mutable_commit_tests {
 
     /// File-backed codes: shed rows move to the code log (out of anonymous
     /// row storage) and are served identically; a graph checkpoint
-    /// references them through code log files the manifest lists (writing
-    /// only rows no earlier file holds), a later commit drops a superseded
-    /// prefix file, a commit without a graph save keeps them, the index
-    /// reopens from them, and stray chunk files are swept.
+    /// references only the log's full chunks and writes the rows of its
+    /// growing last chunk inline: chunk files are written once and reused by
+    /// later checkpoints, never rewritten as a longer prefix; a commit
+    /// without a graph save keeps its files, the index reopens from them,
+    /// and stray chunk files are swept.
     #[test]
     fn shed_rows_live_in_the_code_log_and_checkpoints_reference_them() {
         // Code log references are a format-2 (write version 13) feature.
@@ -6309,6 +6499,7 @@ mod mutable_commit_tests {
         index.set_nrt(true);
         index.enable_mutable_vectors().unwrap();
         add_quantized(&mut index, 0..300);
+        index.vectors.registered_mutable_field(1).unwrap().set_code_log_chunk_bytes(4096);
         index.publish().unwrap();
         index.seal().unwrap();
         let field = index.vectors.registered_mutable_field(1).unwrap();
@@ -6328,16 +6519,17 @@ mod mutable_commit_tests {
             meta.vector_store.mutable_fields[0].clone()
         };
         let first = commit(&index, true);
-        assert_eq!(first.code_files.len(), 1, "{:?}", first.code_files);
-        assert!(dir.exists(&first.code_files[0]));
+        assert!(!first.code_files.is_empty(), "{:?}", first.code_files);
+        assert!(first.code_files.iter().all(|name| dir.exists(name)));
         add_quantized(&mut index, 300..600);
         index.publish().unwrap();
         index.seal().unwrap();
         assert_eq!(field.shed_all().unwrap(), 300);
         let second = commit(&index, true);
-        assert_eq!(second.code_files.len(), 1);
-        assert_ne!(second.code_files, first.code_files, "a longer prefix is a new immutable file");
-        assert!(!dir.exists(&first.code_files[0]), "the superseded prefix goes with the commit");
+        assert!(second.code_files.len() > first.code_files.len() && second.code_files.starts_with(&first.code_files),
+            "full chunk files are reused, never rewritten: {:?} then {:?}", first.code_files, second.code_files);
+        let on_disk: Vec<String> = dir.list().unwrap().into_iter().filter(|name| crate::vector::store::is_code_log_file(name)).collect();
+        assert!(on_disk.iter().all(|name| second.code_files.contains(name)), "no partial chunk prefix files: {on_disk:?}");
         // More rows committed without a graph save: reopening catches up.
         add_quantized(&mut index, 600..650);
         index.publish().unwrap();
@@ -6360,6 +6552,119 @@ mod mutable_commit_tests {
         crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
     }
 
+    /// Incremental graph saves (segment format v39): commits after a full
+    /// graph checkpoint list deltas holding only what changed; a chain whose
+    /// deltas pass their share of its full checkpoint is folded into a new
+    /// full one (the old chain's files go with that commit); a reopen gives
+    /// the graph and results of the last commit exactly.
+    #[test]
+    fn graph_saves_are_incremental_and_reopen_exactly() {
+        graph_saves_case(crate::codec::GRAPH_DELTA_SINCE, 20);
+    }
+    /// The same with link logs (v40): saves log the link edits; a reopen has
+    /// the committed graph's members (list order may differ, so the search
+    /// is compared by its hits).
+    #[test]
+    fn graph_link_logs_are_incremental_and_reopen_exactly() {
+        graph_saves_case(crate::codec::GRAPH_LINK_LOG_SINCE, 400);
+    }
+    /// A force merge folds the chain: the next save is a full checkpoint.
+    #[test]
+    fn force_merge_folds_the_graph_save_chain() {
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(crate::codec::GRAPH_LINK_LOG_SINCE));
+        let (dir, mut index) = code_log_index("graph-fold", 0..500);
+        let commit = |index: &Index| -> crate::vector::store::MutableFieldManifest {
+            let mut capture = index.begin_vector_capture(true).unwrap();
+            capture.finish().unwrap();
+            index.prepare_commit_with(capture).unwrap().run().unwrap();
+            let meta: Meta = serde_json::from_slice(dir.open_read(META_FILE).unwrap().as_slice()).unwrap();
+            meta.vector_store.mutable_fields[0].clone()
+        };
+        let first = commit(&index);
+        add_quantized(&mut index, 500..520);
+        index.publish().unwrap();
+        index.seal().unwrap();
+        let second = commit(&index);
+        assert_eq!((second.generation, second.deltas.len()), (first.generation, 1));
+        index.force_merge().unwrap();
+        add_quantized(&mut index, 520..540);
+        index.publish().unwrap();
+        index.seal().unwrap();
+        let third = commit(&index);
+        assert!(third.deltas.is_empty() && third.generation != first.generation, "{third:?}");
+        assert!(!dir.exists(&second.latest_file()), "the folded chain's log goes");
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+    }
+    fn graph_saves_case(version: u32, per_round: usize) {
+        let link = version >= crate::codec::GRAPH_LINK_LOG_SINCE;
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(version));
+        let (dir, mut index) = code_log_index("graph-delta", 0..2000);
+        let field = index.vectors.registered_mutable_field(1).unwrap();
+        field.shed_all().unwrap();
+        field.commit_owner().unwrap();
+        let commit = |index: &Index| -> crate::vector::store::MutableFieldManifest {
+            let mut capture = index.begin_vector_capture(true).unwrap();
+            capture.finish().unwrap();
+            index.prepare_commit_with(capture).unwrap().run().unwrap();
+            let meta: Meta = serde_json::from_slice(dir.open_read(META_FILE).unwrap().as_slice()).unwrap();
+            meta.vector_store.mutable_fields[0].clone()
+        };
+        let first = commit(&index);
+        assert!(first.deltas.is_empty() && first.chainable && first.base_bytes > 0, "{first:?}");
+        let (mut previous, mut deltas, mut folds, mut next) = (first, 0, 0, 2000);
+        for round in 0..8 {
+            add_quantized(&mut index, next..next + per_round);
+            next += per_round;
+            index.publish().unwrap();
+            index.seal().unwrap();
+            field.shed_all().unwrap();
+            let entry = commit(&index);
+            if entry.generation == previous.generation {
+                assert_eq!(entry.deltas.len(), previous.deltas.len() + 1, "round {round}");
+                let written = entry.delta_bytes - previous.delta_bytes;
+                assert!(written * if link { 1 } else { 2 } < entry.base_bytes, "round {round}: a delta of {written} bytes over {} full", entry.base_bytes);
+                deltas += 1;
+            } else {
+                assert!(entry.deltas.is_empty(), "round {round}: a new chain starts full");
+                let ratio = if link { 1.0 } else { 0.5 };
+                assert!(previous.delta_bytes as f64 > ratio * previous.base_bytes as f64 || previous.deltas.len() >= 16,
+                    "round {round}: folded early {previous:?}");
+                for file in previous.files().iter().filter(|file| !entry.files().contains(file)) {
+                    assert!(!dir.exists(file), "round {round}: {file} of the old chain stays");
+                }
+                folds += 1;
+            }
+            for file in entry.files() { assert!(dir.exists(&file), "round {round}: {file}"); }
+            previous = entry;
+        }
+        assert!(deltas >= 2 && folds >= 1, "{deltas} deltas, {folds} full saves");
+        // End on a delta, then reopen from base + deltas.
+        if previous.deltas.is_empty() {
+            add_quantized(&mut index, next..next + 20);
+            next += 20;
+            index.publish().unwrap();
+            index.seal().unwrap();
+            previous = commit(&index);
+            assert!(!previous.deltas.is_empty());
+        }
+        let query: Vec<f32> = (0..16).map(|d| ((d * 5) % 97) as f32 / 97.0).collect();
+        let live = quantized_hits(&index, &query);
+        // Killed mid-save: a delta written in part (and its temporary), no
+        // commit listing it; the reopen uses the committed chain.
+        dir.write(&previous.delta_filename(previous.generation + 1_000), b"RMVD\x01\0\0\0torn").unwrap();
+        let reopened = Index::open_in(dir.clone()).unwrap();
+        assert_eq!(reopened.vectors.mutable_active_nodes(1), Some(next as u32));
+        let restored = quantized_hits(&reopened, &query);
+        if link {
+            let keys = |hits: &[(u64, f32)]| { let mut k: Vec<u64> = hits.iter().map(|h| h.0).collect(); k.sort_unstable(); k };
+            let overlap = keys(&restored).iter().filter(|k| keys(&live).contains(k)).count();
+            assert!(overlap + 1 >= live.len(), "the chain reopens to the committed graph: {restored:?} vs {live:?}");
+        } else {
+            assert_eq!(restored, live, "the chain reopens to the committed graph");
+        }
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
+    }
+
     fn code_log_index(name: &str, rows: std::ops::Range<usize>) -> (Arc<RamDirectory>, Index) {
         let options = VectorFieldOptions { oversample: 2.0, ..VectorFieldOptions::quantized_hnsw(crate::vector::Quantization::Int8) };
         let schema = vec![Field::new(1, "vector", FieldType::Vector { dim: 16 }).with_similarity("l2_norm").with_vector_options(Some(options))];
@@ -6368,6 +6673,9 @@ mod mutable_commit_tests {
         index.set_nrt(true);
         index.enable_mutable_vectors().unwrap();
         add_quantized(&mut index, rows);
+        // Small code log chunks: a test's shed rows fill some (checkpoints
+        // reference only full ones).
+        index.vectors.registered_mutable_field(1).unwrap().set_code_log_chunk_bytes(4096);
         index.publish().unwrap();
         index.seal().unwrap();
         (dir, index)
@@ -6815,8 +7123,9 @@ mod mutable_commit_tests {
                 assert_eq!(&bytes[..8], b"RMVC\x02\0\0\0");
                 assert_eq!(&rows[..8], b"RMVR\x04\0\0\0", "quantized {quantized}, write version {version}");
                 if quantized {
-                    // Shed rows live in the code log: referenced, never copied.
-                    assert!(!entry.code_files.is_empty() && entry.code_files.iter().all(|name| dir.exists(name)));
+                    // Shed rows live in the code log: its full chunks are
+                    // referenced (the rows of a partial one inline).
+                    assert!(entry.code_files.iter().all(|name| dir.exists(name)));
                 } else {
                     assert!(entry.code_files.is_empty());
                 }
@@ -6974,6 +7283,8 @@ mod mutable_commit_tests {
         add(&mut index, 40..60);
         index.publish().unwrap();
         assert_eq!(search(&retained), before);
+        // #295: the exact scan holds the best k (5) of its 40 rows, not all.
+        assert!(crate::query::mutable_knn::EXACT_SCAN_PEAK.with(|p| p.get()) <= 5, "bounded by k");
     }
 
     /// Skip unchanged fields: a commit with no graph change reuses the last
@@ -7408,6 +7719,41 @@ mod mutable_commit_tests {
             assert_eq!(index.vectors.mutable_active_nodes(1), Some(2), "phase {phase}: the sealed memtable rows joined");
             assert_eq!(index.knn_search(&KnnRequest::new(1, vec![1.,2.], 10)).unwrap().len(), 2, "phase {phase}");
         }
+    }
+
+    /// #294 supplemental witness: a row written while its field had no
+    /// graph is sealed after `flat` → `hnsw`; between the seal reserving its
+    /// point P and inserting it into the graph, a graph-backed write takes
+    /// and inserts Q > P. The sealed row still joins the graph and is found
+    /// by kNN, with no reopen.
+    #[test]
+    fn late_graphless_seal_overtaken_by_a_graph_write_stays_searchable() {
+        let mut index = Index::new("late-seal", schema(), IndexSettings::default());
+        index.set_nrt(true);
+        index.set_auto_seal(false);
+        index.schema.iter_mut().find(|f| f.id == 1).unwrap().vector_options.as_mut().unwrap().graph = false;
+        let mut doc = Document::new(); doc.add_vector(1, vec![1., 2.]);
+        index.add_document(&doc).unwrap();
+        let mut upgraded = index.schema.clone();
+        upgraded.iter_mut().find(|f| f.id == 1).unwrap().vector_options.as_mut().unwrap().graph = true;
+        index.schema = upgraded;
+        index.enable_new_mutable_vector_fields().unwrap();
+        assert_eq!(index.complete_vector_migrations().unwrap(), 1);
+        let reserved_before = index.vectors.next_point_id();
+        let overtaken = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (store, seen) = (index.vectors.clone(), overtaken.clone());
+        *crate::segment::SEAL_UNRESERVED_HOOK.lock().unwrap() = Some((Arc::as_ptr(&index.vectors) as usize, Box::new(move || {
+            // The seal has reserved P; Q is issued and inserted first.
+            let field = store.registered_mutable_field(1).unwrap();
+            let (lease, _) = field.stage(&[&[9., 9.]]).unwrap().accept().unwrap();
+            seen.store(lease.points().next().unwrap(), std::sync::atomic::Ordering::SeqCst);
+        })));
+        index.refresh().unwrap();
+        let q = overtaken.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(q, u64::MAX, "the seal ran the hook");
+        assert!(q > reserved_before, "Q was issued above the sealed row's point");
+        let hits = index.knn_search(&KnnRequest::new(1, vec![1., 2.], 10)).unwrap();
+        assert_eq!(hits.len(), 1, "the sealed row is searchable before any reopen");
     }
 
     #[test]
@@ -8549,4 +8895,93 @@ mod filtered_knn_bench {
                 mean(0), mean(1), mean(2), mean(3), mean(4));
         });
     }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    use crate::codec::directory::RamDirectory;
+    use crate::types::{Document, Field, FieldType, Term};
+
+    fn committed() -> (Arc<RamDirectory>, u32) {
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(crate::codec::VERSION));
+        let dir = Arc::new(RamDirectory::default());
+        let schema = vec![Field::new(0, "title", FieldType::Text)];
+        let mut index = Index::create_in(dir.clone(), "integrity", schema, IndexSettings::default()).unwrap();
+        for i in 0..100 {
+            let mut d = Document::new();
+            d.add_text(0, &format!("all w{i}"));
+            index.add_document(&d).unwrap();
+        }
+        index.seal().unwrap();
+        let id = index.segments[0].id;
+        index.segments[0].delete_doc(7).unwrap();
+        index.commit().unwrap();
+        (dir, id)
+    }
+
+    fn all(index: &Index) -> u64 {
+        index.search_term(&Term::new_text(0, "all"), 1000).unwrap().total_hits
+    }
+
+    /// #284: a committed deletion file that is truncated, missing, or
+    /// written for another segment fails the open instead of bringing the
+    /// deleted doc back; the intact file keeps it deleted.
+    #[test]
+    fn damaged_deletion_files_fail_the_open() {
+        let (dir, id) = committed();
+        let reopened = Index::open_in(dir.clone()).unwrap();
+        assert_eq!(all(&reopened), 99);
+        drop(reopened);
+        let name = crate::codec::deletes_file_name(id);
+        let good = dir.open_read(&name).unwrap().as_slice().to_vec();
+        let mut foreign = good.clone();
+        foreign[8] ^= 1;
+        for (what, bytes) in [("empty", Some(Vec::new())), ("word-truncated", Some(good[..good.len() - 8].to_vec())), ("byte-truncated", Some(good[..good.len() - 3].to_vec())), ("missing", None), ("foreign", Some(foreign))] {
+            match &bytes {
+                Some(b) => dir.write(&name, b).unwrap(),
+                None => dir.delete(&name).unwrap(),
+            }
+            let opened = Index::open_in(dir.clone());
+            assert!(matches!(opened, Err(RusticError::Corrupted(_))), "{what}: {:?}", opened.map(|i| all(&i)));
+        }
+        dir.write(&name, &good).unwrap();
+        assert_eq!(all(&Index::open_in(dir.clone()).unwrap()), 99);
+    }
+
+    /// #283: with startup checking a changed segment body or footer doc
+    /// count fails the open; a damaged column directory fails it even
+    /// without; the commit's own doc count is checked too.
+    #[test]
+    fn startup_check_detects_segment_corruption() {
+        let (dir, id) = committed();
+        let name = crate::codec::segment_file_name(id);
+        let good = dir.open_read(&name).unwrap().as_slice().to_vec();
+        let open = |verify: bool| crate::segment::with_verified_open(verify, || Index::open_in(dir.clone()));
+        assert!(open(true).is_ok());
+        // A body byte inside the stored section (still parses).
+        let file = crate::codec::open_segment_file(dir.open_read(&name).unwrap(), false).unwrap();
+        let store_at = file.store.as_slice().as_ptr() as usize - dir.open_read(&name).unwrap().as_slice().as_ptr() as usize;
+        drop(file);
+        let mut body = good.clone();
+        body[store_at + 20] ^= 0x40;
+        dir.write(&name, &body).unwrap();
+        assert!(matches!(open(true), Err(RusticError::Corrupted(_))), "body checksum");
+        // The footer's doc count.
+        let mut footer = good.clone();
+        let count_at = footer.len() - crate::codec::FOOTER_LEN + crate::codec::NUM_SECTIONS * 16;
+        footer[count_at] ^= 1;
+        dir.write(&name, &footer).unwrap();
+        assert!(matches!(open(true), Err(RusticError::Corrupted(_))), "footer covered by the checksum");
+        assert!(matches!(open(false), Err(RusticError::Corrupted(_))), "the commit's doc count");
+        dir.write(&name, &good).unwrap();
+        assert_eq!(all(&open(true).unwrap()), 99);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next `n` [`Index::seal_writers`] calls fail as a
+    /// segment write would.
+    static FAIL_SEAL_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

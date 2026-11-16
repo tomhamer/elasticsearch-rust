@@ -665,7 +665,9 @@ pub fn delete_model_snapshot(node: &Node, job_id: &str, snapshot_id: &str) -> Re
     }
     let ids: Vec<String> = found.iter().map(|(id, _)| id.clone()).collect();
     ridx::delete_results(node, job_id, &job, &ids)?;
-    ridx::delete_by_query(node, ridx::STATE_PATTERN, json!({"prefix": {"_id": format!("{job_id}_model_state_{snapshot_id}#")}}));
+    // `_id` takes no prefix query: the snapshot's state documents by id.
+    let state_ids: Vec<String> = (1..=16).map(|n| format!("{job_id}_model_state_{snapshot_id}#{n}")).collect();
+    ridx::delete_by_query(node, ridx::STATE_PATTERN, json!({"ids": {"values": state_ids}}));
     Ok(json!({"acknowledged": true}))
 }
 
@@ -852,7 +854,20 @@ pub fn delete_forecasts(node: &Node, job_id: &str, forecast_ids: &str, allow_no_
         filters.push(json!({"terms": {"forecast_id": ids}}));
     }
     let found = ridx::search_all(node, &read_alias(job_id), json!({"bool": {"filter": filters}}), json!(["_doc"]))?;
-    let found_ids: Vec<String> = found.iter().filter_map(|(_, d)| d["forecast_id"].as_str().map(str::to_string)).collect();
+    let mut found_ids: Vec<String> = found.iter().filter_map(|(_, d)| d["forecast_id"].as_str().map(str::to_string)).collect();
+    if !all {
+        // An explicit id whose descriptor is gone (an interrupted cleanup)
+        // still owns its forecast points: they are deleted too.
+        let orphans = ridx::search(node, &read_alias(job_id), &json!({"size": 0, "query": {"bool": {"filter": [{"terms": {"forecast_id": ids}}, {"term": {"result_type": "model_forecast"}}]}},
+            "aggs": {"ids": {"terms": {"field": "forecast_id", "size": ids.len().max(1)}}}}))?;
+        for b in orphans["aggregations"]["ids"]["buckets"].as_array().into_iter().flatten() {
+            if let Some(fid) = b["key"].as_str() {
+                if !found_ids.iter().any(|f| f == fid) {
+                    found_ids.push(fid.to_string());
+                }
+            }
+        }
+    }
     if all {
         if found_ids.is_empty() && !allow_no_forecasts {
             return Err(EsError::resource_not_found(format!("No forecast(s) [{}] exists for job [{job_id}]", if forecast_ids.is_empty() { "_all" } else { forecast_ids })));

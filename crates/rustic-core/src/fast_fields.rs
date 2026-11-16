@@ -1182,6 +1182,12 @@ impl FastFields {
         self.i64_columns.remove(&field)
     }
 
+    /// Remove and return the boolean column of `field` (a doc with several
+    /// booleans promotes the field to a multi-valued 0/1 column).
+    pub fn take_bool_column(&mut self, field: u16) -> Option<BoolColumn> {
+        self.bool_columns.remove(&field)
+    }
+
     pub fn take_f64_column(&mut self, field: u16) -> Option<F64Column> {
         self.f64_columns.remove(&field)
     }

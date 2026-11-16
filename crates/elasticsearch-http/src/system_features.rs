@@ -419,3 +419,14 @@ fn x509_info(cert: &[u8]) -> Option<CertInfo> {
     }
     Some(CertInfo { serial: hex, issuer: x500_name(issuer)?, subject: x500_name(subject)?, expiry: x509_time(na_tag, na)? })
 }
+
+/// The system index patterns of feature `name` (`None`: no such feature),
+/// for snapshot `feature_states` selection.
+pub fn feature_index_patterns(name: &str) -> Option<&'static [&'static str]> {
+    FEATURES.iter().find(|f| f.name == name).map(|f| f.indices)
+}
+
+/// Every feature's name.
+pub fn all_feature_names() -> Vec<&'static str> {
+    FEATURES.iter().map(|f| f.name).collect()
+}

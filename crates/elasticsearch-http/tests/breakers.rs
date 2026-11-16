@@ -442,3 +442,47 @@ async fn upgraded_breaker_settings_are_archived() {
     let (_, v) = es.get("/_cluster/settings?flat_settings=true").await;
     assert_eq!(v["persistent"], json!({"indices.breaker.total.use_real_memory": "false"}), "{v}");
 }
+
+/// Review #107: `geotile_grid` / `geohex_grid` over a world-spanning
+/// `geo_shape` at a high precision trip the request breaker while the
+/// shapes are tiled (ES's `GeoGridTiler` charging its cell arrays), even
+/// with `size: 1`: on the serial path (one doc) and the parallel one (a
+/// segment of thousands of docs). The node keeps serving, everything is
+/// released, and a coarse grid still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn world_shape_grid_trips_the_request_breaker() {
+    let _serial = SERIAL.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let world = "POLYGON ((-179 -84, 179 -84, 179 84, -179 84, -179 -84))";
+    for (index, n) in [("one_shape", 1usize), ("many_shapes", 4200)] {
+        let (st, v) = es.put(&format!("/{index}"), json!({"settings": {"number_of_shards": 1}, "mappings": {"properties": {"s": {"type": "geo_shape"}}}})).await;
+        assert_eq!(st, 200, "{v}");
+        let mut body = String::new();
+        for _ in 0..n {
+            body.push_str("{\"index\":{}}\n");
+            body.push_str(&json!({"s": world}).to_string());
+            body.push('\n');
+        }
+        let (st, v) = es.bulk(index, body).await;
+        assert_eq!((st, v["errors"].clone()), (200, json!(false)), "{v}");
+    }
+    es.limits(json!({"indices.breaker.request.limit": "1mb"})).await;
+    for index in ["one_shape", "many_shapes"] {
+        for grid in [json!({"geotile_grid": {"field": "s", "precision": 14, "size": 1}}), json!({"geohex_grid": {"field": "s", "precision": 7, "size": 1}})] {
+            let started = std::time::Instant::now();
+            let (st, v) = es.post(&format!("/{index}/_search"), json!({"size": 0, "aggs": {"g": grid}})).await;
+            assert_eq!(st, 429, "{index} {grid}: {v}");
+            assert_breaking(&v["error"]["root_cause"][0], "request", 1 << 20);
+            assert!(v["error"]["root_cause"][0]["reason"].as_str().unwrap().contains("data for [<agg [g]>]"), "{v}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "{index} {grid}: {:?}", started.elapsed());
+        }
+    }
+    let (st, v) = es.get("/_cluster/health").await;
+    assert_eq!(st, 200, "{v}");
+    es.assert_released().await;
+    es.limits(json!({"indices.breaker.request.limit": null})).await;
+    let (st, v) = es.post("/many_shapes/_search", json!({"size": 0, "aggs": {"g": {"geotile_grid": {"field": "s", "precision": 2, "size": 1}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["aggregations"]["g"]["buckets"][0]["doc_count"], 4200, "{v}");
+}

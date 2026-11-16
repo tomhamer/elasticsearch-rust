@@ -46,6 +46,127 @@
     "config": {
       "type": "object"
     },
+    "security": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "false = development only: no authentication and no TLS"
+        },
+        "elasticPassword": {
+          "type": "object",
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "http": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "secretName": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "transport": {
+              "type": "object",
+              "properties": {
+                "secretName": {
+                  "type": "string"
+                },
+                "verificationMode": {
+                  "type": "string",
+                  "enum": [
+                    "certificate",
+                    "full"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "generate",
+                "cert-manager"
+              ]
+            },
+            "generate": {
+              "type": "object",
+              "properties": {
+                "caDays": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "certDays": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false
+            },
+            "certManager": {
+              "type": "object",
+              "properties": {
+                "issuerRef": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "group": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "duration": {
+                  "type": "string"
+                },
+                "renewBefore": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "extraDnsNames": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "extraIPs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "clusterDomain": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "clusterBootstrapped": {
       "type": "boolean"
     },

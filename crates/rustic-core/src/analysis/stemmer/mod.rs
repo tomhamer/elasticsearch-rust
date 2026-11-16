@@ -25,6 +25,24 @@ pub mod spanish;
 pub mod swedish;
 pub mod turkish;
 
+// The Snowball runtime and the stemmers translated from Lucene's
+// generated Snowball classes (tools/snowball2rs.py).
+pub mod snowball;
+pub mod lucene;
+mod lc_bengali;
+mod lc_bulgarian;
+mod lc_czech;
+mod lc_greek;
+mod lc_hindi;
+mod lc_indonesian;
+mod lc_sorani;
+pub mod sb_armenian;
+pub mod sb_basque;
+pub mod sb_catalan;
+pub mod sb_estonian;
+pub mod sb_irish;
+pub mod sb_lithuanian;
+
 pub use porter::{porter_stem, snowball_porter_stem, StemFilter};
 
 /// Full-vocabulary conformance tests against the official Snowball test data.
@@ -162,5 +180,31 @@ pub(crate) mod vocab_tests {
     #[test]
     fn turkish() {
         check("turkish", 96_000, super::turkish::stem);
+    }
+    // SIDE 005: the Snowball stemmers of the language analyzers that
+    // lacked a stemming stage, over their complete vocabularies.
+    #[test]
+    fn armenian() {
+        check("armenian", 100_000, super::sb_armenian::stem);
+    }
+    #[test]
+    fn basque() {
+        check("basque", 21_000, super::sb_basque::stem);
+    }
+    #[test]
+    fn catalan() {
+        check("catalan", 48_000, super::sb_catalan::stem);
+    }
+    #[test]
+    fn estonian() {
+        check("estonian", 57_000, super::sb_estonian::stem);
+    }
+    #[test]
+    fn irish() {
+        check("irish", 186_000, super::sb_irish::stem);
+    }
+    #[test]
+    fn lithuanian() {
+        check("lithuanian", 86_000, super::sb_lithuanian::stem);
     }
 }

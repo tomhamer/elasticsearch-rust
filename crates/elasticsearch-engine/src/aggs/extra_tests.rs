@@ -39,11 +39,11 @@ fn run_on(f: &Fixture, aggs: Value, only: Option<&[usize]>) -> Result<Value> {
         let docs: Vec<DocId> = (0..l.num_docs()).filter(|d| only.map(|o| o.contains(&(base + *d as usize))).unwrap_or(true)).collect();
         base += l.num_docs() as usize;
         let scores = docs.iter().map(|d| *d as f32).collect();
-        segs.push(AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs, scores });
+        segs.push(AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs, scores });
     }
     let fetch = |_s: usize, _d: DocId, _sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({})) };
     let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
     run_aggregations(&aggs, &segs, &env)
 }
 
@@ -247,10 +247,10 @@ fn fused_range_auto_date_histogram_matches_per_range_collection() {
         assert_eq!(run_on(&f, spec.clone(), Some(&only)).unwrap(), generic(spec, Some(&only)), "subset {spec}");
         // Uncollected roots (a `match_all` over segments without deletions).
         let leaves = f.index.leaves();
-        let segs: Vec<AggSeg> = leaves.iter().map(|l| AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: Vec::new(), scores: Vec::new() }).collect();
+        let segs: Vec<AggSeg> = leaves.iter().map(|l| AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: Vec::new(), scores: Vec::new() }).collect();
         let fetch = |_s: usize, _d: DocId, _sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({})) };
         let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
         let elided = super::super::with_elided_root(vec![true; segs.len()], || run_aggregations(spec, &segs, &env)).unwrap();
         assert_eq!(elided, want, "elided {spec}");
         super::super::NO_FUSED_RANGE.with(|c| c.set(true));
@@ -261,4 +261,159 @@ fn fused_range_auto_date_histogram_matches_per_range_collection() {
     assert!(super::super::FUSED_RANGES.with(std::cell::Cell::get) >= fused_before + 3 * specs.len(), "the fused path ran");
     assert!(super::super::range_auto_date_fields(&specs[2]).is_some_and(|f| f == ["size", "ts", "tmin", "size", "size", "n"]));
     assert!(super::super::range_auto_date_fields(&json!({"r": {"range": {"field": "size", "ranges": ranges}, "aggs": {"d": {"date_histogram": {"field": "ts", "fixed_interval": "1h"}}}}})).is_none());
+}
+
+/// ES `InternalWeightedAvg`: a multi-valued value field counts the doc's
+/// weight once per value, and the cluster reduce of the shards' states
+/// (weighted sum, summed weights) equals one shard over every doc.
+#[test]
+fn weighted_avg_shard_states_reduce_like_one_shard() {
+    let f = fixture(
+        json!({"properties": {"v": {"type": "double"}, "w": {"type": "double"}, "d": {"type": "date"}}}),
+        &[
+            json!({"v": [0.0, 2.0], "w": 1.0, "d": ["2020-01-01T00:00:00Z", "2020-01-03T00:00:00Z"]}),
+            json!({"v": 10.0, "w": 1.0, "d": "2020-01-10T00:00:00Z"}),
+            json!({"v": [1.0, 1.0, 4.0], "w": 2.0, "d": "2020-01-02T00:00:00Z"}),
+            json!({"w": 5.0}),
+            json!({"v": 3.0}),
+        ],
+    );
+    let spec = json!({"w": {"weighted_avg": {"value": {"field": "v"}, "weight": {"field": "w"}}},
+        "wd": {"weighted_avg": {"value": {"field": "d"}, "weight": {"field": "w"}, "format": "yyyy-MM-dd"}}});
+    let whole = run(&f, spec.clone()).unwrap();
+    // (0 + 2 + 10 + 2 * (1 + 1 + 4)) / (1 + 1 + 1 + 3 * 2) = 24 / 9
+    assert!((whole["w"]["value"].as_f64().unwrap() - 24.0 / 9.0).abs() < 1e-12, "{whole}");
+    assert!(whole["w"].get("__p").is_none(), "{whole}");
+    // The review's example: v:[0,2],w:1 and v:[10],w:1 is 4, not 5.5.
+    let two = run_on(&f, json!({"w": spec["w"].clone()}), Some(&[0, 1])).unwrap();
+    assert_eq!(two["w"]["value"], json!(4.0));
+    for split in [vec![vec![0usize], vec![1, 2, 3, 4]], vec![vec![0, 2], vec![1], vec![3, 4]], vec![vec![0], vec![1], vec![2], vec![3], vec![4]], vec![vec![0, 1], vec![]]] {
+        let only: Vec<usize> = split.iter().flatten().copied().collect();
+        let want = run_on(&f, spec.clone(), Some(&only)).unwrap();
+        let parts: Vec<Value> = split.iter().map(|s| {
+            let _shard = crate::search::ReadShardCountScope::enter(Some(split.len()));
+            run_on(&f, spec.clone(), Some(s)).unwrap()
+        }).collect();
+        for name in ["w", "wd"] {
+            let vals: Vec<&Value> = parts.iter().map(|p| &p[name]).collect();
+            assert!(vals.iter().all(|v| v.get("__p").is_some()), "{vals:?}");
+            let conf = spec[name]["weighted_avg"].as_object().unwrap();
+            let got = crate::aggs::partial::reduce_shard_states(name, "weighted_avg", conf, &vals).unwrap().unwrap();
+            match (got["value"].as_f64(), want[name]["value"].as_f64()) {
+                (Some(g), Some(w)) => assert!((g - w).abs() < 1e-9 * w.abs().max(1.0), "{split:?} {name}: {got} vs {}", want[name]),
+                _ => assert_eq!(got["value"], want[name]["value"], "{split:?} {name}"),
+            }
+            assert_eq!(got.get("value_as_string"), want[name].get("value_as_string"), "{split:?} {name}");
+        }
+    }
+}
+
+/// Parent pipelines run in dependency order whatever their declaration
+/// order (ES `resolvePipelineAggregatorOrder`); cycles and unknown paths
+/// are rejected.
+#[test]
+fn parent_pipelines_run_in_dependency_order() {
+    // Bucket sums 1, 3, 6.
+    let f = fixture(json!({"properties": {"k": {"type": "long"}, "x": {"type": "long"}}}),
+        &[json!({"k": 0, "x": 1}), json!({"k": 1, "x": 3}), json!({"k": 2, "x": 6})]);
+    let defs = [
+        ("s", json!({"sum": {"field": "x"}})),
+        ("d", json!({"derivative": {"buckets_path": "s"}})),
+        ("cs", json!({"cumulative_sum": {"buckets_path": "d"}})),
+        ("bs", json!({"bucket_script": {"buckets_path": {"c": "cs", "s": "s"}, "script": "params.c * 10 + params.s"}})),
+        ("sel", json!({"bucket_selector": {"buckets_path": {"b": "bs"}, "script": "params.b > 1"}})),
+    ];
+    let orders: [&[usize]; 4] = [&[0, 1, 2, 3, 4], &[4, 3, 2, 1, 0], &[2, 4, 0, 3, 1], &[3, 1, 4, 0, 2]];
+    let mut first: Option<Value> = None;
+    for order in orders {
+        let mut subs = serde_json::Map::new();
+        for i in order {
+            subs.insert(defs[*i].0.into(), defs[*i].1.clone());
+        }
+        let subs = Value::Object(subs);
+        let r = run(&f, json!({"h": {"histogram": {"field": "k", "interval": 1}, "aggs": subs.clone()}})).unwrap();
+        let cs: Vec<Value> = r["h"]["buckets"].as_array().unwrap().iter().map(|b| b["cs"]["value"].clone()).collect();
+        // The review's example: [0, 2, 5], not [0, 0, 0]; the selector
+        // (bs = 10 * cs + s > 1) drops the first bucket.
+        assert_eq!(cs, vec![json!(2.0), json!(5.0)], "{order:?}: {r}");
+        // Nested one level down too.
+        let nested = run(&f, json!({"t": {"terms": {"field": "k", "size": 1}, "aggs": {"h": {"histogram": {"field": "k", "interval": 1}, "aggs": subs}}}})).unwrap();
+        match &first {
+            None => first = Some(json!([r, nested])),
+            Some(f) => assert_eq!(&json!([r, nested]), f, "{order:?}"),
+        }
+    }
+    let err = run(&f, json!({"h": {"histogram": {"field": "k", "interval": 1}, "aggs": {
+        "a": {"derivative": {"buckets_path": "b"}}, "b": {"cumulative_sum": {"buckets_path": "a"}}}}})).unwrap_err();
+    assert!(err.to_string().contains("Cyclical dependency found with pipeline aggregator"), "{err}");
+    let err = run(&f, json!({"h": {"histogram": {"field": "k", "interval": 1}, "aggs": {
+        "a": {"derivative": {"buckets_path": "nope"}}}}})).unwrap_err();
+    assert!(err.to_string().contains("No aggregation found for path [nope]"), "{err}");
+}
+
+/// `bucket_selector` / `bucket_script` gap policies over an empty bucket
+/// (ES `BucketHelpers.resolveBucketValue`).
+#[test]
+fn pipeline_gap_policies_over_empty_buckets() {
+    let f = fixture(json!({"properties": {"k": {"type": "long"}, "x": {"type": "long"}}}),
+        &[json!({"k": 0, "x": 4}), json!({"k": 2, "x": 6})]);
+    let keys = |policy: &str, script: &str| -> Vec<Value> {
+        let r = run(&f, json!({"h": {"histogram": {"field": "k", "interval": 1}, "aggs": {"a": {"avg": {"field": "x"}},
+            "sel": {"bucket_selector": {"buckets_path": {"x": "a"}, "script": script, "gap_policy": policy}}}}})).unwrap();
+        r["h"]["buckets"].as_array().unwrap().iter().map(|b| b["key"].clone()).collect()
+    };
+    // The empty bucket 1 (avg null): 0 under insert_zeros, NaN otherwise.
+    assert_eq!(keys("insert_zeros", "params.x > 0"), vec![json!(0.0), json!(2.0)]);
+    assert_eq!(keys("insert_zeros", "params.x == 0"), vec![json!(1.0)]);
+    assert_eq!(keys("skip", "params.x <= 0"), Vec::<Value>::new());
+    assert_eq!(keys("keep_values", "params.x != params.x"), vec![json!(1.0)]);
+    let script = |policy: &str| -> Vec<Value> {
+        let r = run(&f, json!({"h": {"histogram": {"field": "k", "interval": 1}, "aggs": {"a": {"avg": {"field": "x"}},
+            "b": {"bucket_script": {"buckets_path": {"x": "a"}, "script": "params.x + 1", "gap_policy": policy}}}}})).unwrap();
+        r["h"]["buckets"].as_array().unwrap().iter().map(|b| b.get("b").map(|v| v["value"].clone()).unwrap_or(json!("none"))).collect()
+    };
+    assert_eq!(script("skip"), vec![json!(5.0), json!("none"), json!(7.0)]);
+    assert_eq!(script("insert_zeros"), vec![json!(5.0), json!(1.0), json!(7.0)]);
+    let err = run(&f, json!({"h": {"histogram": {"field": "k", "interval": 1}, "aggs": {"a": {"avg": {"field": "x"}},
+        "b": {"bucket_script": {"buckets_path": {"x": "a"}, "script": "params.x", "gap_policy": "bogus"}}}}})).unwrap_err();
+    assert!(err.to_string().contains("Unknown GapPolicy"), "{err}");
+}
+
+/// #576: `top_metrics` honours the sort's `mode` and `missing`.
+#[test]
+fn top_metrics_sort_mode_and_missing() {
+    let f = fixture(
+        json!({"properties": {"s": {"type": "long"}, "m": {"type": "long"}}}),
+        &[json!({"s": [1, 100], "m": 10}), json!({"s": [5, 6], "m": 20}), json!({"m": 30})],
+    );
+    let top = |sort: Value| -> Value {
+        let r = run(&f, json!({"t": {"top_metrics": {"metrics": {"field": "m"}, "sort": sort}}})).unwrap();
+        r["t"]["top"][0].clone()
+    };
+    let t = top(json!({"s": {"order": "asc", "mode": "max"}}));
+    assert_eq!((t["metrics"]["m"].clone(), t["sort"][0].clone()), (json!(20), json!(6)), "{t}");
+    let t = top(json!({"s": {"order": "asc"}}));
+    assert_eq!(t["metrics"]["m"], json!(10), "default asc mode is min: {t}");
+    let t = top(json!({"s": {"order": "asc", "mode": "avg"}}));
+    assert_eq!(t["metrics"]["m"], json!(20), "avg 5.5 < 50.5: {t}");
+    let t = top(json!({"s": {"order": "asc", "missing": "_first"}}));
+    assert_eq!(t["metrics"]["m"], json!(30), "{t}");
+    let t = top(json!({"s": {"order": "asc", "missing": 0}}));
+    assert_eq!(t["metrics"]["m"], json!(30), "{t}");
+    let t = top(json!({"s": {"order": "desc"}}));
+    assert_eq!(t["metrics"]["m"], json!(10), "missing is last by default: {t}");
+}
+
+/// #625: `t_test` sides apply their `missing` replacement.
+#[test]
+fn t_test_applies_missing_values() {
+    let f = fixture(
+        json!({"properties": {"a": {"type": "double"}, "b": {"type": "double"}}}),
+        &[json!({"a": 0.0, "b": 1.0}), json!({"a": 2.0, "b": 3.0}), json!({"b": 1.0}), json!({"b": 3.0})],
+    );
+    let r = run(&f, json!({"t": {"t_test": {"a": {"field": "a", "missing": 0}, "b": {"field": "b"}, "type": "paired"}}})).unwrap();
+    let p = r["t"]["value"].as_f64().unwrap();
+    assert!(p > 0.05 && p < 0.07, "differences -1,-1,-1,-3 give p ~ 0.058: {r}");
+    let r = run(&f, json!({"t": {"t_test": {"a": {"field": "a", "missing": 0}, "b": {"field": "b"}, "type": "heteroscedastic"}}})).unwrap();
+    assert!(r["t"]["value"].as_f64().is_some(), "{r}");
 }

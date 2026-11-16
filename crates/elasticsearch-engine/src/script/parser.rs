@@ -93,6 +93,10 @@ pub fn parse(src: &str) -> PResult<(ScriptAst, Vec<usize>)> {
 }
 
 pub fn parse_with_literals(src: &str, literals: &std::collections::HashMap<usize, Vec<u16>>) -> PResult<(ScriptAst, Vec<usize>)> {
+    crate::parse_depth::guarded(|| parse_with_literals_unguarded(src, literals))
+}
+
+fn parse_with_literals_unguarded(src: &str, literals: &std::collections::HashMap<usize, Vec<u16>>) -> PResult<(ScriptAst, Vec<usize>)> {
     let toks = lex(src)?;
     let mut p = Parser { toks, i: 0, stmt_starts: Vec::new(), in_args: 0, literals: literals.clone(), nest: crate::parse_depth::Nesting::new(512) };
     let mut functions = Vec::new();
@@ -157,7 +161,7 @@ impl Parser {
             Tok::Eof => "<EOF>".to_string(),
             Tok::Ident(s) => s.clone(),
             Tok::Int(v, _) => v.to_string(),
-            Tok::Float(v) => v.to_string(),
+            Tok::Float(v) | Tok::FloatF(v) => v.to_string(),
             Tok::Str(s) => format!("'{s}'"),
             Tok::Regex(p, f) => format!("/{p}/{f}"),
             Tok::P(p) => p.to_string(),
@@ -283,7 +287,7 @@ impl Parser {
             let t = match self.peek() {
                 Tok::Ident(s) => s.clone(),
                 Tok::Int(v, _) => v.to_string(),
-                Tok::Float(v) => v.to_string(),
+                Tok::Float(v) | Tok::FloatF(v) => v.to_string(),
                 Tok::Str(s) => format!("'{s}'"),
                 Tok::Regex(p, f) => format!("/{p}/{f}"),
                 Tok::P(p) => p.to_string(),
@@ -650,6 +654,10 @@ impl Parser {
                         self.i += 1;
                         Ok(Expr { pos, kind: ExprKind::Double(-v) })
                     }
+                    Tok::FloatF(v) if !self.is_p_at(1, ".") => {
+                        self.i += 1;
+                        Ok(float_literal(pos, -v))
+                    }
                     _ => {
                         let e = self.unary()?;
                         Ok(Expr { pos, kind: ExprKind::Unary(UnOp::Neg, Box::new(e)) })
@@ -675,7 +683,7 @@ impl Parser {
                         let next = self.peek_at(2 + n).clone();
                         let starts_expr = match next {
                             Tok::Ident(ref s) => s != "instanceof",
-                            Tok::Int(..) | Tok::Float(_) | Tok::Str(_) => true,
+                            Tok::Int(..) | Tok::Float(_) | Tok::FloatF(_) | Tok::Str(_) => true,
                             Tok::P("(") | Tok::P("!") | Tok::P("~") | Tok::P("[") => true,
                             Tok::P("-") | Tok::P("+") | Tok::P("++") | Tok::P("--") => is_prim,
                             _ => false,
@@ -787,6 +795,10 @@ impl Parser {
             Tok::Float(v) => {
                 self.i += 1;
                 Ok(Expr { pos, kind: ExprKind::Double(v) })
+            }
+            Tok::FloatF(v) => {
+                self.i += 1;
+                Ok(float_literal(pos, v))
             }
             Tok::Str(s) => {
                 self.i += 1;
@@ -960,4 +972,10 @@ fn int_kind(v: i128, long: bool, pos: usize) -> PResult<ExprKind> {
         return Err(ScriptErr::compile(pos, format!("Invalid int constant [{v}].")));
     }
     Ok(ExprKind::Int(v as i32))
+}
+
+/// A `float` literal: its single-precision value typed `float` (a cast of
+/// the exact double, so every compile path sees the float static type).
+fn float_literal(pos: usize, v: f64) -> Expr {
+    Expr { pos, kind: ExprKind::Cast { ty: Ty::Float, expr: Box::new(Expr { pos, kind: ExprKind::Double(v) }) } }
 }

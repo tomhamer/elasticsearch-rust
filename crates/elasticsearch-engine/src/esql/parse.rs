@@ -69,6 +69,65 @@ pub struct SortKey {
     pub nulls_first: Option<bool>,
 }
 
+/// The cast target of an ES SQL type name (`CAST(x AS BIGINT)`) or ODBC
+/// name (`CONVERT(x, SQL_BIGINT)`), as ES 9.5.5's `ExpressionBuilder`
+/// resolves it: a `SQL_` name through `SqlDataTypes.ODBC_TO_ES` only, any
+/// other through `SQL_TO_ES` (the ES type names, then the ODBC names
+/// without `SQL_`, which override `FLOAT` to double, then `BOOL`, `INT`,
+/// `STRING`). `None`: a type ES does not recognize.
+pub fn sql_cast_type(raw: &str) -> Option<String> {
+    let upper = raw.to_ascii_uppercase();
+    let odbc = |n: &str| -> Option<String> {
+        Some(match n {
+            "BIT" => "boolean",
+            "TINYINT" => "byte",
+            "SMALLINT" => "short",
+            "INTEGER" => "integer",
+            "BIGINT" => "long",
+            "UBIGINT" => "unsigned_long",
+            "REAL" => "float",
+            "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" => "double",
+            "GUID" | "CHAR" | "WCHAR" => "keyword",
+            "VARCHAR" | "WVARCHAR" | "LONGVARCHAR" | "WLONGVARCHAR" => "text",
+            "BINARY" | "VARBINARY" | "LONGVARBINARY" => "binary",
+            "DATE" => "date",
+            "TIME" => "time",
+            "TIMESTAMP" => "datetime",
+            n if n.strip_prefix("INTERVAL_").is_some_and(|u| matches!(u, "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "YEAR_TO_MONTH" | "DAY_TO_HOUR" | "DAY_TO_MINUTE" | "DAY_TO_SECOND" | "HOUR_TO_MINUTE" | "HOUR_TO_SECOND" | "MINUTE_TO_SECOND")) => return Some(n.to_ascii_lowercase()),
+            _ => return None,
+        }.to_string())
+    };
+    if let Some(n) = upper.strip_prefix("SQL_") {
+        return odbc(n);
+    }
+    if let Some(t) = odbc(&upper) {
+        return Some(t);
+    }
+    Some(match upper.as_str() {
+        "BOOL" | "BOOLEAN" => "boolean",
+        "INT" => "integer",
+        "STRING" | "KEYWORD" => "keyword",
+        "TEXT" => "text",
+        "LONG" => "long",
+        "SHORT" => "short",
+        "BYTE" => "byte",
+        "HALF_FLOAT" => "half_float",
+        "SCALED_FLOAT" => "scaled_float",
+        "UNSIGNED_LONG" => "unsigned_long",
+        "DATETIME" => "datetime",
+        "IP" => "ip",
+        "VERSION" => "version",
+        "NULL" => "null",
+        "GEO_POINT" => "geo_point",
+        "GEO_SHAPE" => "geo_shape",
+        "SHAPE" => "shape",
+        "CONSTANT_KEYWORD" => "constant_keyword",
+        "WILDCARD" => "wildcard",
+        _ => return None,
+    }.to_string())
+}
+
+
 #[derive(Clone, Debug)]
 pub enum Cmd {
     /// `FROM`/`TS`: index patterns, metadata fields, and `(subquery)` branches.
@@ -136,6 +195,39 @@ impl Params {
         }
         Ok(p)
     }
+}
+
+/// Key of a SQL parameter's declared type (set by `sql_params`).
+pub const SQL_PARAM_TYPE: &str = "\u{0}sql_type";
+
+/// A SQL parameter's value as a literal of its declared type (ES SQL
+/// `SqlTypedParamValue`); `None`: an unknown type or a value it cannot hold.
+fn typed_param(v: &Value, ty: &str) -> Option<Val> {
+    if v.is_null() {
+        return Some(Val::Null);
+    }
+    Some(match ty.to_ascii_lowercase().as_str() {
+        "datetime" | "date" | "timestamp" => match v {
+            Value::String(s) => Val::Date(super::func::parse_date_str(s)?),
+            Value::Number(n) => Val::Date(n.as_i64()?),
+            _ => return None,
+        },
+        "byte" | "short" | "integer" => Val::Int(i64::from(i32::try_from(v.as_i64()?).ok()?)),
+        "long" => Val::Long(v.as_i64()?),
+        "unsigned_long" => match v.as_u64()? {
+            u if u <= i64::MAX as u64 => Val::Long(u as i64),
+            u => Val::ULong(u),
+        },
+        "double" | "float" | "half_float" | "scaled_float" => Val::Double(v.as_f64()?),
+        "keyword" | "text" | "constant_keyword" | "wildcard" => Val::Str(match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }),
+        "boolean" => Val::Bool(v.as_bool()?),
+        "ip" | "version" => Val::Str(v.as_str()?.to_string()),
+        "null" => Val::Null,
+        _ => json_to_val(v),
+    })
 }
 
 pub fn json_to_val(v: &Value) -> Val {
@@ -500,6 +592,15 @@ impl<'a> Parser<'a> {
                 Expr::Lit(Val::Int(i)) => Expr::Lit(Val::Int(-i)),
                 Expr::Lit(Val::Long(i)) => Expr::Lit(Val::Long(-i)),
                 Expr::Lit(Val::Double(d)) => Expr::Lit(Val::Double(-d)),
+                // `-9223372036854775808` is `i64::MIN`; a larger magnitude
+                // is a double, as ES reads it.
+                Expr::Lit(Val::ULong(u)) if u == 1 << 63 => Expr::Lit(Val::Long(i64::MIN)),
+                Expr::Lit(Val::ULong(u)) => Expr::Lit(Val::Double(-(u as f64))),
+                // `-INTERVAL ...`: the literal negated (ES folds the sign in).
+                Expr::Cast(inner, t) if t.starts_with(super::sqltime::LITERAL_PREFIX) => match *inner {
+                    Expr::Lit(Val::Str(iso)) => Expr::Cast(Box::new(Expr::Lit(Val::Str(super::sqltime::negate_iso(&iso).unwrap_or(iso)))), t),
+                    other => Expr::Neg(Box::new(Expr::Cast(Box::new(other), t))),
+                },
                 other => Expr::Neg(Box::new(other)),
             });
         }
@@ -543,6 +644,10 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 self.number_lit(Val::Double(d))
             }
+            Tok::UInt(u) => {
+                self.i += 1;
+                self.number_lit(Val::ULong(u))
+            }
             Tok::Str(s) => {
                 self.i += 1;
                 Ok(Expr::Lit(Val::Str(s)))
@@ -555,6 +660,9 @@ impl<'a> Parser<'a> {
                     }
                     if m.get("kind").and_then(Value::as_str).map(|k| k.eq_ignore_ascii_case("identifier")).unwrap_or(false) {
                         return Ok(Expr::Col(m.get("value").and_then(Value::as_str).unwrap_or("").to_string(), pos));
+                    }
+                    if let (Some(x), Some(t)) = (m.get("value"), m.get(SQL_PARAM_TYPE).and_then(Value::as_str)) {
+                        return typed_param(x, t).map(Expr::Lit).ok_or_else(|| parsing_err(self.full, pos, format!("Invalid parameter data type [{t}]")));
                     }
                     if let Some(x) = m.get("value") {
                         return Ok(Expr::Lit(json_to_val(x)));
@@ -634,6 +742,10 @@ impl<'a> Parser<'a> {
                         self.i += 1;
                         return self.sql_case(pos);
                     }
+                    "INTERVAL" if self.d == Dialect::Sql && matches!(self.peek_at(1), Tok::Int(_) | Tok::Dec(_) | Tok::Str(_) | Tok::Op("+") | Tok::Op("-")) => {
+                        self.i += 1;
+                        return self.sql_interval(pos);
+                    }
                     "CAST" if self.d == Dialect::Sql && matches!(self.peek_at(1), Tok::LParen) => {}
                     _ => {}
                 }
@@ -650,6 +762,67 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.unexpected("{QUOTED_STRING, INTEGER_LITERAL, DECIMAL_LITERAL, FALSE, NOT, NULL, ?, TRUE, '+', '-', '[', '(', UNQUOTED_IDENTIFIER, QUOTED_IDENTIFIER}")),
         }
+    }
+
+    /// ES SQL `INTERVAL [+|-] (number | 'pattern') unit [TO unit]`
+    /// (`ExpressionBuilder.visitInterval`): a literal of its interval type.
+    fn sql_interval(&mut self, pos: usize) -> Result<Expr> {
+        use super::sqltime as st;
+        let mut negative = false;
+        if matches!(self.peek(), Tok::Op("-")) {
+            negative = true;
+            self.i += 1;
+        } else if matches!(self.peek(), Tok::Op("+")) {
+            self.i += 1;
+        }
+        let value_at = self.pos();
+        let value = self.peek().clone();
+        self.i += 1;
+        let unit_at = self.pos();
+        let unit = |p: &mut Self| -> Result<st::Unit> {
+            let at = p.pos();
+            match p.peek().clone() {
+                Tok::Ident(w) => match st::Unit::parse(&w) {
+                    Some(u) => {
+                        p.i += 1;
+                        Ok(u)
+                    }
+                    None => Err(parsing_err(p.full, at, format!("mismatched input '{w}' expecting {{'DAY', 'DAYS', 'HOUR', 'HOURS', 'MINUTE', 'MINUTES', 'MONTH', 'MONTHS', 'SECOND', 'SECONDS', 'YEAR', 'YEARS'}}"))),
+                },
+                _ => Err(p.unexpected("{'DAY', 'DAYS', 'HOUR', 'HOURS', 'MINUTE', 'MINUTES', 'MONTH', 'MONTHS', 'SECOND', 'SECONDS', 'YEAR', 'YEARS'}")),
+            }
+        };
+        let leading = unit(self)?;
+        let mut trailing = None;
+        let mut trailing_at = unit_at;
+        if self.eat_kw("TO") {
+            trailing_at = self.pos();
+            trailing = Some(unit(self)?);
+        }
+        st::check_declaration(leading, trailing).map_err(|m| parsing_err(self.full, trailing_at, m))?;
+        let ty = st::interval_type(leading, trailing).map_err(|m| parsing_err(self.full, pos, m))?;
+        let iso = match value {
+            Tok::Int(_) | Tok::Dec(_) | Tok::UInt(_) => {
+                if trailing.is_some() {
+                    let t = format!("{:?}", trailing.unwrap()).to_ascii_uppercase();
+                    return Err(parsing_err(self.full, trailing_at, format!("Invalid interval declaration; trailing unit [{t}] specified but the value is with numeric (single unit), use the string notation instead")));
+                }
+                let n: i64 = match value {
+                    Tok::Int(i) => i,
+                    Tok::UInt(u) => i64::try_from(u).map_err(|_| parsing_err(self.full, value_at, format!("Value [{u}] cannot be used as it is too large to convert into [{:?}]s", leading).to_string()))?,
+                    Tok::Dec(d) if d.fract() == 0.0 => d as i64,
+                    _ => return Err(parsing_err(self.full, value_at, "Fractional values are not supported for intervals")),
+                };
+                let n = if negative { -n } else { n };
+                st::of_number(n, leading).map_err(|m| parsing_err(self.full, value_at, m))?
+            }
+            Tok::Str(s) => {
+                let iso = st::parse_pattern(&s, ty).map_err(|m| parsing_err(self.full, value_at, m))?;
+                if negative { st::negate_iso(&iso).unwrap_or(iso) } else { iso }
+            }
+            _ => return Err(parsing_err(self.full, value_at, "expected an interval value")),
+        };
+        Ok(Expr::Cast(Box::new(Expr::Lit(Val::Str(iso))), format!("{}{ty}", st::LITERAL_PREFIX)))
     }
 
     fn sql_case(&mut self, pos: usize) -> Result<Expr> {
@@ -684,7 +857,19 @@ impl<'a> Parser<'a> {
             if !self.eat_kw("AS") {
                 return Err(self.unexpected("AS"));
             }
-            let ty = self.ident()?.to_ascii_lowercase();
+            let at = self.pos();
+            let raw = self.ident()?;
+            let ty = sql_cast_type(&raw).ok_or_else(|| parsing_err(self.full, at, format!("Does not recognize type [{raw}]")))?;
+            self.expect(&Tok::RParen, "')'")?;
+            return Ok(Expr::Cast(Box::new(e), ty));
+        }
+        // ES SQL `CONVERT(expr, type)`: CAST with ODBC `SQL_` type names.
+        if self.d == Dialect::Sql && name == "CONVERT" {
+            let e = self.expr()?;
+            self.expect(&Tok::Comma, "','")?;
+            let at = self.pos();
+            let raw = self.ident()?;
+            let ty = sql_cast_type(&raw).ok_or_else(|| parsing_err(self.full, at, format!("Does not recognize type [{raw}]")))?;
             self.expect(&Tok::RParen, "')'")?;
             return Ok(Expr::Cast(Box::new(e), ty));
         }
@@ -787,6 +972,10 @@ fn unquote_name(s: &str) -> String {
 
 /// Parse a full ES|QL query (its `SET` statements are skipped).
 pub fn parse_query(full: &str, params: &Params) -> Result<Vec<Cmd>> {
+    crate::parse_depth::guarded(|| parse_query_unguarded(full, params))
+}
+
+fn parse_query_unguarded(full: &str, params: &Params) -> Result<Vec<Cmd>> {
     Ok(parse_statement(full, params)?.1)
 }
 

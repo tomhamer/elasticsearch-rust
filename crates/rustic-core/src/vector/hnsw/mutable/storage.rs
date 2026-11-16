@@ -113,8 +113,200 @@ pub(super) struct Writer {
     pub(super) capture_log: Option<CaptureLog>,
     pending_memory:Option<crate::admission::Reservation>,
     free_memory:Option<crate::admission::Reservation>,
-    visibility_memory:Option<crate::admission::Reservation>,
+    pub(super) visibility_memory:Option<crate::admission::Reservation>,
     retired_memory:Option<crate::admission::Reservation>,
+    /// Slots whose checkpoint record changed since the last capture (see
+    /// [`SaveChanges`]), and of those, slots a node was inserted into.
+    pub(super) save_dirty: SlotBits,
+    pub(super) save_inserted: SlotBits,
+    /// Slots whose node's retirement changed since the last capture.
+    pub(super) save_retired: SlotBits,
+    /// Link edits published since the last capture (see [`EditLog`]).
+    pub(super) save_edits: EditLog,
+    /// Changes taken by captures whose checkpoint is not durable yet.
+    pub(super) save_pending: Vec<PendingSave>,
+}
+
+/// One capture's changes ([`Writer::take_save_changes`]), kept until a
+/// checkpoint at or after it is durable.
+pub(super) struct PendingSave {
+    generation: u64,
+    dirty: SlotBits,
+    inserted: SlotBits,
+    retired: SlotBits,
+    edits: Vec<std::sync::Arc<EditChunk>>,
+    edits_complete: bool,
+}
+
+/// The link edits a graph publishes, in order, as compact entries: a link
+/// list's ids removed and added (`LINK_EDIT`: slot, level, counts, ids; about
+/// 16 bytes for a back-link added and one pruned, where its whole record is
+/// ~130), or a node removed (`REMOVE_EDIT`: slot). Appended under the graph
+/// writer as publications happen, in chunks charged to admission; a capture
+/// cuts them ([`Writer::take_save_changes`]) and an incremental save writes
+/// every chunk since the newest durable checkpoint.
+#[derive(Default)]
+pub(super) struct EditLog {
+    current: Vec<u8>,
+    sealed: Vec<std::sync::Arc<EditChunk>>,
+    memory: Option<crate::admission::Reservation>,
+    /// Bytes logged since the last capture.
+    bytes: usize,
+    /// Some edit since the last capture is not logged (the cluster's segment
+    /// format is below v40, or the log passed [`EDIT_LOG_MAX_BYTES`]): the
+    /// next save cannot be a link log.
+    incomplete: bool,
+}
+
+/// A sealed run of [`EditLog`] entries.
+pub struct EditChunk {
+    pub bytes: Vec<u8>,
+    _memory: Option<crate::admission::Reservation>,
+}
+
+/// [`EditLog`] entry kinds.
+pub const LINK_EDIT: u8 = 1;
+pub const REMOVE_EDIT: u8 = 2;
+/// Bytes an [`EditLog`] chunk holds before it is sealed.
+const EDIT_CHUNK_BYTES: usize = 1 << 20;
+/// Unsaved edits an [`EditLog`] holds at most (past it they are dropped and
+/// the next save is not a link log).
+const EDIT_LOG_MAX_BYTES: usize = 256 << 20;
+/// Steps the log's admission charge grows by.
+const EDIT_CHARGE_STEP: usize = 64 << 10;
+
+impl EditLog {
+    /// Append `entries` (whole entries). Never refused: the publication they
+    /// describe already happened (the charge may pass the budget).
+    pub(super) fn append(&mut self, entries: &[u8]) {
+        if entries.is_empty() || self.incomplete { return; }
+        if crate::codec::write_version() < crate::codec::GRAPH_LINK_LOG_SINCE || self.bytes + entries.len() > EDIT_LOG_MAX_BYTES {
+            // Not logged: the next save is not a link log.
+            self.incomplete = true;
+            self.current = Vec::new();
+            self.sealed.clear();
+            self.memory = None;
+            self.bytes = 0;
+            return;
+        }
+        // Charged as it grows (in steps), never refused: the publication
+        // it describes already happened.
+        let charged = self.memory.as_ref().map_or(0, |memory| memory.bytes() as usize);
+        if self.current.len() + entries.len() > charged {
+            let more = (self.current.len() + entries.len() - charged).max(EDIT_CHARGE_STEP) as u64;
+            crate::admission::forced(|| match self.memory.as_mut() {
+                Some(memory) => memory.grow(more, "graph link edit log"),
+                None => crate::admission::shared().reserve(more, "graph link edit log").map(|memory| { self.memory = Some(memory); }),
+            }).ok();
+        }
+        self.current.extend_from_slice(entries);
+        self.bytes += entries.len();
+        if self.current.len() >= EDIT_CHUNK_BYTES { self.seal(); }
+    }
+    fn seal(&mut self) {
+        if self.current.is_empty() { return; }
+        let bytes = std::mem::take(&mut self.current);
+        self.sealed.push(std::sync::Arc::new(EditChunk { bytes, _memory: self.memory.take() }));
+    }
+    /// Every entry logged since the last cut, as sealed chunks, and whether
+    /// every edit since was logged.
+    fn cut(&mut self) -> (Vec<std::sync::Arc<EditChunk>>, bool) {
+        self.seal();
+        self.bytes = 0;
+        let complete = !std::mem::take(&mut self.incomplete);
+        (std::mem::take(&mut self.sealed), complete)
+    }
+}
+
+/// A set of graph slots (0-based), one bit each.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct SlotBits(Vec<u64>);
+impl SlotBits {
+    pub fn mark(&mut self, slot: u32) {
+        let word = slot as usize / 64;
+        if word >= self.0.len() { self.0.resize(word + 1, 0); }
+        self.0[word] |= 1 << (slot % 64);
+    }
+    pub fn contains(&self, slot: u32) -> bool {
+        self.0.get(slot as usize / 64).is_some_and(|word| word & (1 << (slot % 64)) != 0)
+    }
+    pub fn union_with(&mut self, other: &SlotBits) {
+        if other.0.len() > self.0.len() { self.0.resize(other.0.len(), 0); }
+        for (a, b) in self.0.iter_mut().zip(&other.0) { *a |= *b; }
+    }
+    pub fn len(&self) -> usize { self.0.iter().map(|w| w.count_ones() as usize).sum() }
+    pub fn is_empty(&self) -> bool { self.0.iter().all(|w| *w == 0) }
+    /// The slots, increasing.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(|(i, &word)| {
+            let mut word = word;
+            std::iter::from_fn(move || {
+                if word == 0 { return None; }
+                let bit = word.trailing_zeros();
+                word &= word - 1;
+                Some(i as u32 * 64 + bit)
+            })
+        })
+    }
+    pub fn heap_bytes(&self) -> usize { self.0.capacity() * 8 }
+}
+
+/// What changed in a graph's checkpoint since its newest durable one, as a
+/// capture took it: the slots whose record (incarnation, presence, node
+/// metadata or links) may differ, and the slots a node was inserted into.
+#[derive(Clone, Default)]
+pub struct SaveChanges {
+    pub slots: SlotBits,
+    pub inserted: SlotBits,
+    /// Slots whose node's retirement changed.
+    pub retired: SlotBits,
+    /// The link edits published since, oldest first ([`EditLog`]), and
+    /// whether they are all of them (else no link log can be saved).
+    pub edits: Vec<std::sync::Arc<EditChunk>>,
+    pub edits_complete: bool,
+}
+impl std::fmt::Debug for SaveChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaveChanges").field("slots", &self.slots.len()).field("inserted", &self.inserted.len())
+            .field("edit_bytes", &self.edits.iter().map(|chunk| chunk.bytes.len()).sum::<usize>()).finish()
+    }
+}
+
+impl Writer {
+    /// Slot `slot`'s checkpoint record changes (`inserted`: a node is
+    /// inserted into it).
+    pub(super) fn mark_saved_change(&mut self, slot: u32, inserted: bool) {
+        self.save_dirty.mark(slot);
+        if inserted { self.save_inserted.mark(slot); }
+    }
+    /// A capture at mutation generation `generation` takes the changes since
+    /// the previous capture; returned: every change since the newest durable
+    /// checkpoint (those of captures not durable yet included).
+    pub(super) fn take_save_changes(&mut self, generation: u64) -> SaveChanges {
+        let dirty = std::mem::take(&mut self.save_dirty);
+        let inserted = std::mem::take(&mut self.save_inserted);
+        let retired = std::mem::take(&mut self.save_retired);
+        let (edits, edits_complete) = self.save_edits.cut();
+        self.save_pending.push(PendingSave { generation, dirty, inserted, retired, edits, edits_complete });
+        let mut changes = SaveChanges { edits_complete: true, ..SaveChanges::default() };
+        for pending in &self.save_pending {
+            changes.edits_complete &= pending.edits_complete;
+            changes.slots.union_with(&pending.dirty);
+            changes.inserted.union_with(&pending.inserted);
+            changes.retired.union_with(&pending.retired);
+            changes.edits.extend(pending.edits.iter().cloned());
+        }
+        changes
+    }
+    /// The checkpoint captured at `generation` is durable: changes taken by
+    /// it and by older captures are in it.
+    pub(super) fn saves_durable(&mut self, generation: u64) {
+        self.save_pending.retain(|pending| pending.generation > generation);
+    }
+    /// Bytes of link edits not in a durable checkpoint yet.
+    pub(super) fn unsaved_edit_bytes(&self) -> usize {
+        self.save_edits.bytes + self.save_pending.iter().flat_map(|p| &p.edits).map(|c| c.bytes.len()).sum::<usize>()
+    }
 }
 
 /// Pre-images for a chunked capture: internal ids at or above `cursor` (and
@@ -141,7 +333,7 @@ fn reserve_vec<T>(values:&mut Vec<T>,memory:&mut Option<crate::admission::Reserv
     let mut next=Vec::new();next.try_reserve_exact(capacity).map_err(|_|failure("graph registry allocation"))?;
     next.append(values);*values=next;*memory=Some(next_memory);Ok(())
 }
-fn reserve_map<K:Eq+std::hash::Hash,V>(values:&mut HashMap<K,V>,memory:&mut Option<crate::admission::Reservation>,needed:usize,label:&str)->Result<()> {
+pub(super) fn reserve_map<K:Eq+std::hash::Hash,V>(values:&mut HashMap<K,V>,memory:&mut Option<crate::admission::Reservation>,needed:usize,label:&str)->Result<()> {
     if needed<=values.capacity(){return Ok(())}
     let capacity=needed.max(values.capacity().saturating_mul(2));
     let buckets=capacity.max(1).checked_next_power_of_two().and_then(|v|v.checked_mul(2)).ok_or_else(||failure("graph map capacity overflow"))?;
@@ -152,8 +344,11 @@ fn reserve_map<K:Eq+std::hash::Hash,V>(values:&mut HashMap<K,V>,memory:&mut Opti
 }
 impl Writer {
     pub(super) fn reserve_slots(&mut self,needed:usize)->Result<()> {
-        reserve_vec(&mut self.free,&mut self.free_memory,needed,"graph free slot registry")?;
-        reserve_map(&mut self.visibility_retained,&mut self.visibility_memory,needed,"graph visibility retirement registry")
+        // (The visibility retirement registry is reserved by `retire_after`
+        // as entries arrive: reserving it for every slot ever allocated held
+        // a map of the whole graph's size, ~75 bytes per node, almost always
+        // empty.)
+        reserve_vec(&mut self.free,&mut self.free_memory,needed,"graph free slot registry")
     }
     fn retirement_obligations(&self) -> usize {
         self.retired.len() + self.outstanding_acks + self.pending.len()
@@ -252,6 +447,8 @@ impl GraphStorage {
                 blocked: None,
                 capture_log: None,
                 pending_memory:None,free_memory:None,visibility_memory:None,retired_memory:None,
+                save_dirty: SlotBits::default(), save_inserted: SlotBits::default(), save_retired: SlotBits::default(),
+                save_edits: EditLog::default(), save_pending: Vec::new(),
             }),
             entry: AtomicU64::new(0),
             publication: AtomicU64::new(0),
@@ -444,6 +641,7 @@ impl GraphStorage {
         }
         .map_err(crate::vector::hnsw::mutable::failure_error)?;
         // All allocations and validation precede issuing the key or handle.
+        writer.mark_saved_change(slot, false);
         if new_slot {
             self.allocated.store(allocated + 1, Ordering::Release);
         } else {
@@ -788,6 +986,7 @@ impl Drop for InsertReservation {
             return;
         };
         transition.commit();
+        writer.mark_saved_change(self.handle.slot(), false);
         writer.pending.remove(&self.key);
         self.control
             .retire_committed(&mut writer, self.handle, self.key);
@@ -840,6 +1039,7 @@ impl Drop for ReclaimedNode {
             self.control.poison();
             return;
         }
+        writer.mark_saved_change(handle.slot(), false);
         if handle.generation() == u32::MAX {
             writer.exhausted += 1;
         } else {

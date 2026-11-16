@@ -906,9 +906,21 @@ impl IvfState {
         // as a sequential scan keeps.
         let accept_rate = |st: &IvfStats| if st.entries_visited == 0 { 1.0 } else { st.entries_scored as f64 / st.entries_visited as f64 };
         // ES: while under the visit budget or the collector is not full.
+        // Stopped (deadline, cancellation): no further wave, so the point
+        // table's read lock is released and writes proceed.
+        let stopped = || -> Result<()> {
+            if crate::cancel::search_stopped() {
+                return Err(crate::error::RusticError::InvalidQuery("vector search stopped: deadline or cancellation".into()));
+            }
+            Ok(())
+        };
+        stopped()?;
         while next < order.len() && (max_visit > stats.entries_visited || heap.len() < budget) {
+            stopped()?;
             let want = if max_visit > stats.entries_visited {
-                max_visit - stats.entries_visited
+                // Bounded waves: the deadline is polled between them (the
+                // visited set is the same as one wave's).
+                (max_visit - stats.entries_visited).min(4 * WAVE_ENTRIES)
             } else {
                 let rate = accept_rate(&stats);
                 if rate > 0.0 { (((budget - heap.len()) as f64 / rate).ceil() as u64).min(WAVE_ENTRIES) } else { 0 }
@@ -922,6 +934,7 @@ impl IvfState {
             let unfiltered_ratio = stats.entries_visited as f32 / n as f32;
             let expected = (2.0 * filtered * unfiltered_ratio).min(stats.entries_visited as f32 / 2.0);
             while next < order.len() && ((stats.entries_scored as f32) < expected || (stats.entries_scored as usize) < budget) {
+                stopped()?;
                 let need = (f64::from(expected) - stats.entries_scored as f64).max(budget as f64 - stats.entries_scored as f64).max(1.0);
                 let rate = accept_rate(&stats);
                 // The accept rate grows as the scan reaches the matches:

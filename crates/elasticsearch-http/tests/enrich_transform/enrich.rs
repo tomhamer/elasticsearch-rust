@@ -148,3 +148,60 @@ async fn enrich_range_policy_and_async_execute() {
     assert_eq!(st, 404, "{v}");
     let _: Value = v;
 }
+
+/// Production review #177: ES|QL match ENRICH enriches every input key,
+/// whatever the size of the policy's dictionary (it read only the first
+/// 10,000 policy documents before).
+#[tokio::test]
+async fn esql_match_enrich_covers_a_dictionary_beyond_ten_thousand_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let es = start(dir.path()).await;
+    let (st, v) = es.put("/dict", json!({"mappings": {"properties": {"key": {"type": "keyword"}, "val": {"type": "keyword"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let n = 10_001;
+    let lines: Vec<Value> = (0..n).flat_map(|i| [json!({"index": {}}), json!({"key": format!("k{i}"), "val": format!("v{i}")})]).collect();
+    let (st, v) = es.bulk("/dict/_bulk?refresh=true", &lines).await;
+    assert_eq!((st, &v["errors"]), (200, &json!(false)));
+    let (st, v) = es.put("/_enrich/policy/dict-policy", json!({"match": {"indices": ["dict"], "match_field": "key", "enrich_fields": ["val"]}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put_empty("/_enrich/policy/dict-policy/_execute").await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/input", json!({"mappings": {"properties": {"key": {"type": "keyword"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let keys = ["k0", "k5000", "k9999", "k10000", "absent"];
+    let lines: Vec<Value> = keys.iter().flat_map(|k| [json!({"index": {}}), json!({"key": k})]).collect();
+    let (st, v) = es.bulk("/input/_bulk?refresh=true", &lines).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.post("/_query", json!({"query": "FROM input | KEEP key | ENRICH dict-policy ON key WITH val | SORT key"})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["values"], json!([["absent", null], ["k0", "v0"], ["k10000", "v10000"], ["k5000", "v5000"], ["k9999", "v9999"]]), "{v}");
+}
+
+/// Production review #178: a range/geo_match ENRICH whose lookup fails
+/// fails the query instead of reading as a nonmatch; a value that cannot
+/// be a match field value is still a plain nonmatch.
+#[tokio::test]
+async fn esql_range_enrich_lookup_failures_fail_the_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let es = start(dir.path()).await;
+    let (st, v) = es.put("/bands", json!({"mappings": {"properties": {"r": {"type": "integer_range"}, "label": {"type": "keyword"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    es.bulk("/bands/_bulk?refresh=true", &[json!({"index": {}}), json!({"r": {"gte": 0, "lt": 10}, "label": "low"})]).await;
+    let (st, v) = es.put("/_enrich/policy/bands-policy", json!({"range": {"indices": ["bands"], "match_field": "r", "enrich_fields": ["label"]}})).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put_empty("/_enrich/policy/bands-policy/_execute").await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.put("/vals", json!({"mappings": {"properties": {"n": {"type": "keyword"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    es.bulk("/vals/_bulk?refresh=true", &[json!({"index": {}}), json!({"n": "5"}), json!({"index": {}}), json!({"n": "abc"})]).await;
+    let q = json!({"query": "FROM vals | KEEP n | ENRICH bands-policy ON n WITH label | SORT n"});
+    *elasticsearch_engine::enrich::FAIL_LOOKUPS.lock() = Some(("bands-policy".into(), 1));
+    let (st, v) = es.post("/_query", q.clone()).await;
+    *elasticsearch_engine::enrich::FAIL_LOOKUPS.lock() = None;
+    assert!(st >= 500, "a failed lookup must fail the query: {st} {v}");
+    assert!(v.to_string().contains("injected lookup failure"), "{v}");
+    // Restored: the match; the unparsable value stays a nonmatch.
+    let (st, v) = es.post("/_query", q).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["values"], json!([["5", "low"], ["abc", null]]), "{v}");
+}

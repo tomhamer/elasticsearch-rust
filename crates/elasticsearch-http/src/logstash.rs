@@ -47,7 +47,16 @@ fn ensure_index(node: &Node) -> Result<Arc<IndexService>, EsError> {
     if let Some(s) = node.get_index(INDEX) {
         return Ok(s);
     }
-    let body = json!({
+    match node.create_index(INDEX, &index_body()) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind == "resource_already_exists_exception" => node.get_index(INDEX).ok_or(e),
+        Err(e) => Err(e),
+    }
+}
+
+/// Settings and mappings of `.logstash`.
+fn index_body() -> Value {
+    json!({
         "settings": {"index": {
             "codec": "best_compression",
             "routing": {"allocation": {"include": {"_tier_preference": "data_content"}}},
@@ -68,12 +77,7 @@ fn ensure_index(node: &Node) -> Result<Arc<IndexService>, EsError> {
                 "username": {"type": "keyword"}
             }
         }
-    });
-    match node.create_index(INDEX, &body) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind == "resource_already_exists_exception" => node.get_index(INDEX).ok_or(e),
-        Err(e) => Err(e),
-    }
+    })
 }
 
 // ---------------------------------------------------------------- JSON positions
@@ -298,14 +302,38 @@ fn put(node: &Node, req: &Req) -> R {
         e.reason = e.reason.replace("document with id 'ID'", &format!("document with id '{id}'"));
         e
     })?;
+    if let Some(rest) = req.internal_cluster_rest() {
+        // On a cluster the pipeline document goes through the coordinator
+        // to the `.logstash` primary, wherever it lives (finding 386).
+        if let Err(e) = (rest.0)("PUT", &format!("/{INDEX}"), Some(index_body())) {
+            if e.kind != "resource_already_exists_exception" {
+                return Err(e);
+            }
+        }
+        let v = (rest.0)("PUT", &format!("/{INDEX}/_doc/{}?refresh=true", url_id(&id)), Some(v))?;
+        return Ok(text_empty(if v["result"] == "created" { 201 } else { 200 }));
+    }
     let svc = ensure_index(node)?;
     let r = svc.write(vec![WriteReq::Index { id: Some(id), source: body.to_string(), routing: None, cond: WriteCond::default() }], true).remove(0)?;
     svc.refresh()?;
     Ok(text_empty(if r.result == "created" { 201 } else { 200 }))
 }
 
+/// `id` as a URI path segment.
+fn url_id(id: &str) -> String {
+    id.bytes().map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 fn delete(node: &Node, req: &Req) -> R {
     let id = req.seg(2).to_string();
+    if let Some(rest) = req.internal_cluster_rest() {
+        return Ok(match (rest.0)("DELETE", &format!("/{INDEX}/_doc/{}?refresh=true", url_id(&id)), None) {
+            Ok(v) if v["result"] == "deleted" => text_empty(200),
+            Ok(_) => text_empty(404),
+            Err(e) if e.status == 404 => text_empty(404),
+            Err(e) => return Err(e),
+        });
+    }
     let Some(svc) = node.get_index(INDEX) else { return Ok(text_empty(404)) };
     if svc.get(&id)?.is_none() {
         return Ok(text_empty(404));
@@ -315,14 +343,85 @@ fn delete(node: &Node, req: &Req) -> R {
     Ok(text_empty(200))
 }
 
+/// Where pipelines are read from: the local `.logstash` copy (a single
+/// node) or, on a cluster, the coordinator, which reaches the shard
+/// wherever it is (finding 386).
+enum Store {
+    Local(Arc<IndexService>),
+    Cluster(crate::ClusterRest),
+}
+
+/// Search page size (ES `TransportGetPipelineAction` scrolls 10,000 at a time).
+const PAGE: usize = 10_000;
+
+impl Store {
+    /// The raw source of pipeline `id`, if stored.
+    fn get(&self, id: &str) -> Result<Option<String>, EsError> {
+        match self {
+            Store::Local(svc) => Ok(svc.get(id)?.and_then(|g| g.source)),
+            Store::Cluster(rest) => match (rest.0)("GET", &format!("/{INDEX}/_doc/{}", url_id(id)), None) {
+                Ok(v) if v["found"] == true => Ok(Some(v["_source"].to_string())),
+                Ok(_) => Ok(None),
+                Err(e) if e.status == 404 => Ok(None),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    /// One page of every pipeline after `after` (index order).
+    fn page(&self, after: Option<&Value>, size: usize) -> Result<Value, EsError> {
+        let mut body = json!({"query": {"match_all": {}}, "size": size, "sort": ["_doc"]});
+        if let Some(a) = after {
+            body["search_after"] = a.clone();
+        }
+        match self {
+            Store::Local(svc) => {
+                svc.refresh()?;
+                let sreq = search::parse_request(&body, &HashMap::new())?;
+                let out = search::execute(&[Target::new(svc.clone())], &sreq, &ExecOpts { terms_lookup: None, cursors: None, max_buckets: 65_536, scroll_id: None, pit_id: None })?;
+                Ok(serde_json::from_str(&out.json)?)
+            }
+            Store::Cluster(rest) => {
+                // Pipelines written through other nodes are visible.
+                let _ = (rest.0)("POST", &format!("/{INDEX}/_refresh"), None);
+                (rest.0)("POST", &format!("/{INDEX}/_search"), Some(body))
+            }
+        }
+    }
+
+    /// Every pipeline `(id, raw source)`, in index order, over all pages
+    /// (finding 387: not just the first 10,000).
+    fn list_all(&self, page_size: usize) -> Result<Vec<(String, String)>, EsError> {
+        let mut rows = Vec::new();
+        let mut after: Option<Value> = None;
+        loop {
+            let v = self.page(after.as_ref(), page_size)?;
+            if v["timed_out"] == true || v["_shards"]["failed"].as_u64().unwrap_or(0) > 0 {
+                return Err(EsError::new(500, "search_phase_execution_exception", "listing Logstash pipelines returned incomplete results"));
+            }
+            let hits = v["hits"]["hits"].as_array().cloned().unwrap_or_default();
+            let n = hits.len();
+            for h in &hits {
+                rows.push((h["_id"].as_str().unwrap_or("").to_string(), h["_source"].to_string()));
+            }
+            match hits.last().map(|h| h["sort"].clone()) {
+                Some(s) if n == page_size && s.is_array() => after = Some(s),
+                _ => return Ok(rows),
+            }
+        }
+    }
+}
+
 fn get(node: &Node, req: &Req) -> R {
     let ids: Vec<String> = if req.segs.len() == 3 { req.seg(2).split(',').filter(|s| !s.is_empty()).map(str::to_string).collect() } else { Vec::new() };
-    let Some(svc) = node.get_index(INDEX) else {
-        return Ok(Resp::json(if ids.is_empty() { 200 } else { 404 }, json!({})));
+    let store = match req.internal_cluster_rest() {
+        Some(rest) => Store::Cluster(rest),
+        None => match node.get_index(INDEX) {
+            Some(svc) => Store::Local(svc),
+            None => return Ok(Resp::json(if ids.is_empty() { 200 } else { 404 }, json!({}))),
+        },
     };
-    // The reference answers from a search: hits come in index order.
-    let all = list_all(&svc)?;
-    let found: Vec<(String, String)> = all.into_iter().filter(|(k, _)| ids.is_empty() || ids.iter().any(|p| if p.contains('*') { wildcard_match(p, k) } else { p == k })).collect();
+    let found = fetch(&store, &ids, PAGE)?;
     if found.is_empty() && !ids.is_empty() {
         return Ok(Resp::json(404, json!({})));
     }
@@ -333,18 +432,57 @@ fn get(node: &Node, req: &Req) -> R {
     Ok(Resp::ok(Value::Object(out)))
 }
 
-/// Every pipeline `(id, raw source)`, in search order.
-fn list_all(svc: &Arc<IndexService>) -> Result<Vec<(String, String)>, EsError> {
-    svc.refresh()?;
-    let t = Target::new(svc.clone());
-    let sreq = SearchRequest { query: Some(json!({"match_all": {}})), size: 10_000, ..Default::default() };
-    let out = search::execute(&[t], &sreq, &ExecOpts { terms_lookup: None, cursors: None, max_buckets: 65_536, scroll_id: None, pit_id: None })?;
-    let v: Value = serde_json::from_str(&out.json)?;
-    let mut rows: Vec<(String, String)> = v["hits"]["hits"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|h| (h["_id"].as_str().unwrap_or("").to_string(), h["_source"].to_string()))
-        .collect();
-    Ok(rows)
+/// The pipelines `ids` names (ES `TransportGetPipelineAction`): exact ids
+/// are fetched directly; wildcards and "all" page through every pipeline.
+fn fetch(store: &Store, ids: &[String], page_size: usize) -> Result<Vec<(String, String)>, EsError> {
+    if !ids.is_empty() && ids.iter().all(|i| !i.contains('*')) {
+        let mut out = Vec::new();
+        for id in ids {
+            if out.iter().any(|(k, _): &(String, String)| k == id) {
+                continue;
+            }
+            match store.get(id) {
+                Ok(Some(src)) => out.push((id.clone(), src)),
+                Ok(None) => {}
+                // No `.logstash` yet: nothing is stored.
+                Err(e) if e.kind == "index_not_found_exception" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        return Ok(out);
+    }
+    let all = match store.list_all(page_size) {
+        Ok(a) => a,
+        Err(e) if e.kind == "index_not_found_exception" => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    Ok(all.into_iter().filter(|(k, _)| ids.is_empty() || ids.iter().any(|p| if p.contains('*') { wildcard_match(p, k) } else { p == k })).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding 387: wildcard / all reads page through every pipeline and
+    /// exact ids are fetched directly, whatever the page size.
+    #[test]
+    fn reads_are_not_capped_by_one_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let svc = ensure_index(&node).unwrap();
+        let reqs: Vec<WriteReq> = (0..7)
+            .map(|i| WriteReq::Index { id: Some(format!("p{i}")), source: json!({"pipeline": format!("input {{}} # {i}")}).to_string(), routing: None, cond: WriteCond::default() })
+            .collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        let store = Store::Local(svc);
+        let all = fetch(&store, &[], 3).unwrap();
+        assert_eq!(all.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["p0", "p1", "p2", "p3", "p4", "p5", "p6"]);
+        assert_eq!(fetch(&store, &["p*".to_string()], 2).unwrap().len(), 7);
+        let one = fetch(&store, &["p6".to_string(), "nope".to_string()], 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(one[0].1.contains("# 6"), "{one:?}");
+        assert!(fetch(&store, &["nope".to_string()], 1).unwrap().is_empty());
+    }
 }

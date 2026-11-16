@@ -134,6 +134,10 @@ pub fn primary_checkpoint(svc: &IndexService, index_uuid: &str, shard: u32, hist
 /// synced first, and the value recorded only when the sync succeeds.
 /// Returns the checkpoint recorded (`None`: the sync failed).
 pub fn note_durable_primary_global_checkpoint(p: &PrimaryCtx) -> Option<i64> {
+    if let Err(e) = ensure_primary_copy_record(p) {
+        tracing::warn!(index = %p.index, shard = p.shard, "{e}");
+        return None;
+    }
     let gcp = p.global_checkpoint();
     match p.copy().shard.sync_translog() {
         Ok(()) => {
@@ -160,10 +164,53 @@ pub fn note_primary_global_checkpoint(svc: &IndexService, allocation_id: &str, g
     }
 }
 
+/// Check that the copy record on disk is this primary's; a missing or
+/// foreign one is rewritten from the record persisted at install. An error
+/// (no such record, or the rewrite failed) means the copy is not
+/// recoverable as this primary after a restart: the caller fences it.
+pub fn ensure_primary_copy_record(p: &PrimaryCtx) -> Result<(), String> {
+    let installed = p.installed_record.lock().clone();
+    let Some(installed) = installed else { return Ok(()) };
+    let current = read_copy_record(p.svc.path());
+    if current.as_ref().is_some_and(|r| r.allocation_id == installed.allocation_id && r.index_uuid == installed.index_uuid && r.shard == installed.shard) {
+        return Ok(());
+    }
+    // Keep the highest durable checkpoint either record holds.
+    let mut rec = installed;
+    if let Some(g) = current.filter(|r| r.allocation_id == rec.allocation_id).and_then(|r| r.global_checkpoint) {
+        rec.global_checkpoint = Some(rec.global_checkpoint.map_or(g, |h| h.max(g)));
+    }
+    write_copy_record(&p.svc, &rec).map_err(|e| format!("shard copy record of primary [{}][{}] is missing and cannot be repaired: {e}", p.index, p.shard))?;
+    tracing::warn!(index = %p.index, shard = p.shard, "repaired the primary's missing shard copy record");
+    Ok(())
+}
+
 const COPY_FILE: &str = "cluster-copy.json";
+
+/// Tests: make [`write_copy_record`] fail under a directory (a full or
+/// failing disk at the copy record's step).
+pub(crate) mod copy_record_test_hook {
+    #[cfg(test)]
+    static FAIL_UNDER: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
+    #[cfg(test)]
+    pub fn fail_under(dir: &std::path::Path, fail: bool) {
+        let mut v = FAIL_UNDER.lock();
+        v.retain(|d| d != dir);
+        if fail { v.push(dir.to_path_buf()); }
+    }
+    #[allow(unused_variables)]
+    pub fn check(path: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_UNDER.lock().iter().any(|d| path.starts_with(d)) {
+            return Err(std::io::Error::other("injected copy record write failure (no space left on device)"));
+        }
+        Ok(())
+    }
+}
 
 pub fn write_copy_record(svc: &IndexService, rec: &CopyRecord) -> std::io::Result<()> {
     let p = svc.path().join(COPY_FILE);
+    copy_record_test_hook::check(&p)?;
     let tmp = p.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_vec(rec).map_err(std::io::Error::other)?)?;
     elasticsearch_engine::rustic_core::platform::sync_file(&tmp)?;
@@ -173,6 +220,83 @@ pub fn write_copy_record(svc: &IndexService, rec: &CopyRecord) -> std::io::Resul
 
 pub fn read_copy_record(index_path: &Path) -> Option<CopyRecord> {
     serde_json::from_slice(&std::fs::read(index_path.join(COPY_FILE)).ok()?).ok()
+}
+
+/// Prefix of a store corruption marker in a shard directory (ES
+/// `Store.CORRUPTED_MARKER_NAME_PREFIX`): `corrupted_<id>`, holding the
+/// failure that found the corruption. A copy carrying one is never opened
+/// from its store again: it is reported with a store exception
+/// ([`ACTION_CORRUPTED_STORES`]) so the master never picks it as a primary,
+/// and only a recovery that replaces the store (which removes the shard
+/// directory, marker included) brings the copy back.
+pub const CORRUPTED_MARKER_PREFIX: &str = "corrupted_";
+
+/// Lists the local copies whose store is marked corrupted
+/// ([`CorruptedCopy`]). Separate from [`ACTION_SHARD_STORES`], whose
+/// bincode records older nodes decode: they simply do not see such copies.
+pub const ACTION_CORRUPTED_STORES: &str = "internal:gateway/local/corrupted_shards";
+
+/// A local copy whose store is marked corrupted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorruptedCopy {
+    pub index: String,
+    pub index_uuid: String,
+    pub shard: u32,
+    pub allocation_id: String,
+    pub reason: String,
+}
+
+/// Whether a shard open/recovery failure is corruption of the copy's
+/// durable data (ES `TranslogCorruptedException` / `CorruptIndexException`):
+/// the translog or replica WAL failed its checks, or the store is already
+/// marked corrupted.
+pub fn is_store_corruption(error: &str) -> bool {
+    error.contains("translog_corrupted_exception")
+        || error.contains("corrupt replica wal")
+        || error.contains("corrupt translog")
+        || error.contains("Preexisting corrupted index")
+}
+
+/// Mark the store in `shard_dir` corrupted (durably), with `reason`.
+pub fn mark_store_corrupted(shard_dir: &Path, reason: &str) -> std::io::Result<()> {
+    if store_corruption(shard_dir).is_some() {
+        return Ok(());
+    }
+    let name = format!("{CORRUPTED_MARKER_PREFIX}{:016x}", rand::random::<u64>());
+    let tmp = shard_dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec(&serde_json::json!({"reason": reason})).map_err(std::io::Error::other)?)?;
+    elasticsearch_engine::rustic_core::platform::sync_file(&tmp)?;
+    std::fs::rename(&tmp, shard_dir.join(&name))?;
+    elasticsearch_engine::rustic_core::platform::sync_dir(shard_dir)
+}
+
+/// The corruption marker of the store in `shard_dir`: (marker name, reason).
+pub fn store_corruption(shard_dir: &Path) -> Option<(String, String)> {
+    for entry in std::fs::read_dir(shard_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(CORRUPTED_MARKER_PREFIX) || name.ends_with(".tmp") {
+            continue;
+        }
+        let reason = std::fs::read(entry.path()).ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["reason"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        return Some((name, reason));
+    }
+    None
+}
+
+/// The local copies (cluster-copy records) whose store is marked corrupted.
+pub fn corrupted_copies(svcs: impl IntoIterator<Item = Arc<IndexService>>) -> Vec<CorruptedCopy> {
+    let mut out = Vec::new();
+    for svc in svcs {
+        let Some(rec) = read_copy_record(svc.path()) else { continue };
+        if let Some((name, reason)) = store_corruption(&shard_path(&svc, rec.shard)) {
+            out.push(CorruptedCopy { index: rec.index, index_uuid: rec.index_uuid, shard: rec.shard, allocation_id: rec.allocation_id,
+                reason: format!("[{name}] {reason}") });
+        }
+    }
+    out
 }
 
 pub fn remove_copy_record(svc: &IndexService) -> std::io::Result<()> {
@@ -220,6 +344,22 @@ pub fn set_aside_copy_for_recovery(svc: &IndexService, shard: u32) -> Result<(),
         retry_shard_locked(|| svc.set_aside_shard_store(shard, &reuse).map(|_| ()))?;
     }
     retry_shard_locked(|| svc.remove_shard(shard, true))
+}
+
+/// A stale copy an interrupted replica file recovery set aside
+/// (`shard-<n>.reuse/`, its copy record already gone) goes back in place
+/// for an operator-forced stale primary (production review #436): its
+/// data is what `allocate_stale_primary` asked for. `Ok(false)`: nothing
+/// set aside.
+pub fn restore_set_aside_copy(svc: &IndexService, shard: u32) -> Result<bool, String> {
+    use crate::replication::file_recovery as fr;
+    let reuse = fr::reuse_dir(svc, shard);
+    if !reuse.join("shard_state.json").exists() {
+        return Ok(false);
+    }
+    let mut restored = false;
+    retry_shard_locked(|| svc.restore_shard_store(shard, &reuse).map(|r| restored = r))?;
+    Ok(restored)
 }
 
 /// A copy detached by a recovery retry is closed in the background: wait
@@ -526,11 +666,23 @@ pub struct PrimaryCtx {
     /// takes from the translog is uploaded before it is shipped, so a write
     /// is acknowledged only once it is durable there.
     pub object_store: std::sync::OnceLock<Arc<crate::stateless::ShardObjectStore>>,
+    /// The copy record persisted when this primary was installed (see
+    /// [`PrimaryCtx::record_installed`]): what a missing or replaced record
+    /// is repaired from ([`ensure_primary_copy_record`]).
+    installed_record: Mutex<Option<CopyRecord>>,
 }
 
 impl PrimaryCtx {
     /// A fresh primary over `svc`; tails the translog from the current end.
     pub fn new(index: &str, shard: u32, allocation_id: &str, term: u64, svc: Arc<IndexService>) -> Result<PrimaryCtx, ReplicationError> {
+        Self::with_proven_global_checkpoint(index, shard, allocation_id, term, svc, -1)
+    }
+
+    /// [`Self::new`] for a primary whose in-sync copies are known to hold
+    /// `proven` (a promoted replica's global checkpoint): the tracker
+    /// starts there, and the cluster state's in-sync set is applied before
+    /// it advances (see `ReplicationTracker::new_primary`).
+    pub fn with_proven_global_checkpoint(index: &str, shard: u32, allocation_id: &str, term: u64, svc: Arc<IndexService>, proven: i64) -> Result<PrimaryCtx, ReplicationError> {
         let copy = try_copy_of(&svc, shard)?;
         // The engine assigns its ops the copy's term (`_primary_term`, the
         // version map, `if_primary_term`): the cluster's, not the term 1 a
@@ -540,7 +692,7 @@ impl PrimaryCtx {
         }
         let max = copy.shard.max_seq_no();
         let tailer = TranslogTailer::open_at(&shard_path(&svc, shard), max + 1)?;
-        let tracker = Arc::new(Mutex::new(ReplicationTracker::new(allocation_id, term, max)));
+        let tracker = Arc::new(Mutex::new(ReplicationTracker::new_primary(allocation_id, term, max, proven)));
         // Every engine flush of this copy keeps the translog ops some copy
         // (or the tailer: the primary's own entry) still needs, so flushes
         // need no write fence. A dropped context retains nothing.
@@ -566,7 +718,17 @@ impl PrimaryCtx {
             targets: Mutex::new(TargetMap::default()),
             relocated: std::sync::atomic::AtomicBool::new(false),
             object_store: std::sync::OnceLock::new(),
+            installed_record: Mutex::new(None),
         })
+    }
+
+    /// Persist `rec` (this primary's copy record) durably and remember it
+    /// for repairs. An error means the copy must not start (or keep) serving
+    /// as this primary: a restart could not find it as an in-sync copy.
+    pub fn record_installed(&self, rec: CopyRecord) -> std::io::Result<()> {
+        write_copy_record(&self.svc, &rec)?;
+        *self.installed_record.lock() = Some(rec);
+        Ok(())
     }
 
     /// The engine copy this primary serves.
@@ -1320,8 +1482,16 @@ pub async fn start_file_recovery_source_checked(p: &PrimaryCtx, target_aid: &str
     let (src, files) = elasticsearch_http::pools::run(elasticsearch_http::pools::Pool::Recovery, move || -> Result<_, String> {
         tracker.lock().init_tracking(&target);
         // A fresh commit: the translog phase replays only what was written
-        // since (ES ships its safe commit; ours is flushed for this).
-        flush_within_graph_lag(&copy, graph_lag_ops)?;
+        // since (ES ships its safe commit; ours is flushed for this). A
+        // shard that never committed an operation ships its empty commit
+        // while its operations are few, as ES ships a new shard's empty
+        // commit and replays them: the target copies nothing for it
+        // (`file_recovery::holds_no_operations`).
+        let empty_commit = copy.shard.committed_seq_no() < 0
+            && copy.shard.uncommitted_ops() <= crate::replication::file_recovery::EMPTY_COMMIT_REPLAY_OPS;
+        if !empty_commit {
+            flush_within_graph_lag(&copy, graph_lag_ops)?;
+        }
         let files = copy.snapshot_files(false).map_err(|e| format!("pinning the commit: {}", e.reason))?;
         crate::replication::file_recovery::validate_file_formats(&files.manifest, target_read_max,
             |path, offset, len| files.read_range(path, offset, len).map_err(|e| e.reason))?;
@@ -2017,6 +2187,61 @@ mod stale_recovery_tests {
         std::fs::create_dir_all(shard_path(&svc, 0)).unwrap();
         std::fs::write(shard_path(&svc, 0).join("partial-snapshot"), b"partial").unwrap();
         assert!(read_copy_record(svc.path()).is_none());
+    }
+
+    /// A primary's copy record that cannot be persisted (full disk) is an
+    /// error, never a silent success, and leaves the previous record whole:
+    /// a restart finds exactly the identity it had before.
+    #[test]
+    fn primary_copy_record_failure_is_reported_and_leaves_the_previous_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, svc, p) = primary(dir.path(), "record-failure");
+        let old = CopyRecord { index: svc.name.clone(), index_uuid: svc.uuid.clone(), shard: 0, allocation_id: "old-in-sync".into(),
+            primary_term: 1, primary: false, history_uuid: Some("h".into()), global_checkpoint: None };
+        write_copy_record(&svc, &old).unwrap();
+        let new = CopyRecord { allocation_id: "aid-p".into(), primary: true, primary_term: 2, ..old.clone() };
+        copy_record_test_hook::fail_under(svc.path(), true);
+        assert!(p.record_installed(new.clone()).is_err());
+        copy_record_test_hook::fail_under(svc.path(), false);
+        assert_eq!(read_copy_record(svc.path()), Some(old.clone()));
+        // Nothing was installed: nothing to keep in place either.
+        assert!(ensure_primary_copy_record(&p).is_ok());
+        assert_eq!(read_copy_record(svc.path()), Some(old.clone()));
+        let path = svc.path().to_path_buf();
+        drop((p, svc, engine));
+        let engine = elasticsearch_engine::node::Node::open(dir.path()).unwrap();
+        let svc = engine.get_index("record-failure").unwrap();
+        assert_eq!(svc.path(), path.as_path());
+        assert_eq!(read_copy_record(svc.path()), Some(old), "deterministic after a restart");
+    }
+
+    /// A started primary whose copy record goes missing has it rewritten
+    /// from the record persisted at install; when that fails too, the
+    /// check fails (the caller fences the copy) and no checkpoint is noted.
+    #[test]
+    fn missing_primary_copy_record_is_repaired_or_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_engine, svc, p) = primary(dir.path(), "record-repair");
+        let rec = CopyRecord { index: svc.name.clone(), index_uuid: svc.uuid.clone(), shard: 0, allocation_id: "aid-p".into(),
+            primary_term: 1, primary: true, history_uuid: Some("h".into()), global_checkpoint: Some(-1) };
+        p.record_installed(rec.clone()).unwrap();
+        assert_eq!(read_copy_record(svc.path()), Some(rec.clone()));
+        std::fs::remove_file(svc.path().join(COPY_FILE)).unwrap();
+        ensure_primary_copy_record(&p).unwrap();
+        assert_eq!(read_copy_record(svc.path()).map(|r| r.allocation_id), Some("aid-p".to_string()));
+        // A foreign record (another allocation's) is replaced as well.
+        write_copy_record(&svc, &CopyRecord { allocation_id: "someone-else".into(), ..rec.clone() }).unwrap();
+        ensure_primary_copy_record(&p).unwrap();
+        assert_eq!(read_copy_record(svc.path()).map(|r| r.allocation_id), Some("aid-p".to_string()));
+        // Gone and not rewritable: fenced.
+        std::fs::remove_file(svc.path().join(COPY_FILE)).unwrap();
+        copy_record_test_hook::fail_under(svc.path(), true);
+        assert!(ensure_primary_copy_record(&p).is_err());
+        assert_eq!(note_durable_primary_global_checkpoint(&p), None);
+        copy_record_test_hook::fail_under(svc.path(), false);
+        assert!(read_copy_record(svc.path()).is_none());
+        assert!(note_durable_primary_global_checkpoint(&p).is_some());
+        assert_eq!(read_copy_record(svc.path()).map(|r| r.allocation_id), Some("aid-p".to_string()));
     }
 
     #[test]

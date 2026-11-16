@@ -1,7 +1,11 @@
 # Smallest useful cluster: 3 master-eligible data nodes.
 #   kubectl apply -f cluster/deploy/operator/examples/quickstart.yaml
 #   kubectl get es quickstart -w
-#   kubectl port-forward svc/quickstart-es-http 9200
+#   kubectl port-forward svc/quickstart-es-http 9200 &
+# Security is always on (HTTPS, transport TLS, authentication), as with ECK:
+#   PASSWORD=$(kubectl get secret quickstart-es-elastic-user -o go-template='{{.data.elastic | base64decode}}')
+#   kubectl get secret quickstart-es-http-certs-public -o go-template='{{index .data "ca.crt" | base64decode}}' > ca.crt
+#   curl --cacert ca.crt -u "elastic:$PASSWORD" https://localhost:9200/_cluster/health?pretty
 # The pods bind 0.0.0.0, so the bootstrap checks are enforced: every
 # Kubernetes node needs vm.max_map_count >= 262144 (see cluster/deploy/README.md).
 apiVersion: elasticsearch.k8s.elastic.co/v1

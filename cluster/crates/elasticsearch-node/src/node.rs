@@ -54,6 +54,23 @@ pub use control::{ShardStartedReq,ShardFailedReq,FollowerMetadataReq};
 /// A CCR follower's metadata change, sent to the elected master.
 pub const ACTION_FOLLOWER_METADATA: &str = "internal:ccr/follower_metadata";
 
+/// CCR (`crate::ccr`): commit a follower's metadata change through the
+/// elected master, then wait until this node applied it.
+pub(crate) async fn commit_follower_metadata(node: &Arc<ClusterNode>, follower: &str, change: &elasticsearch_engine::ccr::FollowerMetadataChange) -> Result<(), RemoteError> {
+    let req = FollowerMetadataReq::of(follower, change).map_err(|e| RemoteError::new(&e.kind, e.reason, e.status))?;
+    let version = if node.is_master() { commit_follower_change(node, req).await? } else { node.to_master::<_, u64>(ACTION_FOLLOWER_METADATA, &req, Duration::from_secs(30)).await? };
+    let mut rx = node.subscribe();
+    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+        while rx.borrow_and_update().version < version {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    Ok(())
+}
+
 /// On the master: a follower's metadata change as a dry run, published.
 async fn commit_follower_change(node: &Arc<ClusterNode>, req: FollowerMetadataReq) -> Result<u64, RemoteError> {
     let parse=|text:&str|crate::owned_json::OwnedJson::parse(text).map_err(|e|RemoteError::new(e.kind,e.reason,e.status));
@@ -255,6 +272,14 @@ impl Drop for VectorOptimizerLease {
 pub struct ClusterNode {
     pub config: NodeConfig,
     pub local: DiscoveryNode,
+    /// The HTTP listener's bound address (`local.http_address` is the
+    /// published one, which a `http.publish_port` can make differ).
+    pub http_bound: SocketAddr,
+    /// Every HTTP bound address (`http_bound` first).
+    pub http_bound_all: Vec<SocketAddr>,
+    /// The listeners of the further HTTP bind addresses, until
+    /// [`crate::front::serve`] serves them beside the first.
+    pub http_extra_listeners: parking_lot::Mutex<Vec<tokio::net::TcpListener>>,
     pub engine: Arc<Engine>,
     pub router: axum::Router,
     /// `xpack.security.http.ssl.*`: the REST listener's TLS server config,
@@ -365,6 +390,13 @@ pub struct ClusterNode {
     /// pending, an acknowledgement of a newer state waits for this to reach
     /// it (an acked change is visible to the requests that follow it).
     customs_settled: std::sync::atomic::AtomicU64,
+    /// Required metadata this node could not apply: the stored script
+    /// catalog of engine 0 / of a shard engine failed to persist. While set,
+    /// `applied_version` does not advance (no acknowledgement counts this
+    /// node as having applied a newer state, as ES fails the publication on
+    /// it) and the application is retried.
+    scripts_failed_engine0: std::sync::atomic::AtomicBool,
+    scripts_failed_shards: std::sync::atomic::AtomicBool,
     /// The committed segment format floor last recorded in the gateway
     /// (`gateway::store_committed_segment_format`): `(cluster uuid, floor)`.
     committed_segment_format: Mutex<Option<(String, u32)>>,
@@ -585,6 +617,41 @@ fn watch_ssl_files(interval: Option<Duration>, contexts: Vec<Arc<dyn elasticsear
     }
 }
 
+/// API key based remote cluster security's TLS contexts (ES 9.5.5): the
+/// remote cluster server (`xpack.security.remote_cluster_server.ssl.*`,
+/// on by default, no client certificates; only with
+/// `remote_cluster_server.enabled`) and the client of remote cluster
+/// servers (`xpack.security.remote_cluster_client.ssl.*`, on by default,
+/// key pair optional). With security disabled both are off unless enabled.
+/// Invalid settings fail the start, as in ES.
+pub(crate) fn remote_cluster_tls(settings: &crate::config::Settings) -> Result<(Option<elasticsearch_transport::TlsConfig>, Option<elasticsearch_transport::TlsConfig>), String> {
+    use elasticsearch_transport::TlsDefaults;
+    let text = |k: &str| settings.get(k).map(|v| match v { serde_json::Value::String(s) => s.clone(), other => other.to_string() });
+    let security = text("xpack.security.enabled").as_deref() != Some("false");
+    let off = |d: TlsDefaults| if security { d } else { TlsDefaults { enabled: false, ..d } };
+    let server = if text("remote_cluster_server.enabled").as_deref() == Some("true") {
+        prefixed_tls_with(settings, "xpack.security.remote_cluster_server.ssl.", off(TlsDefaults::REMOTE_CLUSTER_SERVER))?
+    } else {
+        None
+    };
+    let client = prefixed_tls_with(settings, "xpack.security.remote_cluster_client.ssl.", off(TlsDefaults::REMOTE_CLUSTER_CLIENT))?;
+    Ok((server, client))
+}
+
+/// A TLS context configured like the transport's under another prefix,
+/// with that context's defaults.
+fn prefixed_tls_with(settings: &crate::config::Settings, prefix: &str, defaults: elasticsearch_transport::TlsDefaults) -> Result<Option<elasticsearch_transport::TlsConfig>, String> {
+    let map = |k: &str| k.strip_prefix(elasticsearch_transport::TRANSPORT_SSL).map(|rest| format!("{prefix}{rest}")).unwrap_or_else(|| k.to_string());
+    let get = |k: &str| match settings.get(&map(k)) {
+        Some(serde_json::Value::String(v)) => Some(v.clone()),
+        Some(serde_json::Value::Null) | None => None,
+        Some(other) => Some(other.to_string()),
+    };
+    let conf = std::path::PathBuf::from(crate::config::get_str(settings, "path.conf").unwrap_or("config"));
+    elasticsearch_transport::TlsConfig::from_settings_with(&get, &|k| crate::config::get_list(settings, &map(k)), &conf, defaults)
+        .map_err(|e| e.replace(elasticsearch_transport::TRANSPORT_SSL, prefix))
+}
+
 fn transport_tls(settings: &crate::config::Settings) -> Result<Option<elasticsearch_transport::TlsConfig>, String> {
     let get = |k: &str| match settings.get(k) {
         Some(serde_json::Value::String(v)) => Some(v.clone()),
@@ -621,15 +688,25 @@ fn check_state_owner(state: &ClusterState, node_id: &str, config: &NodeConfig) -
         voters)))
 }
 
-async fn bind_first(ip: std::net::IpAddr, ports: &[u16]) -> std::io::Result<tokio::net::TcpListener> {
+/// One listener per address in `ips`, all on the first port of `ports`
+/// every one of them can bind (ES binds each resolved bind address on a
+/// common port of the range); port 0 takes the first address's free port.
+async fn bind_all(ips: &[std::net::IpAddr], ports: &[u16]) -> std::io::Result<Vec<tokio::net::TcpListener>> {
     let mut last = None;
-    for p in ports {
-        match tokio::net::TcpListener::bind(SocketAddr::new(ip, *p)).await {
-            Ok(l) => return Ok(l),
-            Err(e) => last = Some(e),
+    'ports: for p in ports {
+        let mut bound: Vec<tokio::net::TcpListener> = Vec::with_capacity(ips.len());
+        for ip in ips {
+            let port = bound.first().and_then(|l| l.local_addr().ok()).map_or(*p, |a| a.port());
+            match tokio::net::TcpListener::bind(SocketAddr::new(*ip, port)).await {
+                Ok(l) => bound.push(l),
+                Err(e) => { last = Some(e); continue 'ports; }
+            }
+        }
+        if !bound.is_empty() {
+            return Ok(bound);
         }
     }
-    Err(last.unwrap_or_else(|| std::io::Error::other("empty port range")))
+    Err(last.unwrap_or_else(|| std::io::Error::other("empty port range or no bind address")))
 }
 
 impl ClusterNode {
@@ -644,6 +721,11 @@ impl ClusterNode {
         };
         crate::internal_capabilities::validate_writer_setting(writer_setting)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        // Boolean settings parse strictly (ES `Booleans.parseBoolean`): an
+        // invalid value fails the start before anything is bound or
+        // written (the CLI checked them already; an in-process start too).
+        crate::settings_validation::validate_node_values(&config.settings)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.0))?;
         // TLS settings fail the start before anything is bound or written.
         let http_tls = http_tls(&config.settings)?;
         let reindex_ssl = reindex_ssl(&config.settings)?;
@@ -654,10 +736,11 @@ impl ClusterNode {
         // one still serves (ports in use) fails here, before it writes
         // anything (it used to create a fresh node id in a data path the
         // live process was still writing).
-        let http = bind_first(config.http_bind, &config.http_ports).await?;
+        let mut http_listeners = bind_all(&config.http_binds, &config.http_ports).await?;
+        let http = http_listeners.remove(0);
         let http_port = http.local_addr()?.port();
-        let transport_probe = bind_first(config.transport_bind, &config.transport_ports).await?;
-        let transport_addr = transport_probe.local_addr()?;
+        let transport_probe = bind_all(&config.transport_binds, &config.transport_ports).await?;
+        let transport_addr = transport_probe[0].local_addr()?;
         // The probe keeps the port until the transport binds it below: freed
         // earlier, the gateway/settings/TLS work in between left a window in
         // which another socket (a parallel process's ephemeral port) could
@@ -694,8 +777,10 @@ impl ClusterNode {
             id: node_id,
             name: config.node_name.clone(),
             ephemeral_id: elasticsearch_cluster::state::random_id(),
-            transport_address: SocketAddr::new(config.transport_publish, transport_addr.port()).to_string(),
-            http_address: SocketAddr::new(config.http_publish, http_port).to_string(),
+            // `<p>.publish_port` (a mapped port) or the bound port: what
+            // peers and sniffing clients connect to.
+            transport_address: SocketAddr::new(config.transport_publish, config.transport_publish_port.unwrap_or(transport_addr.port())).to_string(),
+            http_address: SocketAddr::new(config.http_publish, config.http_publish_port.unwrap_or(http_port)).to_string(),
             host: config.transport_publish.to_string(),
             ip: config.transport_publish.to_string(),
             roles: config.roles.clone(),
@@ -703,9 +788,11 @@ impl ClusterNode {
             version: ES_VERSION.to_string(),
         };
         let mut tcfg = TransportConfig::new(config.cluster_name.clone(), local.clone(), SocketAddr::new(config.transport_bind, transport_addr.port()));
-        tcfg.publish_addr = Some(SocketAddr::new(config.transport_publish, transport_addr.port()));
+        tcfg.publish_addr = Some(SocketAddr::new(config.transport_publish, config.transport_publish_port.unwrap_or(transport_addr.port())));
+        tcfg.extra_bind_addrs = config.transport_binds.iter().skip(1).copied().collect();
         tcfg.settings = crate::config::transport_settings(&config.settings)?;
         tcfg.tls = transport_tls(&config.settings)?;
+        remote_cluster_tls(&config.settings)?;
         let frame_admission: elasticsearch_transport::FrameAdmission = Arc::new(|bytes| {
             elasticsearch_engine::memory::breakers().reserve_native(bytes as u64, "transport protocol buffer")
                 .map(|reservation| Box::new(reservation.into_result_owner()) as Box<dyn Send + Sync>)
@@ -740,6 +827,8 @@ impl ClusterNode {
             // `elasticsearch.yml` / `-E` settings the engine reads as node
             // settings (e.g. `xpack.license.self_generated.type`).
             *engine.node_settings.write() = node_settings.clone();
+            // `xpack.inference.builtin_fallback`: an invalid value fails the start.
+            elasticsearch_engine::inference::backend::parse_fallback(node_settings.get(elasticsearch_engine::inference::backend::FALLBACK_SETTING))?;
             crate::install_breaker_release_hook();
             elasticsearch_engine::memory::validate_node_settings(&node_settings)?;
             elasticsearch_engine::memory::configure(&engine);
@@ -747,6 +836,8 @@ impl ClusterNode {
             elasticsearch_http::configure_processors(&node_settings);
             // `indices.query.bool.max_nested_depth` (static; invalid fails the start).
             elasticsearch_engine::query::limits::configure_nested_depth(&node_settings)?;
+            // `script.painless.regex.enabled` / `script.painless.regex.limit-factor` (static).
+            elasticsearch_engine::script::regex::configure(&node_settings)?;
             engine.security.configure(elasticsearch_engine::security::SecConfig::from_node_settings(&node_settings)?);
             // What the REST layer actually serves, not just the setting.
             engine.security.cfg.write().http_ssl = http_tls.is_some();
@@ -766,7 +857,7 @@ impl ClusterNode {
             elasticsearch_engine::gpu::bootstrap_check(&node_settings, enforce)?;
             // ES `BootstrapChecks` (process limits, memory lock, discovery,
             // and transport TLS while security is enabled).
-            crate::bootstrap_checks::run(&config.settings, engine.security.enabled(), &[config.transport_bind], config.transport_publish, config.single_node)?;
+            crate::bootstrap_checks::run(&config.settings, engine.security.enabled(), &config.transport_binds, config.transport_publish, config.single_node)?;
             // The cluster drives engine 0's lifecycle (`lifecycle_tick`): on the
             // master its passes are published like any metadata change.
             engine.ilm.drive_externally();
@@ -814,7 +905,7 @@ impl ClusterNode {
             Arc::new(s)
         };
         let (state_tx, _) = watch::channel(initial);
-        let uuids = UuidMap::load(&config.data_path.join("_cluster/uuids.json"));
+        let uuids = UuidMap::load_at_start(&config.data_path.join("_cluster/uuids.json"))?;
         let shard_engines = crate::shard_engines::ShardEngines::open(&config.data_path, node_settings, engine.clone());
         let object_store = {
             let flat: BTreeMap<String, String> = config.settings.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect();
@@ -826,9 +917,17 @@ impl ClusterNode {
             crate::stateless::ObjectStore::open(&config.settings, &ctx).await?
         };
 
+        let http_bound = http.local_addr()?;
+        let mut http_bound_all = vec![http_bound];
+        for l in &http_listeners {
+            http_bound_all.push(l.local_addr()?);
+        }
         let node = Arc::new(ClusterNode {
             config,
             local: local.clone(),
+            http_bound,
+            http_bound_all,
+            http_extra_listeners: parking_lot::Mutex::new(http_listeners),
             engine,
             router,
             http_tls,
@@ -877,6 +976,8 @@ impl ClusterNode {
             adaptive_selection: Default::default(),
             applied_version: Default::default(),
             customs_settled: Default::default(),
+            scripts_failed_engine0: Default::default(),
+            scripts_failed_shards: Default::default(),
             committed_segment_format: Mutex::new(committed_segment_format),
         });
         let _ = node.me.set(Arc::downgrade(&node));
@@ -911,6 +1012,39 @@ impl ClusterNode {
             node.engine.ilm.set_cluster_steps(Some(steps.clone()));
             let _ = node.lifecycle_steps.set(steps);
         }
+        // Enrich lookups on a node without a copy of the enrich index (a
+        // dedicated ingest or coordinating node): searched through this
+        // node's coordinator on the nodes that hold it, as ES's
+        // `EnrichCoordinatorProxyAction` does.
+        {
+            let weak = Arc::downgrade(&node);
+            let runtime = tokio::runtime::Handle::current();
+            let lookup: elasticsearch_engine::enrich::RemoteLookup = Arc::new(move |index: &str, body: &serde_json::Value| {
+                use elasticsearch_engine::error::EsError;
+                let node = weak.upgrade().ok_or_else(|| EsError::new(503, "node_closed_exception", "node closed"))?;
+                let headers = crate::front::SharedHeaders::try_pairs(&[(crate::front::SYSTEM_HEADER, "true"), ("content-type", "application/json")])?;
+                let mut req = crate::front::RestReq::try_new_uri("POST", format_args!("/{}/_search", crate::front::UriComponent(index)), &headers, &[], 0, Default::default(), None)?;
+                req.set_json(body)?;
+                let (tx, rx) = std::sync::mpsc::channel();
+                runtime.spawn(async move {
+                    let _ = tx.send(crate::front::dispatch(&node, req).await);
+                });
+                // Engine threads block here (never an async worker).
+                let resp = rx.recv_timeout(Duration::from_secs(60))
+                    .map_err(|_| EsError::new(500, "elasticsearch_exception", format!("enrich lookup in [{index}] did not answer")))?;
+                let v = resp.body_json().unwrap_or(serde_json::Value::Null);
+                if !resp.is_success() {
+                    let e = &v["error"];
+                    return Err(EsError::new(resp.status, e["type"].as_str().unwrap_or("elasticsearch_exception"),
+                        e["reason"].as_str().map(str::to_string).unwrap_or_else(|| format!("enrich lookup in [{index}] failed with status {}", resp.status))));
+                }
+                Ok(v)
+            });
+            elasticsearch_engine::enrich::set_remote_lookup(&node.engine, Some(lookup));
+        }
+        // Transforms: cluster-owned storage and persistent tasks fenced by
+        // master ownership (see `transforms`).
+        crate::transforms::install(&node);
         // CCR follower metadata (the leader's mapping, settings, aliases)
         // is a metadata change like any other: a dry run on the master's
         // copy, published, then applied by every node's applier (never
@@ -992,6 +1126,13 @@ impl ClusterNode {
         let hook: Arc<dyn elasticsearch_engine::index::MappingUpdateHook> = Arc::new(crate::mapping_update::ClusterMappingHook::new(Arc::downgrade(&node)));
         node.engine.set_mapping_update_hook(Some(hook.clone()));
         node.shard_engines.set_mapping_update_hook(hook);
+        let barrier: Arc<dyn elasticsearch_engine::reindex::ReplicationBarrier> = Arc::new(crate::bulk_by_scroll_ack::ClusterReplicationBarrier::new(Arc::downgrade(&node)));
+        node.engine.set_replication_barrier(Some(barrier.clone()));
+        node.shard_engines.set_replication_barrier(barrier);
+        // Finished engine tasks' results go to the cluster's `.tasks` (#96).
+        let sinks = crate::front::bg_task::task_result_sinks(Arc::downgrade(&node));
+        *node.engine.task_result_sink.write() = Some(sinks(0));
+        node.shard_engines.set_task_result_sinks(sinks);
         node.register_handlers();
 
         let coordinator = Coordinator::new(cs, local, gateway.persisted().clone(), rand::random(), Box::new(Updater(master_ctx)));
@@ -1136,6 +1277,11 @@ impl ClusterNode {
             let n = n.clone();
             async move {
                 n.ensure_master()?;
+                // A primary that failed to open because its store is
+                // corrupted (it marked the store before reporting).
+                if r.message.starts_with(PRIMARY_START_FAILED) && shards::is_store_corruption(&r.message) {
+                    n.note_corrupted_copy(&r.index, r.shard, &r.allocation_id, &r.message);
+                }
                 let failed = FailedShard { index: r.index, shard: r.shard, allocation_id: r.allocation_id, message: r.message, failure: None, mark_as_stale: r.mark_as_stale };
                 let task = master::shard_failed_task(n.master.clone(), failed, r.reporter_term);
                 let memory=r.memory;
@@ -1220,6 +1366,20 @@ impl ClusterNode {
                 let p = n.shards.primary(&r.index, r.shard).ok_or_else(|| remote("shard_not_found_exception", format!("[{}][{}] is not a primary on this node", r.index, r.shard), 404))?;
                 let current = || n.shards.primary(&r.index, r.shard).is_some_and(|held| Arc::ptr_eq(&held, &p))
                     && recovery_start_matches(&n.state(), &n.local.id, &p, &r.target_allocation_id, None);
+                // ES `PeerRecoverySourceService` / `DelayRecoveryException`:
+                // the target can start before this node applied the state
+                // that assigned it (it applied that state first). Wait for
+                // it, as ES's target retries, instead of failing the copy:
+                // a failure here starts a new allocation the target again
+                // sees first, until the retries run out.
+                if !current() {
+                    let mut states = n.subscribe();
+                    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+                        while !current() && n.shards.primary(&r.index, r.shard).is_some_and(|held| Arc::ptr_eq(&held, &p)) {
+                            if states.changed().await.is_err() { break; }
+                        }
+                    }).await;
+                }
                 let (recovery_id, info) = shards::start_recovery_source_checked(&p, &r.target_allocation_id, r.from_seq_no, current).await.map_err(|e| remote("recovery_failed_exception", e, 500))?;
                 Ok(RecoveryStartResp { recovery_id, info })
             }
@@ -1384,6 +1544,11 @@ impl ClusterNode {
             async move { n.local_copy_records().map_err(|e|RemoteError::new(e.kind,e.reason,e.status)) }
         });
         let n = self.clone();
+        t.register_handler(shards::ACTION_CORRUPTED_STORES, move |_: ()| {
+            let n = n.clone();
+            async move { Ok::<_, RemoteError>(n.local_corrupted_copies()) }
+        });
+        let n = self.clone();
         t.register_handler(ACTION_PRIMARY_PROBE, move |r: (crate::replication::recovery::RecoveryText, u32)| {
             let n = n.clone();
             async move { Ok::<_, RemoteError>(n.shards.primary(&r.0, r.1).is_some()) }
@@ -1395,6 +1560,10 @@ impl ClusterNode {
         });
         crate::front::register_forward_handler(self);
         crate::front::register_past_tsdb_handler(self);
+        // Remote cluster connections (CCS, CCR) and the actions remote
+        // clusters call, then CCR's leader and follower sides.
+        crate::remote_cluster::register(self);
+        crate::ccr::register(self);
     }
 
     /// The effective value of a node-level dynamic setting: cluster
@@ -1442,6 +1611,42 @@ impl ClusterNode {
 
     /// The copies this node holds data for (for full-restart allocation).
     pub fn local_copy_records(&self) -> elasticsearch_engine::error::Result<crate::store_records::StoreRecords> { crate::store_records::collect(self) }
+
+    /// Every data node's copies whose store is marked corrupted (node id,
+    /// copy); a node that does not answer (or predates the action) lists none.
+    pub async fn cluster_corrupted_copies(&self) -> Vec<(String, shards::CorruptedCopy)> {
+        let state = self.state();
+        let mut out = Vec::new();
+        for n in state.data_nodes() {
+            let copies = if n.id == self.local.id {
+                self.local_corrupted_copies()
+            } else {
+                let Ok(addr) = n.transport_address.parse::<SocketAddr>() else { continue };
+                self.transport.send_request::<_, Vec<shards::CorruptedCopy>>(addr, shards::ACTION_CORRUPTED_STORES, &(), Duration::from_secs(10)).await.unwrap_or_default()
+            };
+            out.extend(copies.into_iter().map(|c| (n.id.clone(), c)));
+        }
+        out
+    }
+
+    /// The local copies whose store is marked corrupted.
+    pub fn local_corrupted_copies(&self) -> Vec<shards::CorruptedCopy> {
+        let mut svcs = Vec::new();
+        let _ = self.try_visit_shard_engines(|_, engine| engine.try_visit_indices(|svc| { svcs.push(svc.clone()); Ok::<_, ()>(()) }));
+        shards::corrupted_copies(svcs)
+    }
+
+    /// Master: a copy was failed because its store is corrupted. Remember
+    /// it until a store listing taken after this includes its marker.
+    fn note_corrupted_copy(&self, index: &str, shard: u32, aid: &str, message: &str) {
+        let state = self.state();
+        let Some(im) = state.metadata.indices.get(index) else { return };
+        let Some(node) = state.routing_table.all_shards()
+            .find(|r| r.index == index && r.shard == shard && r.allocation_id() == Some(aid))
+            .and_then(|r| r.node_id.clone()) else { return };
+        let copy = shards::CorruptedCopy { index: index.to_string(), index_uuid: im.uuid.clone(), shard, allocation_id: aid.to_string(), reason: message.to_string() };
+        self.master.stores.lock().noted.push((std::time::Instant::now(), node, copy));
+    }
 
     /// ES's acknowledgement: wait until every node in the state has applied
     /// a cluster state of at least `version` (the ack timeout). Returns
@@ -1517,6 +1722,39 @@ impl ClusterNode {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         true
+    }
+
+    /// Wait (bounded) until every node of the state applied the cluster
+    /// state `version` (ES: the publication that, e.g., created an index is
+    /// acknowledged by every node), whatever customs a node still defers
+    /// for an engine API in flight: [`Self::wait_applied_everywhere`] also
+    /// waits for those, and an engine API waiting on it for a state whose
+    /// customs are deferred because of that very API never finished (the
+    /// first `PUT _security/user` after a start timed out creating
+    /// `.security-7`).
+    pub async fn wait_state_applied_everywhere(&self, version: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let st = self.state();
+            let mut all = self.applied_version() >= version;
+            for n in st.nodes.values().filter(|n| n.id != self.local.id) {
+                if !all {
+                    break;
+                }
+                let Ok(addr) = n.transport_address.parse::<SocketAddr>() else { continue };
+                match self.transport.send_request::<_, u64>(addr, ACTION_APPLIED_VERSION, &(), Duration::from_secs(5)).await {
+                    Ok(v) if v >= version => {}
+                    _ => all = false,
+                }
+            }
+            if all {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     pub async fn wait_applied_everywhere(&self, version: u64, timeout: Duration) -> bool {
@@ -1778,7 +2016,7 @@ impl ClusterNode {
     /// the metadata service.
     fn apply_state_metadata(&self, state: &Arc<ClusterState>, force: bool) {
         let mv = (state.metadata.cluster_uuid.clone(), state.metadata.version);
-        if !force && self.last_metadata_version.lock().as_ref() == Some(&mv) && self.apply_retry.lock().is_empty() && !self.shard_apply_failed.load(std::sync::atomic::Ordering::SeqCst) {
+        if !force && self.last_metadata_version.lock().as_ref() == Some(&mv) && self.apply_retry.lock().is_empty() && !self.shard_apply_failed.load(std::sync::atomic::Ordering::SeqCst) && !self.required_metadata_failed() {
             self.note_customs_settled(state.version);
             return;
         }
@@ -1792,9 +2030,17 @@ impl ClusterNode {
                 if let Some(e) = crate::meta_extra::apply_inference(&self.engine, &state.metadata) {
                     tracing::error!("failed to apply inference endpoints: {e}");
                 }
-                if let Some(e) = crate::meta_extra::apply_stored_scripts(&self.engine, &state.metadata) {
-                    tracing::error!("failed to apply stored scripts: {e}");
+                if let Some(e) = crate::meta_extra::apply_trained_models(&self.engine, &state.metadata) {
+                    tracing::error!("failed to apply trained model deployments: {e}");
                 }
+                let scripts = crate::meta_extra::apply_stored_scripts(&self.engine, &state.metadata);
+                if let Some(e) = &scripts {
+                    tracing::error!("failed to apply stored scripts (retried; this node does not acknowledge newer states until it succeeds): {e}");
+                }
+                self.scripts_failed_engine0.store(scripts.is_some(), std::sync::atomic::Ordering::SeqCst);
+            } else {
+                // The master's engine 0 is where the catalog is changed.
+                self.scripts_failed_engine0.store(false, std::sync::atomic::Ordering::SeqCst);
                 if let Some(e) = crate::meta_extra::apply_esql_views(&self.engine, &state.metadata) {
                     tracing::error!("failed to apply ES|QL views: {e}");
                 }
@@ -1816,7 +2062,7 @@ impl ClusterNode {
                 .filter(|k| prev.as_ref().is_none_or(|p| p.metadata.customs.get(*k) != state.metadata.customs.get(*k)))
                 .collect();
             let api_inflight = self.engine_api_inflight.load(std::sync::atomic::Ordering::SeqCst) > 0;
-            let engine_holds_all = api_inflight && engine_customs_changed.iter().all(|k| crate::meta_extra::engine_holds_custom(&self.engine, &state.metadata, k));
+            let engine_holds_all = api_inflight && engine_customs_changed.iter().all(|k| crate::meta_extra::engine_holds_change(&self.engine, prev.as_ref().map(|p| &p.metadata), &state.metadata, k));
             let families: Vec<&'static str> = if api_inflight { Vec::new() } else { self.engine_api_families.lock().keys().copied().collect() };
             // Only those families held back: the state applied keeps their
             // previous form (recorded as deferred below).
@@ -1831,7 +2077,7 @@ impl ClusterNode {
                     let mut own = elasticsearch_cluster::state::Metadata::default();
                     crate::meta_extra::extract_only(&self.engine, &mut own, Some(*f));
                     let own = own.customs.remove(*f);
-                    if crate::meta_extra::same_custom(f, own.as_ref(), state.metadata.customs.get(*f)) {
+                    if crate::meta_extra::engine_holds_change(&self.engine, prev.as_ref().map(|p| &p.metadata), &state.metadata, f) {
                         families_held.push(*f);
                     }
                     match own {
@@ -1911,13 +2157,16 @@ impl ClusterNode {
                 if let Some(e) = crate::meta_extra::apply_enrich(&self.engine, &state.metadata) {
                     tracing::error!("failed to apply enrich policies: {e}");
                 }
+                crate::meta_extra::apply_watcher(&self.engine, &state.metadata);
             }
         }
         let prev_shards = self.shards_mirrored.lock().clone().filter(|p| !force && p.metadata.cluster_uuid == state.metadata.cluster_uuid);
         let mut shard_errors: Vec<(String, String)> = Vec::new();
+        let mut shard_scripts_failed = false;
         for (k, rep) in self.apply_shard_engines(prev_shards.as_ref().map(|p| &p.metadata), &state.metadata) {
             for (index, reason) in &rep.failed_mappings { self.fail_mapping_copy(index, k, reason); }
             for (i, e) in rep.errors {
+                shard_scripts_failed |= i == crate::shard_engines::STORED_SCRIPTS_FAILURE;
                 tracing::error!(index = %i, shard = k, "failed to apply metadata to shard engine: {e}");
                 shard_errors.push((i, e));
             }
@@ -1925,6 +2174,13 @@ impl ClusterNode {
         // Only what applied advances: a failed part is retried from its
         // previous form (the rest is not re-diffed from an ever older base).
         self.shard_apply_failed.store(!shard_errors.is_empty(), std::sync::atomic::Ordering::SeqCst);
+        self.scripts_failed_shards.store(shard_scripts_failed, std::sync::atomic::Ordering::SeqCst);
+        // Tombstoned copies in shard engines that are not open (a deleted
+        // dangling index's copy of a shard number the metadata lacks).
+        let graveyard = elasticsearch_cluster::graveyard::CUSTOM;
+        if prev_shards.as_ref().is_none_or(|p| p.metadata.customs.get(graveyard) != state.metadata.customs.get(graveyard)) {
+            crate::rest::dangling::purge_tombstoned_unopened(self, &state.metadata);
+        }
         *self.shards_mirrored.lock() = Some(mirrored_after(state, prev_shards.as_deref(), &shard_errors));
         if let Some(m) = engine0_mirrored {
             *self.last_metadata_version.lock() = Some(mv);
@@ -1980,11 +2236,40 @@ impl ClusterNode {
         if state.version == 0 || state.master_node_id.is_none() {
             return;
         }
+        let failed_before = self.required_metadata_failed();
+        let shards_failed_before = self.shard_apply_failed.load(std::sync::atomic::Ordering::SeqCst);
         self.apply_state_metadata(&state, false);
+        // The state was otherwise applied when it arrived: once its required
+        // metadata is in effect too, it counts as applied.
+        if failed_before {
+            self.note_applied(state.version);
+        }
+        // A shard engine that failed to open (or apply) when the state
+        // arrived holds copies the state assigns here: once it applies,
+        // reconcile them (start or recover them) without waiting for an
+        // unrelated state change (SIDE 003).
+        if shards_failed_before && !self.shard_apply_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.reconcile_shards(&state);
+        }
     }
 
     fn application_failed(&self) -> bool {
-        !self.apply_retry.lock().is_empty() || self.shard_apply_failed.load(std::sync::atomic::Ordering::SeqCst)
+        !self.apply_retry.lock().is_empty() || self.shard_apply_failed.load(std::sync::atomic::Ordering::SeqCst) || self.required_metadata_failed()
+    }
+
+    /// Whether required metadata of the applied state is not in effect here
+    /// (see `scripts_failed_engine0`).
+    fn required_metadata_failed(&self) -> bool {
+        self.scripts_failed_engine0.load(std::sync::atomic::Ordering::SeqCst) || self.scripts_failed_shards.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record `version` as completely applied here, unless required
+    /// metadata failed to apply (then acknowledgements keep waiting, and
+    /// the retry that succeeds records it).
+    fn note_applied(&self, version: u64) {
+        if !self.required_metadata_failed() {
+            self.applied_version.fetch_max(version, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     // ------------------------------------------------------------- applier
@@ -2024,16 +2309,27 @@ impl ClusterNode {
                     || self.pending.lock().contains(&primary_open_pending_key(&svc.name, k)) {
                     continue;
                 }
+                let fully_active = state.routing_table.shard_table(&svc.name, k).map(|t| !t.copies.is_empty() && t.copies.iter().all(|c| c.state == ShardState::Started)).unwrap_or(false);
                 if shards::read_copy_record(svc.path()).is_none() {
-                    // A file recovery's leftovers (staged files, the old
-                    // store set aside) of a copy no longer assigned here.
+                    // A file recovery's leftovers of a copy no longer
+                    // assigned here. The old store it set aside may be the
+                    // only (stale) copy an operator can still force-allocate
+                    // (production review #436): like any copy's data it is
+                    // kept until the shard is fully active elsewhere.
                     use crate::replication::file_recovery as fr;
-                    if fr::staging_dir(&svc, k).exists() || fr::reuse_dir(&svc, k).exists() || fr::install_dir(&svc, k).exists() {
-                        crate::replication::file_recovery::remove_recovery_dirs(&svc, k);
+                    let reuse = fr::reuse_dir(&svc, k);
+                    let keep_store = reuse.join("shard_state.json").exists() && !fully_active;
+                    if fr::staging_dir(&svc, k).exists() || fr::install_dir(&svc, k).exists() || (reuse.exists() && !keep_store) {
+                        if keep_store {
+                            for dir in [fr::staging_dir(&svc, k), fr::install_dir(&svc, k)] {
+                                let _ = std::fs::remove_dir_all(dir);
+                            }
+                        } else {
+                            crate::replication::file_recovery::remove_recovery_dirs(&svc, k);
+                        }
                     }
                     continue;
                 }
-                let fully_active = state.routing_table.shard_table(&svc.name, k).map(|t| !t.copies.is_empty() && t.copies.iter().all(|c| c.state == ShardState::Started)).unwrap_or(false);
                 // Never on the routing table's word alone while this copy is
                 // still in-sync: after a full restart the table says "started"
                 // for copies no node has opened yet.
@@ -2117,11 +2413,46 @@ impl ClusterNode {
     fn same_incarnation_index(&self, index: &str, shard: u32, state: &ClusterState) -> Option<Arc<IndexService>> {
         let (svc, im) = (self.engine_for(shard)?.get_index(index)?, state.metadata.indices.get(index)?);
         let mapped = self.with_uuids(shard, |uuids| uuids.indices.get(index).cloned()).flatten();
-        same_incarnation(mapped.as_ref(), &im.uuid, &svc.uuid).then_some(svc)
+        if same_incarnation(mapped.as_ref(), &im.uuid, &svc.uuid) {
+            return Some(svc);
+        }
+        // Not (correctly) in the map: the copy's own records decide.
+        let same = self.with_uuids(shard, |uuids| mirror::incarnation(&svc, &im.uuid, uuids) == mirror::Incarnation::Same).unwrap_or(false);
+        same.then_some(svc)
     }
 
     fn wipe_copy_in(&self, engine: &Engine, uuids: &mut UuidMap, index: &str, state: &ClusterState) -> Option<Arc<IndexService>> {
         let im = state.metadata.indices.get(index)?;
+        // A local copy whose identity is unknown may be the only copy of
+        // some data: move it aside instead of deleting it.
+        if let Some(svc) = engine.get_index(index) {
+            // Unknown identity, or an older incarnation no tombstone names
+            // (ES keeps it dangling): set aside, never deleted.
+            let keep = match mirror::incarnation(&svc, &im.uuid, uuids) {
+                mirror::Incarnation::Unknown(why) => Some(why),
+                mirror::Incarnation::Other(_) => match mirror::disposal(&svc, &state.metadata, uuids) {
+                    mirror::Disposal::Dangling(why) => Some(why),
+                    mirror::Disposal::Delete(_) => None,
+                },
+                mirror::Incarnation::Same => None,
+            };
+            if let Some(why) = keep {
+                let holds = mirror::holds_shard_data(svc.path());
+                drop(svc);
+                if holds {
+                    match engine.quarantine_local_index_copy(index) {
+                        Ok(to) => {
+                            tracing::error!(%index, kept = %to.display(), "local index copy of unknown identity quarantined (not deleted; listed by GET _dangling): {why}");
+                            uuids.indices.remove(index);
+                        }
+                        Err(e) => {
+                            tracing::error!(%index, "cannot quarantine a local copy of unknown identity ({why}): {}", e.reason);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
         let mut last = String::new();
         for _ in 0..5 {
             let _ = crate::meta_extra::delete_local_copy(engine, index);
@@ -2129,7 +2460,9 @@ impl ClusterNode {
             match mirror::create_sparse(engine, index, im) {
                 Ok(s) => {
                     uuids.indices.insert(index.to_string(), (im.uuid.clone(), s.uuid.clone()));
-                    s.set_cluster_uuid(&im.uuid);
+                    if let Err(e) = s.set_cluster_uuid(&im.uuid) {
+                        tracing::warn!(%index, "failed to persist the copy's index uuid: {}", e.reason);
+                    }
                     if let Err(e) = uuids.save() {
                         tracing::warn!(%index, "failed to persist the index uuid map: {e}");
                     }
@@ -2147,7 +2480,9 @@ impl ClusterNode {
         // one and re-create it cluster-wide, dropping every copy.
         let existing = engine.get_index(index)?;
         uuids.indices.insert(index.to_string(), (im.uuid.clone(), existing.uuid.clone()));
-        existing.set_cluster_uuid(&im.uuid);
+        if let Err(e) = existing.set_cluster_uuid(&im.uuid) {
+            tracing::warn!(%index, "failed to persist the copy's index uuid: {}", e.reason);
+        }
         if let Err(e) = uuids.save() {
             tracing::warn!(%index, "failed to persist the index uuid map: {e}");
         }
@@ -2219,6 +2554,13 @@ impl ClusterNode {
         }
         svc.reload_search_analyzers().map_err(|error| format!("failed analyzer recovery: [{}] {}", error.kind, error.reason))?;
         let recovery = if shards::shard_path(svc, shard).join("shard_state.json").exists() { EngineRecovery::ExistingStore } else { EngineRecovery::Empty };
+        if matches!(recovery, EngineRecovery::ExistingStore) {
+            // ES `Store.failIfCorrupted`: a store marked corrupted is never
+            // opened again; only a recovery replacing it brings it back.
+            if let Some((marker, reason)) = shards::store_corruption(&shards::shard_path(svc, shard)) {
+                return Err(format!("failed to open shard copy: [corrupt_index_exception] Preexisting corrupted index [{marker}] caused by: {reason}"));
+            }
+        }
         match svc.open_shard(shard, ShardOpenSpec { allocation_id: aid.to_string(), primary: true, primary_term: 1, recovery }) {
             Ok(_) => Ok(()),
             Err(_) if svc.shard(shard).is_some() => Ok(()),
@@ -2277,6 +2619,15 @@ impl ClusterNode {
         rec.index_uuid == im.uuid && rec.shard == shard && im.in_sync_allocation_ids.get(&shard).map(|s| s.contains(&rec.allocation_id)).unwrap_or(false)
     }
 
+    /// Is the copy on disk a copy of this index incarnation's `shard`
+    /// (whatever its allocation)?
+    fn local_copy_of_incarnation(&self, state: &ClusterState, index: &str, shard: u32) -> bool {
+        let Some(im) = state.metadata.indices.get(index) else { return false };
+        let Some(svc) = self.engine_for(shard).and_then(|e| e.get_index(index)) else { return false };
+        let Some(rec) = shards::read_copy_record(svc.path()) else { return false };
+        rec.index_uuid == im.uuid && rec.shard == shard
+    }
+
     fn reconcile_one(&self, state: &ClusterState, index: &str, shard: u32, routing: &ShardRouting) {
         let Some(im) = state.metadata.indices.get(index) else { return };
         let Some(aid) = routing.allocation_id().map(str::to_string) else { return };
@@ -2298,6 +2649,22 @@ impl ClusterNode {
                         if self.engine_for(shard).and_then(|e| e.get_index(index)).is_some_and(|svc| !Arc::ptr_eq(&svc, &p.svc)) {
                             tracing::warn!(%index, shard, "failing a primary whose engine copy was replaced beneath it");
                             self.report_failed(index, shard, &aid, None, "the primary's engine copy was replaced", false);
+                            return;
+                        }
+                        // A primary that handed off to a relocation target
+                        // the master then cancelled (the target failed after
+                        // the handoff, or its finalize response was lost):
+                        // the state keeps this copy as the started primary,
+                        // but it refuses every write for good. Fail it, data
+                        // kept, so allocation reopens the store under a new
+                        // primary term (ES fails a source whose handoff
+                        // cannot complete) instead of every write waiting
+                        // for a primary that never comes (production review
+                        // #450). The target was never started by the
+                        // master, so it accepted no write as primary.
+                        if p.relocated.load(std::sync::atomic::Ordering::SeqCst) && routing.state == ShardState::Started && routing.relocating_node_id.is_none() {
+                            tracing::warn!(%index, shard, "failing a handed-off primary whose relocation was cancelled");
+                            self.report_failed(index, shard, &aid, None, "primary relocation was cancelled after the handoff", false);
                             return;
                         }
                         self.refresh_primary_targets(state, p);
@@ -2404,7 +2771,34 @@ impl ClusterNode {
             // in-sync set. The master's store listing can be stale (the copy
             // may have been wiped since), so check what is really on disk.
             let in_sync_known = im.in_sync_allocation_ids.get(&shard).map(|s| !s.is_empty()).unwrap_or(false);
-            if from_existing && in_sync_known && !self.local_copy_in_sync(state, index, shard) {
+            // An operator-forced stale primary (`allocate_stale_primary`:
+            // an existing store bootstrapping a new history) is out of sync
+            // by definition: the master replaced the in-sync set with the
+            // new allocation. It needs only a copy of this very index
+            // incarnation and shard on disk (production review #436); the
+            // new history and allocation are persisted once it opened.
+            let forced_stale = matches!(routing.recovery_source, Some(RecoverySource::ExistingStore { bootstrap_new_history_uuid: true }));
+            if from_existing && forced_stale {
+                // The copy an interrupted replica file recovery set aside
+                // (its record already removed) is this incarnation's: put
+                // it back before checking.
+                let restored = !self.local_copy_of_incarnation(state, index, shard)
+                    && self.same_incarnation_index(index, shard, state).is_some()
+                    && match shards::restore_set_aside_copy(&svc, shard) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(%index, shard, "cannot restore the set-aside copy for a stale primary: {e}");
+                            false
+                        }
+                    };
+                if restored {
+                    tracing::warn!(%index, shard, "a stale primary takes the copy an interrupted recovery set aside");
+                } else if !self.local_copy_of_incarnation(state, index, shard) {
+                    tracing::warn!(%index, shard, "refusing a stale primary: no copy of this shard on this node");
+                    self.report_failed(index, shard, &aid, None, "no copy of this shard on this node to allocate as a stale primary", false);
+                    return;
+                }
+            } else if from_existing && in_sync_known && !self.local_copy_in_sync(state, index, shard) {
                 tracing::warn!(%index, shard, "refusing to start a primary from a local copy that is not in-sync");
                 self.report_failed(index, shard, &aid, None, "local copy is not an in-sync copy of this shard", false);
                 return;
@@ -2420,12 +2814,31 @@ impl ClusterNode {
                 self.open_primary_then_start(index, shard, &aid, term, svc);
                 return;
             }
+            // A forced empty primary (`allocate_empty_primary`) replaces a
+            // stale or corrupt store left on this node: ES's empty-store
+            // recovery creates an empty store; reopening the old one would
+            // republish abandoned documents, or fail on its corruption
+            // marker (production review #437). Only a sparse copy that is
+            // not open is reset (a new index has nothing on disk; the
+            // master's full-open engine-0 copies keep theirs).
+            if matches!(routing.recovery_source, Some(RecoverySource::EmptyStore)) && svc.is_sparse() && svc.shard(shard).is_none() {
+                let dir = shards::shard_path(&svc, shard);
+                if dir.join("shard_state.json").exists() || shards::store_corruption(&dir).is_some() {
+                    tracing::warn!(%index, shard, "an empty primary replaces the store on disk");
+                    if let Err(e) = shards::reset_copy_for_recovery(&svc, shard) {
+                        self.report_failed(index, shard, &aid, None, &format!("failed to start primary: cannot reset the old store for an empty primary: {e}"), false);
+                        return;
+                    }
+                }
+            }
             let start = || -> Result<Arc<PrimaryCtx>, String> {
                 Self::ensure_copy_open(&svc, shard, &aid)?;
                 PrimaryCtx::new(index, shard, &aid, term, svc.clone()).map(Arc::new).map_err(|e| e.to_string())
             };
             match start() {
-                Ok(p) => self.install_started_primary(state, index, shard, &aid, term, svc, p, routing),
+                Ok(p) => {
+                    let _ = self.install_started_primary(state, index, shard, &aid, term, svc, p, routing);
+                }
                 Err(e) => {
                     // Leave no orphan open copy behind (data stays on disk).
                     if svc.is_sparse() {
@@ -2446,8 +2859,13 @@ impl ClusterNode {
     /// Record and register a primary whose copy is open, and report it
     /// started to the master. Under the apply lock.
     #[allow(clippy::too_many_arguments)]
-    fn install_started_primary(&self, state: &ClusterState, index: &str, shard: u32, aid: &str, term: u64, svc: Arc<IndexService>, p: Arc<PrimaryCtx>, routing: &ShardRouting) {
-        let Some(im) = state.metadata.indices.get(index) else { return };
+    /// Returns whether it was installed: a copy record that cannot be
+    /// persisted fails the start (the copy is closed, its data kept, and the
+    /// failure reported), since a restart could not recover the copy as an
+    /// in-sync one; nothing is registered or reported started.
+    #[must_use]
+    fn install_started_primary(&self, state: &ClusterState, index: &str, shard: u32, aid: &str, term: u64, svc: Arc<IndexService>, p: Arc<PrimaryCtx>, routing: &ShardRouting) -> bool {
+        let Some(im) = state.metadata.indices.get(index) else { return false };
         // ES `bootstrapNewHistoryUUID`: a forced stale or empty primary
         // starts a new history; an existing-store primary continues its.
         let continues = matches!(routing.recovery_source, Some(RecoverySource::ExistingStore { bootstrap_new_history_uuid: false }));
@@ -2455,10 +2873,17 @@ impl ClusterNode {
         self.attach_object_store(&p, &im.uuid);
         self.refresh_primary_targets(state, &p);
         let checkpoint = shards::primary_checkpoint(&svc, &im.uuid, shard, &history_uuid, -1);
-        let _ = shards::write_copy_record(&svc, &CopyRecord { index: index.into(), index_uuid: im.uuid.clone(), shard, allocation_id: aid.to_string(), primary_term: term, primary: true,
-            history_uuid: Some(history_uuid), global_checkpoint: Some(checkpoint) });
+        let record = CopyRecord { index: index.into(), index_uuid: im.uuid.clone(), shard, allocation_id: aid.to_string(), primary_term: term, primary: true,
+            history_uuid: Some(history_uuid), global_checkpoint: Some(checkpoint) };
+        if let Err(e) = p.record_installed(record) {
+            tracing::error!(%index, shard, "failed to persist the primary's shard copy record: {e}");
+            let _ = svc.close_shard_if_same(&p.copy());
+            self.report_failed(index, shard, aid, None, &format!("failed to start primary: cannot persist the shard copy record: {e}"), false);
+            return false;
+        }
         self.shards.insert(LocalShard { index: index.into(), shard, allocation_id: aid.to_string(), term, svc, role: Role::Primary(p), recovery: None });
         self.report_started(index, shard, aid);
+        true
     }
 
     /// Start an existing-store primary without blocking the cluster
@@ -2513,7 +2938,7 @@ impl ClusterNode {
                 let same_term = state.metadata.indices.get(&index).is_some_and(|im| im.primary_term(shard) == term);
                 match (opened, routing) {
                     (Ok(p), Some(routing)) if same_svc && free && same_term => {
-                        me.install_started_primary(&state, &index, shard, &aid, term, svc, p, &routing);
+                        let _ = me.install_started_primary(&state, &index, shard, &aid, term, svc, p, &routing);
                         return;
                     }
                     (Err(e), Some(_)) if same_svc && free => {
@@ -2521,7 +2946,18 @@ impl ClusterNode {
                         if svc.is_sparse() {
                             let _ = svc.close_shard(shard);
                         }
-                        me.report_failed(&index, shard, &aid, None, &format!("failed to start primary: {e}"), false);
+                        // Corrupted durable data (translog / replica WAL):
+                        // mark the store (ES `markStoreCorrupted`), so the
+                        // copy is reported with a store exception and the
+                        // master recovers the shard from another copy, or
+                        // leaves it red; it is never silently cut back.
+                        if shards::is_store_corruption(&e) {
+                            tracing::error!(%index, shard, "shard copy is corrupted, marking its store: {e}");
+                            if let Err(error) = shards::mark_store_corrupted(&shards::shard_path(&svc, shard), &e) {
+                                tracing::error!(%index, shard, "failed to mark the store corrupted: {error}");
+                            }
+                        }
+                        me.report_failed(&index, shard, &aid, None, &format!("{PRIMARY_START_FAILED}: {e}"), false);
                         return;
                     }
                     (Ok(p), _) => {
@@ -2602,9 +3038,10 @@ impl ClusterNode {
                 };
                 match (restored, routing) {
                     (Ok((p, rec)), Some(routing)) if same_svc && free && same => {
-                        me.install_started_primary(&state, &index, shard, &aid, term, svc, p, &routing);
-                        if let Some(local) = me.shards.get(&index, shard) {
-                            local.lock().recovery = Some(Arc::new(Mutex::new(Some(rec))));
+                        if me.install_started_primary(&state, &index, shard, &aid, term, svc, p, &routing) {
+                            if let Some(local) = me.shards.get(&index, shard) {
+                                local.lock().recovery = Some(Arc::new(Mutex::new(Some(rec))));
+                            }
                         }
                         return;
                     }
@@ -2662,7 +3099,32 @@ impl ClusterNode {
             let state = self.state();
             negotiated_segment_format(&state, advertised_read_max).max(effective_segment_format_floor(&state.metadata))
         };
-        let staged = match file_restore::stage_shard(self, svc, shard, spec, &staging, readable).await {
+        // ES aborts a restore whose index is deleted: stop downloading (and
+        // drop any blob-store request in flight) as soon as this incarnation
+        // or its restore entry leaves the cluster state.
+        let cancel = elasticsearch_snapshots::CancelToken::new();
+        let watcher = {
+            let (mut rx, cancel, index, uuid) = (self.subscribe(), cancel.clone(), index.to_string(), spec.index_uuid.clone());
+            tokio::spawn(async move {
+                loop {
+                    let gone = {
+                        let st = rx.borrow_and_update();
+                        let incarnation = st.metadata.indices.get(&index).map(|im| Some(&im.uuid) == uuid.as_ref()).unwrap_or(false);
+                        !incarnation || uuid.as_deref().is_some_and(|u| file_restore::file_restore_of(&st, &index, u).is_none())
+                    };
+                    if gone {
+                        cancel.cancel(format!("restore of [{index}] aborted: the index was deleted or its restore is no longer in progress"));
+                        return;
+                    }
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let staged = file_restore::stage_shard(self, svc, shard, spec, &staging, readable, &cancel).await;
+        watcher.abort();
+        let staged = match staged {
             Ok(staged) => staged,
             Err(e) => {
                 // Nothing of a failed download is kept (a retry downloads again).
@@ -2855,6 +3317,14 @@ impl ClusterNode {
                 }
                 Self::ensure_copy_open(&prep_svc, shard, &prep_aid)?;
                 let _ = std::fs::write(shards::shard_path(&prep_svc, shard).join(fr::PLACEHOLDER_MARKER), b"");
+                // Test seam (process clusters): once the file named by
+                // `RUSTIC_TEST_FAIL_FILE_RECOVERY` lists the index, its
+                // replica file recovery fails right after it set the old
+                // store aside (production review #436: a stale copy left
+                // there).
+                if test_fail_file_recovery(&prep_svc.name) {
+                    return Err("injected failure after setting the store aside (test)".into());
+                }
                 ReplicaApplier::open(prep_svc.clone(), shard).map(Arc::new).map_err(|e| e.to_string())
             }).await.map_err(|e| e.reason).and_then(|r| r);
             let rt = tokio::runtime::Handle::current();
@@ -3300,15 +3770,18 @@ impl ClusterNode {
     fn promote(&self, index: &str, shard: u32, aid: &str, term: u64, svc: &Arc<IndexService>, r: &ReplicaApplier) -> Result<(Arc<PrimaryCtx>, Option<crate::replication::replica::PromotionResync>), String> {
         let owed = term > r.primary_term() || r.promotion_pending() == Some(term);
         let resync = if owed { Some(r.promote_to_primary(term).map_err(|e| e.to_string())?) } else { None };
-        let p = PrimaryCtx::new(index, shard, aid, term, svc.clone()).map_err(|e| e.to_string())?;
+        let p = PrimaryCtx::with_proven_global_checkpoint(index, shard, aid, term, svc.clone(), r.global_checkpoint()).map_err(|e| e.to_string())?;
         let p = Arc::new(p);
         if let Some(im) = self.state().metadata.indices.get(index) {
             self.attach_object_store(&p, &im.uuid);
             // A promoted replica continues the history it recovered into.
             let history_uuid = shards::primary_history_uuid(svc, &im.uuid, shard, true);
             let checkpoint = shards::primary_checkpoint(svc, &im.uuid, shard, &history_uuid, r.global_checkpoint());
-            let _ = shards::write_copy_record(svc, &CopyRecord { index: index.into(), index_uuid: im.uuid.clone(), shard, allocation_id: aid.into(), primary_term: term, primary: true,
-                history_uuid: Some(history_uuid), global_checkpoint: Some(checkpoint) });
+            // A promoted copy whose record cannot be persisted is not
+            // promoted: after a restart it could not be found as this primary.
+            p.record_installed(CopyRecord { index: index.into(), index_uuid: im.uuid.clone(), shard, allocation_id: aid.into(), primary_term: term, primary: true,
+                history_uuid: Some(history_uuid), global_checkpoint: Some(checkpoint) })
+                .map_err(|e| format!("cannot persist the shard copy record: {e}"))?;
         }
         Ok((p, resync))
     }
@@ -3403,6 +3876,11 @@ impl ClusterNode {
         let source_binding = reuse.as_ref().map(|r| (r.source_allocation_id.clone(), r.primary_term));
         // An operations-based reuse keeps this copy's history identity.
         let history_uuid = reuse.as_ref().and_then(|r| r.history_uuid.clone());
+        // Test seam: the listed index never reuses its local copy (its
+        // recovery copies files, setting the old store aside).
+        if reuse.is_some() && test_fail_file_recovery(index) {
+            return Err(PREFIX_REUSE_REJECTED.into());
+        }
         let start: RecoveryStartResp = if let Some(offer) = reuse {
             let accepted: Option<RecoveryStartResp> = match self.transport.send_request(addr, shards::ACTION_RECOVERY_REUSE, &offer, Duration::from_secs(60)).await {
                 Ok(response) => response,
@@ -3504,6 +3982,12 @@ impl ClusterNode {
             // recovered reader. Let Tokio replace this worker so coordination
             // and transport heartbeats continue while the operation permit fences
             // this exact copy against replacement.
+            // Test seam (process clusters): a relocation target of the listed
+            // indices fails right after the source handed off, as a disk
+            // error persisting its copy record would (production review #450).
+            if relocation && std::env::var("RUSTIC_TEST_FAIL_RELOCATION_FINALIZE").is_ok_and(|v| v.split(',').any(|t| t == index)) {
+                return Err("persisting recovered copy failed: injected failure after the handoff (test)".into());
+            }
             shards::write_copy_record(&svc, &CopyRecord { index: index.into(), index_uuid: uuid.into(), shard, allocation_id: aid.into(), primary_term: term, primary: false,
                 history_uuid: history_uuid.clone(), global_checkpoint: None })
                 .map_err(|e| format!("persisting recovered copy failed: {e}"))?;
@@ -3564,6 +4048,9 @@ impl ClusterNode {
         }
         let context=self.admit_recovery_memory(index,shard,aid,uuid,term,primary_node,start.recovery_id,envelope)?;
         context.scope_future(async {
+        if fr::holds_no_operations(&start.manifest) {
+            return self.recover_replica_from_empty_commit(index, shard, aid, uuid, term, svc, placeholder, addr, slot, relocation, &start, &staging, &reuse).await;
+        }
         let settings = self.recovery_settings();
         let reserve = self.disk_reserve(svc.path());
         // Diff, reuse, resume and the disk check read files: off the runtime.
@@ -3733,6 +4220,34 @@ impl ClusterNode {
         let _ = pools::run(Pool::Recovery, move || std::fs::remove_dir_all(&old)).await;
         Ok(finished_copy)
         }).await
+    }
+
+    /// Phase 1 of a file recovery whose source commit holds no operation
+    /// (`file_recovery::holds_no_operations`): the empty placeholder copy
+    /// already is that commit, so no file is copied or installed (ES copies
+    /// only the files the target lacks, here none) and phase 2 replays every
+    /// operation onto the placeholder, which becomes the recovered copy.
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_replica_from_empty_commit(&self, index: &str, shard: u32, aid: &str, uuid: &str, term: u64, svc: Arc<IndexService>, placeholder: Arc<ReplicaApplier>, addr: SocketAddr,
+        slot: Arc<Mutex<Option<RecoveryState>>>, relocation: bool, start: &crate::replication::file_recovery::FileRecoveryStartResp, staging: &std::path::Path, reuse: &std::path::Path) -> Result<Arc<elasticsearch_engine::index::IndexShard>, String>
+    {
+        use crate::replication::file_recovery as fr;
+        use elasticsearch_http::pools::{self, Pool};
+        tracing::info!(index, shard, from = start.info.start_seq_no, "file-based recovery from an empty commit: nothing to copy");
+        // Files an earlier attempt staged for another commit are spare.
+        let spare = staging.to_path_buf();
+        let _ = pools::run(Pool::Recovery, move || std::fs::remove_dir_all(&spare)).await;
+        let resp = RecoveryStartResp { recovery_id: start.recovery_id, info: start.info.clone() };
+        let stats = crate::replication::recovery::FileRecoveryStats::default();
+        let finished_copy = self.finish_peer_recovery(index, shard, aid, uuid, term, svc.clone(), placeholder, addr, slot, relocation, resp, None, start.history_uuid.clone(), Some(stats)).await?;
+        // The placeholder is the recovered copy now: a later file recovery
+        // sets it aside for reuse instead of discarding it as empty.
+        let (marker, old) = (shards::shard_path(&svc, shard).join(fr::PLACEHOLDER_MARKER), reuse.to_path_buf());
+        let _ = pools::run(Pool::Recovery, move || {
+            let _ = std::fs::remove_file(&marker);
+            let _ = std::fs::remove_dir_all(&old);
+        }).await;
+        Ok(finished_copy)
     }
 
     /// Replace the placeholder of a file recovery with the received copy
@@ -3919,18 +4434,36 @@ impl ClusterNode {
     }
 
     /// Stateless: give a new primary context its object store directory and
-    /// upload a first commit (so a later recovery need not replay the whole
-    /// translog).
+    /// upload a first commit under its term. The commit is the term's claim
+    /// on the object store (a deposed primary's later commit can no longer
+    /// replace it, nor collect anything of it: production review #93), so
+    /// nothing this primary writes is acknowledged before it is published:
+    /// its snapshot is captured under the primary gate, taken here before
+    /// the primary can accept a write, and the first translog upload waits
+    /// for the publication. The commit also spares a later recovery the
+    /// whole translog.
     fn attach_object_store(&self, p: &Arc<PrimaryCtx>, index_uuid: &str) {
         let Some(os) = self.object_store.as_ref().filter(|_| self.local.is_stateless()) else { return };
         let shard_store = os.shard(index_uuid, p.shard);
         if p.object_store.set(shard_store.clone()).is_err() {
             return;
         }
+        shard_store.begin_initial_commit();
         let (svc, shard, term, gate) = (p.svc.clone(), p.shard, p.term, p.gate.clone());
+        // A fresh context: nothing holds its gate yet.
+        let permit = gate.clone().try_write_owned().ok();
+        let (index, aid) = (p.index.clone(), p.allocation_id.clone());
+        let me = self.me();
         tokio::spawn(async move {
-            if let Err(e) = shard_store.commit(svc, shard, term, gate).await {
-                tracing::warn!(shard, "initial object store commit failed: {e}");
+            let permit = match permit {
+                Some(permit) => permit,
+                None => gate.write_owned().await,
+            };
+            if let Err(e) = shard_store.initial_commit(svc, shard, term, permit).await {
+                // Fenced (a newer term owns the store) or failed for good:
+                // this primary can acknowledge nothing more.
+                tracing::warn!(%index, shard, "initial object store commit failed: {e}");
+                me.report_failed(&index, shard, &aid, None, &format!("initial object store commit failed: {e}"), false);
             }
         });
     }
@@ -4039,8 +4572,8 @@ impl ClusterNode {
         }
         if !register(target.applier().clone()) { return Err(STALE_RECOVERY.into()); }
         tokio::task::block_in_place(|| target.snapshot_done()).map_err(|e| e.to_string())?;
-        for name in &plan.translog {
-            let batch = os.translog_batch(name).await?;
+        for i in 0..plan.translog.len() {
+            let batch = os.plan_translog_batch(&plan, i).await?;
             if !register(target.applier().clone()) { return Err(STALE_RECOVERY.into()); }
             tokio::task::block_in_place(|| target.apply_translog_batch(&batch, None)).map_err(|e| e.to_string())?;
             *slot.lock() = Some(target.state());
@@ -4215,12 +4748,22 @@ impl ClusterNode {
                 me.pending.lock().remove(&key);
                 return;
             };
-            for attempt in 0..REPORT_MAX_RETRIES {
-                match me.to_master::<_, ()>(ACTION_SHARD_STARTED, &req, Duration::from_secs(60)).await {
+            // Retried until the master acknowledges it or the copy is
+            // superseded (no longer this initializing allocation): a
+            // started copy never stays INITIALIZING because its report was
+            // given up (SIDE 015). Backoff: 500 ms, then 2 s after
+            // REPORT_MAX_RETRIES attempts.
+            for attempt in 0u32.. {
+                let sent: Result<(), String> = if take_injected_started_refusal() {
+                    Err("injected shard-started refusal".into())
+                } else {
+                    me.to_master::<_, ()>(ACTION_SHARD_STARTED, &req, Duration::from_secs(60)).await.map_err(|e| e.reason.clone())
+                };
+                match sent {
                     Ok(()) => break,
-                    Err(e) => tracing::warn!(index = %req.index, attempt, "shard-started report failed: {}", e.reason),
+                    Err(e) => tracing::warn!(index = %req.index, attempt, "shard-started report failed: {e}"),
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(if attempt < REPORT_MAX_RETRIES { 500 } else { 2000 })).await;
                 let still = me.my_routing(&me.state(), &req.index, req.shard, &req.allocation_id).map(|r| r.state == ShardState::Initializing).unwrap_or(false);
                 let ours = me.shards.get(&req.index, req.shard).map(|l| l.lock().allocation_id == req.allocation_id).unwrap_or(false);
                 if !still || !ours {
@@ -4371,6 +4914,52 @@ impl ClusterNode {
                         me.lifecycle_tick(clock).await;
                     });
                 }
+            }
+        });
+        // Transforms: the elected master loads them and takes over their
+        // persistent tasks; any other node stops executing them. The same
+        // tick resumes data frame analytics jobs a restart interrupted.
+        let weak = Arc::downgrade(&self);
+        tokio::spawn(async move {
+            let mut tick = every(Duration::from_secs(1));
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            loop {
+                tick.tick().await;
+                let Some(me) = weak.upgrade() else { break };
+                if busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let done = busy.clone();
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    crate::transforms::tick(&me);
+                    resume_ml_analytics(&me, &runtime);
+                    done.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
+        // Watcher: this node triggers the watches of its `.watches` copies
+        // (see `watcher_sched`).
+        crate::watcher_sched::install(&self);
+        let weak = Arc::downgrade(&self);
+        tokio::spawn(async move {
+            let mut tick = every(Duration::from_millis(250));
+            loop {
+                tick.tick().await;
+                let Some(me) = weak.upgrade() else { break };
+                tokio::task::spawn_blocking(move || crate::watcher_sched::tick(&me));
+            }
+        });
+        // GeoIP databases: the master downloads into `.geoip_databases`,
+        // every node installs from it (see `geoip_sched`).
+        crate::geoip_sched::install(&self);
+        let weak = Arc::downgrade(&self);
+        tokio::spawn(async move {
+            let mut tick = every(Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                let Some(me) = weak.upgrade() else { break };
+                tokio::task::spawn_blocking(move || crate::geoip_sched::tick(&me));
             }
         });
         let weak = Arc::downgrade(&self);
@@ -4792,7 +5381,17 @@ impl ClusterNode {
         // is waited out: its retained ops would keep the translog over the
         // threshold and re-trigger this flush each round (writes after
         // `max` are no reason to wait).
+        let (fence_index, fence_shard, fence_aid) = (p.index.clone(), p.shard, p.allocation_id.clone());
+        let fenced: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let fence_out = fenced.clone();
         let flushed = tokio::task::spawn_blocking(move || {
+            // A primary whose copy record is gone (and cannot be rewritten)
+            // could not be found as an in-sync copy after a restart: it is
+            // failed below rather than left acknowledging writes.
+            if let Err(e) = shards::ensure_primary_copy_record(&p) {
+                *fence_out.lock() = Some(e);
+                return Ok(());
+            }
             shards::sync_peer_recovery_leases(&p, &assigned, elasticsearch_engine::hooks::retention::DEFAULT_LEASE_PERIOD_MILLIS);
             // A lower bound of every in-sync copy's checkpoint, for this
             // copy's own operations-based recovery if it is ever deposed (and
@@ -4828,6 +5427,11 @@ impl ClusterNode {
         }).await;
         if let Ok(Err((index, reason))) = flushed {
             tracing::warn!(%index, "periodic flush failed: {reason}");
+        }
+        let fence = fenced.lock().take();
+        if let Some(reason) = fence {
+            tracing::error!(index = %fence_index, shard = fence_shard, "failing the primary: {reason}");
+            self.report_failed(&fence_index, fence_shard, &fence_aid, None, &reason, false);
         }
     }
 
@@ -4934,27 +5538,36 @@ impl ClusterNode {
 
     /// Ask every data node for the copies it holds, concurrently.
     async fn fetch_stores(&self, state: &ClusterState) {
-        async fn fetch<'a>(node:&'a ClusterNode,id:&'a str,addr:SocketAddr)->(&'a str,Result<crate::store_records::StoreRecords,elasticsearch_transport::TransportError>){
+        let started = std::time::Instant::now();
+        async fn fetch<'a>(node:&'a ClusterNode,id:&'a str,addr:SocketAddr)->(&'a str,Result<crate::store_records::StoreRecords,elasticsearch_transport::TransportError>,Vec<shards::CorruptedCopy>){
             let recs = node.transport.send_request::<_, crate::store_records::StoreRecords>(addr, shards::ACTION_SHARD_STORES, &(), Duration::from_secs(10)).await;
-            (id, recs)
+            // Copies marked corrupted (an older node does not know the
+            // action: it lists none).
+            let corrupted = if recs.is_ok() {
+                node.transport.send_request::<_, Vec<shards::CorruptedCopy>>(addr, shards::ACTION_CORRUPTED_STORES, &(), Duration::from_secs(10)).await.unwrap_or_default()
+            } else { Vec::new() };
+            (id, recs, corrupted)
         }
         // Fixed stack futures bound fanout without depending on JoinAll's
         // private queue/task allocation layout. IDs borrow the retained state.
         let mut nodes=state.data_nodes().filter_map(|n|n.transport_address.parse::<SocketAddr>().ok().map(|addr|(n.id.as_str(),addr)));
         let mut out = crate::store_records::StoreCache::default();
-        async fn optional<'a>(node:&'a ClusterNode,next:Option<(&'a str,SocketAddr)>)->Option<(&'a str,Result<crate::store_records::StoreRecords,elasticsearch_transport::TransportError>)>{
+        async fn optional<'a>(node:&'a ClusterNode,next:Option<(&'a str,SocketAddr)>)->Option<(&'a str,Result<crate::store_records::StoreRecords,elasticsearch_transport::TransportError>,Vec<shards::CorruptedCopy>)>{
             match next {Some((id,addr))=>Some(fetch(node,id,addr).await),None=>None}
         }
         loop {
             let first=nodes.next();if first.is_none(){break}
             let results=tokio::join!(optional(self,first),optional(self,nodes.next()),optional(self,nodes.next()),optional(self,nodes.next()));
             for result in [results.0,results.1,results.2,results.3].into_iter().flatten(){
-                if let (id,Ok(recs))=result {
+                if let (id,Ok(recs),corrupted)=result {
                     if let Err(error)=out.try_insert(id,recs){tracing::warn!(%error,"store cache admission refused");return;}
+                    if !corrupted.is_empty() { out.corrupted.insert(id.to_string(), corrupted); }
                 }
             }
         }
-        *self.master.stores.lock() = out;
+        let mut cache = self.master.stores.lock();
+        out.noted = std::mem::take(&mut cache.noted).into_iter().filter(|(at, _, _)| *at >= started).collect();
+        *cache = out;
     }
 
     async fn refresh_cluster_info(&self, state: &ClusterState) {
@@ -4968,6 +5581,10 @@ impl ClusterNode {
     }
 }
 
+/// Prefix of the shard-failed message of an existing-store primary that
+/// could not be opened.
+const PRIMARY_START_FAILED: &str = "failed to start primary";
+
 /// In-place retries of a peer recovery before the shard is failed to the
 /// master (about five minutes with the 5s backoff cap).
 const RECOVERY_MAX_RETRIES: u32 = 60;
@@ -4975,6 +5592,14 @@ const RECOVERY_MAX_RETRIES: u32 = 60;
 const STALE_RECOVERY: &str = "recovery target copy was removed from this node";
 /// Attempts for a shard-started / shard-failed report (500 ms apart).
 const REPORT_MAX_RETRIES: u32 = 40;
+
+/// Test seam: `RUSTIC_TEST_REFUSE_SHARD_STARTED=<n>` fails this node's first
+/// `n` shard-started sends as a refusing master would (SIDE 015).
+fn take_injected_started_refusal() -> bool {
+    static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicI64> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| std::sync::atomic::AtomicI64::new(std::env::var("RUSTIC_TEST_REFUSE_SHARD_STARTED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)));
+    left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0
+}
 
 /// What the master answers a term-checked failure report from a reporter
 /// whose primary term is no longer current (`master::shard_failed_task`).
@@ -5179,7 +5804,7 @@ mod reader_context_tests {
         *engines[1].fetch_budget.lock() = engines[0].fetch_budget.lock().clone();
         for e in &engines {
             e.scrolls.lock().insert("s".into(), elasticsearch_engine::node::ScrollCtx {
-                targets: Vec::new(), req: elasticsearch_engine::search::SearchRequest::default(), cursors: Vec::new(), keep_alive: Duration::from_secs(1), expires: past, accounting: None, lost: Vec::new(),
+                targets: Vec::new(), req: elasticsearch_engine::search::SearchRequest::default(), cursors: Vec::new(), keep_alive: Duration::from_secs(1), expires: past, accounting: None, lost: Vec::new(), owner: None, permit: None,
             });
             e.pits.lock().insert("p".into(), elasticsearch_engine::node::PitCtx { targets: Vec::new(), keep_alive: Duration::from_secs(1), expires: past, accounting: None, lost: Vec::new() });
             e.fold_contexts.lock().insert("f".into(), elasticsearch_engine::node::PitCtx { targets: Vec::new(), keep_alive: Duration::from_secs(1), expires: past, accounting: None, lost: Vec::new() });
@@ -5578,7 +6203,7 @@ impl Applier for ClusterNode {
             self.reconcile_shards(&state);
         }
         // Fully applied (metadata and shards): what acknowledgements wait for.
-        self.applied_version.fetch_max(state.version, std::sync::atomic::Ordering::SeqCst);
+        self.note_applied(state.version);
         if started.elapsed() >= Duration::from_secs(5) {
             tracing::warn!(version=state.version,
                 wait_ms=acquired.as_millis() as u64,
@@ -5862,6 +6487,9 @@ mod engine_api_held_delete_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(node.await_own_master_state(Duration::from_secs(20)).await, "the single node never became master");
+        // No settling: the master's first metadata job (its registry pass,
+        // which installs the watcher's lifecycle policy) runs while the
+        // tests' engine APIs are in flight, as it can on a new master.
         node
     }
 
@@ -6005,7 +6633,12 @@ mod engine_api_held_delete_tests {
         assert!(!waiter.is_finished(), "acknowledged before the change is visible on this node");
         // The API publishes and finishes.
         let va = IN_ENGINE_API.scope((), node.publish_engine_metadata_since(before)).await.expect("kept job");
+        // As the front end does once an engine API is done: what was
+        // deferred for it is applied before it answers (without this the
+        // test waited for the 5 s retry timer and passed or failed on its
+        // phase).
         drop(guard);
+        node.settle_deferred_customs().await;
         let started = Instant::now();
         assert!(waiter.await.unwrap(), "the acknowledgement timed out");
         assert!(started.elapsed() < Duration::from_secs(3), "waited for the retry timer: {:?}", started.elapsed());
@@ -6015,6 +6648,33 @@ mod engine_api_held_delete_tests {
         let published = node.state().metadata.customs[crate::meta_extra::INGEST_CUSTOM].to_string();
         assert!(published.contains("\"a\"") && published.contains("\"b\""), "{published}");
         assert!(deferred_markers(&node).is_empty());
+    }
+
+    /// An index an engine API creates (`.security-7` for the first
+    /// `PUT _security/user`) is acknowledged once its publication is applied
+    /// on every node, even while a custom stays deferred for that API in
+    /// flight: the customs-settled wait never settled under the API's own
+    /// guard, so the API timed out after 30 s (the 503 "security index
+    /// creation was not applied everywhere" right after a start).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_index_created_under_an_engine_api_is_acknowledged_despite_its_deferred_customs() {
+        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let node = single_node(dir.path()).await;
+        let guard = node.engine_api_enter(Some(crate::meta_extra::INGEST_CUSTOM)).await;
+        publish_custom(&node, crate::meta_extra::INGEST_CUSTOM, ingest_custom(&["held"])).await;
+        assert!(!deferred_markers(&node).is_empty(), "the custom was not deferred");
+        let t0 = Instant::now();
+        let ((), version) = node.mutate_engine_metadata(|engine| {
+            engine.create_index(".security-7", &json!({"settings": {"index": {"hidden": true, "number_of_shards": 1, "number_of_replicas": 0}}})).map(|_| ())
+        }).await.expect("create");
+        assert!(node.wait_state_applied_everywhere(version, Duration::from_secs(5)).await, "not acknowledged");
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        // The customs wait is what the API used to block on.
+        assert!(!node.wait_applied_everywhere(version, Duration::from_millis(500)).await, "the customs were not deferred");
+        drop(guard);
+        node.settle_deferred_customs().await;
+        assert!(node.wait_applied_everywhere(version, Duration::from_secs(5)).await);
+        assert!(engine_pipelines(&node).contains(&"held".to_string()));
     }
 
     /// An unscoped engine API in flight holds back only customs the engine
@@ -6187,5 +6847,161 @@ mod report_admission_tests {
         }).await;
         assert_eq!(built, None);
         assert_eq!(checks.get(), 3);
+    }
+}
+
+/// Relaunch data frame analytics jobs that were running when this node
+/// restarted (ES reassigns their persistent tasks), through the system
+/// coordinator so their reads and writes reach every shard.
+fn resume_ml_analytics(node: &Arc<ClusterNode>, runtime: &tokio::runtime::Handle) {
+    let analytics = elasticsearch_engine::ml::dfa::has_interrupted(&node.engine);
+    // Anomaly detection datafeeds that were started: their workers resume
+    // too (ES reassigns the datafeed persistent tasks).
+    let datafeeds = elasticsearch_engine::ml::anomaly::has_datafeeds_to_resume(&node.engine);
+    if !analytics && !datafeeds {
+        return;
+    }
+    let Ok(rest) = crate::front::background_cluster_rest(node.clone(), runtime.clone(), crate::front::BackgroundSubject::System) else { return };
+    let (resumed, feeds) = elasticsearch_engine::coord::scoped(Some(rest), || {
+        let resumed = if analytics { elasticsearch_engine::ml::dfa::resume_interrupted(&node.engine) } else { Vec::new() };
+        let feeds = if datafeeds { elasticsearch_engine::ml::anomaly::resume_datafeeds(&node.engine) } else { Vec::new() };
+        (resumed, feeds)
+    });
+    for id in resumed {
+        tracing::info!(id, "resumed data frame analytics job after restart");
+    }
+    for id in feeds {
+        tracing::info!(id, "resumed anomaly detection datafeed after restart");
+    }
+}
+
+/// Test seam (process clusters): the file named by
+/// `RUSTIC_TEST_FAIL_FILE_RECOVERY` lists `index` (production review #436).
+fn test_fail_file_recovery(index: &str) -> bool {
+    std::env::var("RUSTIC_TEST_FAIL_FILE_RECOVERY").ok().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|v| v.split([',', '\n']).any(|t| t.trim() == index))
+}
+
+#[cfg(test)]
+mod published_address_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A mapped port: connections to `127.0.0.1:<from>` reach `127.0.0.1:<to>`.
+    async fn forward(from: u16, to: u16) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", from)).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", to)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+    }
+
+    /// #411: a list-valued `network.bind_host` binds one transport and one
+    /// HTTP listener per address, on a common port (ES); both serve.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_bind_address_gets_a_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The node outlives the test (its runtime is not shut down), so keep
+        // its data directory: a deleted one makes cluster-persist exit the process.
+        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let mut settings = crate::config::Settings::new();
+        for (key, value) in [
+            ("cluster.name", json!("multi-bind")),
+            ("node.name", json!("multi-bind")),
+            ("path.data", json!(dir.path().join("data"))),
+            ("path.logs", json!(dir.path().join("logs"))),
+            ("network.bind_host", json!(["127.0.0.1", "127.0.0.2"])),
+            ("network.publish_host", json!("127.0.0.1")),
+            ("http.port", json!("0")),
+            ("transport.port", json!("0")),
+            ("discovery.type", json!("single-node")),
+            ("xpack.security.enabled", json!("false")),
+        ] { settings.insert(key.into(), value); }
+        let config = NodeConfig::from_settings(settings).unwrap();
+        assert_eq!(config.transport_binds.len(), 2);
+        let (node, listener) = ClusterNode::start(config).await.unwrap();
+        let transport = node.transport.bound_addresses().to_vec();
+        assert_eq!(transport.iter().map(|a| a.ip().to_string()).collect::<Vec<_>>(), vec!["127.0.0.1", "127.0.0.2"]);
+        assert_eq!(transport[0].port(), transport[1].port(), "one port for every address");
+        let http = node.http_bound_all.clone();
+        assert_eq!(http.len(), 2);
+        assert_eq!(http[0].port(), http[1].port());
+        tokio::spawn(crate::front::serve(node.clone(), listener));
+        // A peer reaches the transport through the second address.
+        let mut peer = node.local.clone();
+        peer.id = "peer".into();
+        peer.ephemeral_id = "peer-process".into();
+        peer.transport_address = "127.0.0.1:0".into();
+        let client = elasticsearch_transport::TransportService::bind(elasticsearch_transport::TransportConfig::new("multi-bind", peer, "127.0.0.1:0".parse().unwrap())).await.unwrap();
+        assert_eq!(client.connect(transport[1]).await.unwrap().node.id, node.local.id);
+        client.close().await;
+        // HTTP answers on both addresses.
+        for addr in &http {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut out = Vec::new();
+            tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut out)).await.unwrap().unwrap();
+            let text = String::from_utf8_lossy(&out);
+            assert!(text.starts_with("HTTP/1.1 200"), "{addr}: {text}");
+        }
+    }
+
+    /// #411 + #412: `network.bind_host: 0.0.0.0` with a separate
+    /// `network.publish_host` listens on every interface (not loopback) and
+    /// publishes the publish host; `transport.publish_port` /
+    /// `http.publish_port` (a mapped port) are what the node advertises,
+    /// and a peer dialling the published transport address through the
+    /// mapping reaches the node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_bind_and_publish_hosts_and_mapped_publish_ports() {
+        // The node outlives the test (its runtime is not shut down), so keep
+        // its data directory: a deleted one makes cluster-persist exit the process.
+        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let (transport_port, mapped_transport, mapped_http) = (free_port(), free_port(), free_port());
+        let mut settings = crate::config::Settings::new();
+        for (key, value) in [
+            ("cluster.name", json!("published-ports")),
+            ("node.name", json!("published-ports")),
+            ("path.data", json!(dir.path().join("data"))),
+            ("path.logs", json!(dir.path().join("logs"))),
+            ("network.bind_host", json!("0.0.0.0")),
+            ("network.publish_host", json!("127.0.0.1")),
+            ("http.port", json!("0")),
+            ("transport.port", json!(transport_port.to_string())),
+            ("transport.publish_port", json!(mapped_transport.to_string())),
+            ("http.publish_port", json!(mapped_http)),
+            ("discovery.type", json!("single-node")),
+            ("xpack.security.enabled", json!("false")),
+        ] { settings.insert(key.into(), value); }
+        let config = NodeConfig::from_settings(settings).unwrap();
+        assert!(config.transport_bind.is_unspecified() && config.http_bind.is_unspecified(), "network.bind_host ignored: {:?}", config.transport_bind);
+        let (node, listener) = ClusterNode::start(config).await.unwrap();
+        let bound = node.transport.bound_address();
+        assert!(bound.ip().is_unspecified() && bound.port() == transport_port, "transport bound at {bound}");
+        assert!(listener.local_addr().unwrap().ip().is_unspecified());
+        assert_eq!(node.local.transport_address, format!("127.0.0.1:{mapped_transport}"));
+        assert_eq!(node.local.http_address, format!("127.0.0.1:{mapped_http}"));
+        assert_eq!(node.transport.publish_address().port(), mapped_transport);
+        assert_eq!(node.http_bound, listener.local_addr().unwrap());
+        // A peer reaches the node at its published (mapped) address.
+        forward(mapped_transport, transport_port).await;
+        let mut peer = node.local.clone();
+        peer.id = "peer".into();
+        peer.ephemeral_id = "peer-process".into();
+        peer.transport_address = "127.0.0.1:0".into();
+        let client = elasticsearch_transport::TransportService::bind(elasticsearch_transport::TransportConfig::new("published-ports", peer, "127.0.0.1:0".parse().unwrap())).await.unwrap();
+        let identity = client.connect(node.local.transport_address.parse().unwrap()).await.unwrap();
+        assert_eq!(identity.node.id, node.local.id);
+        assert_eq!(identity.node.transport_address, node.local.transport_address, "the handshake advertises the mapped port");
+        client.close().await;
+        std::mem::forget(listener);
     }
 }

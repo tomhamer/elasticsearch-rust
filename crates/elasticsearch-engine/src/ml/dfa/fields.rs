@@ -158,8 +158,15 @@ pub fn detect(node: &Node, cfg: &Value) -> Result<Selection> {
     let mut entries = Vec::new();
     let mut included = Vec::new();
     let excluded = |name: &str, types: &[String], reason: String| json!({"name": name, "mapping_types": types, "is_included": false, "is_required": false, "reason": reason});
+    // `source._source`: fields it leaves out are not analysis inputs
+    // (ES `ExtractedFieldsDetector.applySourceFiltering`).
+    let source_filter = cfg["source"].get("_source").filter(|v| v.is_object()).cloned();
     for f in &infos {
         let required = dep.as_deref() == Some(f.name.as_str());
+        if source_filter.as_ref().is_some_and(|filter| super::config::is_field_excluded(filter, &f.name)) && !required {
+            entries.push(excluded(&f.name, &f.types, "field excluded by source filtering".into()));
+            continue;
+        }
         if !includes.is_empty() && !includes.iter().any(|p| crate::mapping::wildcard_match(p, &f.name)) && !required {
             entries.push(excluded(&f.name, &f.types, "field not in includes list".into()));
             continue;
@@ -287,10 +294,13 @@ fn source_value<'a>(src: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// A field's value in a hit: its own path, or its parent's for a
 /// multi-field (`f.keyword` → `f`).
-fn field_value<'a>(src: &'a Value, name: &str) -> Option<&'a Value> {
+pub(crate) fn field_value<'a>(src: &'a Value, name: &str) -> Option<&'a Value> {
     let v = source_value(src, name).or_else(|| name.rfind('.').and_then(|i| source_value(src, &name[..i])))?;
+    // A multi-valued field has no single value (ES `DataFrameDataExtractor`
+    // skips such a document): `[0, 100]` is not `0` (#573).
     let v = match v {
-        Value::Array(a) => a.first()?,
+        Value::Array(a) if a.len() == 1 => &a[0],
+        Value::Array(_) => return None,
         x => x,
     };
     (!v.is_null() && !v.is_object()).then_some(v)
@@ -399,19 +409,93 @@ pub fn preview(node: &Node, cfg: &Value) -> Result<Value> {
     Ok(json!({"feature_values": rows}))
 }
 
-/// Merged `properties` of the source indices' mappings (for the dest index).
-pub fn source_properties(node: &Node, cfg: &Value) -> Map<String, Value> {
-    let mut props: BTreeMap<String, Value> = BTreeMap::new();
+/// Merged `properties` of the source indices' mappings (for the dest
+/// index), ES `MappingsMerger`: a field mapped differently by two source
+/// indices is refused before anything is created or written (#537).
+pub fn source_properties(node: &Node, cfg: &Value) -> Result<Map<String, Value>> {
+    let mut props: BTreeMap<String, (Value, String)> = BTreeMap::new();
     if let Ok(targets) = node.resolve(&source_expr(cfg), ResolveOpts { allow_no_indices: true, ignore_unavailable: true, ..Default::default() }) {
         for t in targets {
             let m = t.svc.meta().mappings.to_json();
             let p = m.get("properties").or_else(|| m.get("_doc").and_then(|d| d.get("properties")));
             for (k, v) in p.and_then(Value::as_object).into_iter().flatten() {
-                props.entry(k.clone()).or_insert_with(|| v.clone());
+                match props.get(k) {
+                    Some((seen, at)) if seen != v => {
+                        return Err(EsError::new(
+                            400,
+                            "status_exception",
+                            format!("cannot merge [properties] mappings because of differences for field [{k}]; mapped as [{seen}] in index [{at}]; mapped as [{v}] in index [{}]", t.svc.name),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        props.insert(k.clone(), (v.clone(), t.svc.name.clone()));
+                    }
+                }
             }
         }
     }
-    props.into_iter().collect()
+    Ok(props.into_iter().map(|(k, (v, _))| (k, v)).collect())
+}
+
+/// The source settings the dest index keeps (ES `DestinationIndex`
+/// `PRESERVED_SETTINGS`): the largest shard and replica counts, and the
+/// `analysis` and `similarity` definitions the copied mappings refer to
+/// (#535). One setting defined differently by two sources is refused.
+pub fn dest_settings(node: &Node, cfg: &Value) -> Result<Map<String, Value>> {
+    let mut out: BTreeMap<String, (Value, String)> = BTreeMap::new();
+    let (mut shards, mut replicas) = (None::<u64>, None::<u64>);
+    if let Ok(targets) = node.resolve(&source_expr(cfg), ResolveOpts { allow_no_indices: true, ignore_unavailable: true, ..Default::default() }) {
+        for t in targets {
+            let meta = t.svc.meta();
+            let num = |k: &str| meta.settings.get(k).and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()));
+            if let Some(n) = num("index.number_of_shards") {
+                shards = Some(shards.map_or(n, |m| m.max(n)));
+            }
+            if let Some(n) = num("index.number_of_replicas") {
+                replicas = Some(replicas.map_or(n, |m| m.max(n)));
+            }
+            for (k, v) in meta.settings.iter().filter(|(k, _)| k.starts_with("index.analysis.") || k.starts_with("index.similarity.")) {
+                match out.get(k) {
+                    Some((seen, at)) if seen != v => {
+                        return Err(EsError::new(
+                            400,
+                            "status_exception",
+                            format!("cannot merge settings because of differences for setting [{k}]; set as [{seen}] in index [{at}]; set as [{v}] in index [{}]", t.svc.name),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        out.insert(k.clone(), (v.clone(), t.svc.name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let mut m: Map<String, Value> = out.into_iter().map(|(k, (v, _))| (k, v)).collect();
+    if let Some(n) = shards {
+        m.insert("index.number_of_shards".into(), Value::String(n.to_string()));
+    }
+    if let Some(n) = replicas {
+        m.insert("index.number_of_replicas".into(), Value::String(n.to_string()));
+    }
+    Ok(m)
+}
+
+/// ES `DestinationIndex.checkResultsFieldIsNotPresentInProperties`: the
+/// results field must not already name a field of the documents the job
+/// copies (or of an existing dest index), whose values the results would
+/// replace (#538).
+pub fn check_results_field_absent(cfg: &Value, props: &Map<String, Value>) -> Result<()> {
+    let results = cfg["dest"]["results_field"].as_str().unwrap_or("ml");
+    if props.contains_key(results) {
+        return Err(EsError::new(
+            400,
+            "status_exception",
+            format!("A field that matches the dest.results_field [{results}] already exists; please set a different results_field"),
+        ));
+    }
+    Ok(())
 }
 
 /// Is the expression token remote (`cluster:index`)?

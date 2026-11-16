@@ -13,6 +13,8 @@ mod code_plane;
 use code_plane::CodePlane;
 mod row_plane;
 use row_plane::{RowPlane, PLANE_REF};
+mod mutation_plane;
+use mutation_plane::MutationPlane;
 pub use row_plane::RowPlaneRef;
 pub use code_plane::CodePlaneRef;
 
@@ -80,19 +82,53 @@ struct PlaneQuarantine {
     installed: Vec<(NodeHandle, u64)>,
 }
 
+/// Directory growth to at least this many slots reserves address space
+/// for [`DIRECTORY_RESERVE_SLOTS`] at once where the platform maps it
+/// lazily (as the node table does): it then never moves, copies or holds a
+/// retired copy again, and is charged as slots are used.
+const DIRECTORY_RESERVE_FROM: usize = 1 << 20;
+const DIRECTORY_RESERVE_SLOTS: usize = 1 << 31;
+/// Slots a reserved directory's charge grows by at least.
+const DIRECTORY_CHARGE_STEP: usize = 1 << 18;
+
 struct SourceDirectory {
-    slots:Box<[AtomicU32]>,
+    slots:super::huge::Slab<AtomicU32>,
+    /// Slots charged to admission (all of them unless reserved ahead).
+    charged:usize,
+    /// Slots below the highest one ever installed (`grow`'s `required`):
+    /// what scans and captures cover, not the reserved length.
+    used:usize,
     _memory:crate::admission::Reservation,
 }
 impl std::ops::Deref for SourceDirectory {type Target=[AtomicU32];fn deref(&self)->&Self::Target{&self.slots}}
 impl std::ops::DerefMut for SourceDirectory {fn deref_mut(&mut self)->&mut Self::Target{&mut self.slots}}
 impl SourceDirectory {
     fn new(capacity:usize,previous:Option<&Self>)->Result<Self>{
-        let bytes=capacity.checked_mul(std::mem::size_of::<AtomicU32>()).ok_or_else(||failure("source directory size"))?;
-        let memory=crate::admission::shared().reserve(bytes as u64,"mutable source directory")?;
-        let mut slots=Vec::new();slots.try_reserve_exact(capacity).map_err(|_|failure("source directory allocation"))?;
-        slots.extend((0..capacity).map(|id|AtomicU32::new(previous.and_then(|p|p.get(id)).map_or(0,|v|v.load(Relaxed)))));
-        Ok(Self{slots:slots.into_boxed_slice(),_memory:memory})
+        let copied=previous.map_or(0,|p|p.len().min(capacity));
+        // Large: address space reserved far ahead, charged for the copied
+        // slots and a step (see `DIRECTORY_RESERVE_FROM`).
+        let reserved=(capacity>=DIRECTORY_RESERVE_FROM).then(||super::huge::Slab::<AtomicU32>::reserved(DIRECTORY_RESERVE_SLOTS.max(capacity))).flatten();
+        let (slots,charged)=match reserved {
+            Some(slots)=>{let charged=copied.max(capacity/2).saturating_add(DIRECTORY_CHARGE_STEP).min(slots.capacity());(slots,charged)}
+            None=>{
+                capacity.checked_mul(std::mem::size_of::<AtomicU32>()).ok_or_else(||failure("source directory size"))?;
+                (super::huge::Slab::zeroed(capacity).ok_or_else(||failure("source directory allocation"))?,capacity)
+            }
+        };
+        let memory=crate::admission::shared().reserve((charged*std::mem::size_of::<AtomicU32>()) as u64,"mutable source directory")?;
+        if let Some(previous)=previous {
+            for (to,from) in slots.iter().zip(previous.iter()).take(copied) { to.store(from.load(Relaxed),Relaxed); }
+        }
+        let used=previous.map_or(0,|p|p.used.min(copied));
+        Ok(Self{slots,charged,used,_memory:memory})
+    }
+    /// Charge a reserved directory for its slots below `required` (a step
+    /// ahead) before they are used.
+    fn charge(&mut self,required:usize)->Result<()>{
+        if required<=self.charged {return Ok(())}
+        let to=required.saturating_add(DIRECTORY_CHARGE_STEP).min(self.slots.capacity()).max(required);
+        self._memory.grow(((to-self.charged)*std::mem::size_of::<AtomicU32>()) as u64,"mutable source directory")?;
+        self.charged=to;Ok(())
     }
 }
 struct Directory {
@@ -216,10 +252,47 @@ pub struct MutableVectorOwner {
     /// `quarantine.installed.len()`: while nonzero the plane is not every
     /// row's copy, so traversal does not read rows by id (`dense_layout`).
     quarantined: AtomicUsize,
-    /// Graph maintenance compares exact rows, not decoded codes
+    /// Graph maintenance does not compare decoded codes
     /// (`get_node_approx`): 1-bit codes decode too coarsely for diversity
-    /// selection and pruning (nodes lost all their links).
+    /// selection and pruning (nodes lost all their links). It compares the
+    /// nodes' 2- or 4-bit maintenance rows ([`MutationPlane`]) instead, or
+    /// their exact rows for a node without one.
     exact_mutation_rows: bool,
+    /// A 1-bit field's maintenance rows (see [`MutationPlane`]).
+    mutation: Option<Box<MutationPlane>>,
+    /// The next directory slot [`MutableVectorOwner::backfill_maintenance_rows`]
+    /// examines (`None`: every slot was examined).
+    backfill: parking_lot::Mutex<Option<usize>>,
+    /// The row references of the newest durable checkpoint and of captures
+    /// not durable yet: an incremental save writes the rows that changed
+    /// since the durable one ([`MutableVectorCheckpoint::write_delta_file`]).
+    saves: parking_lot::Mutex<RowSaves>,
+}
+
+/// A rows section's header ([`MutableVectorOwner::read_rows_header`]): the
+/// calibration (quantized fields) and the code log (id, row words, rows per
+/// chunk, chunks).
+struct RowsHeader<'a> {
+    quantized: bool,
+    calibration: Option<&'a [u8]>,
+    log: Option<(u64, usize, usize, Vec<ChunkRef>)>,
+}
+
+/// See [`MutableVectorOwner::saves`].
+#[derive(Default)]
+struct RowSaves {
+    durable: Option<SavedRows>,
+    pending: Vec<SavedRows>,
+}
+
+/// The source rows a checkpoint holds, by reference: the graph mutation
+/// generation it was captured at, the row reference of every node id, and
+/// its code log's id.
+#[derive(Clone)]
+pub(crate) struct SavedRows {
+    generation: u64,
+    references: Arc<crate::admission::Allocation<Vec<LevelsRef>>>,
+    log: Option<u64>,
 }
 
 /// Holds the same generation domain as the graph. Every lookup acquires the
@@ -386,6 +459,23 @@ fn code_pair_scorer(quantized: &QuantizedOwner, epoch: u64, dim: usize) -> Optio
     { let _ = osq; None }
 }
 
+/// [`MutableVectorSource::get_node_approx`] of a 1-bit field's node: its
+/// maintenance row ([`MutationPlane`]) decoded, if it has one of the same
+/// calibration epoch as its codes (`row`, its source row).
+fn mutation_row<'s>(owner: &MutableVectorOwner, decoded: &'s DecodedRows, _row: &[f32], handle: NodeHandle) -> Option<&'s [f32]> {
+    let plane = owner.mutation.as_deref()?;
+    let quantized = owner.quantized.as_ref()?;
+    // The row's own calibration (its epoch's centroid, or the frozen
+    // maintenance one); the caller validated the node's identity, and a
+    // slot's entry is cleared whenever it is reinstalled.
+    let (epoch, words) = plane.entry(internal_id(handle))?;
+    let dim = owner.graph.dim as usize;
+    decoded.get_or_decode_with(handle.as_u64(), |_, out| {
+        let Some(centroid) = quantized.maintenance_centroid(epoch) else { return false };
+        mutation_plane::decode(centroid.centroid(), words, dim, plane.bits(), out)
+    })
+}
+
 /// [`MutableVectorSource::get_node_approx`] of a quantized owner's row.
 /// The epoch is resolved only for a row not decoded yet, and then from the
 /// read's own epoch cache.
@@ -425,6 +515,10 @@ pub struct CapturedMutableVectorRead {
 /// together with ES document ownership and the WAL sequence in one manifest.
 pub struct MutableVectorCheckpoint {
     graph: std::sync::OnceLock<crate::admission::Allocation<Vec<u8>>>,
+    /// CRC-32 of the graph section's bytes, taken as they stream
+    /// ([`Self::write_graph`]): the rows section records it without the
+    /// graph ever held whole in memory.
+    graph_crc: std::sync::OnceLock<u32>,
     graph_owner: Arc<MutableHnsw>,
     graph_view: MutableHnswSnapshot,
     incarnations: crate::admission::Allocation<Vec<u32>>,
@@ -441,6 +535,12 @@ pub struct MutableVectorCheckpoint {
     /// slot are written with their codes inline instead.
     log_rows: Option<u64>,
     log_slot: usize,
+    /// The graph slots changed since the newest durable checkpoint
+    /// ([`SaveChanges`]), that checkpoint's rows (`None`: none known, a
+    /// full save), and this capture's code log id.
+    changes: SaveChanges,
+    durable: Option<SavedRows>,
+    log_id: Option<u64>,
 }
 
 /// A mutable checkpoint at its capture point, not copied yet
@@ -453,6 +553,7 @@ pub struct PendingMutableCheckpoint {
     nodes: u32,
     quantization: Option<crate::admission::Allocation<Vec<u8>>>,
     mutation_generation: u64,
+    changes: SaveChanges,
 }
 
 impl PendingMutableCheckpoint {
@@ -462,7 +563,7 @@ impl PendingMutableCheckpoint {
     /// Copy the graph as of the capture point and capture the source rows
     /// its nodes reference.
     pub fn finish(self) -> Result<MutableVectorCheckpoint> {
-        let Self { owner, pending, watermark, retirements, nodes, quantization, mutation_generation } = self;
+        let Self { owner, pending, watermark, retirements, nodes, quantization, mutation_generation, changes } = self;
         let view = owner.graph.finish_capture(pending)?;
         let count=view.visible_identities().count();
         let bytes=count.checked_mul(std::mem::size_of::<(u64,NodeHandle)>()).ok_or_else(||failure("checkpoint identity bytes"))?;
@@ -471,12 +572,25 @@ impl PendingMutableCheckpoint {
         identities.try_reserve_exact(count).map_err(|_| failure("checkpoint identity allocation"))?;
         identities.extend(view.visible_identities());
         let identities=crate::admission::Allocation::new(identities,identities_memory);
-        let (source, log_rows, log_slot) = {
+        let (source, log_rows, log_slot, log_id) = {
             let _writer = owner.graph.control.writer.lock();
             // The log's single appender holds this writer: the row count
             // matches the tags these references carry.
             let log_slot = owner.log.as_ref().map_or(0, CodeLogs::active_slot);
-            (owner.capture_references(&view)?, owner.log.as_ref().map(|logs| logs.active().rows()), log_slot)
+            (owner.capture_references(&view)?, owner.log.as_ref().map(|logs| logs.active().rows()), log_slot,
+                owner.log.as_ref().map(|logs| logs.active().id()))
+        };
+        // The rows this capture holds, by reference, for the saves after it
+        // once it is durable ([`MutableVectorOwner::saves_durable`]).
+        let durable = {
+            let memory = crate::admission::shared().reserve((source.references.len() * std::mem::size_of::<LevelsRef>()) as u64, "saved row references")?;
+            let mut references = Vec::new();
+            references.try_reserve_exact(source.references.len()).map_err(|_| failure("saved row references allocation"))?;
+            references.extend_from_slice(&source.references);
+            let mut saves = owner.saves.lock();
+            saves.pending.try_reserve(1).map_err(|_| failure("saved rows registry"))?;
+            saves.pending.push(SavedRows { generation: mutation_generation, references: Arc::new(crate::admission::Allocation::new(references, memory)), log: log_id });
+            saves.durable.clone()
         };
         let incarnations_memory=restore_words(nodes as usize,"checkpoint captured incarnations")?;
         let mut incarnations = Vec::new();
@@ -487,10 +601,10 @@ impl PendingMutableCheckpoint {
             incarnations.push(table.get(id).ok_or_else(|| failure("checkpoint node absent"))?.metadata().incarnation);
         }
         drop(table);
-        Ok(MutableVectorCheckpoint { graph: std::sync::OnceLock::new(), graph_owner: owner.graph.clone(),
+        Ok(MutableVectorCheckpoint { graph: std::sync::OnceLock::new(), graph_crc: std::sync::OnceLock::new(), graph_owner: owner.graph.clone(),
             graph_view: view, incarnations:crate::admission::Allocation::new(incarnations,incarnations_memory), watermark,
             retirements, source, identities, dim: owner.graph.dim,
-            quantization, mutation_generation, log_rows, log_slot })
+            quantization, mutation_generation, log_rows, log_slot, changes, durable, log_id })
     }
 }
 
@@ -514,10 +628,26 @@ impl MutableVectorCheckpoint {
         let allocated = self.incarnations.len() as u32;
         let length = self.graph_owner.retained_len(&self.graph_view, allocated)?;
         output.write_all(&(length as u64).to_le_bytes())?;
+        let mut crc = 0xFFFF_FFFF;
         let written = self.graph_owner.stream_retained(&self.graph_view, allocated, self.watermark, &self.retirements,
-            Some(&self.incarnations), GRAPH_STREAM_CHUNK, &mut |bytes: &[u8]| output.write_all(bytes))?;
+            Some(&self.incarnations), GRAPH_STREAM_CHUNK, &mut |bytes: &[u8]| { crc = crate::codec::crc32_update(crc, bytes); output.write_all(bytes) })?;
         if written != length { return Err(failure("graph checkpoint length changed while streaming")); }
+        let _ = self.graph_crc.set(!crc);
         Ok(())
+    }
+
+    /// CRC-32 of the graph section: taken while it streamed, else of the
+    /// cached bytes, else streamed again into the checksum only (never the
+    /// whole graph in memory: at tens of millions of nodes it is many GB).
+    fn graph_crc(&self) -> Result<u32> {
+        if let Some(&crc) = self.graph_crc.get() { return Ok(crc); }
+        if let Some(graph) = self.graph.get() { return Ok(crate::codec::crc32(graph)); }
+        let allocated = self.incarnations.len() as u32;
+        let mut crc = 0xFFFF_FFFF;
+        self.graph_owner.stream_retained(&self.graph_view, allocated, self.watermark, &self.retirements,
+            Some(&self.incarnations), GRAPH_STREAM_CHUNK, &mut |bytes: &[u8]| { crc = crate::codec::crc32_update(crc, bytes); Ok(()) })?;
+        let _ = self.graph_crc.set(!crc);
+        Ok(!crc)
     }
 
     pub fn graph_bytes(&self) -> Result<&[u8]> {
@@ -560,14 +690,7 @@ impl MutableVectorCheckpoint {
             return self.write_file_compatible(directory, name, version).map(|()| Vec::new());
         }
         // The capture's guard keeps this log alive through a later switch.
-        let (chunks, code_files) = match (self.source.owner.log.as_ref().and_then(|logs| logs.get(self.log_slot)), self.log_rows) {
-            (Some(log), Some(rows)) if rows > 0 => {
-                let chunks = log.persist(directory, rows)?;
-                let files = log.file_names(&chunks);
-                (chunks, files)
-            }
-            _ => (Vec::new(), Vec::new()),
-        };
+        let (chunks, boundary, code_files) = self.persist_log(directory)?;
         let mut output = directory.create_output(name)?;
         output.cold_checkpoint();
         output.write_all(b"RMVC\x02\0\0\0")?;
@@ -582,7 +705,109 @@ impl MutableVectorCheckpoint {
             }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        self.write_rows_logged(&mut Sink(output.as_mut()), &chunks)?;
+        self.write_rows_logged(&mut Sink(output.as_mut()), &chunks, boundary)?;
+        output.finish()?;
+        Ok(code_files)
+    }
+
+    /// The code log's full chunks among the rows this capture references
+    /// made durable ([`CodeLog::persist_full`]): their references, the rows
+    /// they cover (rows past are written inline) and their files.
+    fn persist_log(&self, directory: &dyn crate::codec::directory::Directory) -> Result<(Vec<ChunkRef>, u64, Vec<String>)> {
+        match (self.source.owner.log.as_ref().and_then(|logs| logs.get(self.log_slot)), self.log_rows) {
+            (Some(log), Some(rows)) if rows > 0 => {
+                let (chunks, boundary) = log.persist_full(directory, rows)?;
+                let files = log.file_names(&chunks);
+                Ok((chunks, boundary, files))
+            }
+            _ => Ok((Vec::new(), 0, Vec::new())),
+        }
+    }
+
+    /// Whether this capture can be saved incrementally over the durable
+    /// checkpoint captured at graph mutation generation `generation` (the
+    /// newest of the chain it would extend): its rows are known, and
+    /// reference the same code log.
+    pub fn delta_eligible(&self, generation: u64) -> bool {
+        self.durable.as_ref().is_some_and(|durable| durable.generation == generation && durable.log == self.log_id)
+    }
+
+    /// Graph slots and rows this capture would write incrementally (for
+    /// reports): (changed graph records, changed rows).
+    pub fn delta_size(&self) -> (usize, usize) {
+        (self.changes.slots.len(), self.changed_rows().map_or(0, |rows| rows.len()))
+    }
+
+    /// The rows that changed since the durable checkpoint: of a node
+    /// inserted since, or whose row reference differs (shed into the code
+    /// log, relocated, ...). `None` without a durable checkpoint.
+    fn changed_rows(&self) -> Option<Vec<(u64, NodeHandle)>> {
+        let durable = self.durable.as_ref()?;
+        Some(self.identities.iter().copied().filter(|&(_, handle)| {
+            let id = internal_id(handle) as usize;
+            self.changes.inserted.contains(handle.slot())
+                || durable.references.get(id).map(|r| r.raw()) != self.source.references.get(id).map(|r| r.raw())
+        }).collect())
+    }
+
+    /// Write an incremental checkpoint (`RMVD1`) over the durable one
+    /// [`Self::delta_eligible`] names: the graph's header and only the slot
+    /// records that changed since ([`MutableHnsw::stream_delta`]), then a
+    /// rows section (`RMVR` v5) with the calibration, the code log's full
+    /// chunks, and only the rows that changed, all under one trailing
+    /// checksum. Published atomically like a full checkpoint, and only
+    /// referenced by the commit that lists it after its chain: a crash
+    /// before then leaves the previous chain the durable one. Returns the
+    /// code log files the chain now references.
+    /// At write version 40 ([`crate::codec::GRAPH_LINK_LOG_SINCE`]) the
+    /// graph section is a link log (`RMVD2`, [`MutableHnsw::stream_link_delta`]):
+    /// the edits made to link lists rather than their whole records.
+    pub fn write_delta_file(&self, directory: &dyn crate::codec::directory::Directory, name: &str, version: u32) -> Result<Vec<String>> {
+        // A link log needs every edit since the durable checkpoint logged;
+        // else (logging off or overflowed) the changed records are saved.
+        let link = version >= crate::codec::GRAPH_LINK_LOG_SINCE && self.changes.edits_complete;
+        use crate::codec::crc32_update;
+        let changed = self.changed_rows().ok_or_else(|| failure("incremental checkpoint without a durable one"))?;
+        let _changed_memory = crate::admission::shared().reserve((changed.capacity() * std::mem::size_of::<(u64, NodeHandle)>()) as u64, "incremental checkpoint rows")?;
+        let (chunks, boundary, code_files) = self.persist_log(directory)?;
+        let allocated = self.incarnations.len() as u32;
+        // The graph section's length first (it precedes the section).
+        let mut length = 0usize;
+        let mut graph = |out: &mut dyn FnMut(&[u8]) -> Result<()>| -> Result<usize> {
+            if link {
+                self.graph_owner.stream_link_delta(&self.graph_view, allocated, self.watermark, &self.retirements, Some(&self.incarnations),
+                    &self.changes, GRAPH_STREAM_CHUNK, out)
+            } else {
+                self.graph_owner.stream_delta(&self.graph_view, allocated, self.watermark, &self.retirements, Some(&self.incarnations),
+                    &self.changes.slots, GRAPH_STREAM_CHUNK, out)
+            }
+        };
+        graph(&mut |bytes: &[u8]| { length += bytes.len(); Ok(()) })?;
+        let mut output = directory.create_output(name)?;
+        output.cold_checkpoint();
+        let mut file_crc = 0xFFFF_FFFF;
+        {
+            let out: &mut dyn crate::codec::directory::OutputFile = output.as_mut();
+            let mut put = |bytes: &[u8]| -> Result<()> { out.write_all(bytes)?; file_crc = crc32_update(file_crc, bytes); Ok(()) };
+            put(if link { b"RMVD\x02\0\0\0" } else { b"RMVD\x01\0\0\0" })?;
+            put(&(length as u64).to_le_bytes())?;
+            let mut graph_crc = 0xFFFF_FFFF;
+            let written = graph(&mut |bytes: &[u8]| { graph_crc = crc32_update(graph_crc, bytes); put(bytes) })?;
+            if written != length { return Err(failure("graph delta length changed while streaming")); }
+            put(b"RMVR\x05\0\0\0")?;
+            put(&self.dim.to_le_bytes())?;
+            put(&(self.identities.len() as u64).to_le_bytes())?;
+            put(&(!graph_crc).to_le_bytes())?;
+            let has_log = self.rows_header(&mut put, &chunks)?;
+            put(&(changed.len() as u64).to_le_bytes())?;
+            let mut row_memory = None;
+            let mut row = Vec::new();
+            for &(key, handle) in &changed {
+                self.row_record(key, handle, has_log, boundary, &mut row, &mut row_memory)?;
+                put(&row)?;
+            }
+        }
+        output.write_all(&(!file_crc).to_le_bytes())?;
         output.finish()?;
         Ok(code_files)
     }
@@ -609,26 +834,38 @@ impl MutableVectorCheckpoint {
     /// RMVR v4 ([`Self::write_file`]): as v3, plus rows that live in the
     /// code log, written as their log index (kind 2) with the log's chunk
     /// list in the header.
-    fn write_rows_logged(&self, output: &mut impl std::io::Write, chunks: &[ChunkRef]) -> Result<()> {
-        use crate::codec::{crc32, crc32_update};
+    fn write_rows_logged(&self, output: &mut impl std::io::Write, chunks: &[ChunkRef], boundary: u64) -> Result<()> {
+        use crate::codec::crc32_update;
         let mut checksum = 0xffff_ffff;
         let mut write = |bytes: &[u8]| -> Result<()> {
             output.write_all(bytes)?;
             checksum = crc32_update(checksum, bytes);
             Ok(())
         };
-        let dim = self.dim as usize;
         write(b"RMVR\x04\0\0\0")?;
         write(&self.dim.to_le_bytes())?;
         write(&(self.identities.len() as u64).to_le_bytes())?;
-        write(&crc32(self.graph_bytes()?).to_le_bytes())?;
+        write(&self.graph_crc()?.to_le_bytes())?;
+        let has_log = self.rows_header(&mut write, chunks)?;
+        let mut row_memory=None;
+        let mut row = Vec::new();
+        for &(key, handle) in self.identities.iter() {
+            self.row_record(key, handle, has_log, boundary, &mut row, &mut row_memory)?;
+            write(&row)?;
+        }
+        output.write_all(&(!checksum).to_le_bytes())?;
+        Ok(())
+    }
+
+    /// A rows section's calibration and code log header (`chunks`: the
+    /// log's chunks the rows may reference); whether it names a log.
+    fn rows_header(&self, write: &mut impl FnMut(&[u8]) -> Result<()>, chunks: &[ChunkRef]) -> Result<bool> {
         write(&u32::from(self.quantization.is_some()).to_le_bytes())?;
         if let Some(quantization) = &self.quantization {
             write(&(quantization.len() as u64).to_le_bytes())?;
             write(quantization)?;
         }
         let log = self.source.owner.log.as_ref().and_then(|logs| logs.get(self.log_slot)).filter(|_| !chunks.is_empty());
-        let log_rows = self.log_rows.unwrap_or(0);
         write(&u32::from(log.is_some()).to_le_bytes())?;
         if let Some(log) = log {
             write(&log.id().to_le_bytes())?;
@@ -637,59 +874,64 @@ impl MutableVectorCheckpoint {
             write(&u32::try_from(chunks.len()).map_err(|_| failure("code log chunk count"))?.to_le_bytes())?;
             for chunk in chunks { write(&chunk.rows.to_le_bytes())?; }
         }
-        let mut row_memory=None;
-        let mut row = Vec::new();
-        for &(key, handle) in self.identities.iter() {
-            let reference = self.source.references.get(internal_id(handle) as usize).copied().unwrap_or(LevelsRef::INVALID);
-            // A row still in the log being compacted away falls through and
-            // is written inline (code-only, f32 durable), like an ArrayStore
-            // code-only row: the file references one log only.
-            if let Some(index) = log_index(reference.raw()).filter(|_| log_slot(reference.raw()) == self.log_slot) {
-                // Validates the identity the row carries, as for any row.
-                self.source.encoded_node(handle, key).ok_or_else(|| failure("captured checkpoint source missing"))?;
-                if log.is_none() || index >= log_rows { return Err(failure("code log row beyond the captured log")); }
-                reserve_output_row(&mut row,&mut row_memory,28)?;
-                row.clear();
-                put64(&mut row, key);
-                put64(&mut row, handle.as_u64());
-                put32(&mut row, 2);
-                put64(&mut row, index);
-                write(&row)?;
-                continue;
-            }
-            let encoded = self.source.encoded_node(handle, key).ok_or_else(|| failure("captured checkpoint source missing"))?;
-            let durable = self.source.raw.row_result(&self.source.owner, key)?.filter(|raw| raw.len() == dim);
-            let embedded: Option<&[f32]> = if is_code_only(encoded) {
-                if durable.is_none() { return Err(failure("code-only checkpoint row has no durable f32")); }
-                None
-            } else {
-                let memory = &encoded[8..8 + dim];
-                match durable {
-                    Some(raw) if raw.iter().zip(memory).all(|(a, b)| a.to_bits() == b.to_bits()) => None,
-                    _ => Some(memory),
-                }
-            };
-            let raw_words=embedded.map_or(0,|values|values.len());
-            let codes=if self.quantization.is_some(){&encoded[codes_start(encoded,dim)..]}else{&[]};
-            let length=raw_words.checked_add(codes.len()).and_then(|v|v.checked_mul(4))
-                .and_then(|v|v.checked_add(if self.quantization.is_some(){32}else{20})).ok_or_else(||failure("checkpoint output row bytes"))?;
-            reserve_output_row(&mut row,&mut row_memory,length)?;
+        Ok(log.is_some())
+    }
+
+    /// Node `(key, handle)`'s row record into `row` (RMVR v4/v5): its code
+    /// log index when its row is in a durable full chunk of the log
+    /// (`has_log`, below `boundary`), else inline (its codes, and its f32
+    /// unless that is durable in the vector store).
+    fn row_record(&self, key: u64, handle: NodeHandle, has_log: bool, boundary: u64, row: &mut Vec<u8>,
+        row_memory: &mut Option<crate::admission::Reservation>) -> Result<()> {
+        let dim = self.dim as usize;
+        let log_rows = self.log_rows.unwrap_or(0);
+        let reference = self.source.references.get(internal_id(handle) as usize).copied().unwrap_or(LevelsRef::INVALID);
+        // A row still in the log being compacted away, or in the log's
+        // partial last chunk, is written inline (code-only, f32 durable),
+        // like an ArrayStore code-only row: the file references one log, and
+        // only its full chunks.
+        if let Some(index) = log_index(reference.raw()).filter(|_| log_slot(reference.raw()) == self.log_slot).filter(|&index| index < boundary) {
+            // Validates the identity the row carries, as for any row.
+            self.source.encoded_node(handle, key).ok_or_else(|| failure("captured checkpoint source missing"))?;
+            if !has_log || index >= log_rows { return Err(failure("code log row beyond the captured log")); }
+            reserve_output_row(row, row_memory, 28)?;
             row.clear();
-            put64(&mut row, key);
-            put64(&mut row, handle.as_u64());
-            put32(&mut row, u32::from(embedded.is_some()));
-            if let Some(values) = embedded {
-                for value in values { put32(&mut row, value.to_bits()); }
-            }
-            if self.quantization.is_some() {
-                put32(&mut row, encoded[3].to_bits());
-                put32(&mut row, encoded[4].to_bits());
-                put32(&mut row, u32::try_from(codes.len()).map_err(|_| failure("encoded checkpoint row length"))?);
-                for value in codes { put32(&mut row, value.to_bits()); }
-            }
-            write(&row)?;
+            put64(row, key);
+            put64(row, handle.as_u64());
+            put32(row, 2);
+            put64(row, index);
+            return Ok(());
         }
-        output.write_all(&(!checksum).to_le_bytes())?;
+        let encoded = self.source.encoded_node(handle, key).ok_or_else(|| failure("captured checkpoint source missing"))?;
+        let durable = self.source.raw.row_result(&self.source.owner, key)?.filter(|raw| raw.len() == dim);
+        let embedded: Option<&[f32]> = if is_code_only(encoded) {
+            if durable.is_none() { return Err(failure("code-only checkpoint row has no durable f32")); }
+            None
+        } else {
+            let memory = &encoded[8..8 + dim];
+            match durable {
+                Some(raw) if raw.iter().zip(memory).all(|(a, b)| a.to_bits() == b.to_bits()) => None,
+                _ => Some(memory),
+            }
+        };
+        let raw_words=embedded.map_or(0,|values|values.len());
+        let codes=if self.quantization.is_some(){&encoded[codes_start(encoded,dim)..]}else{&[]};
+        let length=raw_words.checked_add(codes.len()).and_then(|v|v.checked_mul(4))
+            .and_then(|v|v.checked_add(if self.quantization.is_some(){32}else{20})).ok_or_else(||failure("checkpoint output row bytes"))?;
+        reserve_output_row(row, row_memory, length)?;
+        row.clear();
+        put64(row, key);
+        put64(row, handle.as_u64());
+        put32(row, u32::from(embedded.is_some()));
+        if let Some(values) = embedded {
+            for value in values { put32(row, value.to_bits()); }
+        }
+        if self.quantization.is_some() {
+            put32(row, encoded[3].to_bits());
+            put32(row, encoded[4].to_bits());
+            put32(row, u32::try_from(codes.len()).map_err(|_| failure("encoded checkpoint row length"))?);
+            for value in codes { put32(row, value.to_bits()); }
+        }
         Ok(())
     }
 
@@ -721,7 +963,7 @@ impl MutableVectorCheckpoint {
     /// row, f32 and codes). A code-only row (its f32 shed from memory once
     /// durable) is written with the f32 read back from the vector store.
     fn write_rows_compatible(&self, output: &mut impl std::io::Write) -> Result<()> {
-        use crate::codec::{crc32, crc32_update};
+        use crate::codec::crc32_update;
         let mut checksum = 0xffff_ffff;
         let mut write = |bytes: &[u8]| -> Result<()> {
             output.write_all(bytes)?;
@@ -732,7 +974,7 @@ impl MutableVectorCheckpoint {
         write(if self.quantization.is_some() { b"RMVR\x02\0\0\0" } else { b"RMVR\x01\0\0\0" })?;
         write(&self.dim.to_le_bytes())?;
         write(&(self.identities.len() as u64).to_le_bytes())?;
-        write(&crc32(self.graph_bytes()?).to_le_bytes())?;
+        write(&self.graph_crc()?.to_le_bytes())?;
         if let Some(quantization) = &self.quantization {
             write(&(quantization.len() as u64).to_le_bytes())?;
             write(quantization)?;
@@ -773,7 +1015,7 @@ impl MutableVectorCheckpoint {
     /// RMVR v3: f32 referenced when durable in the vector store, codes for
     /// quantized rows (see [`Self::write_rows`]).
     fn write_rows_v3(&self, output: &mut impl std::io::Write) -> Result<()> {
-        use crate::codec::{crc32, crc32_update};
+        use crate::codec::crc32_update;
         let mut checksum = 0xffff_ffff;
         let mut write = |bytes: &[u8]| -> Result<()> {
             output.write_all(bytes)?;
@@ -784,7 +1026,7 @@ impl MutableVectorCheckpoint {
         write(b"RMVR\x03\0\0\0")?;
         write(&self.dim.to_le_bytes())?;
         write(&(self.identities.len() as u64).to_le_bytes())?;
-        write(&crc32(self.graph_bytes()?).to_le_bytes())?;
+        write(&self.graph_crc()?.to_le_bytes())?;
         write(&u32::from(self.quantization.is_some()).to_le_bytes())?;
         if let Some(quantization) = &self.quantization {
             write(&(quantization.len() as u64).to_le_bytes())?;
@@ -847,11 +1089,13 @@ impl MutableVectorOwner {
     fn capture_references(self: &Arc<Self>, graph: &MutableHnswSnapshot) -> Result<CapturedMutableVectorRead> {
         let guard = self.graph.control.domain.take_guard().map_err(crate::vector::hnsw::mutable::failure_error)?;
         let directory = self.directory.lock();
-        let bytes=directory.current.len().checked_mul(std::mem::size_of::<LevelsRef>()).ok_or_else(||failure("captured source bytes"))?;
+        // The used slots, not a directory reserved far ahead.
+        let used = directory.current.used.min(directory.current.len());
+        let bytes=used.checked_mul(std::mem::size_of::<LevelsRef>()).ok_or_else(||failure("captured source bytes"))?;
         let memory=crate::admission::shared().reserve(bytes as u64,"captured source references")?;
         let mut references = Vec::new();
-        references.try_reserve_exact(directory.current.len()).map_err(|_| failure("capture source allocation"))?;
-        references.extend(directory.current.iter().enumerate().map(|(id, r)| {
+        references.try_reserve_exact(used).map_err(|_| failure("capture source allocation"))?;
+        references.extend(directory.current.iter().take(used).enumerate().map(|(id, r)| {
             // Retain only identities represented by this captured graph. A
             // previously retired token may already have been handed to source
             // reclamation before our guard; such unrelated slots are excluded.
@@ -875,7 +1119,7 @@ impl MutableVectorOwner {
     /// state that must match it; [`PendingMutableCheckpoint::finish`] copies
     /// the graph (chunked, graph writers interleaved) as of that point.
     pub fn begin_checkpoint(self: &Arc<Self>) -> Result<PendingMutableCheckpoint> {
-        let (pending, (watermark, retirements, nodes, quantization, mutation_generation)) = self.graph.begin_capture(|writer, _| {
+        let (pending, (watermark, retirements, nodes, quantization, mutation_generation, changes)) = self.graph.begin_capture(|writer, _| {
             self.graph.control.check_readable()?;
             // Pending reservations (graph ingestion in flight) are not part
             // of the captured graph: their nodes are invisible to it, their
@@ -890,11 +1134,14 @@ impl MutableVectorOwner {
             let mut retirements=std::collections::HashMap::new();retirements.try_reserve(count).map_err(|_|failure("checkpoint retirement allocation"))?;
             retirements.extend(writer.visibility_retained.iter().map(|(&id,&generation)|(id,generation)));
             let retirements=crate::admission::Allocation::new(retirements,memory);
-            Ok((writer.watermark, retirements, self.graph.num_nodes(),
-                self.quantized.as_ref().map(QuantizedOwner::checkpoint).transpose()?,
-                self.graph.mutation_generation()))
+            let quantization = self.quantized.as_ref().map(QuantizedOwner::checkpoint).transpose()?;
+            let generation = self.graph.mutation_generation();
+            // Everything changed since the newest durable save (taken last:
+            // nothing fallible follows).
+            let changes = writer.take_save_changes(generation);
+            Ok((writer.watermark, retirements, self.graph.num_nodes(), quantization, generation, changes))
         })?;
-        Ok(PendingMutableCheckpoint { owner: self.clone(), pending, watermark, retirements, nodes, quantization, mutation_generation })
+        Ok(PendingMutableCheckpoint { owner: self.clone(), pending, watermark, retirements, nodes, quantization, mutation_generation, changes })
     }
 
     /// Open an atomically published graph/source pair, retaining mapped bytes
@@ -1027,7 +1274,7 @@ impl MutableVectorOwner {
                     for _ in 0..words {codes.push(input.u32()?);}
                     let epoch = owner.quantized.as_ref().unwrap().get(epoch_id).ok_or_else(|| corrupt("quantized row calibration missing"))?;
                     if embedded {
-                        owner.install_row_encoded(handle, key, &values, Some(&EncodedRow { epoch, words: codes, _memory:None }))?;
+                        owner.install_row_encoded(handle, key, &values, Some(&EncodedRow { epoch, words: codes, mutation: Vec::new(), mutation_epoch: 0, _memory:None }))?;
                     } else {
                         owner.install_code_only(handle, key, &epoch, &codes)?;
                     }
@@ -1053,26 +1300,16 @@ impl MutableVectorOwner {
     /// v3 rows plus code log references, the log reopened from the chunk
     /// files the header lists (mapped; nothing is copied for them).
     fn restore_logged(directory: &dyn crate::codec::directory::Directory, graph_bytes: &[u8], row_bytes: &[u8], raw: Option<&dyn RawRowsSnapshot>) -> Result<(Arc<MutableHnsw>, Self)> {
-        use crate::codec::crc32;
-        if row_bytes.len() < 32 { return Err(corrupt("owned source checkpoint truncated")); }
-        let (body, checksum) = row_bytes.split_at(row_bytes.len() - 4);
-        if crc32(body) != u32::from_le_bytes(checksum.try_into().unwrap()) {
-            return Err(corrupt("owned source checksum"));
-        }
-        let mut input = Decoder { bytes: body, offset: 0 };
-        if input.take(8)? != b"RMVR\x04\0\0\0" { return Err(corrupt("owned source version")); }
-        let dim = input.u32()?;
-        let count = usize::try_from(input.u64()?).map_err(|_| corrupt("source row count"))?;
-        if input.u32()? != crc32(graph_bytes) { return Err(corrupt("source graph checksum")); }
+        Self::restore_logged_chain(directory, graph_bytes, row_bytes, &[], raw)
+    }
+
+    /// A rows section's calibration and code log header ([`MutableVectorCheckpoint::rows_header`]).
+    fn read_rows_header<'a>(input: &mut Decoder<'a>) -> Result<RowsHeader<'a>> {
         let quantized = match input.u32()? { 0 => false, 1 => true, _ => return Err(corrupt("source row flags")) };
-        let graph = Arc::new(MutableHnsw::open(graph_bytes)?);
-        if graph.dim != dim || graph.active_nodes() as usize != count { return Err(corrupt("source graph shape")); }
-        let mut owner = Self::new(graph.clone())?;
-        if quantized {
+        let calibration = if quantized {
             let length = usize::try_from(input.u64()?).map_err(|_| corrupt("quantized calibration length"))?;
-            owner.quantized = Some(QuantizedOwner::restore(input.take(length)?, dim as usize, graph.similarity)?);
-            owner.attach_code_plane()?;
-        }
+            Some(input.take(length)?)
+        } else { None };
         let log = match input.u32()? {
             0 => None,
             1 => {
@@ -1083,10 +1320,114 @@ impl MutableVectorOwner {
                 if row_words == 0 || rows_per_chunk == 0 || chunks > input.remaining() / 4 { return Err(corrupt("code log header")); }
                 let mut refs = Vec::with_capacity(chunks);
                 for chunk in 0..chunks { refs.push(ChunkRef { chunk: chunk as u32, rows: input.u32()? }); }
-                Some(CodeLog::restore(directory, id, row_words, rows_per_chunk, &refs)?)
+                Some((id, row_words, rows_per_chunk, refs))
             }
             _ => return Err(corrupt("code log flag")),
         };
+        Ok(RowsHeader { quantized, calibration, log })
+    }
+
+    /// Step over one row record after its identity (RMVR v4/v5).
+    fn skip_row(input: &mut Decoder<'_>, dim: usize, quantized: bool) -> Result<()> {
+        match input.u32()? {
+            2 => { input.u64()?; }
+            kind @ (0 | 1) => {
+                if kind == 1 { input.take(dim.checked_mul(4).ok_or_else(|| corrupt("source row width"))?)?; }
+                if quantized {
+                    input.take(8)?;
+                    let words = input.u32()? as usize;
+                    input.take(words.checked_mul(4).ok_or_else(|| corrupt("source code width"))?)?;
+                }
+            }
+            _ => return Err(corrupt("source row kind")),
+        }
+        Ok(())
+    }
+
+    /// Open a full checkpoint `name` with the incremental ones of its chain
+    /// (`deltas`, oldest first, see [`MutableVectorCheckpoint::write_delta_file`])
+    /// applied: the graph and rows of the newest capture. Every delta's
+    /// checksum is verified.
+    pub fn open_chain_with(directory: &dyn crate::codec::directory::Directory, name: &str, deltas: &[String], raw: Option<&dyn RawRowsSnapshot>) -> Result<(Arc<MutableHnsw>, Self)> {
+        use crate::codec::crc32;
+        if deltas.is_empty() { return Self::open_file_with(directory, name, raw); }
+        let file = directory.open_read(name)?;
+        let mut input = Decoder { bytes: file.as_slice(), offset: 0 };
+        if input.take(8)? != b"RMVC\x02\0\0\0" { return Err(corrupt("graph delta over a checkpoint not of format 2")); }
+        let graph_len = usize::try_from(input.u64()?).map_err(|_| corrupt("owned checkpoint graph length"))?;
+        let graph = input.take(graph_len)?;
+        let rows = input.take(input.remaining())?;
+        let files = deltas.iter().map(|delta| directory.open_read(delta)).collect::<Result<Vec<_>>>()?;
+        let mut parts = Vec::with_capacity(files.len());
+        for file in &files {
+            let bytes = file.as_slice();
+            if bytes.len() < 20 { return Err(corrupt("graph delta truncated")); }
+            let (body, checksum) = bytes.split_at(bytes.len() - 4);
+            if crc32(body) != u32::from_le_bytes(checksum.try_into().unwrap()) { return Err(corrupt("graph delta checksum")); }
+            let mut input = Decoder { bytes: body, offset: 0 };
+            let version = input.take(8)?;
+            if version != b"RMVD\x01\0\0\0" && version != b"RMVD\x02\0\0\0" { return Err(corrupt("graph delta file version")); }
+            let length = usize::try_from(input.u64()?).map_err(|_| corrupt("graph delta length"))?;
+            let graph = input.take(length)?;
+            parts.push((graph, input.take(input.remaining())?));
+        }
+        Self::restore_logged_chain(directory, graph, rows, &parts, raw)
+    }
+
+    /// [`Self::restore_logged`] with the incremental checkpoints `deltas`
+    /// (their graph and rows sections, oldest first) applied: each node's
+    /// newest row, the newest calibration and code log.
+    fn restore_logged_chain(directory: &dyn crate::codec::directory::Directory, graph_bytes: &[u8], row_bytes: &[u8],
+        deltas: &[(&[u8], &[u8])], raw: Option<&dyn RawRowsSnapshot>) -> Result<(Arc<MutableHnsw>, Self)> {
+        use crate::codec::crc32;
+        if row_bytes.len() < 32 { return Err(corrupt("owned source checkpoint truncated")); }
+        let (body, checksum) = row_bytes.split_at(row_bytes.len() - 4);
+        if crc32(body) != u32::from_le_bytes(checksum.try_into().unwrap()) {
+            return Err(corrupt("owned source checksum"));
+        }
+        let mut input = Decoder { bytes: body, offset: 0 };
+        if input.take(8)? != b"RMVR\x04\0\0\0" { return Err(corrupt("owned source version")); }
+        let dim = input.u32()?;
+        let mut count = usize::try_from(input.u64()?).map_err(|_| corrupt("source row count"))?;
+        if input.u32()? != crc32(graph_bytes) { return Err(corrupt("source graph checksum")); }
+        let mut header = Self::read_rows_header(&mut input)?;
+        let quantized = header.quantized;
+        // The deltas' rows, indexed by node handle (the newest wins): held
+        // through the restore, charged before it grows (a budget that
+        // cannot cover it refuses the open before the graph is replayed).
+        let mut changed: std::collections::HashMap<u64, (usize, usize)> = std::collections::HashMap::new();
+        let mut _changed_memory = crate::admission::shared().reserve(0, "graph delta row index")?;
+        for (index, (graph, rows)) in deltas.iter().enumerate() {
+            let mut delta = Decoder { bytes: rows, offset: 0 };
+            if delta.take(8)? != b"RMVR\x05\0\0\0" { return Err(corrupt("graph delta rows version")); }
+            if delta.u32()? != dim { return Err(corrupt("graph delta rows dimensions")); }
+            count = usize::try_from(delta.u64()?).map_err(|_| corrupt("source row count"))?;
+            if delta.u32()? != crc32(graph) { return Err(corrupt("graph delta rows checksum")); }
+            header = Self::read_rows_header(&mut delta)?;
+            if header.quantized != quantized { return Err(corrupt("graph delta rows quantization")); }
+            let records = delta.u64()?;
+            if records > (delta.remaining() / 20) as u64 { return Err(corrupt("graph delta row count")); }
+            let needed = super::map_bytes::<u64, (usize, usize)>(changed.len() + records as usize);
+            if needed > _changed_memory.bytes() { _changed_memory.grow(needed - _changed_memory.bytes(), "graph delta row index")?; }
+            changed.try_reserve(records as usize).map_err(|_| failure("graph delta row index allocation"))?;
+            for _ in 0..records {
+                let at = delta.offset;
+                delta.u64()?;
+                let handle = delta.u64()?;
+                Self::skip_row(&mut delta, dim as usize, quantized)?;
+                changed.insert(handle, (index, at));
+            }
+            if delta.remaining() != 0 { return Err(corrupt("graph delta rows trailing bytes")); }
+        }
+        let delta_graphs: Vec<&[u8]> = deltas.iter().map(|(graph, _)| *graph).collect();
+        let graph = Arc::new(MutableHnsw::open_chain(graph_bytes, &delta_graphs)?);
+        if graph.dim != dim || graph.active_nodes() as usize != count { return Err(corrupt("source graph shape")); }
+        let mut owner = Self::new(graph.clone())?;
+        if let Some(calibration) = header.calibration {
+            owner.quantized = Some(QuantizedOwner::restore(calibration, dim as usize, graph.similarity)?);
+            owner.attach_code_plane()?;
+        }
+        let log = header.log.take().map(|(id, row_words, rows_per_chunk, refs)| CodeLog::restore(directory, id, row_words, rows_per_chunk, &refs)).transpose()?;
         if log.is_some() && !quantized { return Err(corrupt("code log of an unquantized field")); }
         owner.log = if quantized { Some(CodeLogs::new(match log { Some(log) => log, None => CodeLog::new()? })) } else { None };
         let retained_epochs = owner.quantized.as_ref().map(QuantizedOwner::retain_epochs).transpose()?;
@@ -1097,10 +1438,25 @@ impl MutableVectorOwner {
             let mut values = Vec::new();
             values.try_reserve_exact(dim as usize).map_err(|_| failure("checkpoint row allocation"))?;
             for (index, (key, handle)) in identities.iter().copied().enumerate() {
+                // The node's newest row: a delta's, else the base's (whose
+                // rows of nodes since removed or replaced are stepped over).
+                let mut delta_input: Decoder<'_>;
+                let input: &mut Decoder<'_> = match changed.get(&handle.as_u64()) {
+                    Some(&(delta, at)) => { delta_input = Decoder { bytes: deltas[delta].1, offset: at }; &mut delta_input }
+                    None => {
+                        while !deltas.is_empty() {
+                            let mut peek = Decoder { bytes: input.bytes, offset: input.offset };
+                            if peek.u64()? == key && peek.u64()? == handle.as_u64() { break; }
+                            input.take(16)?;
+                            Self::skip_row(&mut input, dim as usize, quantized)?;
+                        }
+                        &mut input
+                    }
+                };
                 if input.u64()? != key || input.u64()? != handle.as_u64() { return Err(corrupt("source row identity")); }
                 match input.u32()? {
                     2 => owner.install_log_ref(handle, key, input.u64()?)?,
-                    kind @ (0 | 1) => owner.restore_v3_row(&mut input, &mut values, handle, key, kind == 1, quantized, raw)?,
+                    kind @ (0 | 1) => owner.restore_v3_row(input, &mut values, handle, key, kind == 1, quantized, raw)?,
                     _ => return Err(corrupt("source row kind")),
                 }
                 if index % 256 == 255 { owner.commit_locked(&mut writer)?; }
@@ -1114,6 +1470,11 @@ impl MutableVectorOwner {
                 }
             }
         }
+        // Base rows past the last node's: of nodes since removed.
+        while !deltas.is_empty() && input.remaining() != 0 {
+            input.take(16)?;
+            Self::skip_row(&mut input, dim as usize, quantized)?;
+        }
         if input.remaining() != 0 { return Err(corrupt("source trailing bytes")); }
         if let Some(logs) = &owner.log {
             let sealed = logs.active().seal_full(directory)?;
@@ -1125,6 +1486,7 @@ impl MutableVectorOwner {
         }
         drop(retained_epochs);
         owner.commit()?;
+        owner.restored_durable()?;
         Ok((graph, owner))
     }
 
@@ -1156,7 +1518,7 @@ impl MutableVectorOwner {
                 .is_some_and(|row| row.len() == dim && row.iter().zip(values.iter()).all(|(a, b)| a.to_bits() == b.to_bits()));
             if let Some(raw) = raw.filter(|_| embedded) { raw.execution_result()?; }
             if embedded && !durable {
-                self.install_row_encoded(handle, key, values, Some(&EncodedRow { epoch, words: codes, _memory:None }))
+                self.install_row_encoded(handle, key, values, Some(&EncodedRow { epoch, words: codes, mutation: Vec::new(), mutation_epoch: 0, _memory:None }))
             } else if self.log.as_ref().is_some_and(CodeLogs::shed_room) && crate::codec::write_version() >= crate::codec::RMVC2_SINCE {
                 // Only a format-2 checkpoint can reference log rows (as shedding).
                 self.install_code_only_logged(handle, key, &epoch, &codes)
@@ -1232,7 +1594,7 @@ impl MutableVectorOwner {
                 let _encoded_memory=restore_words(words-base,"checkpoint encoded row copy")?;
                 let mut codes=Vec::new();codes.try_reserve_exact(words-base).map_err(|_|failure("checkpoint encoded row allocation"))?;
                 codes.extend(values[base..].iter().map(|v|v.to_bits()));
-                let encoded = EncodedRow { epoch, words:codes, _memory:None };
+                let encoded = EncodedRow { epoch, words:codes, mutation: Vec::new(), mutation_epoch: 0, _memory:None };
                 // Check row shape and finite score without rebuilding calibration.
                 // Quantized scorer construction: optional normalized f32 row,
                 // byte codes + byte reuse buffer, OSQ centered f32 + i32 codes.
@@ -1275,7 +1637,7 @@ impl MutableVectorOwner {
             pending_reclamation: parking_lot::Mutex::new(Vec::new()),
             pointer, len: AtomicUsize::new(16), plane: None, row_plane,
             quarantine: parking_lot::Mutex::new(PlaneQuarantine::default()), quarantined: AtomicUsize::new(0),
-            exact_mutation_rows: false })
+            exact_mutation_rows: false, mutation: None, backfill: parking_lot::Mutex::new(None), saves: parking_lot::Mutex::new(RowSaves::default()) })
     }
 
     pub(crate) fn new_quantized(graph: Arc<MutableHnsw>, spec: Option<crate::vector::es_quant::EsQuant>) -> Result<Self> {
@@ -1297,6 +1659,10 @@ impl MutableVectorOwner {
         self.graph.control.enable_dense_publications()?;
         self.plane = Some(Box::default());
         self.exact_mutation_rows = self.quantized.as_ref().is_some_and(|q| q.spec().bits < 4);
+        if self.quantized.as_ref().is_some_and(|q| q.spec().bits == 1 && q.spec().osq) {
+            self.mutation = Some(Box::new(MutationPlane::new(self.graph.dim as usize, mutation_plane::bits())));
+            *self.backfill.get_mut() = Some(0);
+        }
         Ok(())
     }
     pub(crate) fn quantization(&self) -> Option<crate::vector::es_quant::EsQuant> {
@@ -1407,10 +1773,10 @@ impl MutableVectorOwner {
     pub fn memory_bytes(&self) -> (usize, usize) {
         let rows = self.rows.stats();
         let directory = self.directory.lock();
-        let held = directory.retired.iter().map(|(_, array)| array.len() * std::mem::size_of::<AtomicU32>()).sum::<usize>();
+        let held = directory.retired.iter().map(|(_, array)| array.charged * std::mem::size_of::<AtomicU32>()).sum::<usize>();
         let quantized = self.quantized.as_ref().map_or(0, QuantizedOwner::memory_bytes);
         let log = self.log.as_ref().map_or(0, |logs| logs.memory_bytes().0);
-        (rows.allocated_bytes + held + directory.current.len() * std::mem::size_of::<AtomicU32>() + quantized + log + self.plane.as_ref().map_or(0, |plane| plane.bytes()) + self.row_plane.as_ref().map_or(0, |plane| plane.bytes()), rows.held_bytes + held)
+        (rows.allocated_bytes + held + directory.current.charged * std::mem::size_of::<AtomicU32>() + quantized + log + self.plane.as_ref().map_or(0, |plane| plane.bytes()) + self.row_plane.as_ref().map_or(0, |plane| plane.bytes()) + self.mutation.as_ref().map_or(0, |plane| plane.bytes().0), rows.held_bytes + held)
     }
 
     /// Compact tensor storage by relocating references, independently of text
@@ -1462,9 +1828,16 @@ impl MutableVectorOwner {
     }
 
     fn grow(&self, directory: &mut Directory, required: usize) -> Result<()> {
-        if required <= directory.current.len() { return Ok(()); }
+        if required <= directory.current.len() {
+            directory.current.charge(required)?;
+            directory.current.used = directory.current.used.max(required);
+            return Ok(());
+        }
         let capacity = required.checked_mul(2).ok_or_else(|| failure("source directory overflow"))?;
         let mut replacement=SourceDirectory::new(capacity,Some(&directory.current))?;
+        // A directory reserved ahead spans more than `capacity`.
+        let capacity = replacement.len();
+        replacement.used = replacement.used.max(required);
         directory.reserve_retirement()?;
         let pointer = replacement.as_mut_ptr();
         let old = std::mem::replace(&mut directory.current, replacement);
@@ -1593,6 +1966,7 @@ impl MutableVectorOwner {
         if let (Some(quantized), Some(encoded)) = (&self.quantized, encoded) {
             quantized.installed(&encoded.epoch);
             self.write_plane(slot, encoded.epoch.id, &encoded.words);
+            self.write_mutation(slot, encoded.mutation_epoch, &encoded.mutation);
         }
         owner.store(reference.raw(), Release);
         unsafe { batch.finish_after_publish() };
@@ -1637,10 +2011,22 @@ impl MutableVectorOwner {
     /// Node `slot`'s [`CodePlane`] entry, best effort: an entry that cannot
     /// be written (memory admission) is left empty, and searches score that
     /// node from its row. Caller holds the graph writer, before publication.
+    /// Also clears the slot's maintenance row: a node installed without
+    /// its f32 at hand (restored) has none, and is maintained from its f32
+    /// ([`Self::write_mutation`] follows for one installed with it).
     fn write_plane(&self, slot: usize, epoch: u64, words: &[u32]) {
         let Ok(id) = u32::try_from(slot) else { return };
+        if let Some(mutation) = &self.mutation { mutation.clear(id); }
         let Some(plane) = &self.plane else { return };
         if plane.write(id, epoch, words).is_err() { plane.clear(id); }
+    }
+
+    /// Node `slot`'s [`MutationPlane`] row, best effort (empty `words`, or
+    /// a row that cannot be written: none, the node is maintained from its
+    /// f32). Caller holds the graph writer, before publication.
+    fn write_mutation(&self, slot: usize, epoch: u64, words: &[u32]) {
+        let (Some(mutation), Ok(id)) = (&self.mutation, u32::try_from(slot)) else { return };
+        if words.is_empty() || mutation.write(id, epoch, words).is_err() { mutation.clear(id); }
     }
 
     /// Install a code-only quantized row (its f32 durable in [`RawRows`]).
@@ -1835,7 +2221,10 @@ impl MutableVectorOwner {
             logs.reclaim(self.graph.control.domain.update_oldest_used_generation());
             if logs.compacting().is_none() {
                 if !logs.idle() || !logs.active().wants_compaction(self.compact_min_rows.load(Relaxed)) { return Ok(0); }
-                logs.begin_compaction(CodeLog::new()?)?;
+                let target = CodeLog::new()?;
+                #[cfg(test)]
+                target.inherit_test_shape(logs.active());
+                logs.begin_compaction(target)?;
             }
         }
         let mut copied = 0;
@@ -1867,7 +2256,8 @@ impl MutableVectorOwner {
         let (slot, target) = (logs.active_slot(), logs.active());
         let old_slot = 1 - slot;
         let directory = self.directory.lock();
-        let end = cursor.saturating_add(CODE_LOG_COMPACT_BATCH).min(directory.current.len());
+        let used = directory.current.used.min(directory.current.len());
+        let end = cursor.saturating_add(CODE_LOG_COMPACT_BATCH).min(used);
         let mut words = Vec::new();
         let mut moved = 0;
         for position in cursor..end {
@@ -1891,7 +2281,7 @@ impl MutableVectorOwner {
             old.untagged();
             moved += 1;
         }
-        if end >= directory.current.len() {
+        if end >= used {
             drop(directory);
             logs.finish_compaction(self.graph.control.domain.current_generation());
             // The next commit saves a checkpoint naming only the new log.
@@ -1906,6 +2296,12 @@ impl MutableVectorOwner {
     #[cfg(test)]
     pub(crate) fn set_code_log_compact_min_rows(&self, rows: u64) {
         self.compact_min_rows.store(rows, Relaxed);
+    }
+
+    /// Test seam: code log chunks of `bytes` (before the first row).
+    #[cfg(test)]
+    pub(crate) fn set_code_log_chunk_bytes(&self, bytes: usize) {
+        if let Some(logs) = &self.log { logs.active().set_test_chunk_bytes(bytes); }
     }
 
     /// Test seam: the active code log holds at most `rows` rows.
@@ -1938,8 +2334,9 @@ impl MutableVectorOwner {
         let (slots, retired) = { let directory = self.directory.lock(); (directory.current.len(), directory.retired.len()) };
         let (log_anon, log_mapped) = self.code_log_memory();
         format!("rows={rows:?} unshed={unshed} directory_slots={slots} retired_directories={retired} plane_bytes={} row_plane_bytes={} \
-            log_anon={log_anon} log_mapped={log_mapped} log_state={:?} quantizer_bytes={}",
+            maintenance_rows={:?} log_anon={log_anon} log_mapped={log_mapped} log_state={:?} quantizer_bytes={}",
             self.plane.as_ref().map_or(0, |plane| plane.bytes()), self.row_plane.as_ref().map_or(0, |plane| plane.bytes()),
+            self.mutation.as_ref().map(|plane| plane.bytes()),
             self.log.as_ref().map(|logs| { let log = logs.active(); (log.id(), log.rows(), log.live_rows(), logs.compacting().is_some()) }),
             self.quantized.as_ref().map_or(0, QuantizedOwner::memory_bytes))
     }
@@ -2022,6 +2419,100 @@ impl MutableVectorOwner {
         drop(read);
         if shed > 0 { self.commit_locked(&mut writer)?; }
         Ok(shed)
+    }
+
+    /// The checkpoint captured at graph mutation generation `generation` (or
+    /// a later one) is durable: the next incremental save is relative to the
+    /// newest capture at or below it.
+    pub(crate) fn saves_durable(&self, generation: u64) {
+        self.graph.saves_durable(generation);
+        let mut saves = self.saves.lock();
+        if let Some(at) = saves.pending.iter().rposition(|saved| saved.generation <= generation) {
+            let durable = saves.pending[at].clone();
+            saves.durable = Some(durable);
+        }
+        saves.pending.retain(|saved| saved.generation > generation);
+    }
+
+    /// The owner was just restored from its durable checkpoint (chain): its
+    /// rows are that checkpoint's, as of the graph's current generation.
+    fn restored_durable(&self) -> Result<()> {
+        let references = {
+            let directory = self.directory.lock();
+            let used = directory.current.used.min(directory.current.len());
+            let memory = crate::admission::shared().reserve((used * std::mem::size_of::<LevelsRef>()) as u64, "saved row references")?;
+            let mut references = Vec::new();
+            references.try_reserve_exact(used).map_err(|_| failure("saved row references allocation"))?;
+            references.extend(directory.current.iter().take(used).map(|r| LevelsRef::from_raw(r.load(Acquire))));
+            crate::admission::Allocation::new(references, memory)
+        };
+        let log = self.log.as_ref().map(|logs| logs.active().id());
+        let mut saves = self.saves.lock();
+        saves.durable = Some(SavedRows { generation: self.graph.mutation_generation(), references: Arc::new(references), log });
+        saves.pending.clear();
+        Ok(())
+    }
+
+    /// Whether [`Self::backfill_maintenance_rows`] has slots left to examine.
+    pub fn maintenance_backfill_pending(&self) -> bool {
+        self.backfill.lock().is_some()
+    }
+
+    /// Give at most `max` nodes without a maintenance row (restored from a
+    /// checkpoint: installed without their f32 at hand) theirs, from their
+    /// f32, examining the slots in order (about the vector store's order:
+    /// mostly sequential reads). Until then pruning reads such a node's f32
+    /// from the store. Rows are computed off the graph writer, then written
+    /// under it for nodes still holding their slot. Returns the rows
+    /// written; `Ok(0)` once every slot was examined (new nodes get theirs
+    /// at installation).
+    pub fn backfill_maintenance_rows(&self, max: usize) -> Result<usize> {
+        let (Some(plane), Some(quantized)) = (self.mutation.as_deref(), self.quantized.as_ref()) else { return Ok(0) };
+        let frozen = if plane.bits() == 2 { quantized.maintenance() } else { None };
+        let mut cursor = self.backfill.lock();
+        let Some(start) = *cursor else { return Ok(0) };
+        let dim = self.graph.dim as usize;
+        let read = self.pin()?;
+        let view = self.graph.try_snapshot()?;
+        let used = { let directory = self.directory.lock(); directory.current.used.min(directory.current.len()) };
+        let end = start.saturating_add(max.saturating_mul(4).max(SHED_SCAN_MIN)).min(used);
+        let mut rows: Vec<(NodeHandle, u64, u64, u64, Vec<u32>)> = Vec::new();
+        for slot in start..end {
+            if rows.len() >= max { *cursor = Some(slot); break; }
+            let Ok(id) = u32::try_from(slot) else { break };
+            if plane.entry(id).is_some() { continue; }
+            let Some(node) = view.current_node(id) else { continue };
+            let (handle, key) = (node.handle(), node.key());
+            let Some(row) = read.encoded_node(handle, key) else { continue };
+            let epoch = u64::from(row[3].to_bits()) | (u64::from(row[4].to_bits()) << 32);
+            let Some(found) = quantized.get(epoch) else { continue };
+            let crate::vector::es_quant::EsQuantizer::Osq(osq) = &found.q else { continue };
+            let raw = if is_code_only(row) {
+                match read.raw.row_result(self, key)?.filter(|raw| raw.len() == dim) { Some(raw) => raw, None => continue }
+            } else { &row[8..8 + dim] };
+            let unit = if self.graph.similarity == Similarity::Cosine { crate::vector::es_quant::es_unit(raw) } else { std::borrow::Cow::Borrowed(raw) };
+            let (row_epoch, words) = match &frozen {
+                Some(frozen) => (mutation_plane::MAINTENANCE_EPOCH, mutation_plane::encode2(&frozen.osq, &unit)),
+                None => (epoch, mutation_plane::encode(osq, &unit, plane.bits())),
+            };
+            rows.push((handle, key, epoch, row_epoch, words));
+        }
+        if rows.len() < max { *cursor = (end < used).then_some(end); }
+        drop(view);
+        let written = rows.len();
+        if written > 0 {
+            let _writer = self.graph.control.writer.lock();
+            // Under the writer no slot is released or reinstalled: a node
+            // still holding its slot with the same codes gets its row.
+            let read = self.pin()?;
+            for (handle, key, epoch, row_epoch, words) in rows {
+                let Some(row) = read.encoded_node(handle, key) else { continue };
+                if epoch != (u64::from(row[3].to_bits()) | (u64::from(row[4].to_bits()) << 32)) { continue; }
+                if plane.entry(internal_id(handle)).is_some() { continue; }
+                if plane.write(internal_id(handle), row_epoch, &words).is_err() { break; }
+            }
+        }
+        Ok(written)
     }
 
     /// Test seam: move the newest queued row to the front of the shed
@@ -2134,6 +2625,7 @@ impl MutableVectorOwner {
             }
             // Reclaimed: no reader reaches this slot's node any more.
             if let (Some(plane), Ok(id)) = (&self.plane, u32::try_from(slot)) { plane.clear(id); }
+            if let (Some(mutation), Ok(id)) = (&self.mutation, u32::try_from(slot)) { mutation.clear(id); }
             owner.store(0, Release);
             if let Some(log) = self.log.as_ref().and_then(|logs| logs.get(log_slot(reference.raw()))) { log.untagged(); }
             return Ok(());
@@ -2148,6 +2640,7 @@ impl MutableVectorOwner {
         }
         let batch = batch.begin_publish();
         if let (Some(plane), Ok(id)) = (&self.plane, u32::try_from(slot)) { plane.clear(id); }
+        if let (Some(mutation), Ok(id)) = (&self.mutation, u32::try_from(slot)) { mutation.clear(id); }
         owner.store(0, Release);
         unsafe { batch.finish_after_publish() };
         Ok(())
@@ -2192,17 +2685,42 @@ impl MutableVectorOwner {
 impl MutableVectorSource for MutableVectorRead<'_> {
     fn execution_result(&self)->Result<()> {self.raw.execution_result()?;self.decoded.execution_result()}
     fn get(&self, _: u64) -> Option<&[f32]> { None }
+    fn has_row(&self, handle: NodeHandle, key: u64, dim: usize) -> bool {
+        // A quantized row (code-only once shed) carries its identity and
+        // codes; its f32 is not needed to keep it as a neighbour.
+        if self.owner.quantized.is_some() && dim == self.owner.graph.dim as usize {
+            return self.encoded_node(handle, key).is_some();
+        }
+        self.get_node(handle, key).is_some_and(|row| row.len() == dim)
+    }
     fn code_row(&self, handle: NodeHandle, key: u64) -> Option<(u64, &[f32])> {
+        // A 1-bit field's 2-bit maintenance rows compare on their codes
+        // (`mutation_plane::CodeSpace`).
+        if let Some(plane) = self.owner.mutation.as_deref().filter(|plane| plane.bits() == 2) {
+            self.encoded_node(handle, key)?;
+            return plane.entry(internal_id(handle));
+        }
         if self.owner.quantized.is_none() || self.owner.exact_mutation_rows { return None; }
         let row = self.encoded_node(handle, key)?;
         let epoch = u64::from(row[3].to_bits()) | (u64::from(row[4].to_bits()) << 32);
         Some((epoch, row.get(codes_start(row, self.owner.graph.dim as usize)..)?))
     }
     fn code_scorer(&self, epoch: u64) -> Option<Box<dyn Fn(&[f32], &[f32]) -> f64 + '_>> {
+        if self.owner.mutation.as_deref().is_some_and(|plane| plane.bits() == 2) {
+            let centroid = self.owner.quantized.as_ref()?.maintenance_centroid(epoch)?;
+            let space = mutation_plane::CodeSpace::new(centroid.centroid(), self.owner.graph.similarity);
+            return Some(Box::new(move |a: &[f32], b: &[f32]| space.distance(a, b)));
+        }
         code_pair_scorer(self.owner.quantized.as_ref()?, epoch, self.owner.graph.dim as usize)
     }
+    fn diverse_on_codes(&self) -> bool {
+        self.owner.mutation.as_deref().is_some_and(|plane| plane.bits() == 2)
+    }
     fn get_node_approx(&self, handle: NodeHandle, key: u64) -> Option<&[f32]> {
-        let Some(quantized) = self.owner.quantized.as_ref().filter(|_| !self.owner.exact_mutation_rows) else { return self.get_node(handle, key) };
+        let Some(quantized) = self.owner.quantized.as_ref().filter(|_| !self.owner.exact_mutation_rows) else {
+            let row = self.encoded_node(handle, key)?;
+            return mutation_row(&self.owner, &self.decoded, row, handle).or_else(|| self.get_node(handle, key));
+        };
         let row = self.encoded_node(handle, key)?;
         approx_row(quantized, &self.decoded, row, self.owner.graph.dim as usize, handle)
     }
@@ -2323,7 +2841,10 @@ impl MutableVectorSource for CapturedMutableVectorRead {
     fn execution_result(&self)->Result<()> {self.raw.execution_result()?;self.decoded.execution_result()}
     fn get(&self, _: u64) -> Option<&[f32]> { None }
     fn get_node_approx(&self, handle: NodeHandle, key: u64) -> Option<&[f32]> {
-        let Some(quantized) = self.owner.quantized.as_ref().filter(|_| !self.owner.exact_mutation_rows) else { return self.get_node(handle, key) };
+        let Some(quantized) = self.owner.quantized.as_ref().filter(|_| !self.owner.exact_mutation_rows) else {
+            let row = self.encoded_node(handle, key)?;
+            return mutation_row(&self.owner, &self.decoded, row, handle).or_else(|| self.get_node(handle, key));
+        };
         let row = self.encoded_node(handle, key)?;
         approx_row(quantized, &self.decoded, row, self.owner.graph.dim as usize, handle)
     }
@@ -2540,6 +3061,621 @@ mod tests {
         crate::codec::TEST_WRITE_VERSION.with(|v| v.set(0));
         let (_, rows) = MutableVectorOwner::open_file(&directory, "old").unwrap();
         assert_eq!(rows.pin().unwrap().get_node(handle, 7), Some([3., 4.].as_slice()));
+    }
+
+    /// Incremental checkpoints: over a full checkpoint, deltas holding only
+    /// the graph records and rows changed since the durable save reopen to
+    /// exactly what a full checkpoint of the same capture reopens to (graph
+    /// encoding, every row and its codes), through inserts, removals with
+    /// slot reuse, rows shed into the code log, and a save that failed part
+    /// way (its changes go in the next delta). Each delta is smaller than a
+    /// full checkpoint; a torn delta is refused by its checksum. Saves as
+    /// whole changed records (v39) reopen byte for byte; as link logs (v40)
+    /// with every list's members (its order may differ).
+    #[test]
+    fn incremental_checkpoints_reopen_exactly_as_full_ones() {
+        incremental_checkpoints_case(crate::codec::GRAPH_DELTA_SINCE);
+    }
+    #[test]
+    fn link_log_checkpoints_reopen_exactly_as_full_ones() {
+        incremental_checkpoints_case(crate::codec::GRAPH_LINK_LOG_SINCE);
+    }
+    /// A graph as comparable data: its entry, slot universe and every node's
+    /// key, handle and level, with each list's members (sorted unless
+    /// `ordered`).
+    fn graph_members(graph: &MutableHnsw, ordered: bool) -> (u64, u32, Vec<(u32, u64, u64, Vec<Vec<u32>>)>) {
+        let view = graph.snapshot();
+        let mut nodes = Vec::new();
+        for id in 1..view.len {
+            let Some(node) = view.current_node(id) else { continue };
+            let links = (0..=node.level()).map(|level| {
+                let mut ids = node.links(level).unwrap().to_vec();
+                if !ordered { ids.sort_unstable(); }
+                ids
+            }).collect();
+            nodes.push((id, node.key(), node.handle().as_u64(), links));
+        }
+        (view.entry, view.len, nodes)
+    }
+    fn incremental_checkpoints_case(version: u32) {
+        let exact = version < crate::codec::GRAPH_LINK_LOG_SINCE;
+        // Edits are logged only while the cluster writes v40.
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(version));
+        use crate::codec::directory::{Directory, FileSlice, OutputFile, RamDirectory};
+        use crate::vector::es_quant::EsQuant;
+        const DIM: usize = 16;
+        struct Raw(Arc<Vec<Vec<f32>>>);
+        impl RawRows for Raw {
+            fn snapshot(&self) -> Result<Option<Box<dyn RawRowsSnapshot>>> { Ok(Some(Box::new(Raw(self.0.clone())))) }
+        }
+        impl RawRowsSnapshot for Raw {
+            fn row(&self, key: u64) -> Option<&[f32]> { self.0.get(key as usize).map(Vec::as_slice) }
+        }
+        #[derive(Debug)]
+        struct Failing<'a>(&'a RamDirectory);
+        struct FailingOutput;
+        impl OutputFile for FailingOutput {
+            fn write_all(&mut self, _: &[u8]) -> Result<()> { Err(failure("injected write failure")) }
+            fn finish(self: Box<Self>) -> Result<()> { panic!("a failed output must not publish") }
+        }
+        impl Directory for Failing<'_> {
+            fn open_read(&self, n: &str) -> Result<FileSlice> { self.0.open_read(n) }
+            fn write(&self, n: &str, b: &[u8]) -> Result<()> { self.0.write(n, b) }
+            fn exists(&self, n: &str) -> bool { self.0.exists(n) }
+            fn delete(&self, n: &str) -> Result<()> { self.0.delete(n) }
+            fn list(&self) -> Result<Vec<String>> { self.0.list() }
+            fn list_admitted(&self, temporary: bool) -> crate::error::Result<crate::codec::directory::AdmittedNames> { self.0.list_admitted(temporary) }
+            fn create_output<'a>(&'a self, _: &str) -> Result<Box<dyn OutputFile + 'a>> { Ok(Box::new(FailingOutput)) }
+        }
+        let total = 1200usize;
+        let vectors: Arc<Vec<Vec<f32>>> = Arc::new((0..total).map(|i| (0..DIM).map(|d| ((i * 31 + d * 7) % 97) as f32 / 97.0 + (i % 5) as f32).collect()).collect());
+        let graph = Arc::new(MutableHnsw::new(DIM as u32, Similarity::L2, HnswParams::default()));
+        let owner = Arc::new(MutableVectorOwner::new_quantized(graph.clone(), Some(EsQuant { bits: 7, osq: true, confidence_interval: None })).unwrap());
+        owner.set_raw_rows(Arc::new(Raw(vectors.clone())));
+        let dir = RamDirectory::default();
+        let mut next = 0u64;
+        let mut live: Vec<(u64, NodeHandle)> = Vec::new();
+        let mut insert = |count: usize, live: &mut Vec<(u64, NodeHandle)>| {
+            for _ in 0..count {
+                let key = next;
+                next += 1;
+                let row = vectors[key as usize].as_slice();
+                let codes = owner.prepare_codes(&[row]).unwrap();
+                let reservation = graph.reserve_insert(key).unwrap();
+                owner.install_prepared(&reservation, row, codes[0].as_ref()).unwrap();
+                let read = owner.pin().unwrap();
+                live.push((key, graph.complete(graph.prepare(reservation, &read).unwrap(), &read).unwrap()));
+            }
+        };
+        let reopen_equal = |chain: &[String], full: &str| {
+            let raw = Raw(vectors.clone());
+            let snapshot = raw.snapshot().unwrap().unwrap();
+            let (a, a_owner) = MutableVectorOwner::open_chain_with(&dir, "base", chain, Some(snapshot.as_ref())).unwrap();
+            let (b, b_owner) = MutableVectorOwner::open_file_with(&dir, full, Some(snapshot.as_ref())).unwrap();
+            if exact { assert_eq!(a.encode(), b.encode(), "graph of {chain:?} vs {full}"); }
+            assert_eq!(graph_members(&a, exact), graph_members(&b, exact), "graph of {chain:?} vs {full}");
+            a_owner.set_raw_rows(Arc::new(Raw(vectors.clone())));
+            b_owner.set_raw_rows(Arc::new(Raw(vectors.clone())));
+            let (ra, rb) = (a_owner.pin().unwrap(), b_owner.pin().unwrap());
+            let identities: Vec<_> = a.snapshot().visible_identities().collect();
+            assert_eq!(identities.len(), b.active_nodes() as usize);
+            for (key, handle) in identities {
+                assert_eq!(ra.get_node(handle, key), rb.get_node(handle, key), "row {key}");
+                assert_eq!(a_owner.code_words_for_test(handle, key), b_owner.code_words_for_test(handle, key), "codes {key}");
+            }
+            graph_members(&a, exact)
+        };
+        insert(400, &mut live);
+        while owner.shed_some(4096).unwrap() > 0 {}
+        let base = owner.capture_checkpoint().unwrap();
+        base.write_file_versioned(&dir, "base", crate::codec::VERSION).unwrap();
+        owner.saves_durable(base.mutation_generation());
+        let mut durable = base.mutation_generation();
+        let base_bytes = dir.open_read("base").unwrap().len();
+        let mut chain: Vec<String> = Vec::new();
+        for round in 0..6 {
+            insert(40, &mut live);
+            // Remove some nodes and let their slots be reused.
+            for _ in 0..12 {
+                let (_, handle) = live.remove((round * 37 + 11) % live.len());
+                let read = owner.pin().unwrap();
+                graph.remove(handle, &read).unwrap();
+            }
+            owner.commit().unwrap();
+            owner.reclaim().unwrap();
+            insert(10, &mut live);
+            owner.shed_some(25).unwrap();
+            let capture = owner.capture_checkpoint().unwrap();
+            assert!(capture.delta_eligible(durable), "round {round}");
+            if round == 2 {
+                // A save failing part way is not durable: the next delta
+                // carries its changes too.
+                assert!(capture.write_delta_file(&Failing(&dir), "failed", version).is_err());
+                assert!(!dir.exists("failed"));
+                continue;
+            }
+            let name = format!("delta{round}");
+            capture.write_delta_file(&dir, &name, version).unwrap();
+            let magic = if exact { b"RMVD\x01\0\0\0" } else { b"RMVD\x02\0\0\0" };
+            assert_eq!(&dir.open_read(&name).unwrap().as_slice()[..8], magic, "round {round}: delta kind");
+            let full = format!("full{round}");
+            capture.write_file_versioned(&dir, &full, crate::codec::VERSION).unwrap();
+            chain.push(name.clone());
+            let encoded = reopen_equal(&chain, &full);
+            assert_eq!(encoded, graph_members(&graph, exact), "round {round}: the capture's graph");
+            let (delta_bytes, full_bytes) = (dir.open_read(&name).unwrap().len(), dir.open_read(&full).unwrap().len());
+            // (A tiny graph: most nodes' links change in a round.)
+            assert!(delta_bytes < full_bytes, "round {round}: delta {delta_bytes} bytes vs full {full_bytes}");
+            owner.saves_durable(capture.mutation_generation());
+            durable = capture.mutation_generation();
+        }
+        assert!(base_bytes > 0);
+        // A torn delta is refused (its checksum), not applied in part.
+        let bytes = dir.open_read(&chain[0]).unwrap().as_slice().to_vec();
+        dir.write("torn", &bytes[..bytes.len() - 9]).unwrap();
+        let raw = Raw(vectors.clone());
+        let snapshot = raw.snapshot().unwrap().unwrap();
+        assert!(MutableVectorOwner::open_chain_with(&dir, "base", &["torn".to_string()], Some(snapshot.as_ref())).is_err());
+        // A capture over a stale durable generation is not eligible.
+        let capture = owner.capture_checkpoint().unwrap();
+        assert!(!capture.delta_eligible(durable + 1_000_000));
+    }
+
+    /// A v40 link log chain fixture: a base of `base` nodes and `rounds`
+    /// link log deltas of `per_round` inserts (and some removals) each, in
+    /// a RAM directory. The chain's names and its link log entries.
+    fn link_log_fixture(base: usize, rounds: usize, per_round: usize)
+        -> (crate::codec::directory::RamDirectory, Vec<String>, Arc<Vec<Vec<f32>>>, usize)
+    {
+        use crate::codec::directory::{Directory, RamDirectory};
+        const DIM: usize = 16;
+        let total = base + rounds * per_round;
+        crate::codec::TEST_WRITE_VERSION.with(|v| v.set(crate::codec::GRAPH_LINK_LOG_SINCE));
+        let vectors: Arc<Vec<Vec<f32>>> = Arc::new((0..total).map(|i| (0..DIM).map(|d| ((i * 31 + d * 7) % 97) as f32 / 97.0 + (i % 5) as f32).collect()).collect());
+        let graph = Arc::new(MutableHnsw::new(DIM as u32, Similarity::L2, HnswParams::default()));
+        let owner = Arc::new(MutableVectorOwner::new_quantized(graph.clone(), Some(crate::vector::es_quant::EsQuant { bits: 7, osq: true, confidence_interval: None })).unwrap());
+        owner.set_raw_rows(Arc::new(FixtureRaw(vectors.clone())));
+        let dir = RamDirectory::default();
+        let mut live: Vec<NodeHandle> = Vec::new();
+        let mut next = 0usize;
+        let mut insert = |count: usize, live: &mut Vec<NodeHandle>| {
+            for _ in 0..count {
+                let row = vectors[next].as_slice();
+                let codes = owner.prepare_codes(&[row]).unwrap();
+                let reservation = graph.reserve_insert(next as u64).unwrap();
+                owner.install_prepared(&reservation, row, codes[0].as_ref()).unwrap();
+                let read = owner.pin().unwrap();
+                live.push(graph.complete(graph.prepare(reservation, &read).unwrap(), &read).unwrap());
+                next += 1;
+            }
+        };
+        insert(base, &mut live);
+        while owner.shed_some(4096).unwrap() > 0 {}
+        let capture = owner.capture_checkpoint().unwrap();
+        capture.write_file_versioned(&dir, "base", crate::codec::GRAPH_LINK_LOG_SINCE).unwrap();
+        owner.saves_durable(capture.mutation_generation());
+        let mut chain = Vec::new();
+        let mut entries = 0;
+        for round in 0..rounds {
+            insert(per_round, &mut live);
+            for _ in 0..per_round / 10 {
+                let handle = live.remove((round * 37 + 11) % live.len());
+                let read = owner.pin().unwrap();
+                graph.remove(handle, &read).unwrap();
+            }
+            owner.commit().unwrap();
+            owner.reclaim().unwrap();
+            while owner.shed_some(4096).unwrap() > 0 {}
+            let capture = owner.capture_checkpoint().unwrap();
+            let name = format!("delta{round}");
+            capture.write_delta_file(&dir, &name, crate::codec::GRAPH_LINK_LOG_SINCE).unwrap();
+            owner.saves_durable(capture.mutation_generation());
+            let file = dir.open_read(&name).unwrap();
+            let bytes = file.as_slice();
+            assert_eq!(&bytes[..8], b"RMVD\x02\0\0\0");
+            let length = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+            entries += MutableHnsw::link_log_entries(&bytes[16..16 + length]).unwrap();
+            chain.push(name);
+        }
+        let capture = owner.capture_checkpoint().unwrap();
+        capture.write_file_versioned(&dir, "full", crate::codec::GRAPH_LINK_LOG_SINCE).unwrap();
+        (dir, chain, vectors, entries)
+    }
+    struct FixtureRaw(Arc<Vec<Vec<f32>>>);
+    impl RawRows for FixtureRaw {
+        fn snapshot(&self) -> Result<Option<Box<dyn RawRowsSnapshot>>> { Ok(Some(Box::new(FixtureRaw(self.0.clone())))) }
+    }
+    impl RawRowsSnapshot for FixtureRaw {
+        fn row(&self, key: u64) -> Option<&[f32]> { self.0.get(key as usize).map(Vec::as_slice) }
+    }
+    fn open_fixture(dir: &crate::codec::directory::RamDirectory, chain: &[String], vectors: &Arc<Vec<Vec<f32>>>) -> Result<(Arc<MutableHnsw>, MutableVectorOwner)> {
+        let snapshot = FixtureRaw(vectors.clone()).snapshot().unwrap().unwrap();
+        MutableVectorOwner::open_chain_with(dir, "base", chain, Some(snapshot.as_ref()))
+    }
+    /// The graph of the fixture's chain alone ([`MutableHnsw::open_chain`]
+    /// over the files' graph sections).
+    fn open_fixture_graph(dir: &crate::codec::directory::RamDirectory, chain: &[String]) -> Result<MutableHnsw> {
+        open_fixture_graph_named(dir, "base", chain)
+    }
+    fn open_fixture_graph_named(dir: &crate::codec::directory::RamDirectory, base: &str, chain: &[String]) -> Result<MutableHnsw> {
+        use crate::codec::directory::Directory;
+        let section = |name: &str| {
+            let bytes = dir.open_read(name).unwrap().as_slice().to_vec();
+            let length = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+            bytes[16..16 + length].to_vec()
+        };
+        let base = section(base);
+        let deltas: Vec<Vec<u8>> = chain.iter().map(|name| section(name)).collect();
+        let deltas: Vec<&[u8]> = deltas.iter().map(Vec::as_slice).collect();
+        MutableHnsw::open_chain(&base, &deltas)
+    }
+
+    /// Reopening a v40 link log chain charges its replay workspace (the
+    /// per-slot index of the logged edits, the record and retirement maps)
+    /// before it grows: a budget that covers the resident graph but not the
+    /// replay refuses the open cleanly (a memory error, nothing left
+    /// charged), also with several reopens at once; the replay window is
+    /// bounded (ranges of slots) and reopens the same graph.
+    #[test]
+    fn link_log_replay_workspace_is_admitted_and_bounded() {
+        let (dir, chain, vectors, entries) = link_log_fixture(1500, 8, 150);
+        assert!(entries > 10_000, "fixture logs {entries} entries");
+        let index = (entries * std::mem::size_of::<(u32, u32, usize)>()) as u64;
+        // Resident: what the reopened graph holds once open (the graph
+        // replay, rows restore after it).
+        let resident = {
+            let budget = crate::admission::Budget::new(u64::MAX / 4);
+            let _shared = crate::admission::private_shared_budget(budget.clone());
+            let opened = open_fixture_graph(&dir, &chain).unwrap();
+            let used = budget.used();
+            drop(opened);
+            used
+        };
+        let expected = graph_members(&MutableVectorOwner::open_file_with(&dir, "full", Some(FixtureRaw(vectors.clone()).snapshot().unwrap().unwrap().as_ref())).unwrap().0, false);
+        let open_under = |limit: u64| {
+            let budget = crate::admission::Budget::new(limit);
+            let _shared = crate::admission::private_shared_budget(budget.clone());
+            let opened = open_fixture_graph(&dir, &chain);
+            let members = opened.as_ref().ok().map(|graph| graph_members(graph, false));
+            let error = opened.err();
+            assert_eq!(budget.used(), 0, "an open leaves nothing charged once dropped or refused");
+            (members, error)
+        };
+        // Generous: opens to the full checkpoint's graph (the owner too).
+        assert_eq!(graph_members(&open_fixture(&dir, &chain, &vectors).unwrap().0, false), expected);
+        let (members, error) = open_under(u64::MAX / 4);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(members.as_ref(), Some(&expected));
+        // A budget covering the same graph's open from its full checkpoint
+        // (no replay) and half the replay index: refused, as a memory
+        // error, not opened past the budget.
+        let full_peak = {
+            let budget = crate::admission::Budget::new(u64::MAX / 4);
+            let _shared = crate::admission::private_shared_budget(budget.clone());
+            let owner = crate::admission::Owner::new();
+            let scope = owner.enter();
+            drop(open_fixture_graph_named(&dir, "full", &[]).unwrap());
+            drop(scope);
+            owner.bytes().peak
+        };
+        assert!(full_peak >= resident, "full open peak {full_peak} vs resident {resident}");
+        let (members, error) = open_under(full_peak + index / 2);
+        assert!(members.is_none(), "opened under {} bytes (full open peak {full_peak}, replay index {index})", full_peak + index / 2);
+        assert!(matches!(error, Some(RusticError::Memory(_))), "{error:?}");
+        // Bounded: a window of 512 entries (an eighth of the entries here)
+        // replays in ranges of slots, to the same graph, at an accounted
+        // peak below the whole index's by about the index less the window;
+        // under that peak the unbounded replay is refused.
+        let peak = |minimum: Option<u64>| {
+            crate::vector::hnsw::mutable::TEST_REPLAY_WINDOW_MIN.with(|window| window.set(minimum));
+            let budget = crate::admission::Budget::new(u64::MAX / 4);
+            let _shared = crate::admission::private_shared_budget(budget.clone());
+            let owner = crate::admission::Owner::new();
+            let scope = owner.enter();
+            let members = graph_members(&open_fixture_graph(&dir, &chain).unwrap(), false);
+            drop(scope);
+            crate::vector::hnsw::mutable::TEST_REPLAY_WINDOW_MIN.with(|window| window.set(None));
+            (owner.bytes().peak, members)
+        };
+        let (whole, _) = peak(None);
+        let (bounded, members) = peak(Some(512));
+        assert_eq!(members, expected, "bounded replay reopens the same graph");
+        let window = entries.div_ceil(8).max(512) as u64 * 16;
+        assert!(bounded + (index - window) / 2 < whole, "bounded peak {bounded} vs whole {whole} (index {index}, window {window})");
+        crate::vector::hnsw::mutable::TEST_REPLAY_WINDOW_MIN.with(|minimum| minimum.set(Some(512)));
+        let (members, error) = open_under(bounded);
+        crate::vector::hnsw::mutable::TEST_REPLAY_WINDOW_MIN.with(|minimum| minimum.set(None));
+        assert!(error.is_none(), "bounded replay under its peak {bounded}: {error:?}");
+        assert_eq!(members.as_ref(), Some(&expected));
+        let (members, error) = open_under(bounded);
+        assert!(members.is_none() && matches!(error, Some(RusticError::Memory(_))), "unbounded replay under {bounded}: {error:?}");
+        // Several reopens at once on one budget that covers two: each opens
+        // or is refused cleanly; the budget is never exceeded and nothing
+        // stays charged.
+        let limit = 2 * (resident + index);
+        let budget = crate::admission::Budget::new(limit);
+        let barrier = std::sync::Barrier::new(4);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                let _shared = crate::admission::private_shared_budget(budget.clone());
+                barrier.wait();
+                let opened = open_fixture_graph(&dir, &chain);
+                assert!(budget.used() <= limit);
+                barrier.wait();
+                opened.map(|graph| graph_members(&graph, false))
+            })).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+        assert_eq!(budget.used(), 0);
+        for result in results {
+            match result {
+                Ok(members) => assert_eq!(members, expected),
+                Err(error) => assert!(matches!(error, RusticError::Memory(_)), "{error:?}"),
+            }
+        }
+    }
+
+    /// The rows side of a chain reopen indexes the deltas' rows by node
+    /// handle, held through the restore: charged before it grows, so a
+    /// budget that cannot cover it refuses the open there (before the graph
+    /// replay), cleanly; reopens at once on one budget open or are refused.
+    #[test]
+    fn chain_row_index_is_admitted() {
+        let (dir, chain, vectors, _) = link_log_fixture(1500, 8, 150);
+        let expected = graph_members(&MutableVectorOwner::open_file_with(&dir, "full", Some(FixtureRaw(vectors.clone()).snapshot().unwrap().unwrap().as_ref())).unwrap().0, false);
+        let open_under = |limit: u64| {
+            let budget = crate::admission::Budget::new(limit);
+            let _shared = crate::admission::private_shared_budget(budget.clone());
+            let opened = open_fixture(&dir, &chain, &vectors).map(|(graph, _)| graph_members(&graph, false));
+            assert_eq!(budget.used(), 0, "an open leaves nothing charged once dropped or refused");
+            opened
+        };
+        assert_eq!(open_under(u64::MAX / 4).unwrap(), expected);
+        // The row index is the open's first charge: a budget short of it
+        // refuses there, not at a later structure.
+        match open_under(1024) {
+            Err(RusticError::Memory(message)) => assert!(message.contains("graph delta row index"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        // Its charge: the open's peak with the rows index vs the full
+        // checkpoint's open (no deltas, no index) under one owner each.
+        let peak = |chain: &[String], name: &str| {
+            let budget = crate::admission::Budget::new(u64::MAX / 4);
+            let _shared = crate::admission::private_shared_budget(budget.clone());
+            let owner = crate::admission::Owner::new();
+            let scope = owner.enter();
+            let snapshot = FixtureRaw(vectors.clone()).snapshot().unwrap().unwrap();
+            drop(MutableVectorOwner::open_chain_with(&dir, name, chain, Some(snapshot.as_ref())).unwrap());
+            drop(scope);
+            owner.bytes().peak
+        };
+        let (with_chain, full) = (peak(&chain, "base"), peak(&[], "full"));
+        assert!(with_chain > full, "chain open peak {with_chain} vs full {full}");
+        // Simultaneous reopens on a budget for about two.
+        let limit = 2 * with_chain + with_chain / 2;
+        let budget = crate::admission::Budget::new(limit);
+        let barrier = std::sync::Barrier::new(4);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                let _shared = crate::admission::private_shared_budget(budget.clone());
+                barrier.wait();
+                let opened = open_fixture(&dir, &chain, &vectors);
+                assert!(budget.used() <= limit);
+                barrier.wait();
+                opened.map(|(graph, _)| graph_members(&graph, false))
+            })).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+        assert_eq!(budget.used(), 0);
+        assert!(results.iter().any(Result::is_ok), "a budget for two opens at least one");
+        for result in results {
+            match result {
+                Ok(members) => assert_eq!(members, expected),
+                Err(error) => assert!(matches!(error, RusticError::Memory(_)), "{error:?}"),
+            }
+        }
+    }
+
+    /// Accounted memory vs RSS of a v40 chain reopen (run alone:
+    /// `--ignored --test-threads 1 --nocapture`; prints both).
+    #[test]
+    #[ignore]
+    fn link_log_replay_accounted_vs_rss() {
+        fn status(field: &str) -> u64 {
+            let text = std::fs::read_to_string("/proc/self/status").unwrap();
+            text.lines().find(|line| line.starts_with(field)).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
+        }
+        let (dir, chain, vectors, entries) = link_log_fixture(20_000, 16, 2_500);
+        let budget = crate::admission::Budget::new(u64::MAX / 4);
+        let _shared = crate::admission::private_shared_budget(budget.clone());
+        let owner = crate::admission::Owner::new();
+        let _scope = owner.enter();
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let before = status("VmRSS:");
+        let opened = open_fixture(&dir, &chain, &vectors).unwrap();
+        let peak_rss = status("VmHWM:") - before;
+        let after_rss = status("VmRSS:").saturating_sub(before);
+        let accounted = owner.bytes();
+        println!("link log replay: entries {entries} index {} MiB; accounted peak {:.1} MiB held {:.1} MiB; rss peak +{:.1} MiB held +{:.1} MiB",
+            entries * 16 >> 20, accounted.peak as f64 / 1048576.0, accounted.current as f64 / 1048576.0, peak_rss as f64 / 1048576.0, after_rss as f64 / 1048576.0);
+        drop(opened);
+    }
+
+    /// A 1-bit (bbq) field's graph maintenance reads no f32 once its rows
+    /// are shed (durable in the vector store, which is on disk when the
+    /// vectors outgrow the page cache): pruning and diversity selection
+    /// compare the nodes' maintenance rows. Before them every
+    /// pruned neighbour list read each member's f32 from the store, hundreds
+    /// of random rows per insert. A node restored without a maintenance row
+    /// still falls back to its f32.
+    #[test]
+    fn one_bit_maintenance_reads_no_shed_f32() {
+        use crate::vector::es_quant::EsQuant;
+        use std::sync::atomic::AtomicUsize;
+        const DIMS: usize = 64;
+        struct Raw(Arc<Vec<Vec<f32>>>, Arc<AtomicUsize>);
+        struct Snap(Arc<Vec<Vec<f32>>>, Arc<AtomicUsize>);
+        impl RawRows for Raw {
+            fn snapshot(&self) -> Result<Option<Box<dyn RawRowsSnapshot>>> { Ok(Some(Box::new(Snap(self.0.clone(), self.1.clone())))) }
+        }
+        impl RawRowsSnapshot for Snap {
+            fn row(&self, key: u64) -> Option<&[f32]> {
+                self.1.fetch_add(1, Relaxed);
+                self.0.get(key as usize).map(Vec::as_slice)
+            }
+        }
+        let n = 1500usize;
+        let vectors: Arc<Vec<Vec<f32>>> = Arc::new((0..n).map(|i| {
+            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let c = (i % 13) as f32;
+            let v: Vec<f32> = (0..DIMS).map(|d| {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                (d as f32 * 0.37 + c).cos() + 0.3 * ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5)
+            }).collect();
+            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+            v.into_iter().map(|a| a / norm).collect()
+        }).collect());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let graph = Arc::new(MutableHnsw::new(DIMS as u32, Similarity::DotProduct, HnswParams::default()));
+        let owner = Arc::new(MutableVectorOwner::new_quantized(graph.clone(), Some(EsQuant { bits: 1, osq: true, confidence_interval: None })).unwrap());
+        owner.set_raw_rows(Arc::new(Raw(vectors.clone(), reads.clone())));
+        let insert = |key: usize| {
+            let codes = owner.prepare_codes(&[vectors[key].as_slice()]).unwrap();
+            let reservation = graph.reserve_insert(key as u64).unwrap();
+            owner.install_prepared(&reservation, &vectors[key], codes[0].as_ref()).unwrap();
+            let read = owner.pin().unwrap();
+            graph.complete(graph.prepare(reservation, &read).unwrap(), &read).unwrap();
+        };
+        for key in 0..n / 2 { insert(key); }
+        // Every row so far sheds its f32 (the store holds it durably).
+        while owner.shed_some(4096).unwrap() > 0 {}
+        assert!(owner.memory_diagnostic().contains("maintenance_rows=Some"));
+        reads.store(0, Relaxed);
+        for key in n / 2..n { insert(key); }
+        assert_eq!(reads.load(Relaxed), 0, "maintenance read shed f32 rows");
+        // Still a connected graph of useful degree (the maintenance rows are fine
+        // enough for diversity selection, unlike decoded 1-bit codes).
+        let view = graph.snapshot();
+        let (mut nodes, mut links) = (0usize, 0usize);
+        for id in 1..view.len {
+            if let Some(node) = view.current_node(id) { nodes += 1; links += node.links(0).map_or(0, <[u32]>::len); }
+        }
+        assert_eq!(nodes, n);
+        assert!(links >= 10 * nodes, "mean level-0 degree {:.1}", links as f64 / nodes as f64);
+        // The maintenance rows approximate their vectors closely: 4-bit
+        // rows within 0.15 each; 2-bit rows within 0.35 on average (0.6
+        // each) on these 64-d unit rows.
+        let read = owner.pin().unwrap();
+        let snapshot = graph.snapshot();
+        let (mut checked, mut total, mut worst) = (0, 0f32, 0f32);
+        for id in 1..snapshot.len {
+            let Some(node) = snapshot.current_node(id) else { continue };
+            let approx = read.get_node_approx(node.handle(), node.key()).unwrap();
+            let exact = &vectors[node.key() as usize];
+            let error: f32 = approx.iter().zip(exact).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+            total += error;
+            worst = worst.max(error);
+            checked += 1;
+        }
+        let mean = total / checked as f32;
+        eprintln!("maintenance rows ({} bits): mean error {mean}, worst {worst}", mutation_plane::bits());
+        if mutation_plane::bits() == 4 { assert!(worst < 0.15, "worst maintenance row error {worst}"); }
+        else { assert!(mean < 0.35 && worst < 0.6, "maintenance row error mean {mean}, worst {worst}"); }
+        assert_eq!(checked, n);
+        assert_eq!(reads.load(Relaxed), 0);
+        drop(read);
+        // Nodes without maintenance rows (as restored from a checkpoint)
+        // get them back from their f32 by the bounded backfill, one store
+        // read each; the rows are those an installation writes.
+        let plane = owner.mutation.as_deref().unwrap();
+        let before: Vec<_> = (1..snapshot.len).filter_map(|id| plane.entry(id).map(|(e, w)| (id, e, w.iter().map(|v| v.to_bits()).collect::<Vec<_>>()))).collect();
+        assert_eq!(before.len(), n);
+        for &(id, _, _) in &before { plane.clear(id); }
+        *owner.backfill.lock() = Some(0);
+        let mut filled = 0;
+        while owner.maintenance_backfill_pending() { filled += owner.backfill_maintenance_rows(64).unwrap(); }
+        assert_eq!(filled, n);
+        assert!(reads.load(Relaxed) <= n + 1, "{} store reads for {n} rows", reads.load(Relaxed));
+        // Rows from before the maintenance centroid froze are re-encoded
+        // around it; the others come back identical.
+        let frozen = before.iter().filter(|(_, epoch, _)| *epoch == mutation_plane::MAINTENANCE_EPOCH).count();
+        if mutation_plane::bits() == 2 { assert!(frozen > n / 2, "{frozen} of {n} rows around the frozen centroid"); }
+        for (id, epoch, words) in before {
+            let (e, w) = plane.entry(id).unwrap();
+            if epoch == mutation_plane::MAINTENANCE_EPOCH || mutation_plane::bits() != 2 {
+                assert_eq!((e, w.iter().map(|v| v.to_bits()).collect::<Vec<_>>()), (epoch, words), "node {id}");
+            } else {
+                assert_eq!(e, mutation_plane::MAINTENANCE_EPOCH, "node {id}");
+            }
+        }
+        assert_eq!(owner.backfill_maintenance_rows(64).unwrap(), 0);
+    }
+
+    /// Diversity selection of a node quantized around the frozen maintenance
+    /// centroid stays on codes when its candidates include rows from before
+    /// the freeze (compared on decoded rows), and selects what decoding every
+    /// row selects. It used to give any such list to the row path, which
+    /// decoded nearly every list (the earliest nodes are in most of them):
+    /// 21% of node CPU under 1-bit vector bulk.
+    #[test]
+    fn diversity_on_codes_with_rows_from_before_the_freeze() {
+        use crate::vector::es_quant::EsQuant;
+        const DIMS: usize = 64;
+        let n = 3 * mutation_plane::MAINTENANCE_FREEZE_ROWS as usize;
+        let graph = Arc::new(MutableHnsw::new(DIMS as u32, Similarity::DotProduct, HnswParams::default()));
+        let owner = Arc::new(MutableVectorOwner::new_quantized(graph.clone(), Some(EsQuant { bits: 1, osq: true, confidence_interval: None })).unwrap());
+        let vectors: Vec<Vec<f32>> = (0..n).map(|i| {
+            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let c = (i % 11) as f32;
+            let v: Vec<f32> = (0..DIMS).map(|d| {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                (d as f32 * 0.29 + c).sin() + 0.3 * ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5)
+            }).collect();
+            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+            v.into_iter().map(|a| a / norm).collect()
+        }).collect();
+        for (key, raw) in vectors.iter().enumerate() {
+            let codes = owner.prepare_codes(&[raw.as_slice()]).unwrap();
+            let reservation = graph.reserve_insert(key as u64).unwrap();
+            owner.install_prepared(&reservation, raw, codes[0].as_ref()).unwrap();
+            let read = owner.pin().unwrap();
+            graph.complete(graph.prepare(reservation, &read).unwrap(), &read).unwrap();
+        }
+        if mutation_plane::bits() != 2 { return; }
+        let plane = owner.mutation.as_deref().unwrap();
+        let read = owner.pin().unwrap();
+        assert!(read.diverse_on_codes());
+        let view = graph.snapshot();
+        let nodes: Vec<_> = (1..view.len).filter_map(|id| view.current_node(id)).collect();
+        let frozen = |id: u32| plane.entry(id).is_some_and(|(e, _)| e == mutation_plane::MAINTENANCE_EPOCH);
+        let m = HnswParams::default().m;
+        let (mut lists, mut mixed, mut same, mut kept, mut agreed) = (0, 0, 0, 0usize, 0usize);
+        for node in nodes.iter().filter(|node| frozen(node.id)).step_by(7).take(60) {
+            let anchor = read.get_node_approx(node.handle(), node.key()).unwrap().to_vec();
+            // The 100 nodes nearest it on approximate rows, as a beam's.
+            let mut candidates: Vec<Candidate> = nodes.iter().filter(|other| other.id != node.id).map(|other| {
+                let row = read.get_node_approx(other.handle(), other.key()).unwrap();
+                Candidate::new(f64::from(Similarity::DotProduct.distance(&anchor, row)), *other)
+            }).collect();
+            candidates.sort_unstable();
+            candidates.truncate(100);
+            if candidates.iter().any(|c| !frozen(c.id)) { mixed += 1; }
+            let (mut on_rows, mut on_codes) = (Vec::new(), Vec::new());
+            select_diverse(&view, &read, Similarity::DotProduct, &candidates, Some(&anchor), m, &mut on_rows, None);
+            assert!(select_diverse_codes(&view, &read, Similarity::DotProduct, &candidates, Some(&anchor),
+                (node.handle(), node.key()), m, &mut on_codes), "a list with rows from before the freeze left the codes");
+            let (rows, codes): (Vec<u32>, Vec<u32>) = (on_rows.iter().map(|c| c.id).collect(), on_codes.iter().map(|c| c.id).collect());
+            lists += 1;
+            if rows == codes { same += 1; }
+            kept += rows.len();
+            agreed += rows.iter().filter(|id| codes.contains(id)).count();
+        }
+        eprintln!("{lists} lists ({mixed} mixed): {same} identical, {agreed} of {kept} selections agree");
+        assert_eq!(lists, 60);
+        assert!(mixed >= 30, "{mixed} of {lists} lists mix calibrations");
+        // Code distances equal the decoded ones up to rounding: near-ties may flip.
+        assert!(same * 10 >= lists * 8, "{same} of {lists} selections identical");
+        assert!(agreed * 100 >= kept * 95, "{agreed} of {kept} selected nodes agree");
     }
 
     /// A 1-bit (bbq) field's graph stays connected: diversity selection
@@ -3169,6 +4305,24 @@ mod source_directory_admission_tests {
         drop(row);
         assert_eq!(owner.bytes().current,0);
     }
+    /// A large directory reserves its address space once and is charged
+    /// as its slots are used: no doubled copy charged at growth.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn large_source_directory_is_reserved_ahead_and_charged_as_used() {
+        let owner=crate::admission::Owner::new();let _scope=owner.enter();
+        let mut small=SourceDirectory::new(16,None).unwrap();small[3].store(91,Relaxed);small.used=4;
+        let mut big=SourceDirectory::new(2*DIRECTORY_RESERVE_FROM,Some(&small)).unwrap();
+        assert_eq!(big.len(),DIRECTORY_RESERVE_SLOTS);
+        assert_eq!((big[3].load(Relaxed),big.used),(91,4));
+        let charged=owner.bytes().current;
+        assert!(charged<=((DIRECTORY_RESERVE_FROM+DIRECTORY_CHARGE_STEP)*4+16*4) as u64,"charged {charged}");
+        big.charge(3*DIRECTORY_RESERVE_FROM).unwrap();
+        assert!(owner.bytes().current-charged<=((2*DIRECTORY_RESERVE_FROM+DIRECTORY_CHARGE_STEP)*4) as u64);
+        big[3*DIRECTORY_RESERVE_FROM-1].store(5,Relaxed);
+        drop(big);drop(small);assert_eq!(owner.bytes().current,0);
+    }
+
     #[test]
     fn source_directory_retirement_keeps_each_generation_charged() {
         let owner=crate::admission::Owner::new();let _scope=owner.enter();

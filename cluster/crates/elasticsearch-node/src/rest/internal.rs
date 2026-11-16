@@ -188,7 +188,7 @@ pub async fn desired_balance(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp
     RestResp::json(200, &body)
 }
 
-pub fn prevalidate_node_removal(node: &ClusterNode, req: &RestReq) -> RestResp {
+pub async fn prevalidate_node_removal(node: &ClusterNode, req: &RestReq) -> RestResp {
     let p = req.params();
     let given: Vec<(&str, &str)> = [("names", "names"), ("ids", "IDs"), ("external_ids", "external IDs")]
         .into_iter()
@@ -225,7 +225,23 @@ pub fn prevalidate_node_removal(node: &ClusterNode, req: &RestReq) -> RestResp {
     let mut overall_safe = true;
     let mut results = Vec::new();
     for n in &found {
-        let blocking = red.iter().any(|idx| st.routing_table.shards_on_node(&n.id).any(|c| &c.index == idx));
+        // A red shard's copy on the node: assigned there, or a store on its
+        // disk (an unassigned stale or in-sync copy has no routing entry:
+        // production review #385). A node whose stores cannot be listed is
+        // not proven safe (ES treats an unverifiable node as unsafe).
+        let assigned = red.iter().any(|idx| st.routing_table.shards_on_node(&n.id).any(|c| &c.index == idx));
+        let stored = if red.is_empty() || assigned {
+            false
+        } else {
+            match n.transport_address.parse::<std::net::SocketAddr>() {
+                Ok(addr) => match node.transport.send_request::<_, crate::store_records::StoreRecords>(addr, crate::shards::ACTION_SHARD_STORES, &(), std::time::Duration::from_secs(10)).await {
+                    Ok(recs) => recs.iter().any(|r| red.iter().any(|idx| r.index.as_str() == *idx)),
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            }
+        };
+        let blocking = assigned || stored;
         let safe = red.is_empty() || !blocking;
         overall_safe &= safe;
         let (reason, msg) = if red.is_empty() {

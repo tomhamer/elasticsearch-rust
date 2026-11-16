@@ -499,19 +499,22 @@ fn domain_root(fqdn: &str) -> Option<String> {
     let mut seg: Option<String> = Some(fqdn.to_lowercase());
     let mut domain_name: Option<String> = None;
     while let Some(s) = seg {
-        if p.exc.contains(s.as_str()) {
+        // Rules are matched in their Unicode form (`IDN.toUnicode`); the
+        // result keeps the input's spelling (finding 456).
+        let key = idn_to_unicode(&s);
+        if p.exc.contains(key.as_str()) {
             return Some(s);
         }
-        if p.icann.contains(s.as_str()) {
+        if p.icann.contains(key.as_str()) {
             return domain_name;
         }
-        if p.private.contains(s.as_str()) {
+        if p.private.contains(key.as_str()) {
             return Some(s);
         }
         let nd = s.find('.');
         let next = nd.map(|i| s[i + 1..].to_string());
         if let Some(n) = &next {
-            let w = format!("*.{n}");
+            let w = format!("*.{}", idn_to_unicode(n));
             if p.icann.contains(w.as_str()) {
                 return domain_name;
             }
@@ -527,9 +530,79 @@ fn domain_root(fqdn: &str) -> Option<String> {
     None
 }
 
+/// `java.net.IDN.toUnicode`: each `xn--` label decoded from Punycode
+/// (RFC 3492); a label that does not decode stays as it is.
+pub fn idn_to_unicode(domain: &str) -> String {
+    domain
+        .split('.')
+        .map(|l| match l.get(..4).filter(|p| p.eq_ignore_ascii_case("xn--")).and_then(|_| punycode_decode(&l[4..])) {
+            Some(u) => u,
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// RFC 3492 Punycode decoding of one label (without `xn--`).
+fn punycode_decode(input: &str) -> Option<String> {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    const SKEW: u32 = 38;
+    const DAMP: u32 = 700;
+    let adapt = |mut delta: u32, num: u32, first: bool| {
+        delta = if first { delta / DAMP } else { delta / 2 };
+        delta += delta / num;
+        let mut k = 0;
+        while delta > ((BASE - TMIN) * TMAX) / 2 {
+            delta /= BASE - TMIN;
+            k += BASE;
+        }
+        k + (BASE - TMIN + 1) * delta / (delta + SKEW)
+    };
+    if !input.is_ascii() {
+        return None;
+    }
+    let (basic, rest) = match input.rfind('-') {
+        Some(i) => (&input[..i], &input[i + 1..]),
+        None => ("", input),
+    };
+    let mut out: Vec<char> = basic.chars().collect();
+    let (mut n, mut i, mut bias) = (128u32, 0u32, 72u32);
+    let mut it = rest.bytes().peekable();
+    while it.peek().is_some() {
+        let old = i;
+        let mut w = 1u32;
+        let mut k = BASE;
+        loop {
+            let c = it.next()?;
+            let digit = match c {
+                b'a'..=b'z' => c - b'a',
+                b'A'..=b'Z' => c - b'A',
+                b'0'..=b'9' => c - b'0' + 26,
+                _ => return None,
+            } as u32;
+            i = i.checked_add(digit.checked_mul(w)?)?;
+            let t = if k <= bias { TMIN } else if k >= bias + TMAX { TMAX } else { k - bias };
+            if digit < t {
+                break;
+            }
+            w = w.checked_mul(BASE - t)?;
+            k += BASE;
+        }
+        let len = out.len() as u32 + 1;
+        bias = adapt(i - old, len, old == 0);
+        n = n.checked_add(i / len)?;
+        i %= len;
+        out.insert(i as usize, char::from_u32(n)?);
+        i += 1;
+    }
+    Some(out.into_iter().collect())
+}
+
 fn is_public_suffix(d: &str) -> bool {
     let p = psl();
-    let d = d.to_lowercase();
+    let d = idn_to_unicode(&d.to_lowercase());
     if p.icann.contains(d.as_str()) || p.private.contains(d.as_str()) {
         return true;
     }
@@ -919,6 +992,19 @@ fn _unused(_: Ipv6Addr, _: EsError) {}
 
 #[cfg(test)]
 mod tests {
+    /// Finding 456: punycode labels match the Unicode suffix rules, and
+    /// the output keeps the input's spelling.
+    #[test]
+    fn registered_domain_decodes_idn_labels() {
+        assert_eq!(idn_to_unicode("xn--55qx5d.cn"), "公司.cn");
+        assert_eq!(idn_to_unicode("xn--mnchen-3ya.de"), "münchen.de");
+        assert_eq!(idn_to_unicode("xn--bcher-kva.example"), "bücher.example");
+        for (input, reg, tld) in [("foo.xn--55qx5d.cn", "foo.xn--55qx5d.cn", "xn--55qx5d.cn"), ("a.bar.xn--55qx5d.cn", "bar.xn--55qx5d.cn", "xn--55qx5d.cn"), ("foo.公司.cn", "foo.公司.cn", "公司.cn"), ("www.example.com", "example.com", "com")] {
+            let d = registered_domain(input).unwrap();
+            assert_eq!((d.registered.as_deref(), d.etld.as_str()), (Some(reg), tld), "{input}");
+        }
+    }
+
     use super::*;
 
     #[test]

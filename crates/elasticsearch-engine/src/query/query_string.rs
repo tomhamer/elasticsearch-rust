@@ -7,7 +7,7 @@
 
 use super::dsl::{expand_fields, match_field, parse_fuzziness, parse_msm, MatchKind, MatchOpts, QueryContext};
 use crate::error::{EsError, Result};
-use rustic_core::query::{Fuzziness, MinShouldMatch, MultiTermRewrite, Query};
+use rustic_core::query::{Fuzziness, MinShouldMatch, Query};
 use serde_json::{json, Map, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,11 +146,18 @@ impl<'a> Parser<'a> {
         Ok(clauses)
     }
 
+    /// A word: escapes are resolved except before `*`, `?` and `\\`, which
+    /// keep theirs, so a literal wildcard character stays distinguishable
+    /// from the operator ([`glob_parts`]; ES decides operators before
+    /// unescaping).
     fn read_word(&mut self) -> String {
         let mut out = String::new();
         while let Some(c) = self.peek() {
             if c == '\\' {
                 if let Some(n) = self.s.get(self.i + 1) {
+                    if matches!(n, '*' | '?' | '\\') {
+                        out.push('\\');
+                    }
                     out.push(*n);
                     self.i += 2;
                     continue;
@@ -213,10 +220,10 @@ impl<'a> Parser<'a> {
             if self.peek() == Some(':') && !w.is_empty() {
                 self.i += 1;
                 if w == "_exists_" {
-                    let f = self.read_word();
+                    let f = unescape(&self.read_word());
                     return Ok(Some(Node::Exists { field: f }));
                 }
-                fld = Some(w);
+                fld = Some(unescape(&w));
             } else {
                 self.i = save;
             }
@@ -309,7 +316,7 @@ impl<'a> Parser<'a> {
                 if eq {
                     self.i += 1;
                 }
-                let v = self.read_word();
+                let v = unescape(&self.read_word());
                 if c == '>' {
                     Node::Range { field: fld, lo: Some(v), hi: None, inc_lo: eq, inc_hi: true, boost: 1.0 }
                 } else {
@@ -324,8 +331,11 @@ impl<'a> Parser<'a> {
                     return Ok(Some(Node::Group { field: None, clauses: vec![], boost: 1.0 }));
                 }
                 let (fuzzy, boost) = self.suffix();
-                let wildcard = w.contains('*') || w.contains('?');
-                Node::Term { field: fld, text: w, fuzzy, boost, wildcard }
+                // Only an unescaped `*` / `?` is an operator; a wildcard term
+                // keeps its glob escapes, any other its literal text.
+                let wildcard = glob_parts(&w).iter().any(|(_, op)| *op);
+                let text = if wildcard { w } else { unescape(&w) };
+                Node::Term { field: fld, text, fuzzy, boost, wildcard }
             }
         }))
     }
@@ -354,12 +364,70 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// A query-string word's characters, each with whether it is a wildcard
+/// operator (an unescaped `*` / `?`); escapes are resolved.
+fn glob_parts(w: &str) -> Vec<(char, bool)> {
+    let mut out = Vec::new();
+    let mut it = w.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = it.next() {
+                    out.push((n, false));
+                }
+            }
+            '*' | '?' => out.push((c, true)),
+            c => out.push((c, false)),
+        }
+    }
+    out
+}
+
+/// `w` (a glob) with each literal run normalized by `a` and re-escaped;
+/// the wildcard operators are kept.
+fn normalize_glob(a: &rustic_core::analysis::Analyzer, w: &str) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    for (c, op) in glob_parts(w) {
+        if op {
+            out.push_str(&glob_escape(&a.normalize(&std::mem::take(&mut run))));
+            out.push(c);
+        } else {
+            run.push(c);
+        }
+    }
+    out.push_str(&glob_escape(&a.normalize(&run)));
+    out
+}
+
+/// The literal text of a word (escapes resolved, operators kept as text).
+fn unescape(w: &str) -> String {
+    glob_parts(w).into_iter().map(|(c, _)| c).collect()
+}
+
+/// `text` as a glob matching itself literally.
+fn glob_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '*' | '?' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 struct Translate<'c, 'a> {
     ctx: &'c QueryContext<'a>,
     default_fields: Vec<(String, f32)>,
     opts: MatchOpts,
     analyze_wildcard: bool,
     allow_leading_wildcard: bool,
+    /// `quote_field_suffix`: quoted text searches `<field><suffix>` where
+    /// that field exists (else the field itself).
+    quote_field_suffix: Option<String>,
+    /// `quote_analyzer`: the analyzer of quoted text.
+    quote_analyzer: Option<std::sync::Arc<rustic_core::analysis::Analyzer>>,
     tie_breaker: f32,
     /// `type: cross_fields`: a term's per-field queries blend their statistics.
     cross_fields: bool,
@@ -383,9 +451,12 @@ impl<'c, 'a> Translate<'c, 'a> {
     }
 
     fn per_field(&self, field: &Option<String>, f: impl Fn(&str) -> Result<Query>) -> Result<Query> {
-        let fields = self.fields_for(field);
+        self.per_fields(&self.fields_for(field), f)
+    }
+
+    fn per_fields(&self, fields: &[(String, f32)], f: impl Fn(&str) -> Result<Query>) -> Result<Query> {
         let mut qs = Vec::new();
-        for (name, b) in &fields {
+        for (name, b) in fields {
             match f(name) {
                 Ok(Query::MatchNone) => {}
                 Ok(q) => qs.push(boosted(q, *b)),
@@ -413,19 +484,60 @@ impl<'c, 'a> Translate<'c, 'a> {
                         if rf.declared == crate::mapping::EsType::ConstantKeyword {
                             return super::dsl::parse_query(&serde_json::json!({"wildcard": {f: {"value": text}}}), self.ctx);
                         }
-                        let Some(id) = rf.core_id else { return Ok(Query::MatchNone) };
+                        if rf.core_id.is_none() {
+                            return Ok(Query::MatchNone);
+                        }
                         if !(rf.ty.is_text() || rf.ty.is_keyword_like()) {
                             return Ok(Query::MatchNone);
                         }
-                        let pat = if rf.ty.is_text() { text.to_lowercase() } else { text.clone() };
-                        if pat == "*" {
-                            return Ok(Query::Exists { field: id });
+                        // ES `QueryStringQueryParser.getWildcardQuerySingle`:
+                        // the pattern's literal runs go through an analyzer's
+                        // normalization (`Analyzer.normalize`: lower-casing,
+                        // folding; no stemming) - the request analyzer when
+                        // forced (text, or `analyze_wildcard`), else a text
+                        // field's search analyzer; a keyword keeps its own
+                        // query (normalizer, flattened key, doc values).
+                        let normalizer: Option<std::sync::Arc<rustic_core::analysis::Analyzer>> = match (&self.opts.analyzer, rf.ty.is_text()) {
+                            (Some(a), true) => Some(a.clone()),
+                            (Some(a), false) if self.analyze_wildcard => Some(a.clone()),
+                            (None, true) => Some(rf.search_analyzer.clone().unwrap_or_else(|| std::sync::Arc::new(rustic_core::analysis::Analyzer::standard()))),
+                            _ => None,
+                        };
+                        let pat = match &normalizer {
+                            Some(a) => normalize_glob(a, text),
+                            None => text.clone(),
+                        };
+                        let parts = glob_parts(&pat);
+                        if parts.len() == 1 && parts[0] == ('*', true) {
+                            return super::dsl::parse_query(&json!({"exists": {"field": f}}), self.ctx);
                         }
-                        if pat.ends_with('*') && !pat[..pat.len() - 1].contains(['*', '?']) {
-                            return Ok(Query::Prefix { field: id, prefix: pat[..pat.len() - 1].as_bytes().to_vec(), max_expansions: usize::MAX, case_insensitive: false, rewrite: MultiTermRewrite::ConstantScore });
+                        let ops = parts.iter().filter(|(_, op)| *op).count();
+                        if ops == 1 && parts.last() == Some(&('*', true)) {
+                            let literal: String = parts[..parts.len() - 1].iter().map(|(c, _)| *c).collect();
+                            // `analyze_wildcard`: the prefix is analyzed with
+                            // the search analyzer; its last token is the prefix
+                            // and earlier ones terms under the default operator
+                            // (ES `getPossiblyAnalyzedPrefixQuery`).
+                            if self.analyze_wildcard && rf.ty.is_text() {
+                                // The analyzed prefix is a prefix query too
+                                // (ES `TextFieldType.prefixQuery`): the same
+                                // expensive-query policy (the DSL `prefix` /
+                                // `wildcard` / `regexp` routes below enforce it).
+                                let index_prefixes = rf.ext.as_ref().is_some_and(|e| e.params.contains_key("index_prefixes"));
+                                if !self.ctx.allow_expensive_queries && !index_prefixes {
+                                    return Err(self.ctx.shard_err_pub("[prefix] queries cannot be executed when 'search.allow_expensive_queries' is set to false. For optimised prefix queries on text fields please enable [index_prefixes]."));
+                                }
+                                let tp = glob_parts(text);
+                                let original: String = tp[..tp.len().saturating_sub(1)].iter().map(|(c, _)| *c).collect();
+                                let mut o = self.opts.clone();
+                                o.kind = MatchKind::BoolPrefix;
+                                o.fuzziness = None;
+                                o.msm = None;
+                                return match_field(f, &Value::String(original), &o, self.ctx);
+                            }
+                            return super::dsl::parse_query(&json!({"prefix": {f: {"value": literal, "rewrite": "constant_score"}}}), self.ctx);
                         }
-                        let _ = self.analyze_wildcard;
-                        Ok(Query::Wildcard { field: id, pattern: pat, max_expansions: usize::MAX, case_insensitive: false, rewrite: MultiTermRewrite::ConstantScore })
+                        super::dsl::parse_query(&json!({"wildcard": {f: {"value": pat, "rewrite": "constant_score"}}}), self.ctx)
                     })?
                 } else {
                     let mut o = self.opts.clone();
@@ -448,17 +560,28 @@ impl<'c, 'a> Translate<'c, 'a> {
                 o.fuzziness = None;
                 o.msm = None;
                 o.slop = slop.unwrap_or(self.opts.slop);
-                let q = self.per_field(field, |f| match_field(f, &Value::String(text.clone()), &o, self.ctx))?;
+                if let Some(a) = &self.quote_analyzer {
+                    o.analyzer = Some(a.clone());
+                }
+                let fields: Vec<(String, f32)> = self.fields_for(field).into_iter().map(|(name, b)| match &self.quote_field_suffix {
+                    Some(suffix) if self.ctx.lookup.get(&format!("{name}{suffix}")).is_some() => (format!("{name}{suffix}"), b),
+                    _ => (name, b),
+                }).collect();
+                let q = self.per_fields(&fields, |f| match_field(f, &Value::String(text.clone()), &o, self.ctx))?;
                 Ok(boosted(q, *boost))
             }
             Node::Regex { field, pattern, boost } => {
                 // Resource limits are request errors, not field/type mismatches.
                 // In particular, implicit wildcard-field leniency cannot swallow them.
                 super::limits::check_regex("query_string", pattern, self.ctx.max_regex_length)?;
+                // The mapped field's own regexp (Lucene grammar, keyword
+                // normalizer, flattened key, wildcard/constant fields).
                 let q = self.per_field(field, |f| {
                     let Some(rf) = self.ctx.lookup.get(f) else { return Ok(Query::MatchNone) };
-                    let Some(id) = rf.core_id else { return Ok(Query::MatchNone) };
-                    Ok(Query::Regexp { field: id, pattern: pattern.clone(), case_insensitive: false, max_expansions: usize::MAX, rewrite: MultiTermRewrite::ConstantScore })
+                    if rf.core_id.is_none() && rf.declared != crate::mapping::EsType::ConstantKeyword {
+                        return Ok(Query::MatchNone);
+                    }
+                    super::dsl::parse_query(&json!({"regexp": {f: {"value": pattern, "rewrite": "constant_score"}}}), self.ctx)
                 })?;
                 Ok(boosted(q, *boost))
             }
@@ -580,6 +703,11 @@ pub fn parse_query_string(o: &Map<String, Value>, ctx: &QueryContext) -> Result<
         opts,
         analyze_wildcard: o.get("analyze_wildcard").and_then(Value::as_bool).unwrap_or(false),
         allow_leading_wildcard: o.get("allow_leading_wildcard").and_then(Value::as_bool).unwrap_or(true),
+        quote_field_suffix: o.get("quote_field_suffix").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+        quote_analyzer: match o.get("quote_analyzer").and_then(Value::as_str) {
+            Some(a) => Some(ctx.lookup.registry.analyzer(a).ok_or_else(|| EsError::query_shard(ctx.index_name, ctx.index_uuid, format!("[query_string] quote_analyzer [{a}] not found")))?),
+            None => None,
+        },
         tie_breaker: o.get("tie_breaker").and_then(Value::as_f64).unwrap_or(if o.get("type").and_then(Value::as_str) == Some("most_fields") { 1.0 } else { 0.0 }) as f32,
         cross_fields: o.get("type").and_then(Value::as_str) == Some("cross_fields"),
         time_zone: o.get("time_zone").and_then(Value::as_str).map(str::to_string),
@@ -853,7 +981,7 @@ impl SimpleParser<'_> {
                 i = ni;
                 Node::Term { field: None, text, fuzzy: Some(n.min(2).to_string()), boost: 1.0, wildcard: false }
             } else if prefix {
-                Node::Term { field: None, text: format!("{text}*"), fuzzy: None, boost: 1.0, wildcard: true }
+                Node::Term { field: None, text: format!("{}*", glob_escape(&text)), fuzzy: None, boost: 1.0, wildcard: true }
             } else {
                 Node::Term { field: None, text, fuzzy: None, boost: 1.0, wildcard: false }
             };
@@ -899,6 +1027,8 @@ pub fn parse_simple_query_string(o: &Map<String, Value>, ctx: &QueryContext) -> 
         opts,
         analyze_wildcard: o.get("analyze_wildcard").and_then(Value::as_bool).unwrap_or(false),
         allow_leading_wildcard: true,
+        quote_field_suffix: o.get("quote_field_suffix").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+        quote_analyzer: None,
         tie_breaker: 1.0,
         cross_fields: false,
         time_zone: None,
@@ -962,5 +1092,47 @@ mod tests {
         assert_eq!(c[0].0, Occur::Must);
         let c = parse("a\\:b", false);
         assert!(matches!(&c[0].1, Node::Term { text, field: None, .. } if text == "a:b"));
+    }
+}
+
+#[cfg(test)]
+mod expensive_policy_tests {
+    use serde_json::json;
+
+    /// #340: with expensive queries disallowed, query_string /
+    /// simple_query_string prefix, wildcard and regexp terms and percolate
+    /// are refused as the direct DSL forms are; ordinary terms still run.
+    #[test]
+    fn alternate_builders_honour_the_expensive_query_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("ex", &json!({"settings": {"number_of_shards": 1, "index.search.allow_expensive_queries": false},
+            "mappings": {"properties": {"t": {"type": "text"}, "q": {"type": "percolator"}}}})).unwrap();
+        let w = vec![crate::index::WriteReq::Index { id: Some("1".into()), source: json!({"t": "abc def", "q": {"match": {"t": "abc"}}}).to_string(), routing: None, cond: Default::default() }];
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let run = |q: serde_json::Value| crate::ml::search(&node, "ex", &json!({"query": q, "track_total_hits": true}));
+        assert_eq!(run(json!({"term": {"t": "abc"}})).unwrap()["hits"]["total"]["value"], 1);
+        for (q, kind) in [
+            (json!({"query_string": {"query": "t:ab*", "lenient": false}}), "[prefix]"),
+            (json!({"query_string": {"query": "t:a?c", "lenient": false}}), "[wildcard]"),
+            (json!({"query_string": {"query": "t:/a.c/", "lenient": false}}), "[regexp]"),
+            (json!({"prefix": {"t": "ab"}}), "[prefix]"),
+            (json!({"percolate": {"field": "q", "document": {"t": "abc"}}}), "[percolate]"),
+        ] {
+            let e = run(q.clone()).err().unwrap_or_else(|| panic!("{q} ran"));
+            let text = format!("{e:?}");
+            assert!(text.contains(kind) && text.contains("allow_expensive_queries"), "{q}: {text}");
+        }
+        // With the all-fields default (`*`) query_string is lenient, and a
+        // lenient field query is a no-match, as ES `newLenientFieldQuery`.
+        assert_eq!(run(json!({"query_string": {"query": "t:ab*"}})).unwrap()["hits"]["total"]["value"], 0);
+        // simple_query_string: refused, or (leniently) no match; never executed.
+        match run(json!({"simple_query_string": {"query": "ab*", "fields": ["t"]}})) {
+            Ok(r) => assert_eq!(r["hits"]["total"]["value"], 0, "{r}"),
+            Err(e) => assert!(format!("{e:?}").contains("allow_expensive_queries"), "{e:?}"),
+        }
     }
 }

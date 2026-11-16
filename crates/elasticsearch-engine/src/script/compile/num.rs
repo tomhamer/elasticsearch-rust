@@ -271,7 +271,9 @@ impl Compiler {
                     Val::Long(l) => Some(*l),
                     _ => None,
                 })),
-                Some((slot, Ty::Double | Ty::Float)) => NumFn::D(Box::new(move |rt| match rt.local(slot) {
+                // Float arithmetic rounds per operation: the general path.
+                Some((_, Ty::Float)) => return None,
+                Some((slot, Ty::Double)) => NumFn::D(Box::new(move |rt| match rt.local(slot) {
                     Val::Double(d) => Some(*d),
                     _ => None,
                 })),
@@ -373,10 +375,8 @@ impl Compiler {
                         })),
                     },
                     Ty::Double => NumFn::D(x.into_d()),
-                    Ty::Float => {
-                        let f = x.into_d();
-                        NumFn::D(Box::new(move |rt| f(rt).map(|d| d as f32 as f64)))
-                    }
+                    // A float value: the general path rounds each float operation.
+                    Ty::Float => return None,
                     _ => return None,
                 }
             }

@@ -117,6 +117,12 @@ pub fn compute(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, host: &
     if super::is_histogram(decl) {
         return histogram_field(name, t, o, docs, host, &f).map(Some);
     }
+    // A numeric field another index maps as a histogram: the histogram
+    // metrics read both representations (whichever index comes first).
+    let any_hist = host.segs.iter().any(|s| s.lookup.get(&f.name).is_some_and(|x| super::is_histogram(x.declared)));
+    if any_hist && decl.is_numeric() && matches!(t, "value_count" | "sum" | "avg" | "min" | "max" | "percentiles" | "percentile_ranks" | "boxplot") {
+        return histogram_field(name, t, o, docs, host, &f).map(Some);
+    }
     // Any index mapping the field as aggregate_metric_double (others may hold raw numbers).
     let any_amd = decl == EsType::AggregateMetricDouble || host.segs.iter().any(|s| s.lookup.get(&f.name).is_some_and(|x| x.declared == EsType::AggregateMetricDouble));
     if any_amd && matches!(t, "min" | "max" | "sum" | "value_count" | "avg") {
@@ -234,7 +240,7 @@ fn ip_range(name: &str, o: &Map<String, Value>, docs: &Docs, host: &Host) -> Res
         if let Some(t) = &r.to {
             m.insert("to".into(), json!(t));
         }
-        m.insert("doc_count".into(), json!(d.iter().map(Vec::len).sum::<usize>()));
+        m.insert("doc_count".into(), json!(crate::aggs::weighted_doc_count(&d)));
         m.extend((host.sub)(&d)?);
         if keyed {
             let k = m.remove("key").and_then(|k| k.as_str().map(str::to_string)).unwrap_or_default();
@@ -255,9 +261,22 @@ fn collect_hist(docs: &Docs, host: &Host, f: &ResolvedField) -> Vec<(f64, u64)> 
         let seg = &host.segs[s];
         let Some(rf) = seg.lookup.get(&f.name) else { continue };
         let Some(id) = rf.core_id else { continue };
-        for &(d, _) in v {
-            for enc in seg.leaf.keyword_values(id, d) {
-                all.extend(histogram::decode(&enc));
+        // Each index's own representation: a histogram's centroids, or (an
+        // index mapping the field as a number) each raw value once, as ES's
+        // histogram-backed metrics read mixed raw / pre-aggregated indices.
+        if super::is_histogram(rf.declared) {
+            for &(d, _) in v {
+                for enc in seg.leaf.keyword_values(id, d) {
+                    all.extend(histogram::decode(&enc));
+                }
+            }
+        } else if rf.ty.is_integer() || rf.ty.is_date() || rf.ty == EsType::Boolean {
+            for &(d, _) in v {
+                all.extend(seg.leaf.i64_values(id, d).into_iter().map(|x| (x as f64, 1)));
+            }
+        } else if rf.ty.is_float() {
+            for &(d, _) in v {
+                all.extend(seg.leaf.f64_values(id, d).into_iter().map(|x| (x, 1)));
             }
         }
     }
@@ -321,6 +340,41 @@ fn pct_key(p: f64) -> String {
     }
 }
 
+/// Poll the search task's cancellation from a filling loop.
+fn poll_cancelled() -> Result<()> {
+    #[cfg(test)]
+    poll_hook::tick();
+    crate::search::check_cancelled()
+}
+
+/// Tests: cancel this thread's search task at the first in-loop poll.
+#[cfg(test)]
+pub(crate) mod poll_hook {
+    use std::cell::Cell;
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static POLLS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn arm(on: bool) {
+        ARMED.with(|a| a.set(on));
+        POLLS.with(|p| p.set(0));
+    }
+    pub fn polls() -> u64 {
+        POLLS.with(Cell::get)
+    }
+    pub fn tick() {
+        POLLS.with(|p| p.set(p.get() + 1));
+        if ARMED.with(Cell::get) {
+            if let Some(t) = rustic_core::cancel::current() {
+                t.cancel("by user request");
+            }
+        }
+    }
+}
+
+/// Bytes of one filled histogram bucket: its map entry and rendered JSON.
+const HIST_GAP_BUCKET_BYTES: u64 = 256;
+
 fn histogram_field(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, host: &Host, f: &ResolvedField) -> Result<Value> {
     let c = collect_hist(docs, host, f);
     let count: u64 = c.iter().map(|x| x.1).sum();
@@ -338,9 +392,27 @@ fn histogram_field(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, hos
             } else {
                 o.get("values").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).collect()).ok_or_else(|| EsError::illegal_argument(format!("[values] must not be null: [{name}]")))?
             };
+            // ES `AbstractHistoBackedHDRPercentilesAggregator`: with `hdr`,
+            // every centroid is recorded with its count in an HDR histogram
+            // and ranks are its cumulative "at or below" fractions.
+            let hdr = o.get("hdr").map(|h| {
+                let digits = h.get("number_of_significant_value_digits").and_then(Value::as_u64).unwrap_or(3) as u32;
+                let mut hist = crate::aggs::sketch::Hdr::new(digits);
+                for (v, n) in &c {
+                    hist.add_count(*v, *n);
+                }
+                hist
+            });
             let vals: Vec<(String, Option<f64>)> = list
                 .iter()
-                .map(|p| (pct_key(*p), if t == "percentiles" { weighted_quantile(&c, p / 100.0) } else { weighted_rank(&c, *p) }))
+                .map(|p| {
+                    let v = match (t, &hdr) {
+                        ("percentiles", _) => weighted_quantile(&c, p / 100.0),
+                        (_, Some(h)) => h.percentile_at_or_below(*p),
+                        _ => weighted_rank(&c, *p),
+                    };
+                    (pct_key(*p), v)
+                })
                 .collect();
             if keyed {
                 let mut m = Map::new();
@@ -370,6 +442,8 @@ fn histogram_field(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, hos
             let interval = num(o.get("interval")).filter(|x| *x > 0.0).ok_or_else(|| EsError::illegal_argument(format!("[interval] must be >0 for histogram aggregation [{name}]")))?;
             let offset = num(o.get("offset")).unwrap_or(0.0);
             let min_doc_count = o.get("min_doc_count").and_then(Value::as_u64).unwrap_or(0);
+            // Held until the buckets are rendered (then the result is charged).
+            let mem = crate::memory::RequestMemory::new();
             let mut b: BTreeMap<i64, u64> = BTreeMap::new();
             for (v, n) in &c {
                 let k = ((v - offset) / interval).floor() as i64;
@@ -377,7 +451,18 @@ fn histogram_field(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, hos
             }
             if min_doc_count == 0 {
                 if let (Some(lo), Some(hi)) = (b.keys().next().copied(), b.keys().last().copied()) {
-                    for k in lo..=hi {
+                    // The filled range is sized (checked) and admitted before
+                    // any empty bucket is created, as the numeric histogram
+                    // does: `search.max_buckets`, then the request breaker.
+                    let width = (hi as i128 - lo as i128) + 1;
+                    if width > host.env.max_buckets as i128 {
+                        return Err(EsError::too_many_buckets(host.env.max_buckets));
+                    }
+                    mem.charge(width as u64 * HIST_GAP_BUCKET_BYTES, &format!("<agg [{name}]>"))?;
+                    for (i, k) in (lo..=hi).enumerate() {
+                        if i % 1024 == 1023 {
+                            poll_cancelled()?;
+                        }
                         b.entry(k).or_default();
                     }
                 }
@@ -452,6 +537,32 @@ fn collect_mixed(docs: &Docs, host: &Host, f: &ResolvedField) -> Mixed {
         }
     }
     m
+}
+
+/// The weighted values (`(value, count)`) of a values-source aggregation
+/// over a field that is a pre-aggregated histogram (`histogram`,
+/// `tdigest`, `exponential_histogram`) in some searched index (numbers of
+/// the other indices count once each): what a shard's mergeable sketch is
+/// built from. `None` when the field is not pre-aggregated anywhere (or a
+/// script is the source).
+pub(crate) fn pre_aggregated_points(o: &Map<String, Value>, docs: &Docs, host: &Host) -> Option<Vec<(f64, u64)>> {
+    if o.contains_key("script") {
+        return None;
+    }
+    let f = field_of(host, o)?;
+    if !host.segs.iter().any(|s| s.lookup.get(&f.name).is_some_and(|x| super::is_histogram(x.declared))) {
+        return None;
+    }
+    let m = collect_mixed(docs, host, &f);
+    let mut pts = m.pts;
+    pts.extend(m.ehs.iter().flat_map(|h| h.points()));
+    Some(pts)
+}
+
+/// Whether the field of `o` is an `aggregate_metric_double` in some index.
+pub(crate) fn is_aggregate_metric(o: &Map<String, Value>, host: &Host) -> bool {
+    let Some(name) = o.get("field").and_then(Value::as_str) else { return false };
+    host.segs.iter().any(|s| s.lookup.get(name).is_some_and(|x| x.declared == EsType::AggregateMetricDouble))
 }
 
 /// Java `Double.toString`-style text of a range bound.
@@ -597,6 +708,8 @@ fn mixed_histogram(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, hos
             let interval = num(o.get("interval")).filter(|x| *x > 0.0).ok_or_else(|| EsError::illegal_argument(format!("[interval] must be >0 for histogram aggregation [{name}]")))?;
             let offset = num(o.get("offset")).unwrap_or(0.0);
             let min_doc_count = o.get("min_doc_count").and_then(Value::as_u64).unwrap_or(0);
+            // Held until the buckets are rendered (then the result is charged).
+            let mem = crate::memory::RequestMemory::new();
             let mut b: BTreeMap<i64, u64> = BTreeMap::new();
             for (v, n) in points() {
                 if v.is_nan() {
@@ -607,7 +720,18 @@ fn mixed_histogram(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, hos
             }
             if min_doc_count == 0 {
                 if let (Some(lo), Some(hi)) = (b.keys().next().copied(), b.keys().last().copied()) {
-                    for k in lo..=hi {
+                    // The filled range is sized (checked) and admitted before
+                    // any empty bucket is created, as the numeric histogram
+                    // does: `search.max_buckets`, then the request breaker.
+                    let width = (hi as i128 - lo as i128) + 1;
+                    if width > host.env.max_buckets as i128 {
+                        return Err(EsError::too_many_buckets(host.env.max_buckets));
+                    }
+                    mem.charge(width as u64 * HIST_GAP_BUCKET_BYTES, &format!("<agg [{name}]>"))?;
+                    for (i, k) in (lo..=hi).enumerate() {
+                        if i % 1024 == 1023 {
+                            poll_cancelled()?;
+                        }
                         b.entry(k).or_default();
                     }
                 }
@@ -720,6 +844,13 @@ fn aggregate_metric(t: &str, docs: &Docs, host: &Host, f: &ResolvedField) -> Res
 
 fn range_histogram(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, host: &Host, f: &ResolvedField, kind: rng::RangeKind) -> Result<Value> {
     use rng::RangeKind as K;
+    if t != "histogram" {
+        if kind == K::Ip {
+            return Err(unsupported(f, t));
+        }
+        let min_doc_count = o.get("min_doc_count").and_then(Value::as_u64).unwrap_or(0);
+        return date_range_histogram(o, name, docs, host, f, min_doc_count);
+    }
     let (interval, offset, date) = if t == "histogram" {
         let iv = num(o.get("interval")).filter(|x| *x > 0.0).ok_or_else(|| EsError::illegal_argument(format!("[interval] must be >0 for histogram aggregation [{name}]")))?;
         (iv, num(o.get("offset")).unwrap_or(0.0), false)
@@ -737,7 +868,7 @@ fn range_histogram(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, hos
             _ => rng::i64_of_key(k) as f64,
         }
     };
-    let min_doc_count = o.get("min_doc_count").and_then(Value::as_u64).unwrap_or(if date { 0 } else { 0 });
+    let min_doc_count = o.get("min_doc_count").and_then(Value::as_u64).unwrap_or(0);
     let mut groups: BTreeMap<i64, Docs> = BTreeMap::new();
     for (s, v) in docs.iter().enumerate() {
         let seg = &host.segs[s];
@@ -787,6 +918,103 @@ fn range_histogram(name: &str, t: &str, o: &Map<String, Value>, docs: &Docs, hos
         } else {
             m.insert("key".into(), values::java_double(key));
         }
+        m.insert("doc_count".into(), json!(n));
+        m.extend((host.sub)(&d)?);
+        buckets.push(Value::Object(m));
+    }
+    Ok(json!({ "buckets": buckets }))
+}
+
+/// `date_histogram` over a `date_range` field: each stored range falls in
+/// every bucket from the one holding its start to the one holding its end,
+/// with `date_histogram`'s own rounding (calendar units, `time_zone`,
+/// `offset`) and key rendering.
+fn date_range_histogram(o: &Map<String, Value>, name: &str, docs: &Docs, host: &Host, f: &ResolvedField, min_doc_count: u64) -> Result<Value> {
+    let rounder = crate::aggs::DateRounder::parse(o, name)?;
+    let max = host.env.max_buckets;
+    let fmt = crate::date::DateFormatter::new(o.get("format").and_then(Value::as_str).unwrap_or(crate::date::DEFAULT_FORMAT)).unwrap_or_default();
+    // ES `DateRangeHistogramAggregator`: each range is clipped to the
+    // (rounded) hard bounds, then every key from its start's to its end's.
+    let (hard, ext) = rounder.bounds(o, &fmt, host.env.now)?;
+    let (hmin, hmax) = hard.unwrap_or((None, None));
+    let mut groups: BTreeMap<i64, Docs> = BTreeMap::new();
+    for (s, v) in docs.iter().enumerate() {
+        let seg = &host.segs[s];
+        let Some(rf) = seg.lookup.get(&f.name) else { continue };
+        let Some(id) = rf.core_id else { continue };
+        for &(d, sc) in v {
+            let mut ks: Vec<i64> = Vec::new();
+            for enc in seg.leaf.keyword_values(id, d) {
+                let Some((lo, hi)) = rng::decode(&enc) else { continue };
+                let (a, b) = (rng::i64_of_key(lo), rng::i64_of_key(hi));
+                let a = hmin.map_or(a, |m| a.max(m));
+                let b = hmax.map_or(b, |m| b.min(m));
+                let mut k = rounder.round(a);
+                let end = rounder.round(b);
+                let mut n = 0usize;
+                while k <= end {
+                    n += 1;
+                    if n > max {
+                        return Err(EsError::too_many_buckets(max));
+                    }
+                    ks.push(k);
+                    let next = rounder.next(k);
+                    if next <= k {
+                        break;
+                    }
+                    k = next;
+                }
+            }
+            ks.sort_unstable();
+            ks.dedup();
+            for k in ks {
+                groups.entry(k).or_insert_with(|| vec![Vec::new(); docs.len()])[s].push((d, sc));
+            }
+        }
+        if groups.len() > max {
+            return Err(EsError::too_many_buckets(max));
+        }
+    }
+    if min_doc_count == 0 {
+        // As `date_histogram` (`InternalDateHistogram.iterateEmptyBuckets`):
+        // gaps, then out to the extended bounds (offset applied).
+        let (mut lo, mut hi) = (groups.keys().next().copied(), groups.keys().last().copied());
+        if let Some((emin, emax)) = ext {
+            let off = rounder.offset();
+            let (emin, emax) = (emin.map(|k| k + off), emax.map(|k| k + off));
+            (lo, hi) = match (lo, hi) {
+                (Some(l), Some(h)) => (Some(emin.map_or(l, |k| l.min(k))), Some(emax.map_or(h, |k| h.max(k)))),
+                _ => match (emin, emax) {
+                    (Some(a), Some(b)) => (Some(a), Some(b)),
+                    _ => (None, None),
+                },
+            };
+        }
+        if let (Some(lo), Some(hi)) = (lo, hi) {
+            let mut k = lo;
+            while k <= hi {
+                if groups.len() > max {
+                    return Err(EsError::too_many_buckets(max));
+                }
+                groups.entry(k).or_insert_with(|| vec![Vec::new(); docs.len()]);
+                let next = rounder.next(k);
+                if next <= k {
+                    break;
+                }
+                k = next;
+            }
+        }
+    }
+    let tz = rounder.tz();
+    let mut buckets = Vec::new();
+    for (k, d) in groups {
+        let n: usize = d.iter().map(Vec::len).sum();
+        if (n as u64) < min_doc_count {
+            continue;
+        }
+        let mut m = Map::new();
+        m.insert("key_as_string".into(), json!(fmt.format(k, tz)));
+        m.insert("key".into(), json!(k));
         m.insert("doc_count".into(), json!(n));
         m.extend((host.sub)(&d)?);
         buckets.push(Value::Object(m));

@@ -10,6 +10,27 @@ const PARALLEL_INGEST_ITEMS: usize = 8;
 
 pub const PREPARED_HEADER: &str = "x-rustic-internal-prepared-ingest";
 
+/// A snapshot restore's own document replay into one index incarnation
+/// (`<cluster uuid>/<index name>`, [`elasticsearch_http::RestoreReplay`]).
+/// Stripped at the client edge.
+pub const RESTORE_REPLAY_HEADER: &str = "x-rustic-internal-restore-replay";
+
+/// Mark the internal bulk `req` as the document replay of a restore into
+/// incarnation `index_uuid` of `index`: its writes pass that incarnation's
+/// write block, on every primary that still holds that incarnation.
+pub fn restore_replay(req: &mut RestReq, index: &str, index_uuid: &str) -> elasticsearch_engine::error::Result<()> {
+    req.retain_headers(|(k, _)| !k.eq_ignore_ascii_case(RESTORE_REPLAY_HEADER))?;
+    req.push_header(RESTORE_REPLAY_HEADER, &format!("{index_uuid}/{index}"))
+}
+
+/// The index a restore-replay request writes into, if `req` is one and the
+/// index is still the incarnation it names.
+pub fn restore_replay_target(node: &ClusterNode, req: &RestReq) -> Option<String> {
+    let (_, value) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(RESTORE_REPLAY_HEADER))?;
+    let (uuid, index) = value.split_once('/')?;
+    node.state().metadata.indices.get(index).filter(|m| m.uuid == uuid).map(|_| index.to_string())
+}
+
 pub fn prepared(req: &RestReq) -> PreparedBulkIngestItems {
     req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(PREPARED_HEADER))
         .and_then(|(_, value)| serde_json::from_str(value).ok()).unwrap_or_default()
@@ -21,6 +42,18 @@ fn attach(req: &mut RestReq, items: PreparedBulkIngestItems) -> elasticsearch_en
         req.push_header(PREPARED_HEADER, &serde_json::to_string(&items).expect("ingest serialization"))?;
     }
     Ok(())
+}
+
+/// Mark every item of the internal bulk `req` as already ingested
+/// (`routings`: each item's routing, in body order): the documents are
+/// written exactly as given, and neither a request, default nor final
+/// pipeline runs for them. For copies of documents that already went
+/// through ingest when they were first written (snapshot restore's
+/// document replay, a resize's document copy): ES restores and resizes
+/// shard files and never runs a pipeline again. The header carrying this is
+/// stripped at the client edge, so only internal requests can set it.
+pub fn bypass_pipelines(req: &mut RestReq, routings: impl IntoIterator<Item = Option<String>>) -> elasticsearch_engine::error::Result<()> {
+    attach(req, PreparedBulkIngestItems(routings.into_iter().enumerate().map(|(position, routing)| (position, PreparedBulkIngest::Write { routing, dynamic_templates: None })).collect()))
 }
 
 /// Subgroups have new positions; preserve the prepared state through retries.
@@ -108,12 +141,19 @@ pub async fn prepare(node: &Arc<ClusterNode>, mut req: RestReq, user: Option<ela
             let routing = engine.index_routing_for(&index, routing).ok()?;
             let pipeline = meta.get("pipeline").and_then(Value::as_str).or_else(|| params.get("pipeline").map(String::as_str));
             let source = item.source_line.as_deref().unwrap_or_default();
-            let outcome = engine.run_ingest_ext(IngestRequest { index: &index, id: item.id.as_deref(), routing: routing.as_deref(), source, pipeline });
+            let cond = elasticsearch_engine::ingest::WriteMeta::of_action(meta);
+            let outcome = engine.run_ingest_ext(IngestRequest { index: &index, id: item.id.as_deref(), routing: routing.as_deref(), source, pipeline, cond });
             let state = match outcome {
                 Ok(IngestOutcome::Unchanged) => PreparedBulkIngest::Write { routing: routing.clone(), dynamic_templates: None },
-                Ok(IngestOutcome::Changed { index, id, routing, source, dynamic_templates }) => {
+                Ok(IngestOutcome::Changed { index, id, routing, source, dynamic_templates, cond: after }) => {
                     item.index = Some(index.clone()); item.id = id.clone(); item.source_line = Some(source);
                     meta.insert("_index".into(), json!(index));
+                    // Version and concurrency metadata the pipelines set
+                    // apply to the write (ES `updateIndexRequestMetadata`):
+                    // the primary reads them from the item's metadata.
+                    if after != cond {
+                        after.to_action(meta);
+                    }
                     // Requirements were checked against the client's original target.
                     meta.insert("require_alias".into(), json!(false));
                     meta.insert("require_data_stream".into(), json!(false));
@@ -217,6 +257,14 @@ async fn prepare_document(node: &Arc<ClusterNode>, mut req: RestReq, user: Optio
                 params.remove("require_alias"); params.remove("require_data_stream");
             }
             match routing { Some(routing) => { params.insert("routing".into(), routing); }, None => { params.remove("routing"); } }
+            // Version and concurrency conditions a pipeline set (the
+            // request had none: a conditional request is not prepared
+            // here) go to the primary as the write's own parameters.
+            if let Some(meta) = serde_json::from_str::<Value>(&item.action_line).ok().as_ref().and_then(|line| line.as_object()).and_then(|o| o.values().next()).and_then(Value::as_object) {
+                for (key, value) in elasticsearch_engine::ingest::WriteMeta::of_action(meta).url_params() {
+                    match value { Some(value) => { params.insert(key.into(), value); }, None => { params.remove(key); } }
+                }
+            }
             let endpoint = if segments[1] == "_create" && item.id.is_none() { "_doc" } else { &segments[1] };
             let mut uri = format!("/{}/{}", super::encode_component(index), endpoint);
             if let Some(id) = &item.id { uri.push_str(&format!("/{}", super::encode_component(id))); }
@@ -248,6 +296,21 @@ mod tests {
         assert!(!document_creates(&segs("/i/_doc/1"), None));
         assert!(document_creates(&segs("/i/_doc/1"), Some("create")));
         assert!(document_creates(&segs("/i/_create/1"), None));
+    }
+
+    #[test]
+    fn bypassed_bulk_marks_every_item_written_as_given() {
+        let mut req = RestReq::try_new("POST","/_bulk",&[],&[],0,Default::default(),None).unwrap();
+        bypass_pipelines(&mut req, [Some("r1".to_string()), None, Some("r3".to_string())]).unwrap();
+        let states = prepared(&req);
+        assert_eq!(states.0.len(), 3);
+        assert!(matches!(states.0.get(&0), Some(PreparedBulkIngest::Write { routing: Some(r), dynamic_templates: None }) if r == "r1"));
+        assert!(matches!(states.0.get(&1), Some(PreparedBulkIngest::Write { routing: None, dynamic_templates: None })));
+        assert!(matches!(states.0.get(&2), Some(PreparedBulkIngest::Write { routing: Some(r), .. }) if r == "r3"));
+        // A subgroup (one primary's items) keeps the bypass.
+        let mut child = req.clone();
+        subgroup(&req, &mut child, &[2]).unwrap();
+        assert!(matches!(prepared(&child).0.get(&0), Some(PreparedBulkIngest::Write { routing: Some(r), .. }) if r == "r3"));
     }
 
     #[test]

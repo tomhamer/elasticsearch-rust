@@ -24,7 +24,7 @@ pub struct Ports {
 
 /// Node `i`'s settings: port 0 for both listeners, the nodes started before
 /// it (known transport ports in `p`) as seed hosts.
-fn settings(cluster: &str, p: Ports, i: usize, dir: &std::path::Path, extra: &[(&str, &str)]) -> Settings {
+pub fn settings(cluster: &str, p: Ports, i: usize, dir: &std::path::Path, extra: &[(&str, &str)]) -> Settings {
     let mut s = Settings::new();
     let mut put = |k: &str, v: Value| {
         s.insert(k.to_string(), v);

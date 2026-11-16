@@ -317,26 +317,67 @@ fn geojson_feature(t: &TileCoord, g: &Value) -> Option<(GeomType, Vec<u32>)> {
             }
             Some((GeomType::Polygon, path_geometry(&rings, true)))
         }
-        "GeometryCollection" => g.get("geometries")?.as_array()?.iter().find_map(|x| geojson_feature(t, x)),
+        // Collections are flattened by `flatten_geometries` first.
         _ => None,
     }
 }
 
+/// `_shards` of a tile from its hits and grid searches: the larger failure
+/// and skip counts, the smaller success count.
+fn merge_shards(a: &Value, b: &Value) -> Value {
+    let n = |v: &Value, k: &str| v[k].as_i64().unwrap_or(0);
+    json!({
+        "total": n(a, "total").max(n(b, "total")),
+        "successful": n(a, "successful").min(n(b, "successful")),
+        "skipped": n(a, "skipped").max(n(b, "skipped")),
+        "failed": n(a, "failed").max(n(b, "failed")),
+    })
+}
+
+/// Every geometry of a fetched field value list, collection members
+/// included (ES's MVT formatter: one feature per value and member).
+fn flatten_geometries(v: &Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| flatten_geometries(x, out)),
+        Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("GeometryCollection") => {
+            o.get("geometries").into_iter().for_each(|g| flatten_geometries(g, out));
+        }
+        Value::Object(_) => out.push(v.clone()),
+        _ => {}
+    }
+}
+
 /// A representative label point (tile pixels) of a GeoJSON geometry.
-fn label_point(t: &TileCoord, g: &Value) -> Option<(i64, i64)> {
-    fn collect(v: &Value, out: &mut Vec<(f64, f64)>) {
-        if let Some(a) = v.as_array() {
-            if a.len() >= 2 && a[0].is_number() {
-                if let (Some(x), Some(y)) = (a[0].as_f64(), a[1].as_f64()) {
-                    out.push((x, y));
-                }
-            } else {
-                a.iter().for_each(|x| collect(x, out));
+fn collect_coords(v: &Value, out: &mut Vec<(f64, f64)>) {
+    if let Some(a) = v.as_array() {
+        if a.len() >= 2 && a[0].is_number() {
+            if let (Some(x), Some(y)) = (a[0].as_f64(), a[1].as_f64()) {
+                out.push((x, y));
             }
+        } else {
+            a.iter().for_each(|x| collect_coords(x, out));
         }
     }
+}
+
+/// Whether geometry `g`'s pixel bounding box meets the tile grown by
+/// `buffer` pixels (ES clips each feature to it: one wholly outside is
+/// no feature).
+fn touches_tile(t: &TileCoord, g: &Value, buffer: i64) -> bool {
     let mut pts = Vec::new();
-    collect(g.get("coordinates")?, &mut pts);
+    if let Some(c) = g.get("coordinates") {
+        collect_coords(c, &mut pts);
+    }
+    let px: Vec<(i64, i64)> = pts.iter().map(|p| t.pixel(p.0, p.1)).collect();
+    let (Some(x0), Some(x1)) = (px.iter().map(|p| p.0).min(), px.iter().map(|p| p.0).max()) else { return false };
+    let (y0, y1) = (px.iter().map(|p| p.1).min().unwrap_or(0), px.iter().map(|p| p.1).max().unwrap_or(0));
+    let (lo, hi) = (-buffer, t.extent as i64 + buffer);
+    x1 >= lo && x0 <= hi && y1 >= lo && y0 <= hi
+}
+
+fn label_point(t: &TileCoord, g: &Value) -> Option<(i64, i64)> {
+    let mut pts = Vec::new();
+    collect_coords(g.get("coordinates")?, &mut pts);
     if pts.is_empty() {
         return None;
     }
@@ -368,9 +409,26 @@ fn parse_err(req: &Req, key: &str, reason: String) -> EsError {
     EsError::new(400, "x_content_parse_exception", format!("[1:{col}] [vector-tile] failed to parse field [{key}]")).caused_by(EsError::illegal_argument(reason))
 }
 
+/// ES `RestVectorTileAction`: the grid aggregation's `size` is
+/// `MultiBucketConsumerService.DEFAULT_MAX_BUCKETS` (65,536), so every
+/// cell of a zoom-0 tile at grid precision 8 (4^8 cells) is returned.
+const MVT_GRID_SIZE: usize = 65_536;
+
 fn uint_param(body: &Value, req: &Req, key: &str, default: i64, min: i64, max: Option<i64>, name: &str) -> Result<i64, EsError> {
-    let v = body.get(key).cloned().or_else(|| req.params.get(key).map(|s| s.parse::<i64>().map(Value::from).unwrap_or(Value::String(s.clone()))));
-    let Some(v) = v else { return Ok(default) };
+    // ES `VectorTileRequest.parseRestRequest`: a URL parameter overrides the
+    // body and is checked by the setter itself (`illegal_argument_exception`,
+    // not a body parse failure).
+    if let Some(s) = req.params.get(key) {
+        let n: i64 = s.parse().map_err(|_| EsError::illegal_argument(format!("Failed to parse int parameter [{key}] with value [{s}]")))?;
+        if n < min {
+            return Err(EsError::illegal_argument(format!("[{name}] parameter cannot be negative, found [{n}]")));
+        }
+        if let Some(m) = max.filter(|m| n > *m) {
+            return Err(EsError::illegal_argument(format!("[{name}] parameter cannot be bigger than {m}, found [{n}]")));
+        }
+        return Ok(n);
+    }
+    let Some(v) = body.get(key).cloned() else { return Ok(default) };
     let Some(n) = v.as_i64() else {
         return Err(parse_err(req, key, format!("failed to parse [{key}] value [{v}]")));
     };
@@ -460,30 +518,41 @@ fn tile(node: &Node, req: &Req, index: &str) -> R {
     let mut hit_bounds: Option<(i64, i64, i64, i64)> = None;
     for h in resp["hits"]["hits"].as_array().cloned().unwrap_or_default() {
         let flds = h.get("fields").cloned().unwrap_or(Value::Null);
-        let Some(geom) = flds.get(&field).and_then(Value::as_array).and_then(|a| a.first()).cloned() else { continue };
-        let Some((ty, g)) = geojson_feature(&t, &geom) else { continue };
-        if g.is_empty() {
-            continue;
-        }
+        let Some(values) = flds.get(&field) else { continue };
+        let mut geoms = Vec::new();
+        flatten_geometries(values, &mut geoms);
         let mut props = vec![("_id".to_string(), Prop::Str(h["_id"].as_str().unwrap_or("").into())), ("_index".to_string(), Prop::Str(h["_index"].as_str().unwrap_or("").into()))];
         for f in &fields {
             if let Some(p) = flds.get(f).and_then(Prop::from_json) {
                 props.push((f.clone(), p));
             }
         }
-        if let Some(lp) = label_point(&t, &geom) {
-            hit_bounds = Some(match hit_bounds {
-                Some(b) => (b.0.min(lp.0), b.1.min(lp.1), b.2.max(lp.0), b.3.max(lp.1)),
-                None => (lp.0, lp.1, lp.0, lp.1),
-            });
-            if with_labels {
-                hit_features.push(Feature { ty, geometry: g, props: props.clone() });
-                props.push(("_mvt_label_position".into(), Prop::Bool(true)));
-                hit_features.push(Feature { ty: GeomType::Point, geometry: point_geometry(&[lp]), props });
+        // ES `buildHitsLayer`: a feature per geometry, then one label.
+        let mut label: Option<(i64, i64)> = None;
+        for geom in &geoms {
+            // A value or member wholly outside the tile is no feature;
+            // with several, one inside still shows (ES clips each).
+            if geoms.len() > 1 && !touches_tile(&t, geom, buffer) {
                 continue;
             }
+            let Some((ty, g)) = geojson_feature(&t, geom) else { continue };
+            if g.is_empty() {
+                continue;
+            }
+            if let Some(lp) = label_point(&t, geom) {
+                hit_bounds = Some(match hit_bounds {
+                    Some(b) => (b.0.min(lp.0), b.1.min(lp.1), b.2.max(lp.0), b.3.max(lp.1)),
+                    None => (lp.0, lp.1, lp.0, lp.1),
+                });
+                label.get_or_insert(lp);
+            }
+            hit_features.push(Feature { ty, geometry: g, props: props.clone() });
         }
-        hit_features.push(Feature { ty, geometry: g, props });
+        if let (true, Some(lp)) = (with_labels, label) {
+            let mut props = props;
+            props.push(("_mvt_label_position".into(), Prop::Bool(true)));
+            hit_features.push(Feature { ty: GeomType::Point, geometry: point_geometry(&[lp]), props });
+        }
     }
     if !hit_features.is_empty() {
         layers.push(Layer { name: "hits", extent, features: hit_features });
@@ -501,18 +570,25 @@ fn tile(node: &Node, req: &Req, index: &str) -> R {
             sub["_mvt_centroid"] = json!({"geo_centroid": {"field": field}});
         }
         let grid = if grid_agg == "geohex" { "geohex_grid" } else { "geotile_grid" };
-        let mut aggs_body = json!({"size": 0, "query": query.clone(), "track_total_hits": false, "aggs": {"_mvt_grid": {grid: {"field": field, "precision": precision, "size": 65535}, "aggs": sub}}});
-        if hex {
-            // ES bounds the geohex grid to the tile: cells touching it.
-            let (w, s_, e, n_) = t.bounds(0.0);
-            aggs_body["aggs"]["_mvt_grid"][grid]["bounds"] = json!({"top_left": {"lat": n_, "lon": w}, "bottom_right": {"lat": s_, "lon": e}});
-        }
+        let mut aggs_body = json!({"size": 0, "query": query.clone(), "track_total_hits": false, "aggs": {"_mvt_grid": {grid: {"field": field, "precision": precision, "size": MVT_GRID_SIZE}, "aggs": sub}}});
+        // ES (`RestVectorTileAction`) bounds the grid to the tile
+        // (`setGeoBoundingBox`): the tilers only produce cells inside it
+        // (geotile cells align with the tile; geohex cells touching it).
+        // Unbounded, a high-zoom tile over large shapes tiled them across
+        // the whole world, and the `size` cut could drop cells of this tile.
+        let (w, s_, e, n_) = t.bounds(0.0);
+        aggs_body["aggs"]["_mvt_grid"][grid]["bounds"] = json!({"top_left": {"lat": n_, "lon": w}, "bottom_right": {"lat": s_, "lon": e}});
         if let Some(rm) = body.get("runtime_mappings") {
             aggs_body["runtime_mappings"] = rm.clone();
         }
         let out = crate::search_api::coordinated_search(node, req, &aggs_body, &params, index, resolve, req.access.as_deref())?;
         let resp: Value = serde_json::from_str(&out).map_err(|e| EsError::internal(format!("bad search output: {e}")))?;
         timed_out |= resp["timed_out"].as_bool().unwrap_or(false);
+        // The grid's shard failures are the tile's too: its meta layer
+        // reports the less complete of the two searches.
+        if let Some(agg_shards) = resp.get("_shards") {
+            shards = merge_shards(&shards, agg_shards);
+        }
         let mut feats: Vec<Feature> = Vec::new();
         let mut stats_acc: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let mut counts: Vec<f64> = Vec::new();
@@ -658,4 +734,193 @@ fn tile(node: &Node, req: &Req, index: &str) -> R {
         put_bytes(&mut tile_bytes, 3, &l.encode());
     }
     Ok(Resp { status: 200, body: RespBody::Bytes(tile_bytes), headers: vec![("content-type", "application/vnd.mapbox-vector-tile".to_string())] })
+}
+
+#[cfg(test)]
+mod grid_size_tests {
+    use super::*;
+
+    fn varint(b: &[u8], i: &mut usize) -> u64 {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let x = b[*i];
+            *i += 1;
+            v |= ((x & 0x7f) as u64) << shift;
+            if x & 0x80 == 0 {
+                return v;
+            }
+            shift += 7;
+        }
+    }
+
+    /// `(field, bytes)` of the length-delimited fields of a message.
+    fn fields(b: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let (mut i, mut out) = (0, Vec::new());
+        while i < b.len() {
+            let tag = varint(b, &mut i);
+            match tag & 7 {
+                0 => {
+                    varint(b, &mut i);
+                }
+                2 => {
+                    let n = varint(b, &mut i) as usize;
+                    out.push((tag >> 3, b[i..i + n].to_vec()));
+                    i += n;
+                }
+                5 => i += 4,
+                1 => i += 8,
+                w => panic!("wire type {w}"),
+            }
+        }
+        out
+    }
+
+    fn layer_features(tile: &[u8], name: &str) -> usize {
+        fields(tile).into_iter().filter(|(f, _)| *f == 3).map(|(_, l)| fields(&l)).find(|l| l.iter().any(|(f, v)| *f == 1 && v == name.as_bytes()))
+            .map(|l| l.iter().filter(|(f, _)| *f == 2).count()).unwrap_or(0)
+    }
+
+    fn req(path_tail: &str, body: Value, params: &[(&str, &str)]) -> Req {
+        let segs: Vec<String> = format!("pts/_mvt/{path_tail}").split('/').map(str::to_string).collect();
+        Req { method: Method::POST, path: format!("/pts/_mvt/{path_tail}"), segs, params: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body: body.to_string().into_bytes().into(), headers: Default::default(), access: None, extensions: axum::http::Extensions::new(), api_version: crate::RestApiVersion::V9 }
+    }
+
+    /// The grid is sized as ES sizes it (65,536): one point in each zoom-8
+    /// tile gives 65,536 cells of tile 0/0/0 at grid precision 8.
+    #[test]
+    fn zoom_zero_grid_returns_every_precision_8_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let svc = node.create_index("pts", &json!({"settings": {"number_of_shards": 1}, "mappings": {"properties": {"p": {"type": "geo_point"}}}})).unwrap();
+        let n = 256u32;
+        let mut batch = Vec::new();
+        for x in 0..n {
+            for y in 0..n {
+                let lon = (x as f64 + 0.5) / n as f64 * 360.0 - 180.0;
+                let lat = (PI * (1.0 - 2.0 * (y as f64 + 0.5) / n as f64)).sinh().atan().to_degrees();
+                batch.push(elasticsearch_engine::index::WriteReq::Index { id: Some(format!("{x}-{y}")), source: json!({"p": {"lat": lat, "lon": lon}}).to_string(), routing: None, cond: Default::default() });
+            }
+            if batch.len() >= 8192 {
+                for r in svc.write(std::mem::take(&mut batch), false) {
+                    r.unwrap();
+                }
+            }
+        }
+        for r in svc.write(batch, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let resp = tile(&node, &req("p/0/0/0", json!({"grid_precision": 8, "size": 0}), &[]), "pts").unwrap();
+        let bytes = match resp.body {
+            crate::RespBody::Bytes(b) => b,
+            _ => panic!("unexpected tile body"),
+        };
+        assert_eq!(layer_features(&bytes, "aggs"), 65_536);
+    }
+
+    /// ES's request checks: grid precision past 8 (a body field: a parse
+    /// failure; a URL parameter: an illegal argument), size past the
+    /// result window.
+    #[test]
+    fn grid_precision_and_size_limits_match_es() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        node.create_index("pts", &json!({"mappings": {"properties": {"p": {"type": "geo_point"}}}})).unwrap();
+        let e = tile(&node, &req("p/0/0/0", json!({"grid_precision": 9}), &[]), "pts").err().unwrap();
+        assert_eq!((e.status, e.kind.as_str()), (400, "x_content_parse_exception"), "{e:?}");
+        assert!(format!("{e:?}").contains("[gridPrecision] parameter cannot be bigger than 8, found [9]"), "{e:?}");
+        let e = tile(&node, &req("p/0/0/0", json!({}), &[("grid_precision", "9")]), "pts").err().unwrap();
+        assert_eq!((e.status, e.kind.as_str()), (400, "illegal_argument_exception"), "{e:?}");
+        assert_eq!(e.reason, "[gridPrecision] parameter cannot be bigger than 8, found [9]");
+        let e = tile(&node, &req("p/0/0/0", json!({"size": 10001}), &[]), "pts").err().unwrap();
+        assert_eq!((e.status, e.kind.as_str()), (400, "search_phase_execution_exception"), "{e:?}");
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    fn varint(b: &[u8], i: &mut usize) -> u64 {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let x = b[*i];
+            *i += 1;
+            v |= ((x & 0x7f) as u64) << shift;
+            if x & 0x80 == 0 {
+                return v;
+            }
+            shift += 7;
+        }
+    }
+
+    /// `(field, bytes)` of the length-delimited fields of a message.
+    fn fields(b: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let (mut i, mut out) = (0, Vec::new());
+        while i < b.len() {
+            let tag = varint(b, &mut i);
+            match tag & 7 {
+                0 => {
+                    varint(b, &mut i);
+                }
+                2 => {
+                    let n = varint(b, &mut i) as usize;
+                    out.push((tag >> 3, b[i..i + n].to_vec()));
+                    i += n;
+                }
+                5 => i += 4,
+                1 => i += 8,
+                w => panic!("wire type {w}"),
+            }
+        }
+        out
+    }
+
+    /// Features of layer `name` of a tile.
+    fn layer_features(tile: &[u8], name: &str) -> usize {
+        fields(tile).into_iter().filter(|(f, _)| *f == 3).map(|(_, l)| fields(&l)).find(|l| l.iter().any(|(f, v)| *f == 1 && v == name.as_bytes()))
+            .map(|l| l.iter().filter(|(f, _)| *f == 2).count()).unwrap_or(0)
+    }
+
+    /// #390: every value of a multi-valued field and every member of a
+    /// geometry collection inside the tile is a feature.
+    #[test]
+    fn tiles_keep_every_visible_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let svc = node.create_index("geo", &json!({"mappings": {"properties": {"location": {"type": "geo_shape"}}}})).unwrap();
+        let pt = |lon: f64, lat: f64| json!({"type": "Point", "coordinates": [lon, lat]});
+        let docs = [
+            // The first value outside tile 1/1/0 (lon 0..180, north), the second inside.
+            json!({"location": [pt(-170.0, 10.0), pt(10.0, 10.0)]}),
+            // Two members inside.
+            json!({"location": {"type": "GeometryCollection", "geometries": [pt(20.0, 20.0), pt(30.0, 30.0)]}}),
+            // Only the later member inside.
+            json!({"location": {"type": "GeometryCollection", "geometries": [pt(-100.0, 10.0), pt(40.0, 40.0)]}}),
+        ];
+        let w = docs.iter().enumerate().map(|(i, d)| elasticsearch_engine::index::WriteReq::Index { id: Some(i.to_string()), source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let req = Req { method: Method::POST, path: "/geo/_mvt/location/1/1/0".into(), segs: ["geo", "_mvt", "location", "1", "1", "0"].iter().map(|s| s.to_string()).collect(), params: Default::default(),
+            body: json!({"grid_precision": 0}).to_string().into_bytes().into(), headers: Default::default(), access: None, extensions: axum::http::Extensions::new(), api_version: crate::RestApiVersion::V9 };
+        let resp = tile(&node, &req, "geo").unwrap();
+        let bytes: Vec<u8> = match resp.body {
+            crate::RespBody::Bytes(b) => b.to_vec(),
+            crate::RespBody::Raw(s) => s.into_bytes(),
+            _ => panic!("unexpected tile body"),
+        };
+        assert_eq!(layer_features(&bytes, "hits"), 4);
+    }
+
+    /// #389: the meta layer reports the grid search's shard failures.
+    #[test]
+    fn tile_shards_take_the_less_complete_search() {
+        let hits = json!({"total": 2, "successful": 2, "skipped": 0, "failed": 0});
+        let grid = json!({"total": 2, "successful": 1, "skipped": 0, "failed": 1, "failures": []});
+        assert_eq!(merge_shards(&hits, &grid), json!({"total": 2, "successful": 1, "skipped": 0, "failed": 1}));
+        assert_eq!(merge_shards(&grid, &hits), json!({"total": 2, "successful": 1, "skipped": 0, "failed": 1}));
+    }
 }

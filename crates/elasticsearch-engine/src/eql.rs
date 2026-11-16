@@ -47,6 +47,10 @@ pub fn remote_scope(remote: Option<RemoteSearch>) -> RemoteScope {
 /// A remote response's shard failures as one error (the first failure's
 /// reason, wrapped like a local per-index failure).
 fn remote_shard_failure(v: &Value) -> Option<EsError> {
+    if v["timed_out"] == json!(true) {
+        // An incomplete read is never taken as a complete one.
+        return Some(search_timeout());
+    }
     if v["_shards"]["failed"].as_u64().unwrap_or(0) == 0 {
         return None;
     }
@@ -231,6 +235,7 @@ impl<'a> P<'a> {
             Tok::Str(s) => json!(s),
             Tok::Int(i) => json!(if neg { -i } else { i }),
             Tok::Dec(d) => json!(if neg { -d } else { d }),
+            Tok::UInt(u) => if neg { json!(-(u as f64)) } else { json!(u) },
             Tok::Ident(s) if s.eq_ignore_ascii_case("true") => json!(true),
             Tok::Ident(s) if s.eq_ignore_ascii_case("false") => json!(false),
             Tok::Ident(s) if s.eq_ignore_ascii_case("null") => Value::Null,
@@ -630,6 +635,19 @@ fn parse_duration(p: &mut P) -> Result<i64> {
 
 /// Parse an EQL query.
 pub fn parse(query: &str, o: &Opts) -> Result<EqlQuery> {
+    // The parse may run on another thread (`parse_depth::guarded`): its
+    // exact-match comparisons (`EXACT`, which verification reads on this
+    // thread: unknown columns, text fields without a keyword) come back
+    // with the result.
+    let (r, exact) = crate::parse_depth::guarded(|| {
+        let r = parse_unguarded(query, o);
+        (r, EXACT.with(|e| std::mem::take(&mut *e.borrow_mut())))
+    });
+    EXACT.with(|e| *e.borrow_mut() = exact);
+    r
+}
+
+fn parse_unguarded(query: &str, o: &Opts) -> Result<EqlQuery> {
     // Normalise `~` suffixes and pipes for the shared tokenizer.
     let mut src = String::with_capacity(query.len());
     let mut in_str = false;
@@ -670,6 +688,11 @@ pub fn parse(query: &str, o: &Opts) -> Result<EqlQuery> {
             t
         })
         .collect();
+    // ES `EqlParser.invokeParser`: the depth pre-scan, before parsing
+    // (a `ParsingException` without a source: `line -1:0`).
+    if crate::esql::lexer::prefix_depth_exceeds(&toks, crate::esql::lexer::QL_MAX_EXPRESSION_DEPTH) {
+        return Err(EsError::new(400, "parsing_exception", format!("line -1:0: EQL statement exceeded the maximum expression depth allowed ({})", crate::esql::lexer::QL_MAX_EXPRESSION_DEPTH)));
+    }
     let mut p = P { full: &src, t: toks, i: 0, o, exact: Vec::new(), nest: crate::parse_depth::Nesting::new(256) };
     let q = if p.eat_kw("sequence") {
         let mut by = Vec::new();
@@ -766,7 +789,7 @@ fn resolve_exact(node: &Node, index: &str, params: &HashMap<String, String>, ful
     // Runtime fields (mapping-level and request-level) exist too.
     let mut runtime_names: Vec<String> = runtime.and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default();
     for t in &targets {
-        if let Some(Value::Object(m)) = t.svc.meta().mappings.runtime {
+        if let Some(Value::Object(m)) = t.svc.mapping_runtime() {
             runtime_names.extend(m.keys().cloned());
         }
     }
@@ -909,6 +932,10 @@ struct Hit {
     /// sources of the results alone (`BasicQueryClient.fetchHits`).
     raw: Option<(Box<serde_json::value::RawValue>, u64)>,
     fields: Option<Value>,
+    /// Typed values of the runtime-field join keys (key → first value, null
+    /// when it has none): correlation reads these, not `_source`, which
+    /// has no runtime field and may hold the overridden source value.
+    keys: Option<serde_json::Map<String, Value>>,
     ts: i64,
     tb: Value,
     /// A `![...]` stage's placeholder (ES `Event.MISSING_EVENT`).
@@ -921,7 +948,7 @@ fn materialized(h: &Hit) -> Result<Hit> {
         Some((raw, _)) => serde_json::from_str(raw.get()).map_err(|e| EsError::internal(e.to_string()))?,
         None => h.source.clone(),
     };
-    Ok(Hit { index: h.index.clone(), id: h.id.clone(), source, raw: None, fields: h.fields.clone(), ts: h.ts, tb: h.tb.clone(), missing: h.missing })
+    Ok(Hit { index: h.index.clone(), id: h.id.clone(), source, raw: None, fields: h.fields.clone(), ts: h.ts, tb: h.tb.clone(), keys: None, missing: h.missing })
 }
 
 /// A copy of `h` as fetched (its source kept as it is, raw or projected).
@@ -934,6 +961,7 @@ fn hit_copy(h: &Hit) -> Hit {
         fields: h.fields.clone(),
         ts: h.ts,
         tb: h.tb.clone(),
+        keys: h.keys.clone(),
         missing: h.missing,
     }
 }
@@ -994,11 +1022,15 @@ fn ts_millis(v: &Value) -> i64 {
 pub struct ShardFailures {
     pub entries: Vec<Value>,
     first: Option<EsError>,
+    /// A stage search timed out (ES `SearchResponse.isTimedOut`).
+    timed_out: bool,
+    /// The indices whose stage search timed out (their hits are partial).
+    timeouts: Vec<String>,
 }
 
 impl ShardFailures {
     fn new() -> Self {
-        Self { entries: Vec::new(), first: None }
+        Self { entries: Vec::new(), first: None, timed_out: false, timeouts: Vec::new() }
     }
     fn push(&mut self, index: &str, e: &EsError) {
         if self.first.is_none() {
@@ -1033,6 +1065,31 @@ impl ShardFailures {
         if self.first.is_none() {
             self.first = other.first.clone();
         }
+        self.timed_out |= other.timed_out;
+        for i in &other.timeouts {
+            if !self.timeouts.contains(i) {
+                self.timeouts.push(i.clone());
+            }
+        }
+    }
+    /// A stage search of `index` timed out: its hits are kept, as ES keeps
+    /// a timed-out search's hits, and the response reports `timed_out`.
+    fn timeout(&mut self, index: &str) {
+        self.timed_out = true;
+        if !self.timeouts.iter().any(|i| i == index) {
+            self.timeouts.push(index.to_string());
+        }
+    }
+    /// Sequences and samples correlate across stage reads, and a `![...]`
+    /// stage proves an absence: an incomplete (timed-out) read must not
+    /// pass for a complete one. Each timed-out index fails as ES fails a
+    /// search that may not return partial results (`SearchTimeoutException`,
+    /// 429 `search_timeout_exception`, "Time exceeded"), so the partial
+    /// result rules decide whether anything is returned.
+    fn timeouts_fail(&mut self) {
+        for i in std::mem::take(&mut self.timeouts) {
+            self.push(&i, &search_timeout());
+        }
     }
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -1054,12 +1111,7 @@ fn mandatory_key_filters(keys: &[String], r: &Request, targets: &[crate::search:
     if keys.is_empty() {
         return Vec::new();
     }
-    let mut runtime: Vec<String> = r.runtime_mappings.as_ref().and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default();
-    for t in targets {
-        if let Some(Value::Object(m)) = t.svc.meta().mappings.runtime {
-            runtime.extend(m.keys().cloned());
-        }
-    }
+    let runtime = runtime_names(r, targets);
     let mut out: Vec<Value> = Vec::new();
     for k in keys {
         let f = json!({"exists": {"field": k}});
@@ -1068,6 +1120,48 @@ fn mandatory_key_filters(keys: &[String], r: &Request, targets: &[crate::search:
         }
     }
     out
+}
+
+/// Runtime fields of the request and of the searched indices' mappings.
+fn runtime_names(r: &Request, targets: &[crate::search::Target]) -> Vec<String> {
+    let mut runtime: Vec<String> = r.runtime_mappings.as_ref().and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    for t in targets {
+        if let Some(Value::Object(m)) = t.svc.mapping_runtime() {
+            runtime.extend(m.keys().cloned());
+        }
+    }
+    runtime
+}
+
+/// Whether the request's `fields` option asks for `name` (a name, a
+/// `{"field": name}` or a `*` pattern matching it).
+fn fields_request_names(fields: &Value, name: &str) -> bool {
+    fn glob(p: &str, s: &str) -> bool {
+        match p.split_once('*') {
+            None => p == s,
+            Some((head, tail)) => s.strip_prefix(head).is_some_and(|rest| (0..=rest.len()).filter(|i| rest.is_char_boundary(*i)).any(|i| glob(tail, &rest[i..]))),
+        }
+    }
+    let entries: Vec<&Value> = match fields {
+        Value::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    entries.iter().any(|e| {
+        let p = e.as_str().or_else(|| e.get("field").and_then(Value::as_str)).unwrap_or("");
+        glob(p, name)
+    })
+}
+
+/// ES `SearchTimeoutException` (a search that timed out where partial
+/// results are not allowed): 429 `search_timeout_exception`.
+fn search_timeout() -> EsError {
+    EsError::new(429, "search_timeout_exception", "Time exceeded")
+}
+
+/// Whether a search response (its text) reports `"timed_out": true`.
+fn response_timed_out(json: &str) -> bool {
+    let head = &json.as_bytes()[..json.len().min(256)];
+    head.windows(16).any(|w| w == b"\"timed_out\":true")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1105,14 +1199,29 @@ fn fetch_after(
     if let Some(t) = &r.tiebreaker {
         sort.push(json!({ t.clone(): {"order": order, "missing": "_last"} }));
     }
-    // EQL accepts cross-cluster expressions: plan the remote parts.
-    let targets = crate::ccr::remote::resolve_local_part(node, index, eql_resolve_opts(params))?.0;
+    // EQL accepts cross-cluster expressions: plan the remote parts (the
+    // connected ones are searched through the cluster, as `alias:index`).
+    let (targets, plan) = crate::ccr::remote::resolve_parts(node, index, eql_resolve_opts(params))?;
+    let remote_parts: Vec<String> = plan.map(|p| p.remote.iter().map(|(a, i)| i.iter().map(|i| format!("{a}:{i}")).collect::<Vec<_>>().join(",")).collect()).unwrap_or_default();
     // Nothing can match (`any where false`): no search to run.
-    if targets.is_empty() || size == 0 || q.cond == json!({"match_none": {}}) {
+    if (targets.is_empty() && remote_parts.is_empty()) || size == 0 || q.cond == json!({"match_none": {}}) {
         return Ok((vec![], ShardFailures::new()));
     }
     filter.extend(mandatory_key_filters(keys, r, &targets));
     filter.extend(extra.iter().cloned());
+    // Join keys that are runtime fields are read as typed values (the
+    // `fields` option): `_source` has no runtime field, and a runtime
+    // override of a source field must correlate on the emitted value.
+    // (Only stages with join keys look: the runtime names cost a lookup per
+    // searched index.)
+    let runtime = if keys.is_empty() { Vec::new() } else { runtime_names(r, &targets) };
+    let mut runtime_keys: Vec<String> = Vec::new();
+    for k in keys {
+        let k = k.strip_prefix('?').unwrap_or(k);
+        if runtime.iter().any(|x| x == k) && !runtime_keys.iter().any(|x| x == k) {
+            runtime_keys.push(k.to_string());
+        }
+    }
     let mut body = json!({"query": {"bool": {"filter": filter}}, "size": size, "sort": sort, "track_total_hits": false});
     if let Some(at) = from {
         // `search_after` is exclusive: step one millisecond back (ahead).
@@ -1121,6 +1230,15 @@ fn fetch_after(
     }
     if let Some(f) = &r.fields {
         body["fields"] = f.clone();
+    }
+    if !runtime_keys.is_empty() && columns.is_none() {
+        let mut fs: Vec<Value> = match &r.fields {
+            Some(Value::Array(a)) => a.clone(),
+            Some(other) => vec![other.clone()],
+            None => Vec::new(),
+        };
+        fs.extend(runtime_keys.iter().map(|k| json!(k)));
+        body["fields"] = Value::Array(fs);
     }
     if let Some(rm) = &r.runtime_mappings {
         body["runtime_mappings"] = rm.clone();
@@ -1158,7 +1276,13 @@ fn fetch_after(
                 if let Some(filter) = t.effective_filter() {
                     remote_body["query"] = json!({"bool":{"filter":[body["query"].clone(),filter]}});
                 }
-                remote(&t.svc.name, t.routing.as_deref(), &remote_body).and_then(|v| match remote_shard_failure(&v) {
+                remote(&t.svc.name, t.routing.as_deref(), &remote_body).and_then(|mut v| {
+                    if v["timed_out"] == json!(true) {
+                        failures.timeout(&t.svc.name);
+                        v["timed_out"] = json!(false);
+                    }
+                    Ok(v)
+                }).and_then(|v| match remote_shard_failure(&v) {
                     // A failing shard fails its index, as a local per-index search does.
                     Some(e) => Err(e),
                     None => Ok(match columns {
@@ -1169,7 +1293,8 @@ fn fetch_after(
             },
             None => {
                 let t0 = Instant::now();
-                let out = crate::search::execute(std::slice::from_ref(t), &req, &opts);
+                let out = crate::search::execute(std::slice::from_ref(t), &req, &opts)
+                    .inspect(|o| if response_timed_out(&o.json) { failures.timeout(&t.svc.name) });
                 phase_add(1, t0);
                 let t0 = Instant::now();
                 let parsed = out.and_then(|out| match columns {
@@ -1181,14 +1306,35 @@ fn fetch_after(
             }
         };
         match one {
-            Ok(found) => hits.extend(found),
+            Ok(mut found) => {
+                if !runtime_keys.is_empty() && columns.is_none() {
+                    for h in &mut found {
+                        take_runtime_keys(h, &runtime_keys, r.fields.as_ref());
+                    }
+                }
+                hits.extend(found)
+            }
             Err(e) => {
                 failures.push(&t.svc.name, &e);
             }
         }
     }
+    // Each connected remote cluster's part, through the cluster's
+    // cross-cluster search (hits name `alias:index`).
+    for expr in &remote_parts {
+        let Some(remote) = &remote else {
+            return Err(EsError::illegal_argument(format!("Cross-cluster calls are not supported in this context but remote indices were requested: [{expr}]")));
+        };
+        match remote(expr, None, &body).and_then(|v| match remote_shard_failure(&v) {
+            Some(e) => Err(e),
+            None => Ok(hits_of_value(v, r)),
+        }) {
+            Ok(found) => hits.extend(found),
+            Err(e) => failures.push(expr, &e),
+        }
+    }
     // Merge the per-index (each already sorted) results.
-    if seen.len() > 1 {
+    if seen.len() + remote_parts.len() > 1 {
         hits.sort_by(|a, b| {
             let o = a.ts.cmp(&b.ts).then_with(|| crate::esql::cmp_vals(&crate::esql::parse::json_to_val(&a.tb), &crate::esql::parse::json_to_val(&b.tb)));
             if desc { o.reverse() } else { o }
@@ -1196,6 +1342,28 @@ fn fetch_after(
         hits.truncate(size);
     }
     Ok((hits, failures))
+}
+
+/// Move a stage hit's runtime join-key values (asked for through `fields`)
+/// into [`Hit::keys`]; the `fields` the request did not ask for are not
+/// returned.
+fn take_runtime_keys(h: &mut Hit, runtime_keys: &[String], requested: Option<&Value>) {
+    let mut keys = serde_json::Map::new();
+    let fields = h.fields.as_mut().and_then(Value::as_object_mut);
+    for k in runtime_keys {
+        let v = fields.as_ref().and_then(|f| f.get(k)).map(|v| match v {
+            Value::Array(a) => a.first().cloned().unwrap_or(Value::Null),
+            x => x.clone(),
+        });
+        keys.insert(k.clone(), v.unwrap_or(Value::Null));
+    }
+    if let Some(f) = h.fields.as_mut().and_then(Value::as_object_mut) {
+        f.retain(|name, _| !runtime_keys.contains(name) || requested.is_some_and(|r| fields_request_names(r, name)));
+        if f.is_empty() && requested.is_none() {
+            h.fields = None;
+        }
+    }
+    h.keys = Some(keys);
 }
 
 /// The hits of a `_source: false` stage search with the timestamp (epoch
@@ -1241,6 +1409,7 @@ fn hits_of_columns(mut v: Value, r: &Request, columns: &[String]) -> Vec<Hit> {
             fields: None,
             ts: ts.unwrap_or(0),
             tb: if bad { json!("ambiguous") } else { Value::Null },
+            keys: None,
             missing: false,
         }
     }).collect()
@@ -1285,6 +1454,7 @@ fn hits_of_column_hits(found: Vec<crate::search::ColumnHit>, columns: &[String])
                 fields: None,
                 ts: ts.unwrap_or(0),
                 tb: if bad { json!("ambiguous") } else { Value::Null },
+                keys: None,
                 missing: false,
             }
         })
@@ -1306,10 +1476,28 @@ fn fetch_sources(node: &Node, index: &str, params: &HashMap<String, String>, r: 
             ids.push((id.as_str(), *ts));
         }
     }
-    let targets = crate::ccr::remote::resolve_local_part(node, index, eql_resolve_opts(params))?.0;
+    let targets = crate::ccr::remote::resolve_parts(node, index, eql_resolve_opts(params))?.0;
     let opts = crate::search::ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: Some(String::new()), pit_id: None };
     let remote = REMOTE.with(|r| r.borrow().clone());
     let mut out: HashMap<(String, String), Value> = HashMap::new();
+    // Hits of remote clusters (`alias:index`): fetched there, by id.
+    if let Some(remote) = &remote {
+        for (name, ids) in by_index.iter().filter(|(n, _)| crate::ccr::remote::is_remote_part(n)) {
+            for batch in ids.chunks(1000) {
+                let values: Vec<&str> = batch.iter().map(|(id, _)| *id).collect();
+                let body = json!({"query": {"ids": {"values": values}}, "size": batch.len(), "track_total_hits": false});
+                let Ok(mut v) = remote(name, None, &body) else { return Ok(None) };
+                if remote_shard_failure(&v).is_some() {
+                    return Ok(None);
+                }
+                let Value::Array(hits) = v["hits"]["hits"].take() else { continue };
+                for mut h in hits {
+                    let key = (h["_index"].as_str().unwrap_or("").to_string(), h["_id"].as_str().unwrap_or("").to_string());
+                    out.insert(key, h.get_mut("_source").map(Value::take).unwrap_or(Value::Null));
+                }
+            }
+        }
+    }
     let mut seen: Vec<&str> = Vec::new();
     for t in &targets {
         let name = t.svc.name.as_str();
@@ -1363,6 +1551,7 @@ fn hits_of_value(mut v: Value, r: &Request) -> Vec<Hit> {
             fields: h.get_mut("fields").map(Value::take),
             source,
             raw: None,
+            keys: None,
             missing: false,
         }
     }).collect()
@@ -1413,6 +1602,7 @@ fn hits_of_text(json: &str, r: &Request, projection: Projection<'_>) -> Result<V
             fields: h.fields,
             source,
             raw,
+            keys: None,
             missing: false,
         })
     }).collect()
@@ -1687,6 +1877,7 @@ pub fn search(node: &Node, index: &str, params: &HashMap<String, String>, body: 
             let (size, tail) = initial_limit(r.size, &pipes, r.tail);
             let (mut seqs, f) = sequences(node, index, params, &r, &by, maxspan, &stages, until.as_ref(), size, tail, &pipes)?;
             failures.merge(&f);
+            failures.timeouts_fail();
             if !failures.is_empty() && !r.allow_partial_sequence_results {
                 seqs.clear();
             }
@@ -1696,6 +1887,7 @@ pub fn search(node: &Node, index: &str, params: &HashMap<String, String>, body: 
             let max_per_key = body.get("max_samples_per_key").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
             let (seqs, f) = samples(node, index, params, &r, &by, &stages, max_per_key)?;
             failures.merge(&f);
+            failures.timeouts_fail();
             hits_object("sequences", seqs.into_iter().take(r.size).map(|(k, evs)| sequence_json(k, evs, true)).collect())
         }
     };
@@ -1705,7 +1897,7 @@ pub fn search(node: &Node, index: &str, params: &HashMap<String, String>, body: 
         }
     }
     phase_add(8, start);
-    let mut out = json!({"is_partial": !failures.is_empty(), "is_running": false, "took": start.elapsed().as_millis() as u64, "timed_out": false, "hits": hits_obj});
+    let mut out = json!({"is_partial": !failures.is_empty(), "is_running": false, "took": start.elapsed().as_millis() as u64, "timed_out": failures.timed_out, "hits": hits_obj});
     if !failures.is_empty() {
         out["shard_failures"] = Value::Array(failures.entries);
     }
@@ -1768,8 +1960,107 @@ fn phase_add(i: usize, t: Instant) {
     let _ = (i, t);
 }
 
-/// Per-stage event cap of a sequence's (and sample's) stage searches.
+/// Size of a fallback (non-windowed) sequence's or a sample's first stage
+/// search; a stage with more events is read again, larger (see [`drain`]).
 const STAGE_CAP: usize = 10_000;
+
+/// Every event of a stage, as ES pages a stage's searches until exhausted
+/// (no stage is cut at [`STAGE_CAP`]): `read(n)` reads the first `n`
+/// events, and while a read comes back full it is read again at twice the
+/// size. The larger read is admitted on the `eql_sequence` breaker before
+/// it is made (about twice the last read's charge), so a stage too large to
+/// hold trips the breaker instead of silently ending early.
+fn drain(mut read: impl FnMut(usize) -> Result<(Vec<Hit>, ShardFailures)>, count: impl FnOnce() -> Option<u64>) -> Result<(Vec<Hit>, ShardFailures)> {
+    let mut size = STAGE_CAP;
+    let mut admitted = crate::memory::breakers().reserve_without_breaking(crate::memory::Kind::EqlSequence, 0);
+    let mut count = Some(count);
+    loop {
+        let (hs, f) = read(size)?;
+        if hs.len() < size {
+            return Ok((hs, f));
+        }
+        let bytes: u64 = hs.iter().map(|h| SeqMemory::hit(h) + SeqMemory::EVENT).sum();
+        let per_hit = bytes / hs.len().max(1) as u64;
+        drop(hs);
+        // The next read: all of the stage's events at once when they can be
+        // counted (one more read instead of re-reading doubling prefixes),
+        // with room for events indexed meanwhile; else twice the size.
+        let next = match count.take().and_then(|c| c()) {
+            Some(total) => (total as usize).saturating_add(total as usize / 64).saturating_add(1).max(size.saturating_mul(2)),
+            None => size.saturating_mul(2),
+        };
+        // The next read's events are admitted before it runs, at this read's
+        // bytes per event.
+        let want = per_hit.saturating_mul(next as u64);
+        let held = admitted.bytes();
+        if want > held {
+            admitted.grow(want - held, "sequence_inflight")?;
+        }
+        size = next;
+    }
+}
+
+/// A stage read of the first `page` events, or (`None`) of all of them
+/// (`count`: the stage's matching events, when it can be counted).
+fn stage_read(page: Option<usize>, mut read: impl FnMut(usize) -> Result<(Vec<Hit>, ShardFailures)>, count: impl FnOnce() -> Option<u64>) -> Result<(Vec<Hit>, ShardFailures)> {
+    match page {
+        Some(p) => read(p),
+        None => drain(read, count),
+    }
+}
+
+/// The number of events stage query `q` matches (what [`fetch_after`]
+/// reads, unsorted), searched per index as it does (locally, or through
+/// the cluster's search for the index); `None` when it cannot be counted
+/// (remote clusters, a failing index: the caller reads by doubling).
+fn stage_count(node: &Node, index: &str, params: &HashMap<String, String>, r: &Request, q: &EventQuery, keys: &[String]) -> Option<u64> {
+    if q.cond == json!({"match_none": {}}) {
+        return Some(0);
+    }
+    let (targets, plan) = crate::ccr::remote::resolve_parts(node, index, eql_resolve_opts(params)).ok()?;
+    if plan.is_some_and(|p| !p.remote.is_empty()) {
+        return None;
+    }
+    let mut filter = vec![json!({"exists": {"field": r.timestamp_field}}), q.cond.clone()];
+    if let Some(c) = &q.category {
+        filter.push(json!({"term": { r.category_field.clone(): c }}));
+    }
+    if let Some(f) = &r.filter {
+        filter.push(f.clone());
+    }
+    filter.extend(mandatory_key_filters(keys, r, &targets));
+    let mut body = json!({"query": {"bool": {"filter": filter}}, "size": 0, "track_total_hits": true});
+    if let Some(rm) = &r.runtime_mappings {
+        body["runtime_mappings"] = rm.clone();
+    }
+    let req = crate::search::parse_request(&body, &HashMap::new()).ok()?;
+    let opts = crate::search::ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: Some(String::new()), pit_id: None };
+    let remote = REMOTE.with(|x| x.borrow().clone());
+    let mut seen: Vec<&str> = Vec::new();
+    let mut total = 0u64;
+    for t in &targets {
+        if seen.contains(&t.svc.name.as_str()) {
+            continue;
+        }
+        seen.push(t.svc.name.as_str());
+        let v: Value = match &remote {
+            Some(remote) => {
+                let mut remote_body = body.clone();
+                if let Some(filter) = t.effective_filter() {
+                    remote_body["query"] = json!({"bool": {"filter": [body["query"].clone(), filter]}});
+                }
+                let v = remote(&t.svc.name, t.routing.as_deref(), &remote_body).ok()?;
+                if remote_shard_failure(&v).is_some() {
+                    return None;
+                }
+                v
+            }
+            None => serde_json::from_str(&crate::search::execute(std::slice::from_ref(t), &req, &opts).ok()?.json).ok()?,
+        };
+        total = total.saturating_add(v["hits"]["total"]["value"].as_u64()?);
+    }
+    Some(total)
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1863,7 +2154,7 @@ thread_local! {
 /// Whether `r`'s timestamp is a `date` field (no runtime field) in `t`: its
 /// doc values are epoch millis, as the matcher orders events.
 fn date_timestamp(t: &crate::search::Target, r: &Request) -> bool {
-    let runtime = matches!(t.svc.meta().mappings.runtime, Some(Value::Object(m)) if m.contains_key(&r.timestamp_field));
+    let runtime = matches!(t.svc.mapping_runtime(), Some(Value::Object(m)) if m.contains_key(&r.timestamp_field));
     !runtime && t.svc.lookup().get(&r.timestamp_field).is_some_and(|f| f.ty == crate::mapping::EsType::Date)
 }
 
@@ -1995,7 +2286,7 @@ fn sequences_over_with(
             }
             continue;
         }
-        let (hs, f) = capped_read(node, index, params, r, &s.q, cap, &keys, projection, columns.as_deref())?;
+        let (hs, f) = stage_read(page, |n| capped_read(node, index, params, r, &s.q, n, &keys, projection, columns.as_deref()), || stage_count(node, index, params, r, &s.q, &keys))?;
         stage_keys.push(keys);
         failures.merge(&f);
         if !bound(hs.as_slice()) {
@@ -2013,9 +2304,11 @@ fn sequences_over_with(
     for (_, s) in &missing {
         let mut keys = by.to_vec();
         keys.extend(s.by.iter().cloned());
-        let (hs, f) = fetch(node, index, params, r, &s.q, cap, false, &keys, projection)?;
+        let (hs, f) = stage_read(page, |n| fetch(node, index, params, r, &s.q, n, false, &keys, projection), || stage_count(node, index, params, r, &s.q, &keys))?;
         failures.merge(&f);
-        let stage = MissingEvents::new(hs.iter().filter_map(|h| join_values(&h.source, &keys).map(|key| (h.ts, serde_json::to_string(&key).unwrap_or_default()))), !by.is_empty());
+        // Keyed whenever the stage has join keys at all: sequence-level `by`
+        // or its own (ES joins per-stage keys positionally).
+        let stage = MissingEvents::new(hs.iter().filter_map(|h| hit_join_values(h, &keys).map(|key| (h.ts, serde_json::to_string(&key).unwrap_or_default()))), !keys.is_empty());
         mem.store += stage.bytes();
         missing_events.push(stage);
         mem.track()?;
@@ -2023,7 +2316,7 @@ fn sequences_over_with(
     let mut until_keys = by.to_vec();
     if let Some(u) = until {
         until_keys.extend(u.by.iter().cloned());
-        let (hs, f) = capped_read(node, index, params, r, &u.q, cap, &until_keys, projection, columns.as_deref())?;
+        let (hs, f) = stage_read(page, |n| capped_read(node, index, params, r, &u.q, n, &until_keys, projection, columns.as_deref()), || stage_count(node, index, params, r, &u.q, &until_keys))?;
         failures.merge(&f);
         if !bound(hs.as_slice()) {
             return Ok(None);
@@ -2057,14 +2350,14 @@ fn sequences_over_with(
         }
         let h = &store[*idx];
         if *kind == 1 {
-            let Some(jk) = join_values(&h.source, &until_keys) else { continue };
+            let Some(jk) = hit_join_values(h, &until_keys) else { continue };
             let k = serde_json::to_string(&jk).unwrap_or_default();
             if let Some(slots) = partial.remove(&k) {
                 mem.other = mem.other.saturating_sub(SeqMemory::key(&k, n) + slots.iter().flatten().map(|s| s.len() as u64 * 8).sum::<u64>());
             }
             continue;
         }
-        let Some(jk) = join_values(&h.source, &stage_keys[*si]) else { continue };
+        let Some(jk) = hit_join_values(h, &stage_keys[*si]) else { continue };
         let k = serde_json::to_string(&jk).unwrap_or_default();
         if !partial.contains_key(&k) {
             mem.other += SeqMemory::key(&k, n);
@@ -2111,17 +2404,45 @@ fn sequences_over_with(
     // trailing (leading) missing stage looks after (before) the sequence,
     // within `maxspan`.
     if !missing.is_empty() {
+        // ES `TumblingWindow.doCheckMissingEvents`: a middle `![...]` event
+        // between its neighbouring positives discards the sequence; the
+        // latest leading one (before the first positive) and the earliest
+        // trailing one (after the last) are weighed against `maxspan`
+        // together, so the sequence survives when some `maxspan` window
+        // holds every positive and no negative.
+        let leading_stage = missing.iter().any(|(pos, _)| *pos == 0);
+        let trailing_stage = missing.iter().any(|(pos, _)| *pos >= n);
+        let exceeds = |from: Option<i64>, to: Option<i64>| match (from, to) {
+            (Some(a), Some(b)) => maxspan.is_some_and(|m| m > 0 && b - a > m),
+            _ => true,
+        };
         done.retain(|(_, jk, seq)| {
             let k = serde_json::to_string(jk).unwrap_or_default();
-            let first_ts = store[seq[0]].ts;
-            missing.iter().zip(&missing_events).all(|((pos, _), evs)| {
-                let lo = if *pos == 0 { maxspan.map(|m| first_ts - m - 1) } else { Some(store[seq[pos - 1]].ts) };
-                let hi = if *pos >= seq.len() { maxspan.map(|m| first_ts + m + 1) } else { Some(store[seq[*pos]].ts) };
-                !evs.between(&k, lo, hi)
-            })
+            let (start, end) = (store[seq[0]].ts, store[seq[seq.len() - 1]].ts);
+            let mut last_leading: Option<i64> = None;
+            let mut first_trailing: Option<i64> = None;
+            for ((pos, _), evs) in missing.iter().zip(&missing_events) {
+                if *pos == 0 {
+                    if let Some(t) = evs.last_before(&k, start) {
+                        last_leading = Some(last_leading.map_or(t, |l| l.max(t)));
+                    }
+                } else if *pos >= seq.len() {
+                    if let Some(t) = evs.first_after(&k, end) {
+                        first_trailing = Some(first_trailing.map_or(t, |f| f.min(t)));
+                    }
+                } else if evs.between(&k, Some(store[seq[pos - 1]].ts), Some(store[seq[*pos]].ts)) {
+                    return false;
+                }
+            }
+            (first_trailing.is_none() && last_leading.is_none())
+                || (last_leading.is_none() && leading_stage)
+                || (first_trailing.is_none() && trailing_stage)
+                || (leading_stage && trailing_stage && exceeds(last_leading, first_trailing))
+                || (leading_stage && !trailing_stage && exceeds(last_leading, Some(end)))
+                || (!leading_stage && trailing_stage && exceeds(Some(start), first_trailing))
         });
     }
-    let placeholder = || Hit { index: String::new(), id: String::new(), source: Value::Null, raw: None, fields: None, ts: 0, tb: Value::Null, missing: true };
+    let placeholder = || Hit { index: String::new(), id: String::new(), source: Value::Null, raw: None, fields: None, ts: 0, tb: Value::Null, keys: None, missing: true };
     // Apply all head/tail windows before parsing full event sources. Matching,
     // missing-event checks and ordering still see the complete candidate set.
     let window = pipe_window(done.len(), size, tail, pipes);
@@ -2207,6 +2528,8 @@ const MAX_TERM_KEY_TERMS: usize = 128;
 thread_local! {
     /// Tests: never give up a windowed run for the capped match.
     static UNBOUNDED_WINDOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: the old search budget and early give-ups (the fallback path).
+    static BUDGETED_WINDOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Tests: the searches of the last windowed run, and whether it
     /// finished (`Some(true)`) or gave up for the capped match.
     static WINDOW_STATS: std::cell::Cell<(usize, usize, Option<bool>)> = const { std::cell::Cell::new((0, 0, None)) };
@@ -2215,15 +2538,18 @@ thread_local! {
     static WINDOW_STOP: std::cell::RefCell<Vec<(usize, MatchPos)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Tests may lift the [`WindowBudget`] and the early give-up of tail runs.
+/// Windowed runs page on until they are decided (ES `TumblingWindow`
+/// keeps paging each stage by `fetch_size` until done): no search budget
+/// or early give-up sends a run to the whole-stage match any more. Tests
+/// may still turn the budget on to exercise that fallback.
 fn unbounded_windows() -> bool {
     #[cfg(test)]
     {
-        UNBOUNDED_WINDOWS.with(|u| u.get())
+        !BUDGETED_WINDOWS.with(|u| u.get())
     }
     #[cfg(not(test))]
     {
-        false
+        true
     }
 }
 
@@ -2278,7 +2604,7 @@ impl KeyKind {
 fn key_kinds(targets: &[crate::search::Target], fields: &[&str]) -> HashMap<String, KeyKind> {
     let mut runtime: Vec<String> = Vec::new();
     for t in targets {
-        if let Some(Value::Object(m)) = t.svc.meta().mappings.runtime {
+        if let Some(Value::Object(m)) = t.svc.mapping_runtime() {
             runtime.extend(m.keys().cloned());
         }
     }
@@ -2601,7 +2927,7 @@ impl Run<'_> {
             return None;
         }
         let mut keys: Vec<Vec<Value>> = m.partial.values().filter(|p| p.slots[a - 1..b].iter().any(Option::is_some)).map(|p| p.key.clone()).collect();
-        keys.extend(feeder.buf.iter().filter_map(|h| join_values(&h.source, &stage_keys[a - 1])));
+        keys.extend(feeder.buf.iter().filter_map(|h| hit_join_values(h, &stage_keys[a - 1])));
         if keys.is_empty() || keys.iter().any(|k| k.len() != width) {
             return None;
         }
@@ -2867,14 +3193,14 @@ impl Run<'_> {
             let ts = h.ts;
             match stages {
                 None => {
-                    let k = join_values(&h.source, until_keys).map(|jk| serde_json::to_string(&jk).unwrap_or_default());
+                    let k = hit_join_values(&h, until_keys).map(|jk| serde_json::to_string(&jk).unwrap_or_default());
                     self.store.push(h);
                     if let Some(k) = k {
                         m.until(&k, &mut self.mem);
                     }
                 }
                 Some((a, b)) => {
-                    let jk = join_values(&h.source, &stage_keys[a]);
+                    let jk = hit_join_values(&h, &stage_keys[a]);
                     self.store.push(h);
                     if let Some(jk) = jk {
                         let k = serde_json::to_string(&jk).unwrap_or_default();
@@ -3181,7 +3507,7 @@ fn windowed_sequences(
             .map(|ix| match returned.get(ix) {
                 Some(1) if run.store[*ix].raw.is_none() => {
                     let h = &mut run.store[*ix];
-                    Ok(Hit { index: std::mem::take(&mut h.index), id: std::mem::take(&mut h.id), source: std::mem::take(&mut h.source), raw: None, fields: h.fields.take(), ts: h.ts, tb: std::mem::take(&mut h.tb), missing: h.missing })
+                    Ok(Hit { index: std::mem::take(&mut h.index), id: std::mem::take(&mut h.id), source: std::mem::take(&mut h.source), raw: None, fields: h.fields.take(), ts: h.ts, tb: std::mem::take(&mut h.tb), keys: None, missing: h.missing })
                 }
                 _ => materialized(&run.store[*ix]),
             })
@@ -3225,6 +3551,19 @@ impl MissingEvents {
         self.timestamps.iter().map(|(k, times)| 56 + k.capacity() as u64 + 8 * times.capacity() as u64).sum()
     }
 
+    /// The latest event of `key` strictly before `t`.
+    fn last_before(&self, key: &str, t: i64) -> Option<i64> {
+        let times = self.timestamps.get(if self.keyed { key } else { "" })?;
+        let i = times.partition_point(|&ts| ts < t);
+        i.checked_sub(1).map(|j| times[j])
+    }
+
+    /// The earliest event of `key` strictly after `t`.
+    fn first_after(&self, key: &str, t: i64) -> Option<i64> {
+        let times = self.timestamps.get(if self.keyed { key } else { "" })?;
+        times.get(times.partition_point(|&ts| ts <= t)).copied()
+    }
+
     fn between(&self, key: &str, lo: Option<i64>, hi: Option<i64>) -> bool {
         let Some(times) = self.timestamps.get(if self.keyed { key } else { "" }) else { return false };
         // Bounds are open; use comparisons rather than +/- 1 so extrema are safe.
@@ -3238,6 +3577,20 @@ fn join_values(source: &Value, keys: &[String]) -> Option<Vec<Value>> {
     keys.iter().map(|key| {
         let optional = key.starts_with('?');
         let value = first_value(source, key.strip_prefix('?').unwrap_or(key));
+        if value.is_null() && !optional { None } else { Some(value) }
+    }).collect()
+}
+
+/// [`join_values`] of a stage event: a runtime-field key reads the event's
+/// typed value ([`Hit::keys`]), every other key its `_source`.
+fn hit_join_values(h: &Hit, keys: &[String]) -> Option<Vec<Value>> {
+    keys.iter().map(|key| {
+        let optional = key.starts_with('?');
+        let name = key.strip_prefix('?').unwrap_or(key);
+        let value = match h.keys.as_ref().and_then(|m| m.get(name)) {
+            Some(v) => v.clone(),
+            None => first_value(&h.source, name),
+        };
         if value.is_null() && !optional { None } else { Some(value) }
     }).collect()
 }
@@ -3262,11 +3615,11 @@ fn samples(
     for s in stages {
         let mut keys = by.to_vec();
         keys.extend(s.by.iter().cloned());
-        let (hs, f) = fetch(node, index, params, r, &s.q, STAGE_CAP, false, &keys, Some(paths.as_slice()))?;
+        let (hs, f) = drain(|n| fetch(node, index, params, r, &s.q, n, false, &keys, Some(paths.as_slice())), || stage_count(node, index, params, r, &s.q, &keys))?;
         failures.merge(&f);
         let mut m: HashMap<String, (Vec<Value>, Vec<Hit>)> = HashMap::new();
         for h in hs {
-            let Some(jk) = join_values(&h.source, &keys) else { continue };
+            let Some(jk) = hit_join_values(&h, &keys) else { continue };
             m.entry(serde_json::to_string(&jk).unwrap_or_default()).or_insert_with(|| (jk, Vec::new())).1.push(h);
         }
         per_stage.push(m);
@@ -3287,29 +3640,40 @@ fn samples(
 }
 
 
-/// Greedy selection in stage order. Used identities only grow, so each stage
-/// can advance a cursor instead of rescanning its already-used prefix for each
-/// sample. Borrow identities; no ID or source allocations during probing.
+/// ES `SampleIterator.matchSamples`: each stage's first
+/// `stages + max_per_key - 1` events (ES's per-key final query size), then a
+/// backtracking search for combinations of distinct events, one per stage,
+/// in stage order, up to `limit` of them. Backtracking finds a sample a
+/// greedy first-unused choice misses (an event that both an early and a
+/// later stage match must go to the stage only it satisfies).
 fn select_samples<'a>(stages: &[&'a [Hit]], limit: usize) -> Vec<Vec<&'a Hit>> {
-    let mut used: HashSet<(&str, &str)> = HashSet::new();
-    let mut cursors = vec![0; stages.len()];
-    let mut out = Vec::new();
-    for _ in 0..limit {
-        let mut sample = Vec::with_capacity(stages.len());
-        for (events, cursor) in stages.iter().zip(&mut cursors) {
-            while *cursor < events.len() && used.contains(&(events[*cursor].index.as_str(), events[*cursor].id.as_str())) {
-                *cursor += 1;
-            }
-            let Some(hit) = events.get(*cursor) else { return out };
-            used.insert((hit.index.as_str(), hit.id.as_str()));
-            sample.push(hit);
-            *cursor += 1;
-        }
-        out.push(sample);
+    if limit == 0 || stages.is_empty() || stages.iter().any(|s| s.is_empty()) {
+        return Vec::new();
     }
+    let take = stages.len() + limit - 1;
+    let lists: Vec<&'a [Hit]> = stages.iter().map(|s| &s[..s.len().min(take)]).collect();
+    fn go<'a>(k: usize, lists: &[&'a [Hit]], partial: &mut Vec<&'a Hit>, out: &mut Vec<Vec<&'a Hit>>, limit: usize) -> bool {
+        for h in lists[k] {
+            if partial.iter().any(|x| x.index == h.index && x.id == h.id) {
+                continue;
+            }
+            partial.push(h);
+            if k + 1 == lists.len() {
+                out.push(partial.clone());
+                if out.len() == limit {
+                    return true;
+                }
+            } else if go(k + 1, lists, partial, out, limit) {
+                return true;
+            }
+            partial.pop();
+        }
+        false
+    }
+    let mut out = Vec::new();
+    go(0, &lists, &mut Vec::with_capacity(lists.len()), &mut out, limit);
     out
 }
-
 
 /// Painless helpers of EQL conditions evaluated per document (ES
 /// `InternalEqlScriptUtils`): `substring` with EQL's negative offsets,
@@ -3329,6 +3693,25 @@ fn painless_lit(v: &Value) -> String {
 fn painless_field(f: &str) -> String {
     let q = f.replace('\'', "\\'");
     format!("(doc.containsKey('{q}') && doc['{q}'].size() > 0 ? doc['{q}'].value : null)")
+}
+
+#[cfg(test)]
+mod parse_state_tests {
+    /// Verification reads the parse's exact-match comparisons on the
+    /// calling thread, wherever the guarded parse ran (here: on the parse
+    /// stack, as from a thread of unknown stack).
+    #[test]
+    fn exact_comparisons_survive_a_guarded_parse() {
+        std::thread::Builder::new().stack_size(2 << 20).spawn(|| {
+            let o = super::Opts { case_sensitive: false };
+            super::parse(r#"sequence with maxspan=10d [network where user == "ADMIN"] ![network where used == "SYSTEM"]"#, &o).unwrap();
+            let fields: Vec<String> = super::EXACT.with(|e| e.borrow().iter().map(|u| u.0.clone()).collect());
+            assert!(fields.contains(&"user".to_string()) && fields.contains(&"used".to_string()), "{fields:?}");
+            super::parse(r#"process where some_text: "foo""#, &o).unwrap();
+            let fields: Vec<String> = super::EXACT.with(|e| e.borrow().iter().map(|u| u.0.clone()).collect());
+            assert_eq!(fields, vec!["some_text".to_string()]);
+        }).unwrap().join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3366,29 +3749,59 @@ mod rally_parser_tests {
         }
     }
 
+    /// ES `SampleIterator.matchSamples` / `match`, ported line by line.
     fn scan_samples<'a>(stages: &[&'a [Hit]], limit: usize) -> Vec<Vec<&'a Hit>> {
-        let mut used = Vec::new();
-        let mut out = Vec::new();
-        for _ in 0..limit {
-            let mut sample: Vec<&Hit> = Vec::new();
-            for events in stages {
-                let Some(hit) = events.iter().find(|h| !used.contains(&(h.index.as_str(), h.id.as_str()))
-                    && !sample.iter().any(|x| x.index == h.index && x.id == h.id)) else { return out };
-                sample.push(hit);
-            }
-            used.extend(sample.iter().map(|h| (h.index.as_str(), h.id.as_str())));
-            out.push(sample);
+        if limit == 0 || stages.is_empty() || stages.iter().any(|s| s.is_empty()) {
+            return Vec::new();
         }
-        out
+        let size = stages.len() + limit - 1;
+        let hits: Vec<Vec<&Hit>> = stages.iter().map(|s| s.iter().take(size).collect()).collect();
+        let mut result: Vec<Vec<&Hit>> = Vec::new();
+        fn matcher<'a>(c: usize, hits: &[Vec<&'a Hit>], result: &mut Vec<Vec<&'a Hit>>, partial: &mut Vec<&'a Hit>, max: usize) {
+            for o in &hits[c] {
+                if !partial.iter().any(|p| p.index == o.index && p.id == o.id) {
+                    partial.push(o);
+                    if c == hits.len() - 1 {
+                        result.push(partial.clone());
+                        if max == result.len() {
+                            return;
+                        }
+                    } else {
+                        matcher(c + 1, hits, result, partial, max);
+                        if max == result.len() {
+                            return;
+                        }
+                    }
+                    partial.pop();
+                }
+            }
+        }
+        matcher(0, &hits, &mut result, &mut Vec::new(), limit);
+        result
+    }
+
+    /// #380: an event two stages match goes where it is needed: stage 1
+    /// matches A and B, stage 2 only A, so the sample is (B, A).
+    #[test]
+    fn sample_selection_backtracks_like_es() {
+        let a = Hit { index: "i".into(), id: "A".into(), source: json!({}), raw: None, fields: None, keys: None, ts: 1, tb: Value::Null, missing: false };
+        let b = Hit { index: "i".into(), id: "B".into(), source: json!({}), raw: None, fields: None, keys: None, ts: 2, tb: Value::Null, missing: false };
+        let s1 = [hit_copy(&a), hit_copy(&b)];
+        let s2 = [hit_copy(&a)];
+        let out = select_samples(&[&s1, &s2], 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0][0].id.as_str(), out[0][1].id.as_str()), ("B", "A"));
+        // No combination of distinct events: no sample.
+        assert!(select_samples(&[&s2, &s2], 1).is_empty());
     }
 
     fn sample_hit(i: usize, stage: usize) -> Hit {
         Hit { index: format!("index-{}", i % 2), id: (i / 2).to_string(),
-            source: json!({"stage":stage,"identity":i}), raw:None, fields:None, ts:0, tb:Value::Null, missing:false }
+            source: json!({"stage":stage,"identity":i}), raw:None, fields:None, ts:0, tb:Value::Null, keys:None, missing:false }
     }
 
     #[test]
-    fn sample_cursors_match_greedy_scan_with_overlaps_duplicates_and_indexes() {
+    fn sample_selection_matches_es_with_overlaps_duplicates_and_indexes() {
         let mut state = 17u64;
         for case in 0..1000 {
             let mut owned = Vec::new();
@@ -4309,17 +4722,24 @@ mod windowed_sequence_tests {
         }
     }
 
-    /// Over budget, a windowed run gives up for the capped match, which
-    /// then answers as before.
+    /// A run that the old budget gave up on (a long, low-yield head window
+    /// with a tiny `fetch_size`) now pages on to the end and decides, with
+    /// the capped match's answer; with the budget on, its give-up still
+    /// answers the same.
     #[test]
-    fn over_budget_falls_back_to_the_capped_match() {
+    fn long_windowed_runs_page_on_instead_of_giving_up() {
         let (_temp, node) = events_index();
         let docs = Arc::new(random_docs(&mut Lcg(37), 2000));
         let body = json!({"query": "sequence by k [a where true] [b where true]", "size": 1000, "fetch_size": 2, "result_position": "head"});
         let _scope = remote_scope(Some(mock(docs.clone(), true, Arc::new(Mutex::new(Vec::new())))));
         let out = run(&node, &body, false).unwrap();
-        assert_eq!(WINDOW_STATS.with(|s| s.get()).2, None, "the windowed run gave up");
+        assert_eq!(WINDOW_STATS.with(|s| s.get()).2, Some(true), "the windowed run gave up");
         assert_eq!(out, run(&node, &body, true).unwrap());
+        BUDGETED_WINDOWS.with(|b| b.set(true));
+        let budgeted = run(&node, &body, false).unwrap();
+        BUDGETED_WINDOWS.with(|b| b.set(false));
+        assert_eq!(WINDOW_STATS.with(|s| s.get()).2, None, "the budgeted run did not give up");
+        assert_eq!(budgeted, out);
     }
 
     /// Through the real search path (`search_after` on the timestamp sort,
@@ -4698,5 +5118,214 @@ mod windowed_sequence_tests {
                 if decided { "decided" } else { "gave up" }, es_p50(name), out["hits"]["sequences"].as_array().map_or(0, Vec::len), if ok { "ok" } else { "MISMATCH" });
         }
         assert!(mismatches.is_empty(), "windowed results differ from the reference: {mismatches:?}");
+    }
+}
+
+/// Fallback sequences and samples read every stage event: nothing past the
+/// first [`STAGE_CAP`] events of a stage is silently dropped.
+#[cfg(test)]
+mod stage_drain_tests {
+    use super::sequence_window_tests::{events_index, put, run};
+    use super::*;
+
+    fn ev(id: &str, ts: i64, cat: &str, k: &str) -> (String, Value) {
+        (id.to_string(), json!({"@timestamp": ts, "event": {"category": cat}, "k": k}))
+    }
+
+    /// `STAGE_CAP` noise events of `cat` before the events that decide.
+    fn noise(cat: &str) -> Vec<(String, Value)> {
+        (0..STAGE_CAP as i64).map(|i| ev(&format!("{cat}-noise-{i}"), i, cat, &format!("n{i}"))).collect()
+    }
+
+    fn count(out: &Value) -> usize {
+        out["hits"]["sequences"].as_array().map_or(0, Vec::len)
+    }
+
+    #[test]
+    fn fallback_sequence_finds_a_match_past_the_first_stage_read() {
+        let (_temp, node) = events_index();
+        let mut docs = noise("a");
+        docs.push(ev("a-target", 20_000, "a", "t"));
+        docs.push(ev("b-target", 20_001, "b", "t"));
+        put(&node, &docs);
+        // Returned `fields` and a tiebreaker each disable the windowed run.
+        for body in [
+            json!({"query": "sequence by k [a where true] [b where true]", "fields": ["k"]}),
+            json!({"query": "sequence by k [a where true] [b where true]", "tiebreaker": "k"}),
+            json!({"query": "sequence by k [a where true] [b where true] | tail 1"}),
+        ] {
+            let out = run(&node, &body, true).unwrap();
+            assert_eq!(count(&out), 1, "{body}: {out}");
+            assert_eq!(out["is_partial"], false);
+            assert_eq!(out["hits"]["sequences"][0]["events"][0]["_id"], "a-target", "{body}");
+        }
+    }
+
+    #[test]
+    fn fallback_sequence_sees_a_missing_stage_veto_past_the_first_stage_read() {
+        let (_temp, node) = events_index();
+        let mut docs = noise("c");
+        docs.push(ev("a-target", 20_000, "a", "t"));
+        docs.push(ev("c-veto", 20_001, "c", "t"));
+        docs.push(ev("b-target", 20_002, "b", "t"));
+        put(&node, &docs);
+        let out = run(&node, &json!({"query": "sequence by k [a where true] ![c where true] [b where true]"}), false).unwrap();
+        assert_eq!(count(&out), 0, "the veto must exclude the sequence: {out}");
+    }
+
+    #[test]
+    fn sample_finds_a_match_past_the_first_stage_read() {
+        let (_temp, node) = events_index();
+        let mut docs = noise("a");
+        docs.push(ev("a-target", 20_000, "a", "t"));
+        docs.push(ev("b-target", 20_001, "b", "t"));
+        put(&node, &docs);
+        let out = run(&node, &json!({"query": "sample by k [a where true] [b where true]"}), false).unwrap();
+        assert_eq!(count(&out), 1, "{out}");
+        assert_eq!(out["hits"]["sequences"][0]["join_keys"], json!(["t"]));
+    }
+}
+
+/// #179 / #180: stage completeness and typed runtime join keys.
+#[cfg(test)]
+mod stage_completeness_tests {
+    use super::sequence_window_tests::{events_index, mock, put, run};
+    use super::*;
+    use std::sync::Mutex;
+
+    fn ev(id: &str, ts: i64, cat: &str, k: &str) -> (String, Value) {
+        (id.to_string(), json!({"@timestamp": ts, "event": {"category": cat}, "k": k}))
+    }
+
+    fn category(body: &Value) -> Option<String> {
+        body["query"]["bool"]["filter"].as_array()?.iter().find_map(|f| f["term"]["event.category"].as_str().map(str::to_string))
+    }
+
+    /// A remote whose search of `cat` times out with no hits returned.
+    fn timing_out(docs: Vec<(String, Value)>, cat: &'static str) -> RemoteSearch {
+        let inner = mock(Arc::new(docs), true, Arc::new(Mutex::new(Vec::new())));
+        Arc::new(move |i: &str, routing: Option<&str>, body: &Value| {
+            if category(body).as_deref() == Some(cat) {
+                return Ok(json!({"timed_out": true, "_shards": {"total": 1, "successful": 1, "failed": 0}, "hits": {"hits": []}}));
+            }
+            inner(i, routing, body)
+        })
+    }
+
+    #[test]
+    fn a_timed_out_missing_stage_never_proves_absence() {
+        let (_temp, node) = events_index();
+        let docs = vec![ev("a1", 1000, "a", "t"), ev("c1", 1001, "c", "t"), ev("b1", 1002, "b", "t")];
+        let q = json!({"query": "sequence by k [a where true] ![c where true] [b where true]"});
+        // Complete reads: the `c` event vetoes the sequence.
+        {
+            let _scope = remote_scope(Some(mock(Arc::new(docs.clone()), true, Arc::new(Mutex::new(Vec::new())))));
+            let out = run(&node, &q, true).unwrap();
+            assert_eq!(out["hits"]["sequences"].as_array().map_or(0, Vec::len), 0, "{out}");
+            assert_eq!((out["timed_out"].clone(), out["is_partial"].clone()), (json!(false), json!(false)));
+        }
+        let _scope = remote_scope(Some(timing_out(docs, "c")));
+        // The `c` read timed out: no complete sequence is claimed.
+        let out = run(&node, &q, true).unwrap();
+        assert_eq!(out["hits"]["sequences"].as_array().map_or(0, Vec::len), 0, "{out}");
+        assert_eq!(out["timed_out"], true, "{out}");
+        assert_eq!(out["is_partial"], true);
+        assert_eq!(out["shard_failures"][0]["reason"]["type"], "search_timeout_exception", "{out}");
+        assert_eq!(out["shard_failures"][0]["reason"]["reason"], "Time exceeded");
+        // Without partial results the request fails (ES `SearchTimeoutException`).
+        let mut strict = q.clone();
+        strict["allow_partial_search_results"] = json!(false);
+        let e = run(&node, &strict, true).unwrap_err();
+        assert_eq!((e.status, e.kind.as_str()), (429, "search_timeout_exception"));
+        // An event query over a timed-out search answers as ES's
+        // `EventPayload` does: its hits, `timed_out: true`, no failure.
+        let out = run(&node, &json!({"query": "c where true"}), false).unwrap();
+        assert_eq!(out["timed_out"], true, "{out}");
+        assert_eq!(out["is_partial"], false);
+        assert!(out.get("shard_failures").is_none(), "{out}");
+        let out = run(&node, &json!({"query": "a where true"}), false).unwrap();
+        assert_eq!((out["timed_out"].clone(), out["is_partial"].clone()), (json!(false), json!(false)), "{out}");
+        assert_eq!(out["hits"]["events"].as_array().map_or(0, Vec::len), 1);
+    }
+
+    #[test]
+    fn runtime_join_keys_correlate_on_their_emitted_values() {
+        let (_temp, node) = events_index();
+        // `k` differs between the events (p / q); `j` holds the host.
+        let doc = |id: &str, ts: i64, cat: &str, k: &str, j: &str| (id.to_string(), json!({"@timestamp": ts, "event": {"category": cat}, "k": k, "j": j}));
+        put(&node, &[doc("a1", 1000, "a", "p", "x"), doc("b1", 2000, "b", "q", "x"), doc("a2", 3000, "a", "p", "y"), doc("b2", 4000, "b", "q", "z")]);
+        let host = json!({"type": "keyword", "script": {"source": "emit(doc['j'].value)"}});
+        let count = |out: &Value| out["hits"]["sequences"].as_array().map_or(0, Vec::len);
+        // A runtime-only key: a1 -> b1 share `x`; a2 (`y`) and b2 (`z`) do not pair.
+        let out = run(&node, &json!({"query": "sequence by rk [a where true] [b where true]", "runtime_mappings": {"rk": host.clone()}}), false).unwrap();
+        assert_eq!(count(&out), 1, "{out}");
+        assert_eq!(out["hits"]["sequences"][0]["join_keys"], json!(["x"]));
+        assert_eq!(out["hits"]["sequences"][0]["events"][0]["_id"], "a1");
+        assert!(out["hits"]["sequences"][0]["events"][0].get("fields").is_none(), "the key is not returned unasked: {out}");
+        // A runtime override of a source key: `k` emits the host, not p / q.
+        let out = run(&node, &json!({"query": "sequence by k [a where true] [b where true]", "runtime_mappings": {"k": host.clone()}}), false).unwrap();
+        assert_eq!(count(&out), 1, "{out}");
+        assert_eq!(out["hits"]["sequences"][0]["join_keys"], json!(["x"]));
+        assert_eq!(out["hits"]["sequences"][0]["events"][0]["_source"]["k"], "p", "the source is returned as stored");
+        // Asked-for fields are still returned.
+        let out = run(&node, &json!({"query": "sequence by rk [a where true] [b where true]", "runtime_mappings": {"rk": host.clone()}, "fields": ["rk"]}), false).unwrap();
+        assert_eq!(out["hits"]["sequences"][0]["events"][0]["fields"]["rk"], json!(["x"]), "{out}");
+        // Samples group on the runtime key too.
+        let out = run(&node, &json!({"query": "sample by rk [a where true] [b where true]", "runtime_mappings": {"rk": host}}), false).unwrap();
+        assert_eq!(count(&out), 1, "{out}");
+        assert_eq!(out["hits"]["sequences"][0]["join_keys"], json!(["x"]));
+    }
+}
+
+/// #266 / #279: missing-event stages join on per-stage keys and are
+/// weighed against `maxspan` as ES's `TumblingWindow` does.
+#[cfg(test)]
+mod missing_stage_tests {
+    use super::sequence_window_tests::{events_index, put, run};
+    use super::*;
+
+    fn ev(id: &str, ts: i64, cat: &str, k: &str) -> (String, Value) {
+        (id.to_string(), json!({"@timestamp": ts, "event": {"category": cat}, "k": k}))
+    }
+
+    fn count(node: &Node, q: &str) -> usize {
+        let out = run(node, &json!({"query": q}), true).unwrap();
+        out["hits"]["sequences"].as_array().map_or(0, Vec::len)
+    }
+
+    #[test]
+    fn per_stage_keys_scope_the_missing_event() {
+        let (_t, node) = events_index();
+        put(&node, &[ev("a1", 1000, "a", "alice"), ev("c1", 2000, "c", "bob"), ev("b1", 3000, "b", "alice")]);
+        let per_stage = "sequence with maxspan=1h [a where true] by k ![c where true] by k [b where true] by k";
+        let global = "sequence by k with maxspan=1h [a where true] ![c where true] [b where true]";
+        assert_eq!(count(&node, per_stage), 1, "bob's event does not veto alice");
+        assert_eq!(count(&node, global), 1);
+        put(&node, &[ev("c2", 2500, "c", "alice")]);
+        assert_eq!(count(&node, per_stage), 0, "alice's own event vetoes");
+        assert_eq!(count(&node, global), 0);
+    }
+
+    #[test]
+    fn leading_and_trailing_missing_windows_follow_maxspan() {
+        let leading = "sequence by k with maxspan=10s ![c where true] [a where true] [b where true]";
+        let trailing = "sequence by k with maxspan=10s [a where true] [b where true] ![c where true]";
+        let both = "sequence by k with maxspan=10s ![c where true] [a where true] [b where true] ![d where true]";
+        let case = |docs: &[(String, Value)], q: &str| {
+            let (_t, node) = events_index();
+            put(&node, docs);
+            count(&node, q)
+        };
+        // A leading cancel more than maxspan before the last positive leaves
+        // a valid window (ES accepts); one inside it vetoes.
+        assert_eq!(case(&[ev("c", 1000, "c", "u"), ev("a", 10_000, "a", "u"), ev("b", 19_000, "b", "u")], leading), 1);
+        assert_eq!(case(&[ev("c", 9_500, "c", "u"), ev("a", 10_000, "a", "u"), ev("b", 19_000, "b", "u")], leading), 0);
+        assert_eq!(case(&[ev("a", 0, "a", "u"), ev("b", 5_000, "b", "u"), ev("c", 11_000, "c", "u")], trailing), 1);
+        assert_eq!(case(&[ev("a", 0, "a", "u"), ev("b", 5_000, "b", "u"), ev("c", 9_000, "c", "u")], trailing), 0);
+        // Both sides: the negatives' gap against maxspan.
+        assert_eq!(case(&[ev("c", 1_000, "c", "u"), ev("a", 10_000, "a", "u"), ev("b", 12_000, "b", "u"), ev("d", 20_000, "d", "u")], both), 1);
+        assert_eq!(case(&[ev("c", 5_000, "c", "u"), ev("a", 10_000, "a", "u"), ev("b", 12_000, "b", "u"), ev("d", 14_000, "d", "u")], both), 0);
+        // Another user's events never count.
+        assert_eq!(case(&[ev("c", 9_500, "c", "v"), ev("a", 10_000, "a", "u"), ev("b", 19_000, "b", "u")], leading), 1);
     }
 }

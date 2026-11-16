@@ -202,7 +202,7 @@ async fn fleet_msearch(node: &Arc<ClusterNode>, req: &RestReq, path_index: Optio
     // Items run concurrently (as msearch items do), each answer in its place.
     let runs = items.into_iter().map(|(header, body, index, cps)| async move {
         let mut q: Vec<String> = ["rest_total_hits_as_int", "typed_keys"].iter().filter_map(|k| base.get(*k).map(|v| format!("{k}={}", encode_component(v)))).collect();
-        for k in ["ignore_unavailable", "allow_no_indices", "expand_wildcards", "allow_partial_search_results", "wait_for_checkpoints_timeout"] {
+        for k in ["ignore_unavailable", "allow_no_indices", "expand_wildcards", "allow_partial_search_results", "wait_for_checkpoints_timeout", "routing", "preference", "search_type", "request_cache", "ccs_minimize_roundtrips"] {
             if let Some(v) = header.get(k).filter(|_| !cps.is_empty() || k != "wait_for_checkpoints_timeout") {
                 q.push(format!("{k}={}", encode_component(&elasticsearch_engine::query::dsl::scalar_string(v))));
             }

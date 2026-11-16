@@ -47,7 +47,17 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => e.insert(crate::script::search::ValueSource::runtime(name, self.segs[seg].index)?),
             };
-            let vals = vs.values(seg, &self.segs[seg].leaf, doc, 0.0, None).ok()?;
+            // A script failure is the search's error (as for every other
+            // aggregation script source), never a missing geometry.
+            let vals = match vs.values(seg, &self.segs[seg].leaf, doc, 0.0, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    if let Some(env) = crate::script::env() {
+                        crate::script::report_error(&env.error, e);
+                    }
+                    return None;
+                }
+            };
             let gs: Vec<Geometry> = vals
                 .iter()
                 .filter_map(|v| match v {
@@ -215,10 +225,14 @@ impl<'a, 'b> Ctx<'a, 'b> {
             }
         }
         let (loc, count) = reduce_centroid_parts(parts.iter().map(|(_, p)| p));
-        match loc {
-            Some((lat, lon)) => json!({ "location": { "lat": values::java_double(lat), "lon": values::java_double(lon) }, "count": count }),
-            None => json!({ "count": count }),
+        let mut out = render_centroid(loc, count);
+        // A reduce follows (shards of a cluster or of local indices): ship
+        // the weighted sums, weights and dimensions (ES `InternalCentroid`
+        // shape state), not just a location and a count.
+        if crate::search::aggregation_shard_response() || super::partial::active() {
+            out["__p"] = json!({ "centroid": parts.iter().map(|(_, p)| centroid_part_state(p)).collect::<Vec<_>>() });
         }
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -276,10 +290,18 @@ impl<'a, 'b> Ctx<'a, 'b> {
             }
         }
         let loc = if point { (n > 0).then(|| (sx / n as f64, sy / n as f64)) } else { acc.value() };
-        Ok(match loc {
-            Some((x, y)) if n > 0 => json!({ "location": { "x": values::java_double(x), "y": values::java_double(y) }, "count": n }),
-            _ => json!({ "count": n }),
-        })
+        let mut out = render_cartesian_centroid(if n > 0 { loc } else { None }, n);
+        // A reduce follows: ship the weighted sums, weight and dimension
+        // (ES `InternalCartesianCentroid` shape state), as geo_centroid does.
+        if crate::search::aggregation_shard_response() || super::partial::active() {
+            let state = if point {
+                json!({"shape": false, "lat": sy, "lon": sx, "count": n})
+            } else {
+                json!({"shape": true, "lat": acc.sy, "lon": acc.sx, "weight": acc.w, "dim": acc.dim as u8, "count": n})
+            };
+            out["__p"] = json!({ "centroid": [state] });
+        }
+        Ok(out)
     }
 }
 
@@ -501,6 +523,82 @@ impl PointCentroidAcc {
     }
 }
 
+fn render_centroid(loc: Option<(f64, f64)>, count: u64) -> Value {
+    match loc {
+        Some((lat, lon)) => json!({ "location": { "lat": values::java_double(lat), "lon": values::java_double(lon) }, "count": count }),
+        None => json!({ "count": count }),
+    }
+}
+
+fn render_cartesian_centroid(loc: Option<(f64, f64)>, count: u64) -> Value {
+    match loc {
+        Some((x, y)) => json!({ "location": { "x": values::java_double(x), "y": values::java_double(y) }, "count": count }),
+        None => json!({ "count": count }),
+    }
+}
+
+fn centroid_part_state(p: &CentroidPart) -> Value {
+    match p {
+        CentroidPart::Shape(a) => json!({"shape": true, "lat": a.lat.value, "lon": a.lon.value, "weight": a.weight.value, "dim": a.dim.ordinal(), "count": a.count}),
+        CentroidPart::Points(a) => json!({"shape": false, "lat": a.lat.value, "lon": a.lon.value, "count": a.count}),
+    }
+}
+
+fn centroid_part_of(v: &Value) -> Option<CentroidPart> {
+    let sum = |k: &str| v.get(k).and_then(Value::as_f64).map(|value| shape::CompSum { value, delta: 0.0 });
+    let count = v.get("count").and_then(Value::as_u64)?;
+    Some(if v.get("shape").and_then(Value::as_bool)? {
+        CentroidPart::Shape(ShapeCentroidAcc { lat: sum("lat")?, lon: sum("lon")?, weight: sum("weight")?, dim: shape::ShapeDim::from_ordinal(v.get("dim").and_then(Value::as_u64)? as u8)?, count })
+    } else {
+        CentroidPart::Points(PointCentroidAcc { lat: sum("lat")?, lon: sum("lon")?, count })
+    })
+}
+
+/// The `geo_centroid` reduce of shard results carrying their centroid
+/// state (`__p.centroid`): every shard's parts reduced as one search
+/// reduces its indices' parts (shape weights and dimensions kept). A
+/// result without state (a geo_point index of an older node) counts as a
+/// point part of its location and count. `None` when no result has state.
+pub fn reduce_centroid_states(vals: &[&Value]) -> Option<Value> {
+    let (loc, count) = reduce_states(vals, "lat", "lon")?;
+    Some(render_centroid(loc, count))
+}
+
+/// `cartesian_centroid`'s [`reduce_centroid_states`] (state sums `lat` =
+/// y, `lon` = x; a stateless result counts as points at its location).
+pub fn reduce_cartesian_centroid_states(vals: &[&Value]) -> Option<Value> {
+    let (loc, count) = reduce_states(vals, "y", "x")?;
+    Some(render_cartesian_centroid(loc.map(|(y, x)| (x, y)), count))
+}
+
+/// `((first, second), count)` of the reduce; `first`/`second`: the
+/// location keys of a result without state.
+fn reduce_states(vals: &[&Value], first: &str, second: &str) -> Option<(Option<(f64, f64)>, u64)> {
+    if !vals.iter().any(|v| v.get("__p").and_then(|p| p.get("centroid")).is_some()) {
+        return None;
+    }
+    let mut parts: Vec<CentroidPart> = Vec::new();
+    for v in vals {
+        match v.get("__p").and_then(|p| p.get("centroid")).and_then(Value::as_array) {
+            Some(list) => {
+                for p in list {
+                    parts.push(centroid_part_of(p)?);
+                }
+            }
+            None => {
+                let count = v.get("count").and_then(Value::as_u64).unwrap_or(0);
+                if count > 0 {
+                    let n = count as f64;
+                    let lat = v["location"][first].as_f64().unwrap_or(0.0) * n;
+                    let lon = v["location"][second].as_f64().unwrap_or(0.0) * n;
+                    parts.push(CentroidPart::Points(PointCentroidAcc { lat: shape::CompSum { value: lat, delta: 0.0 }, lon: shape::CompSum { value: lon, delta: 0.0 }, count }));
+                }
+            }
+        }
+    }
+    Some(reduce_centroid_parts(parts.iter()))
+}
+
 /// One shard's `geo_centroid` result before the reduce.
 pub(super) enum CentroidPart {
     Shape(ShapeCentroidAcc),
@@ -707,19 +805,19 @@ fn ring_centroid(r: &[Pt], hole: bool) -> (f64, f64, f64) {
 
 /// Grid kinds of the geo grid aggregations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Grid {
+pub(crate) enum Grid {
     Tile,
     Hash,
     Hex,
 }
 
 /// `(top, left, bottom, right)` of the `bounds` of a grid aggregation.
-pub(super) type BBox = (f64, f64, f64, f64);
+pub(crate) type BBox = (f64, f64, f64, f64);
 
 /// ES `Geo{Tile,Hash,Hex}BoundedPredicate`: does a cell share an interior
 /// point with the bounds?
 #[derive(Clone)]
-pub(super) struct CellPred {
+pub(crate) struct CellPred {
     grid: Grid,
     bbox: BBox,
     crosses: bool,
@@ -731,7 +829,7 @@ pub(super) struct CellPred {
 }
 
 impl CellPred {
-    pub(super) fn new(grid: Grid, precision: u32, bbox: BBox) -> CellPred {
+    pub(crate) fn new(grid: Grid, precision: u32, bbox: BBox) -> CellPred {
         let (top, left, bottom, right) = bbox;
         let mut p = CellPred { grid, bbox, crosses: right < left, min_x: 0, max_x: 0, min_y: 0, max_y: 0 };
         if grid == Grid::Tile {
@@ -774,7 +872,7 @@ impl CellPred {
         }
     }
 
-    pub(super) fn key(&self, key: &str, precision: u32) -> bool {
+    pub(crate) fn key(&self, key: &str, precision: u32) -> bool {
         match self.grid {
             Grid::Tile => {
                 let mut it = key.split('/').skip(1).map(|v| v.parse::<u32>().unwrap_or(0));

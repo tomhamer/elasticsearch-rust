@@ -34,6 +34,10 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "es.labels" . | nindent 4 }}
+  {{- if include "es.bootstrapped" . }}
+  annotations:
+    elasticsearch/cluster-formed: "true"
+  {{- end }}
 data:
   {{- if include "es.bootstrapped" . }}
   {}

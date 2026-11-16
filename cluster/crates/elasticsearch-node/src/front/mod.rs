@@ -13,7 +13,9 @@ mod response;
 pub use response::RestResp;
 mod failure_store;
 mod ingest;
+pub(crate) use ingest::{bypass_pipelines, restore_replay};
 mod native_security;
+mod security_cache;
 pub mod classify;
 pub mod fanout;
 mod agg_reduce;
@@ -25,8 +27,10 @@ mod connector_store;
 mod fleet_checkpoints;
 mod fleet_search;
 mod ccr_follow;
+pub(crate) mod ccs;
 mod snapshot_cache_stats;
 mod query_rewrite;
+mod lookup_fields;
 mod app_search;
 mod esql_dist;
 mod xpack_query;
@@ -39,6 +43,7 @@ mod merge_memo;
 pub use qtf::{counts as qtf_counts, reruns as qtf_reruns, single_rounds as qtf_single_rounds, SINGLE_ROUND_DISABLED as QTF_SINGLE_ROUND_DISABLED, LIGHT_DISABLED as QTF_LIGHT_DISABLED};
 
 use crate::node::{ClusterNode, TransportNet};
+use elasticsearch_engine::boxed_future::{boxed, BoxFuture};
 use crate::shards::{PrimaryCtx, ShardsInfo};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -61,6 +66,8 @@ const DATA_STREAM_BACKING_WRITE_HEADER: &str = "x-rustic-internal-datastream-bac
 /// A `retriever` / `rank` search's phase (`plan` | `apply`), see
 /// [`rank_search`]; never accepted from clients.
 const RANK_PLAN_HEADER: &str = "x-rustic-internal-rank-plan";
+/// The point in time a compound retriever search's children read.
+const RANK_PIT_HEADER: &str = "x-rustic-internal-rank-pit";
 /// Set on an ES|QL response that could not read every shard it needed from
 /// started local copies: the `index#shard` list it needed.
 const ESQL_SHARDS_HEADER: &str = "x-rustic-internal-esql-shards";
@@ -88,9 +95,120 @@ fn is_system(headers: &[(String, String)]) -> bool {
     headers.iter().any(|(k, v)| k.eq_ignore_ascii_case(SYSTEM_HEADER) && v == "true")
 }
 
+/// Cluster-internal work running as a stored subject (a watch's owner): the
+/// value is an encoded [`elasticsearch_engine::security::owner::StoredAuthn`].
+/// Stripped from client HTTP requests at the edge, so only node-to-node
+/// requests built by this code can carry it; the engine authenticates such
+/// a request as that subject ([`elasticsearch_http::InternalIdentity`]).
+pub(crate) const IDENTITY_HEADER: &str = "x-rustic-internal-identity";
+
+fn internal_identity(headers: &[(String, String)]) -> Option<elasticsearch_engine::security::owner::StoredAuthn> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(IDENTITY_HEADER)).and_then(|(_, v)| elasticsearch_engine::security::owner::StoredAuthn::decode(v))
+}
+
+/// Coordinator calls for the watcher's background work on this node
+/// (`elasticsearch_engine::watcher::RestFactory`): each call runs as the
+/// identity it names (a watch's stored subject, `_system` for `None`) and
+/// is linked to no request task.
+pub fn watcher_rest_factory(node: &Arc<ClusterNode>) -> elasticsearch_engine::watcher::RestFactory {
+    let (coordinator, runtime) = (node.clone(), tokio::runtime::Handle::current());
+    Arc::new(move |identity: Option<&elasticsearch_engine::security::owner::StoredAuthn>| {
+        let headers = match identity {
+            Some(id) => SharedHeaders::try_pairs(&[(IDENTITY_HEADER, id.encode().as_str())])?,
+            None => SharedHeaders::try_pairs(&[(SYSTEM_HEADER, "true")])?,
+        };
+        Ok(cluster_rest(coordinator.clone(), runtime.clone(), headers, None))
+    })
+}
+
+/// The subject of a request this front answers itself (its own async
+/// searches): `_system`, a stored identity, or the request's credentials.
+/// `None` with security off or when the credentials do not authenticate.
+pub(crate) async fn front_caller(node: &ClusterNode, req: &RestReq) -> Option<elasticsearch_engine::security::Authn> {
+    if !node.engine.security.enabled() {
+        return None;
+    }
+    if is_system(&req.headers) {
+        return Some(elasticsearch_engine::security::Security::system());
+    }
+    if let Some(id) = internal_identity(&req.headers) {
+        return Some(id.to_authn());
+    }
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let (authorization, run_as) = (header("authorization").map(str::to_owned), header("es-security-runas-user").map(str::to_owned));
+    elasticsearch_http::security::owner::authenticate_headers(&node.engine, authorization.as_deref(), run_as.as_deref()).await
+}
+
 /// Marks the inner dispatch of a synonyms update, whose reload details the
 /// outer call merges across nodes.
 const SYNONYMS_INNER_HEADER: &str = "x-rustic-internal-synonyms-inner";
+const RELOAD_INNER_HEADER: &str = "x-rustic-internal-reload-analyzers-inner";
+/// The per-node drain leg of an add-block (the engine's
+/// `observability::BLOCK_DRAIN_HEADER`).
+const BLOCK_DRAIN_HEADER: &str = "x-rustic-internal-block-drain";
+
+/// A node's leg of `_reload_search_analyzers`: the reload in this node's
+/// main engine and in each shard engine (shard `k >= 1` of an index lives
+/// in engine `k`, with its own analyzers), the engines selected here so
+/// the choice never depends on a header crossing nodes.
+async fn reload_every_engine(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
+    let mut merged = json!({"_shards": {"total": 0, "successful": 0, "failed": 0}, "reload_details": []});
+    let mut engines: Vec<u32> = vec![0];
+    engines.extend(node.shard_engines.all().into_iter().map(|(k, _)| k).filter(|k| *k > 0));
+    for k in engines {
+        let mut leg = req.clone();
+        if let Err(error) = leg.retain_headers(|(h, _)| !h.eq_ignore_ascii_case(crate::shard_engines::SHARD_HEADER)) { return err(error) }
+        if k > 0 {
+            if let Err(error) = leg.push_header(crate::shard_engines::SHARD_HEADER, &k.to_string()) { return err(error) }
+        }
+        let resp = local_canonical(node, &leg).await;
+        if resp.status == 404 && k > 0 {
+            continue; // no copy of these indices in engine `k`
+        }
+        if !resp.is_success() {
+            return resp;
+        }
+        if let Some(v) = resp.body_json() {
+            crate::rest::nodes::merge_reload_details(&mut merged, &v, &node.local.id);
+        }
+    }
+    RestResp::json(200, &merged)
+}
+
+/// `PUT /{index}/_block/{write|read_only|read_only_allow_delete}`.
+fn is_add_write_block(req: &RestReq) -> bool {
+    let segments = req.segments();
+    req.method() == Method::PUT && segments.len() == 3 && segments[1] == "_block" && matches!(segments[2].as_str(), "write" | "read_only" | "read_only_allow_delete")
+}
+
+/// ES `TransportVerifyShardIndexBlockAction`: once the block is published,
+/// every node waits for its copies' writes admitted before the block;
+/// `shards_acknowledged` only when all drained (production review #231:
+/// a write past its block check could still apply after the response).
+async fn drain_after_block(node: &Arc<ClusterNode>, req: &RestReq, mut resp: RestResp) -> RestResp {
+    let mut inner = req.clone();
+    if let Err(error) = inner.push_header(BLOCK_DRAIN_HEADER, "1") { return err(error) }
+    let ids: Vec<String> = node.state().nodes.keys().cloned().collect();
+    let mut drained = true;
+    for id in ids {
+        let leg = if id == node.local.id {
+            let mut local = inner.clone();
+            local.hops = 1;
+            dispatch(node, local).await
+        } else {
+            forward(node, &id, &inner).await
+        };
+        drained &= leg.is_success() && leg.body_json().is_some_and(|v| v["drained"] == json!(true));
+    }
+    if let Some(mut v) = resp.body_json() {
+        if v.get("shards_acknowledged").is_some() {
+            v["shards_acknowledged"] = json!(drained);
+            resp.replace_json(&v);
+            resp.retain_headers(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+        }
+    }
+    resp
+}
 /// Master action: create the backing index of a time series data stream
 /// covering a past `@timestamp` (`TransportPastTimeSeriesIndexCreationAction`).
 pub const ACTION_PAST_TSDB_INDEX: &str = "internal:cluster/past_tsdb_index";
@@ -327,7 +445,7 @@ fn decode(s: &str) -> String {
     decode_hex(s.as_bytes(), true)
 }
 
-fn decode_path(s: &str) -> String {
+pub(crate) fn decode_path(s: &str) -> String {
     decode_hex(s.as_bytes(), false)
 }
 
@@ -431,6 +549,31 @@ fn cluster_rest_answer(response: RestResp) -> Result<Value, elasticsearch_engine
         return Ok(value);
     }
     Err(elasticsearch_engine::error::EsError::from_error_json(response.status, &value["error"]))
+}
+
+/// Who a [`background_cluster_rest`] call runs as.
+pub(crate) enum BackgroundSubject<'a> {
+    /// The internal `_system` user.
+    System,
+    /// `_system` running as a user (`es-security-runas-user`).
+    RunAsUser(&'a str),
+    /// A stored subject ([`IDENTITY_HEADER`]: an encoded
+    /// [`elasticsearch_engine::security::owner::StoredAuthn`], API keys
+    /// included).
+    Identity(&'a str),
+}
+
+/// A [`cluster_rest`] call with no caller request, as `subject`:
+/// background work such as a transform resumed by a new master, which runs
+/// with the stored authentication of the subject that created it.
+pub(crate) fn background_cluster_rest(coordinator: Arc<ClusterNode>, runtime: tokio::runtime::Handle, subject: BackgroundSubject<'_>)
+    -> elasticsearch_engine::error::Result<Arc<dyn Fn(&str, &str, Option<Value>) -> Result<Value, elasticsearch_engine::error::EsError> + Send + Sync>> {
+    let credentials = match subject {
+        BackgroundSubject::System => SharedHeaders::try_pairs(&[(SYSTEM_HEADER, "true")])?,
+        BackgroundSubject::RunAsUser(user) => SharedHeaders::try_pairs(&[(SYSTEM_HEADER, "true"), ("es-security-runas-user", user)])?,
+        BackgroundSubject::Identity(encoded) => SharedHeaders::try_pairs(&[(IDENTITY_HEADER, encoded)])?,
+    };
+    Ok(cluster_rest(coordinator, runtime, credentials, None))
 }
 
 /// [`cluster_rest`] for several calls at once ([`elasticsearch_http::ClusterRestMany`]):
@@ -544,7 +687,7 @@ async fn local_engine_request_on(node: &ClusterNode, router_override: Option<axu
         },
     };
     let b = Request::builder().method(req.method()).uri(req.uri.parse::<Uri>().unwrap_or_else(|_| Uri::from_static("/")));
-    let headers=req.headers.iter().filter(|(k,_)|!(k.eq_ignore_ascii_case(crate::shard_engines::SHARD_HEADER) || k.eq_ignore_ascii_case(esql_dist::FETCH_HEADER) || k.eq_ignore_ascii_case(esql_dist::COORDINATOR_HEADER) || k.eq_ignore_ascii_case(SYSTEM_HEADER) || k.eq_ignore_ascii_case(NESTED_HEADER) || k.eq_ignore_ascii_case(copies::READ_COPIES_HEADER) || k.eq_ignore_ascii_case(fleet_search::WAIT_HEADER) || k.eq_ignore_ascii_case(TRIPS_HEADER))).map(|(k,v)|(k.as_str(),v.as_str()));
+    let headers=req.headers.iter().filter(|(k,_)|!(k.eq_ignore_ascii_case(crate::shard_engines::SHARD_HEADER) || k.eq_ignore_ascii_case(esql_dist::FETCH_HEADER) || k.eq_ignore_ascii_case(esql_dist::COORDINATOR_HEADER) || k.eq_ignore_ascii_case(SYSTEM_HEADER) || k.eq_ignore_ascii_case(IDENTITY_HEADER) || k.eq_ignore_ascii_case(NESTED_HEADER) || k.eq_ignore_ascii_case(copies::READ_COPIES_HEADER) || k.eq_ignore_ascii_case(fleet_search::WAIT_HEADER) || k.eq_ignore_ascii_case(TRIPS_HEADER))).map(|(k,v)|(k.as_str(),v.as_str()));
     let headers=match elasticsearch_http::outgoing_headers::collect_valid(headers) {
         Ok(headers)=>headers,Err(error)=>return (err(error),None),
     };
@@ -608,6 +751,7 @@ async fn local_engine_request_on(node: &ClusterNode, router_override: Option<axu
         }
     }
     if is_system(&req.headers) { r.extensions_mut().insert(elasticsearch_http::SystemIdentity); }
+    else if let Some(id) = internal_identity(&req.headers) { r.extensions_mut().insert(elasticsearch_http::InternalIdentity(id)); }
     r.extensions_mut().insert(elasticsearch_http::CoordinatorUsage);
     let internal_backing_write = req.headers.iter().any(|(name, value)| name.eq_ignore_ascii_case(DATA_STREAM_BACKING_WRITE_HEADER) && value == "true");
     if internal_backing_write {
@@ -634,6 +778,12 @@ async fn local_engine_request_on(node: &ClusterNode, router_override: Option<axu
     if req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case(qtf::LIGHT_HEADER)) {
         r.extensions_mut().insert(elasticsearch_http::InternalQtfLight);
     }
+    if req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case(contexts::PIT_SHARD_TAGS_HEADER)) {
+        r.extensions_mut().insert(elasticsearch_http::InternalPitShardTags);
+    }
+    if req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case(elasticsearch_http::RECOVERY_SOURCE_HEADER)) {
+        r.extensions_mut().insert(elasticsearch_http::InternalRecoverySource);
+    }
     match req.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case(qtf::HEADER)).map(|(_, v)| v.as_str()) {
         Some("rerun") => {
             r.extensions_mut().insert(elasticsearch_http::InternalQtf::Rerun);
@@ -652,6 +802,9 @@ async fn local_engine_request_on(node: &ClusterNode, router_override: Option<axu
         }
         _ => {}
     }
+    if let Some((_, pit)) = req.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case(RANK_PIT_HEADER)) {
+        r.extensions_mut().insert(elasticsearch_http::InternalRankPit(pit.clone()));
+    }
     let coordinator = node.me();
     let runtime = tokio::runtime::Handle::current();
     {
@@ -665,6 +818,17 @@ async fn local_engine_request_on(node: &ClusterNode, router_override: Option<axu
         let credentials = match crate::reindex_multi::credentials(req) {Ok(v)=>v,Err(e)=>return (err(e),None)};
         if !search_read {
             r.extensions_mut().insert(elasticsearch_http::ClusterRestRaw(cluster_rest_raw(coordinator.clone(), runtime.clone(), credentials.clone(), linked_parent.clone())));
+            // Background work (scheduled watches) runs each call as an
+            // identity it names: a stored subject, or `_system` for `None`.
+            // Not linked to this request's task: it outlives the request.
+            let (as_coordinator, as_runtime) = (coordinator.clone(), runtime.clone());
+            r.extensions_mut().insert(elasticsearch_http::ClusterRestAs(Arc::new(move |identity: Option<&elasticsearch_engine::security::owner::StoredAuthn>| {
+                let headers = match identity {
+                    Some(id) => SharedHeaders::try_pairs(&[(IDENTITY_HEADER, id.encode().as_str())])?,
+                    None => SharedHeaders::try_pairs(&[(SYSTEM_HEADER, "true")])?,
+                };
+                Ok(elasticsearch_http::ClusterRest(cluster_rest(as_coordinator.clone(), as_runtime.clone(), headers, None)))
+            })));
         }
         if is_rank_plan_phase(req) {
             r.extensions_mut().insert(elasticsearch_http::ClusterRestMany(cluster_rest_many(coordinator.clone(), runtime.clone(), credentials.clone(), linked_parent.clone())));
@@ -697,12 +861,20 @@ async fn local_engine_request_on(node: &ClusterNode, router_override: Option<axu
         r.extensions_mut().insert(elasticsearch_http::NativeSecurityMirror(Arc::new(move |id, document| {
             runtime.block_on(native_security::mirror(&coordinator, id.to_string(), document))
         })));
+        let coordinator = node.me();
+        let runtime = tokio::runtime::Handle::current();
+        r.extensions_mut().insert(elasticsearch_http::SecurityCacheClear(Arc::new(move |kind, names, usernames| {
+            runtime.block_on(security_cache::broadcast(&coordinator, kind.to_string(), names, usernames))
+        })));
         if req.segments().get(1).map(String::as_str) == Some("enroll") {
             r.extensions_mut().insert(crate::enrollment::request_extension(&node.me()));
         }
     }
     let prepared_ingest = ingest::prepared(req);
     if !prepared_ingest.0.is_empty() { r.extensions_mut().insert(prepared_ingest); }
+    if let Some(index) = ingest::restore_replay_target(node, req) {
+        r.extensions_mut().insert(elasticsearch_http::RestoreReplay(index));
+    }
     if req.segments().get(0).map(String::as_str) == Some("_cat") && req.segments().get(1).map(String::as_str) == Some("aliases") {
         let state = node.state();
         let aliases = state.metadata.indices.iter().map(|(name, im)| {
@@ -1164,6 +1336,7 @@ fn forwarding_timeout(req: &RestReq) -> Option<Duration> {
 pub fn register_forward_handler(node: &Arc<ClusterNode>) {
     failure_store::register(node);
     native_security::register(node);
+    security_cache::register(node);
     fleet_search::register(node);
     let n = node.clone();
     node.transport.register_handler(ACTION_FORWARD, move |admitted: admitted::Request| {
@@ -1303,21 +1476,30 @@ impl std::fmt::Display for DocumentUri<'_>{fn fmt(&self,f:&mut std::fmt::Formatt
 /// connection), plain HTTP otherwise.
 pub async fn serve(node: Arc<ClusterNode>, listener: tokio::net::TcpListener) -> std::io::Result<()> {
     let tls = node.http_tls.clone();
+    // The further bind addresses' listeners (ES: one per bound address)
+    // serve the same router.
+    let extra: Vec<tokio::net::TcpListener> = std::mem::take(&mut *node.http_extra_listeners.lock());
     let app = axum::Router::new().fallback(move |req: Request<Body>| {
         let node = node.clone();
-        elasticsearch_http::panic_guard(async move { handle_http(node, req).await })
+        elasticsearch_http::panic_guard(boxed(move || handle_http(node, req)))
     });
     let app = app.into_make_service_with_connect_info::<elasticsearch_http::HttpConnection>();
-    match tls {
-        Some(config) => axum::serve(elasticsearch_http::TlsListener::new(listener, config)?, app).await,
-        None => axum::serve(listener, app).await,
+    let mut servers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>> = Vec::new();
+    for l in std::iter::once(listener).chain(extra) {
+        let app = app.clone();
+        servers.push(match &tls {
+            Some(config) => { let l = elasticsearch_http::TlsListener::new(l, config.clone())?; Box::pin(async move { axum::serve(l, app).await }) }
+            None => Box::pin(async move { axum::serve(l, app).await }),
+        });
     }
+    // Ends (with its error) when any listener does, as a single one did.
+    futures::future::select_all(servers).await.0
 }
 
 async fn handle_http(node:Arc<ClusterNode>,req:Request<Body>)->Response<Body>{
     let control=elasticsearch_http::in_flight_policy(req.method().as_str(),req.uri().path(),elasticsearch_http::incremental_bulk(&node.engine))==elasticsearch_http::InFlight::Holds;
     let started=std::time::Instant::now();
-    let r=elasticsearch_engine::memory::request_policy_future(control,handle_http_inner(node,req)).await;
+    let r=elasticsearch_engine::memory::request_policy_future(control,boxed(move || handle_http_inner(node,req))).await;
     stats_phases::record("front_http", vec![("total", started.elapsed().as_micros())]);
     r
 }
@@ -1328,7 +1510,30 @@ async fn handle_http_inner(node: Arc<ClusterNode>, req: Request<Body>) -> Respon
     // it makes below hold their copies without tripping).
     let policy = elasticsearch_http::in_flight_policy(parts.method.as_str(), parts.uri.path(), elasticsearch_http::incremental_bulk(&node.engine));
     let authorization = parts.headers.get("authorization").and_then(|v| v.to_str().ok());
-    let authenticated=elasticsearch_http::security::authenticated(&node.engine, authorization);
+    // ES authenticates on the request headers before aggregating the body
+    // (its HTTP header validator; OPTIONS / CORS preflight is exempt): known-
+    // invalid credentials get their 401, and a saturated crypto pool or a
+    // rate-limited client its 429, without a byte of the body being read.
+    // Expensive password verification runs on the bounded crypto pool,
+    // never on this networking runtime.
+    let authenticated = if parts.method == Method::OPTIONS {
+        elasticsearch_http::security::authenticated(&node.engine, authorization)
+    } else {
+        let peer = parts.extensions.get::<axum::extract::ConnectInfo<elasticsearch_http::HttpConnection>>().and_then(|c| c.0.remote_ip());
+        match elasticsearch_http::security::edge::authenticate(&node.engine, authorization, peer).await {
+            elasticsearch_http::security::edge::EdgeAuth::Authenticated => true,
+            verdict => {
+                let response = match verdict {
+                    elasticsearch_http::security::edge::EdgeAuth::Failed(fail) => edge_unauthorized(&node, fail, &parts),
+                    elasticsearch_http::security::edge::EdgeAuth::Rejected(error) => to_http(err(error)),
+                    elasticsearch_http::security::edge::EdgeAuth::Authenticated => unreachable!(),
+                };
+                elasticsearch_http::http_request(&parts.method, parts.uri.path(), parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"), &parts.headers,
+                    0, parts.extensions.get::<axum::extract::ConnectInfo<elasticsearch_http::HttpConnection>>().map(|c| &c.0)).done(&response);
+                return response;
+            }
+        }
+    };
     let mut _inflight = match elasticsearch_http::InFlightBody::reserve(node.engine.breakers, policy, 0, || authenticated) {
         Ok(r) => r,
         Err(e) => return to_http(err(e)),
@@ -1341,29 +1546,9 @@ async fn handle_http_inner(node: Arc<ClusterNode>, req: Request<Body>) -> Respon
         body.len() as u64, parts.extensions.get::<axum::extract::ConnectInfo<elasticsearch_http::HttpConnection>>().map(|c| &c.0));
     let mut edge_memory=match node.engine.breakers.reserve_native(0,"HTTP edge metadata"){Ok(memory)=>memory,Err(error)=>return to_http(err(error))};
     let mut headers = match header_vec(&parts.headers,&mut edge_memory){Ok(headers)=>headers,Err(error)=>return to_http(err(error))};
-    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(crate::shard_engines::PREFILTER_SHARDS_HEADER)
-        && !name.eq_ignore_ascii_case(ingest::PREPARED_HEADER)
-        && !name.eq_ignore_ascii_case(failure_store::TOKEN_HEADER)
-        && !name.eq_ignore_ascii_case(failure_store::TOKENS_HEADER)
-        && !name.eq_ignore_ascii_case(failure_store::ACK_HEADER)
-        && !name.eq_ignore_ascii_case(failure_store::POSITIONS_HEADER)
-        && !name.eq_ignore_ascii_case(DATA_STREAM_BACKING_WRITE_HEADER)
-        && !name.eq_ignore_ascii_case(esql_dist::FETCH_HEADER)
-        && !name.eq_ignore_ascii_case(SYNONYMS_INNER_HEADER)
-        && !name.eq_ignore_ascii_case(SYSTEM_HEADER)
-        && !name.eq_ignore_ascii_case(RANK_PLAN_HEADER)
-        && !name.eq_ignore_ascii_case(qtf::HEADER)
-        && !name.eq_ignore_ascii_case(qtf::CTX_HEADER)
-        && !name.eq_ignore_ascii_case(qtf::PINNED_HEADER)
-        && !name.eq_ignore_ascii_case(qtf::LIGHT_HEADER)
-        && !name.eq_ignore_ascii_case(elasticsearch_http::HIT_SPANS_HEADER)
-        && !name.eq_ignore_ascii_case(contexts::SCROLL_TOUCH_HEADER)
-        && !name.eq_ignore_ascii_case(esql_dist::COORDINATOR_HEADER)
-        && !name.eq_ignore_ascii_case(copies::READ_COPIES_HEADER)
-        && !name.eq_ignore_ascii_case(fleet_search::WAIT_HEADER)
-        && !name.eq_ignore_ascii_case(NESTED_HEADER)
-        && !name.eq_ignore_ascii_case(adaptive::QUERY_HEADER)
-        && !name.eq_ignore_ascii_case(TRIPS_HEADER));
+    // Internal routing / coordination headers are never accepted from a
+    // client: the node sets them only between its own components.
+    headers.retain(|(name, _)| !is_internal_header(name));
     // Content codings are negotiated here, at the client edge, only: every
     // internal sub-request (per-shard bulk, forwards, fan-outs) must see
     // plain bodies, or the coordinator can't parse the replies it merges.
@@ -1384,15 +1569,32 @@ async fn handle_http_inner(node: Arc<ClusterNode>, req: Request<Body>) -> Respon
     };
     let json_body = map.as_ref().map(|_| body.clone());
     let mut req = match RestReq::try_new(parts.method.as_str(),&uri,&headers,&body,0,Dfs::None,None){Ok(value)=>value,Err(error)=>return to_http(err(error))};
+    // ES `AbstractRestChannel` (`pretty`, `human`: a bad value is a 400 on a
+    // channel without the request's parameters), then
+    // `RestController.validateErrorTrace` (a simple error response), for
+    // every request, before any API runs.
+    let params = req.params();
+    if let Err(error) = elasticsearch_http::channel_params(&params) {
+        return to_http(encode_wire(err(error), wire.as_ref(), is_head));
+    }
+    if let Err(message) = elasticsearch_http::validate_error_trace(&params, elasticsearch_http::detailed_errors_enabled(&node.engine)) {
+        let pretty = elasticsearch_engine::settings::param_bool(params.get("pretty").map(String::as_str), false).unwrap_or(false);
+        let resp = crate::rest::util::render_json(RestResp::json(400, &json!({"error": message, "status": 400})), None, pretty, false);
+        return to_http(encode_wire(resp, wire.as_ref(), is_head));
+    }
+    // Boolean parameters parse strictly (ES `paramAsBoolean`), before any API runs.
+    if let Err(error) = elasticsearch_http::check_bool_params(req.path(), &params) {
+        return to_http(encode_wire(err(error), wire.as_ref(), is_head));
+    }
     // ES applies `filter_path` once, to the final response. Coordinated APIs
     // merge shard / node parts that must arrive whole (sort values, `_shards`,
     // totals), so the parameter stops here and filters the answer below.
     let filter_path = match take_filter_path(&mut req){Ok(value)=>value,Err(error)=>return to_http(err(error))};
     record_search_usage(&node, &req);
     let mut resp = if node.engine.security.enabled() {
-        authorized_frontend(&node, &req).await
+        boxed(|| authorized_frontend(&node, &req)).await
     } else {
-        match ingest::prepare(&node, req, None).await {
+        match boxed(|| ingest::prepare(&node, req, None)).await {
             Ok(req) => dispatch(&node, req).await,
             Err(error) => error,
         }
@@ -1466,7 +1668,7 @@ fn record_search_usage(node: &ClusterNode, req: &RestReq) {
 
 /// Run the existing HTTP validation/security pipeline before the cluster
 /// coordinator. The continuation is an in-process extension, never a header.
-async fn authorized_frontend(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
+pub(crate) async fn authorized_frontend(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
     // Authorization distinguishes an existing index from auto-creation. The
     // applied cluster state can precede its engine mirror; wait before checking
     // privileges so a newly created index does not require create_index again.
@@ -1483,6 +1685,11 @@ async fn authorized_frontend(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp
         return RestResp::error(400, "illegal_argument_exception", "invalid request");
     };
     *request.headers_mut()=headers;
+    // A request this node built for an internal subject (internal headers
+    // never come from clients: the edge strips them), e.g. a remote
+    // cluster's user (`remote_cluster`): authorized as that subject.
+    if is_system(&req.headers) { request.extensions_mut().insert(elasticsearch_http::SystemIdentity); }
+    else if let Some(id) = internal_identity(&req.headers) { request.extensions_mut().insert(elasticsearch_http::InternalIdentity(id)); }
     let state = node.state();
     let mut existing: BTreeSet<String> = state.metadata.indices.keys().cloned().collect();
     for index in state.metadata.indices.values() { existing.extend(index.aliases.keys().cloned()); }
@@ -1519,7 +1726,7 @@ async fn authorized_frontend(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp
             let request_memory = admitted.memory;
             let rest = admitted.value;
             let user = authorized.access.as_deref().map(|access| access.user().clone());
-            let response = match ingest::prepare(&node, rest, user).await {
+            let response = match boxed(|| ingest::prepare(&node, rest, user)).await {
                 Ok(rest) => dispatch(&node, rest).await,
                 Err(error) => error,
             };
@@ -1535,6 +1742,8 @@ async fn authorized_frontend(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp
                     "x-opaque-id" => "x-opaque-id", "content-encoding" => "content-encoding",
                     // SQL text formats carry the cursor and async state in headers.
                     "cursor" => "cursor", "async-id" => "async-id", "async-partial" => "async-partial", "async-running" => "async-running",
+                    // ES|QL async results carry their id and state in headers.
+                    "x-elasticsearch-async-id" => "x-elasticsearch-async-id", "x-elasticsearch-async-is-running" => "x-elasticsearch-async-is-running",
                     _ => return Err(elasticsearch_engine::error::EsError::new(500, "illegal_state_exception", format!("unsupported coordinator response header [{key}]"))),
                 };
                 headers.push((name, admitted::text(&mut header_memory, value)?));
@@ -1662,9 +1871,11 @@ fn header_has(h: &[(String, String)], name: &str, needle: &str) -> bool {
     h.iter().any(|(k, v)| k.eq_ignore_ascii_case(name) && v.to_ascii_lowercase().contains(needle))
 }
 
-/// Periodic cleanup of coordinator-held contexts (expired async searches).
+/// Periodic cleanup of coordinator-held contexts (expired async searches
+/// and composite scrolls with their buffered hits).
 pub(crate) fn reap_expired_contexts() {
     contexts::reap_asyncs();
+    contexts::purge_expired();
 }
 
 /// Inflate a `Content-Encoding: gzip` request body (as the engine does) and
@@ -1705,6 +1916,42 @@ fn header_vec(h: &HeaderMap,memory:&mut elasticsearch_engine::memory::Reservatio
     let mut out=admitted::slots(memory,count)?;
     for (key,value) in h.iter(){if let Ok(value)=value.to_str(){out.push((admitted::text(memory,key.as_str())?,admitted::text(memory,value)?));}}
     Ok(out)
+}
+
+/// Headers the node uses between its own components (shard routing, local
+/// execution, parent tasks, ack-through, system identity, nested dispatch,
+/// QTF / ES|QL / failure-store / fleet / ARS coordination, decoded content
+/// type). A client must never be able to set one: the public edge drops
+/// every `x-rustic-internal-*` / `x-es-cluster-*` header and the listed
+/// others before anything reads them.
+pub(crate) const INTERNAL_HEADERS: &[&str] = &[
+    crate::shard_engines::SHARD_HEADER, crate::shard_engines::PREFILTER_SHARDS_HEADER, EXEC_LOCAL, ACK_THROUGH_HEADER,
+    crate::rest::tasks::PARENT_HEADER, ingest::PREPARED_HEADER, failure_store::TOKEN_HEADER, failure_store::TOKENS_HEADER,
+    failure_store::ACK_HEADER, failure_store::POSITIONS_HEADER, DATA_STREAM_BACKING_WRITE_HEADER, esql_dist::FETCH_HEADER,
+    esql_dist::COORDINATOR_HEADER, esql_dist::FORWARD_HEADER, ESQL_SHARDS_HEADER, SYNONYMS_INNER_HEADER, RELOAD_INNER_HEADER, BLOCK_DRAIN_HEADER, SYSTEM_HEADER, IDENTITY_HEADER,
+    RANK_PLAN_HEADER, qtf::HEADER, qtf::CTX_HEADER, qtf::PINNED_HEADER, qtf::LIGHT_HEADER, elasticsearch_http::HIT_SPANS_HEADER,
+    contexts::SCROLL_TOUCH_HEADER, copies::READ_COPIES_HEADER, fleet_search::WAIT_HEADER, NESTED_HEADER, adaptive::QUERY_HEADER,
+    adaptive::STATS_HEADER, TRIPS_HEADER, PUBLISHED_VERSION_HEADER, elasticsearch_http::xcontent_in::ORIGINAL_CONTENT_TYPE,
+    "x-es-alias-catalog",
+];
+
+pub(crate) fn is_internal_header(name: &str) -> bool {
+    let lower = |prefix: &str| name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes());
+    lower("x-rustic-internal-") || lower("x-es-cluster-") || INTERNAL_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// The security layer's 401 for credentials the edge found invalid, sent
+/// before (and instead of) reading the request body.
+fn edge_unauthorized(node: &ClusterNode, fail: elasticsearch_engine::security::AuthFail, parts: &axum::http::request::Parts) -> Response<Body> {
+    let head = parts.method == Method::HEAD;
+    match elasticsearch_http::security::edge::failure_response(&node.engine, fail, &parts.method, parts.uri.path(), parts.uri.query()) {
+        Some((status, headers, body)) => {
+            let mut response = to_http(RestResp::new(status, headers, body));
+            if head { *response.body_mut() = Body::empty(); }
+            response
+        }
+        None => authentication_required_http(head),
+    }
 }
 
 fn authentication_required_http(head:bool)->Response<Body> {
@@ -1941,10 +2188,32 @@ async fn exec_on(node: &Arc<ClusterNode>, owner: &str, req: RestReq) -> RestResp
     forward(node, owner, &r).await
 }
 
-pub async fn dispatch(node:&Arc<ClusterNode>,req:RestReq)->RestResp{
+/// Whether running `req` straight on the local engine (the [`EXEC_LOCAL`]
+/// branch of `dispatch_inner`) would write documents without the primary's
+/// replication: a single-document write (`_doc`, `_create`, `_update`) or
+/// a `_bulk` that is not the coordinator's trusted data-stream backing
+/// subgroup (run through `local_bulk`).
+fn exec_local_bypasses_replication(req: &RestReq) -> bool {
+    if req.method == "GET" || req.method == "HEAD" {
+        return false;
+    }
+    let segs = req.segments();
+    match segs.last().map(String::as_str) {
+        Some("_bulk") => !req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case(DATA_STREAM_BACKING_WRITE_HEADER) && v == "true"),
+        _ => matches!(segs.get(1).map(String::as_str), Some("_doc" | "_create" | "_update")),
+    }
+}
+
+/// The coordinator dispatch, as a boxed future (it recurses for some
+/// routes, and keeping it on the heap keeps the awaiting poll frames small;
+/// see [`elasticsearch_engine::boxed_future`]).
+pub fn dispatch<'a>(node:&'a Arc<ClusterNode>,req:RestReq)->BoxFuture<'a,RestResp>{
+    Box::pin(dispatch_policy(node,req))
+}
+async fn dispatch_policy(node:&Arc<ClusterNode>,req:RestReq)->RestResp{
     let control=elasticsearch_http::in_flight_policy(&req.method,req.path(),true)==elasticsearch_http::InFlight::Holds;
     let started=std::time::Instant::now();
-    let r=elasticsearch_engine::memory::request_policy_future(control,dispatch_inner(node,req)).await;
+    let r=elasticsearch_engine::memory::request_policy_future(control,boxed(move || dispatch_inner(node,req))).await;
     stats_phases::record("front_dispatch", vec![("total", started.elapsed().as_micros())]);
     r
 }
@@ -1954,6 +2223,16 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
     if req.hops == 0 {
         if let Err(error)=req.retain_headers(|(k,_)|!k.eq_ignore_ascii_case(crate::shard_engines::SHARD_HEADER)){return err(error)};
         if let Err(error)=req.retain_headers(|(k,_)|!k.eq_ignore_ascii_case(crate::rest::tasks::PARENT_HEADER)){return err(error)};
+    }
+    // A document write never runs on the local engine as is: whoever marked
+    // it for local execution, it goes through the primary's write path
+    // below (execute_write: sequencing, replication to every in-sync copy
+    // before the acknowledgement), as every ES write goes through its
+    // replication action's primary phase (production review #89). Only the
+    // trusted data-stream backing bulk keeps the marker: `local_bulk` is
+    // that write path.
+    if req.hops > 0 && req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(EXEC_LOCAL)) && exec_local_bypasses_replication(&req) {
+        if let Err(error)=req.retain_headers(|(k,_)|!k.eq_ignore_ascii_case(EXEC_LOCAL)){return err(error)};
     }
     if req.hops > 0 && req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(EXEC_LOCAL)) {
         let mut r = req;
@@ -1965,7 +2244,7 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
         if r.segments().last().map(String::as_str) == Some("_bulk")
             && r.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case(DATA_STREAM_BACKING_WRITE_HEADER) && v == "true")
         {
-            return local_bulk(node, &r).await;
+            return boxed(|| local_bulk(node, &r)).await;
         }
         if let Some(spec) = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(ACK_THROUGH_HEADER)).map(|(_, v)| v.clone()) {
             let segs = r.segments();
@@ -1975,51 +2254,74 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
                     let (Ok(shard), Ok(seq_no), Ok(term)) = (shard.parse::<u32>(), seq_no.parse::<i64>(), term.parse::<u64>()) else {
                         return RestResp::error(400, "illegal_argument_exception", "malformed acknowledgement request");
                     };
-                    return ack_reply_json(&local_ack_through(node, &segs[0], shard, seq_no, term).await);
+                    return ack_reply_json(&boxed(|| local_ack_through(node, &segs[0], shard, seq_no, term)).await);
                 }
             }
         }
         if r.method() == Method::DELETE && r.path().trim_end_matches('/') == "/_search/scroll/_all" {
-            let freed = match contexts::clear_all_local(node, &r).await { Ok(n) => n, Err(e) => return err(e) };
+            let freed = match boxed(|| contexts::clear_all_local(node, &r)).await { Ok(n) => n, Err(e) => return err(e) };
             return RestResp::json(200, &json!({"succeeded": true, "num_freed": freed}));
         }
-        return wrap_context_ids(node, &r, local_canonical(node, &r).await);
+        return wrap_context_ids(node, &r, boxed(|| local_canonical(node, &r)).await);
     }
     let segs = req.segments();
     let seg_refs: Vec<&str> = segs.iter().map(String::as_str).collect();
-    if let Some(response) = connector_store::handle(node, &req).await {
+    if let Some(response) = boxed(|| connector_store::handle(node, &req)).await {
         return response;
     }
     // Fleet secrets perform internal document/metadata requests through
     // ClusterRest. Do not hold the master's metadata mutation lock around
     // this handler: its index-creation sub-request needs that same lock.
     if seg_refs.starts_with(&["_fleet", "secret"]) {
-        return local_canonical(node, &req).await;
+        return boxed(|| local_canonical(node, &req)).await;
     }
-    if let Some(response) = fleet_checkpoints::handle(node, &req).await {
+    if let Some(response) = boxed(|| fleet_checkpoints::handle(node, &req)).await {
         return response;
     }
-    if let Some(response) = fleet_search::handle(node, &req).await {
+    if let Some(response) = boxed(|| fleet_search::handle(node, &req)).await {
         return response;
     }
-    ccr_follow::await_leader_copies(node, &req).await;
-    if let Some(response) = snapshot_cache_stats::handle(node, &req).await {
+    boxed(|| ccr_follow::await_leader_copies(node, &req)).await;
+    if let Some(response) = boxed(|| snapshot_cache_stats::handle(node, &req)).await {
         return response;
     }
-    if let Some(response) = snapshot_cache_stats::handle_stats(node, &req).await {
+    if let Some(response) = boxed(|| snapshot_cache_stats::handle_stats(node, &req)).await {
         return response;
     }
     if let Some((source, target)) = crate::resize::resize_target(&req) {
-        return crate::resize::handle(node, &req, &source, &target).await;
+        return boxed(|| crate::resize::handle(node, &req, &source, &target)).await;
     }
     if req.method() == Method::POST && seg_refs == ["_query"] {
-        return esql_on_copies(node, &req).await;
+        return boxed(|| esql_on_copies(node, &req)).await;
     }
     if let Some(kind) = xpack_query::kind(req.method.as_str(), &segs, &req.body) {
-        return xpack_query::handle(node, &req, kind).await;
+        return boxed(|| xpack_query::handle(node, &req, kind)).await;
     }
     if req.method() == Method::GET && seg_refs == ["_xpack", "usage"] {
-        return crate::rest::nodes::xpack_usage(node, &req).await;
+        return boxed(|| crate::rest::nodes::xpack_usage(node, &req)).await;
+    }
+    // `_reload_search_analyzers` rebuilds the analyzers on every node (each
+    // keeps its own analyzers of the index): run on each, details merged
+    // (production review #232: it reported reloads it never ran).
+    if req.hops == 0 && matches!(req.method(), Method::GET | Method::POST) && seg_refs.len() == 2 && seg_refs[1] == "_reload_search_analyzers"
+        && !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(RELOAD_INNER_HEADER))
+    {
+        let mut inner = req.clone();
+        if let Err(error) = inner.push_header(RELOAD_INNER_HEADER, "1") { return err(error) }
+        let mut merged = json!({"_shards": {"total": 0, "successful": 0, "failed": 0}, "reload_details": []});
+        let ids: Vec<String> = node.state().nodes.keys().cloned().collect();
+        // One leg per node; each node rebuilds every engine it has (see
+        // the leg handler below).
+        for id in ids {
+            let resp = if id == node.local.id { dispatch(node, inner.clone()).await } else { forward(node, &id, &inner).await };
+            if !resp.is_success() {
+                return resp;
+            }
+            if let Some(v) = resp.body_json() {
+                crate::rest::nodes::merge_reload_details(&mut merged, &v, &id);
+            }
+        }
+        return RestResp::json(200, &merged);
     }
     // A synonyms set update reloads dependent analyzers on every node.
     if req.hops == 0 && matches!(req.method(), Method::PUT | Method::DELETE) && seg_refs.first() == Some(&"_synonyms") && seg_refs.len() >= 2
@@ -2028,12 +2330,12 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
         let set=match SharedText::try_new(seg_refs[1]){Ok(v)=>v,Err(e)=>return err(e)};
         let mut inner = req.clone();
         if let Err(error)=inner.push_header(SYNONYMS_INNER_HEADER,"1"){return err(error)};
-        let mut resp = Box::pin(dispatch(node, inner)).await;
+        let mut resp = dispatch(node, inner).await;
         if resp.is_success(){
             let text=match std::str::from_utf8(&resp.body){Ok(v)=>v,Err(_)=>return resp};
             let mut body=match crate::owned_json::OwnedJson::parse(text){Ok(v)=>v,Err(e)=>return err(e)};
             if body["reload_analyzers_details"].is_object(){
-                let mut reload=match crate::rest::nodes::cluster_synonyms_reload(node,&set).await{Ok(v)=>v,Err(e)=>return err(e)};
+                let mut reload=match boxed(|| crate::rest::nodes::cluster_synonyms_reload(node,&set)).await{Ok(v)=>v,Err(e)=>return err(e)};
                 if let Err(e)=body.prepare_reply_owner(&reload){return err(e)}
                 let mut value=Value::Null;
                 if let Err(e)=reload.transform(|v,_|{value=std::mem::take(v);Ok(())}){return err(e)}
@@ -2045,6 +2347,26 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
         }
         return resp;
     }
+    // A reload leg (see the `_reload_search_analyzers` fan-out above) runs
+    // on this node, in the engine its shard header names. Routed normally,
+    // a non-read index API goes to the master: every leg rebuilt the
+    // master's analyzers and no other node's, while reporting each node as
+    // reloaded (production review #232).
+    if req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(RELOAD_INNER_HEADER)) {
+        return boxed(|| reload_every_engine(node, &req)).await;
+    }
+    // The drain leg of an add-block: this node's own copies (see
+    // `drain_after_block`), never the master's metadata route.
+    if req.hops > 0 && req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(BLOCK_DRAIN_HEADER)) {
+        return boxed(|| local_canonical(node, &req)).await;
+    }
+    // Cross-cluster replication (`crate::ccr`): its APIs run where CCR
+    // decides (the master for changes, every node for stats).
+    if seg_refs.first() == Some(&"_ccr") || seg_refs.get(1) == Some(&"_ccr") {
+        if let Some(r) = crate::ccr::handle(node, &req).await {
+            return r;
+        }
+    }
     let route = classify(&req.method(), &seg_refs);
     // These metadata APIs expand wildcards locally. A node with an
     // incompletely applied index mirror can otherwise return a successful
@@ -2054,13 +2376,13 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
             || segs.get(1).is_some_and(|s| s == "_alias")
             || write_path::is_data_stream_get(&req))
     {
-        await_mirror(node).await;
+        boxed(|| await_mirror(node)).await;
     }
     match route {
         Route::Cluster(api) => {
             let before = node.state().version;
-            let resp = crate::rest::handle(node, api, &req).await;
-            acknowledged(node, &req, before, resp).await
+            let resp = boxed(|| crate::rest::handle(node, api, &req)).await;
+            boxed(|| acknowledged(node, &req, before, resp)).await
         }
         Route::Local if req.method() == Method::GET && (
             segs.first().is_some_and(|s| matches!(s.as_str(), "_connector" | "_connector_sync_job" | "_connector_secret" | "_inference"))
@@ -2072,12 +2394,18 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
             || (segs.first().map(String::as_str) == Some("_query") && segs.get(1).map(String::as_str) == Some("view"))) => {
             // These resource writes are owned by the elected master. A
             // read must use the same owner until its store is replicated.
-            if node.is_master() { local_canonical(node, &req).await }
-            else { crate::rest::forward_to_master(node, &req).await }
+            if node.is_master() { boxed(|| local_canonical(node, &req)).await }
+            else { boxed(|| crate::rest::forward_to_master(node, &req)).await }
         }
-        Route::Local if write_path::is_data_stream_get(&req) => write_path::data_stream_get(node, &req).await,
+        Route::Local if write_path::is_data_stream_get(&req) => boxed(|| write_path::data_stream_get(node, &req)).await,
+        // `_resolve/index` naming remote clusters (ES `ResolveIndexAction`'s remote part).
+        Route::Local if req.method() == Method::GET && segs.len() == 3 && segs[0] == "_resolve" && segs[1] == "index"
+            && elasticsearch_engine::ccr::remote::has_remote_expression(&segs[2]) => {
+            let expr = segs[2].clone();
+            boxed(|| ccs::resolve_index(node, &req, &expr)).await
+        }
         Route::Local => {
-            let response = local_canonical(node, &req).await;
+            let response = boxed(|| local_canonical(node, &req)).await;
             let segments = req.segments();
             if segments.first().map(String::as_str) == Some("_data_stream") && segments.last().map(String::as_str) == Some("_stats") {
                 // Data stream stats broadcast to every active backing-index
@@ -2086,32 +2414,37 @@ async fn dispatch_inner(node: &Arc<ClusterNode>, mut req: RestReq) -> RestResp {
                     body["data_streams"].as_array().cloned().unwrap_or_default()).filter_map(|stream|
                     stream["data_stream"].as_str().map(str::to_string)).collect();
                 if !names.is_empty() {
-                    let response = write_path::data_stream_stats(node, &req, response).await;
-                    return crate::stats_shards::adjust(node, &req, &names.join(","), response).await;
+                    let response = boxed(|| write_path::data_stream_stats(node, &req, response)).await;
+                    let joined = names.join(",");
+                    return boxed(|| crate::stats_shards::adjust(node, &req, &joined, response)).await;
                 }
             }
             response
         },
         Route::Master => {
             let before = node.state().version;
-            let resp = on_master(node, &req).await;
-            acknowledged(node, &req, before, resp).await
+            let resp = boxed(|| on_master(node, &req)).await;
+            let resp = boxed(|| acknowledged(node, &req, before, resp)).await;
+            if req.hops == 0 && resp.is_success() && is_add_write_block(&req) {
+                return boxed(|| drain_after_block(node, &req, resp)).await;
+            }
+            resp
         }
-        Route::Write { index } if write_path::is_by_query(&req) => write_path::by_query(node, &req, &index).await,
-        Route::Write { index } => write(node, &req, &index).await,
-        Route::Bulk { default_index } => bulk_route(node, &req, default_index.as_deref()).await,
+        Route::Write { index } if write_path::is_by_query(&req) => boxed(|| write_path::by_query(node, &req, &index)).await,
+        Route::Write { index } => boxed(|| write(node, &req, &index)).await,
+        Route::Bulk { default_index } => boxed(|| bulk_route(node, &req, default_index.as_deref())).await,
         // A client search runs as its coordinating search task.
         Route::Read { targets } if search_task::coordinates(&req) => {
             // A retriever's child search runs as the client task's child.
             let (parent_id, parent_token) = match search_task::take_linked() { Some((id, token)) => (Some(id), token), None => (None, None) };
-            search_task::run(node, &req, search_task::SEARCH_ACTION, parent_id.as_deref(), parent_token, |r| async move { read(node, &r, &targets).await }).await
+            boxed(|| search_task::run(node, &req, search_task::SEARCH_ACTION, parent_id.as_deref(), parent_token, |r| async move { boxed(|| read(node, &r, &targets)).await })).await
         }
-        Route::Read { targets } => read(node, &req, &targets).await,
-        Route::Broadcast { targets, op } => broadcast(node, &req, &targets, op).await,
+        Route::Read { targets } => boxed(|| read(node, &req, &targets)).await,
+        Route::Broadcast { targets, op } => boxed(|| broadcast(node, &req, &targets, op)).await,
         Route::Context(ContextKind::Scroll) if search_task::coordinates_scroll(&req) => {
-            search_task::run(node, &req, search_task::SCROLL_ACTION, None, None, |r| async move { context(node, &r, ContextKind::Scroll).await }).await
+            boxed(|| search_task::run(node, &req, search_task::SCROLL_ACTION, None, None, |r| async move { boxed(|| context(node, &r, ContextKind::Scroll)).await })).await
         }
-        Route::Context(kind) => context(node, &req, kind).await,
+        Route::Context(kind) => boxed(|| context(node, &req, kind)).await,
     }
 }
 
@@ -2790,6 +3123,37 @@ fn wanted_active_shards(node: &ClusterNode, req: &RestReq, index: &str) -> Optio
     }
 }
 
+/// A write's admission check on shard `shard` of `index`: with fewer active
+/// copies than `wanted`, ES's 503 `unavailable_shards_exception` (retryable
+/// until `timeout`; nothing has executed). `None`: enough copies.
+fn active_copies_shortfall(st: &elasticsearch_cluster::state::ClusterState, index: &str, shard: u32, wanted: ActiveShards, timeout: Duration) -> Option<RestResp> {
+    let m = st.metadata.indices.get(index)?;
+    let (needed, label) = match wanted {
+        ActiveShards::All => (m.number_of_replicas as usize + 1, "ALL".to_string()),
+        ActiveShards::Count(n) => (n, n.to_string()),
+    };
+    // One copy: the primary the write is routed to (checked there).
+    if needed <= 1 {
+        return None;
+    }
+    let have = st.routing_table.shard_table(index, shard).map(|t| t.copies.iter().filter(|c| c.active()).count()).unwrap_or(0);
+    (have < needed).then(|| RestResp::error(503, "unavailable_shards_exception", &format!(
+        "[{index}][{shard}] Not enough active copies to meet shard count of [{label}] (have {have}, needed {needed}). Timeout: [{}]",
+        time_value(timeout))))
+}
+
+/// A duration as ES's `TimeValue` prints it (`1m`, `30s`, `500ms`).
+fn time_value(d: Duration) -> String {
+    let ms = d.as_millis();
+    match ms {
+        0 => "0s".to_string(),
+        ms if ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
+        ms if ms % 60_000 == 0 => format!("{}m", ms / 60_000),
+        ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
+        ms => format!("{ms}ms"),
+    }
+}
+
 /// Wait until every shard of `index` has the wanted active copies.
 async fn wait_for_active_shards(node: &ClusterNode, index: &str, wanted: ActiveShards, timeout: Duration) -> bool {
     let mut rx = node.subscribe();
@@ -2850,6 +3214,22 @@ async fn concrete_write_index(node: &Arc<ClusterNode>, name: &str, auto_create: 
     // stream is not mistaken for an auto-create candidate (or a missing
     // backing index).
     await_mirror(node).await;
+    // An accepted lazy rollover (`rollover_on_write`) of the target data
+    // stream (or a data stream alias's write data stream) happens before
+    // the write: the master resolves the write target, rolling the stream
+    // over exactly once however many writers ask, and every node applies
+    // the new generation before the write is routed to it.
+    if node.engine.pending_lazy_rollover(name) {
+        let r: Result<SharedText, RemoteError> = node.to_master(ACTION_AUTO_CREATE, &name, Duration::from_secs(30)).await;
+        return match r {
+            Ok(c) => {
+                wait_for_primary(node, &c, Duration::from_secs(60)).await;
+                await_mirror(node).await;
+                Ok(c)
+            }
+            Err(e) => Err(RestResp::from_remote(&e)),
+        };
+    }
     let engine = node.engine.clone();
     let n = SharedText::try_new(name).map_err(err)?;
     let local = tokio::task::spawn_blocking(move || engine.write_index(&n, false).and_then(|s|SharedText::try_new(&s.name))).await.ok();
@@ -3005,24 +3385,31 @@ fn prepare_write(req: &RestReq, new_id: impl FnOnce() -> String) -> elasticsearc
     })
 }
 
-/// A create answered 409 on a retry: decide whether the document there is
-/// the one this very request wrote on an earlier attempt whose response was
-/// lost, and if so return the success that attempt would have returned.
+/// Whether a retry's conflict can be proven to be the request's own earlier
+/// attempt. Only for a create whose id the coordinator generated: nobody
+/// else knows the id, so the document's existence is the proof (ES dedups
+/// these the same way, by the auto-generated id and `isRetry`).
 ///
-/// For a coordinator-generated id the document's existence is the proof
-/// (nobody else knows the id). For a client-supplied id (`expect_source`)
-/// it is a heuristic: the document must be at version 1 with exactly the
-/// source this request sent.
-async fn confirm_created(node: &Arc<ClusterNode>, conflict: &Value, index: &str, raw_id: &str, routing: Option<&str>, expect_source: Option<&Value>, deadline: tokio::time::Instant) -> elasticsearch_engine::error::Result<Option<Value>> {
+/// Never for a client-supplied id (create, `if_seq_no`/`if_primary_term`,
+/// external versions): another client can send the identical request, and
+/// comparing the stored document's content, version or seq_no cannot tell
+/// which request wrote it. Turning such a conflict into success could tell
+/// two competing writers that both won (production review #14). Without a
+/// durable operation identity the outcome stays unknown: the lost attempt's
+/// error, never a success and never a definite failure.
+fn retry_conflict_provable(create: bool, generated: bool) -> bool {
+    create && generated
+}
+
+/// A create with a coordinator-generated id answered 409 on a retry (see
+/// [`retry_conflict_provable`]): the document there is the one this very
+/// request wrote on an earlier attempt whose response was lost; return the
+/// success that attempt would have returned once the primary acknowledges it.
+async fn confirm_created(node: &Arc<ClusterNode>, conflict: &Value, index: &str, raw_id: &str, routing: Option<&str>, deadline: tokio::time::Instant) -> elasticsearch_engine::error::Result<Option<Value>> {
     let index = conflict["index"].as_str().unwrap_or(index);
     let Some((doc, at)) = primary_doc(node, index, raw_id, routing).await? else { return Ok(None) };
     if doc["found"] != json!(true) {
         return Ok(None);
-    }
-    if let Some(src) = expect_source {
-        if doc["_version"] != json!(1) || &doc["_source"] != src {
-            return Ok(None);
-        }
     }
     if !acked_on_primary(node, &doc, &at, deadline).await {
         return Ok(None);
@@ -3216,52 +3603,13 @@ fn own_echo(delete: bool, status: u16, body: &Value) -> bool {
     status == 409 || (delete && status == 404 && body["result"] == "not_found")
 }
 
-/// The condition a conditional index request carried.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Condition {
-    if_seq_no: Option<i64>,
-    version: Option<i64>,
-}
-
-/// Whether the document now stored (`doc`, a GET response) is what a
-/// conditional index request with this `source` wrote: same source, and a
-/// seq_no above the one it required (`if_seq_no`) or exactly its external
-/// `version`. A heuristic, as for creates with a client-supplied id: another
-/// request sending the identical source under the same condition is
-/// indistinguishable (and then equally "this" write).
-fn is_own_write(doc: &Value, source: &Value, cond: Condition) -> bool {
-    if doc["found"] != json!(true) || &doc["_source"] != source {
-        return false;
-    }
-    match (cond.if_seq_no, cond.version) {
-        (Some(required), _) => doc["_seq_no"].as_i64().is_some_and(|s| s > required),
-        (None, Some(v)) => doc["_version"].as_i64() == Some(v),
-        (None, None) => false,
-    }
-}
-
-/// A conditional index answered 409 on a retry: if the stored document is
-/// the one this request wrote on its lost attempt, the success to return.
-async fn confirm_written(node: &Arc<ClusterNode>, conflict: &Value, index: &str, raw_id: &str, routing: Option<&str>, source: &Value, cond: Condition, deadline: tokio::time::Instant) -> elasticsearch_engine::error::Result<Option<Value>> {
-    let index = conflict["index"].as_str().unwrap_or(index);
-    let Some((doc, at)) = primary_doc(node, index, raw_id, routing).await? else { return Ok(None) };
-    if !is_own_write(&doc, source, cond) || !acked_on_primary(node, &doc, &at, deadline).await {
-        return Ok(None);
-    }
-    let result = if doc["_version"] == json!(1) { "created" } else { "updated" };
-    Ok(Some(write_result(node, &doc, index, result)))
-}
-
-/// The raw id of an index request (`PUT|POST /{index}/_doc/{id}`).
-fn indexed_id(req: &RestReq) -> Option<String> {
-    let raw: Vec<&str> = req.path().split('/').filter(|s| !s.is_empty()).collect();
-    match (req.method.as_str(), raw.as_slice()) {
-        ("PUT" | "POST", [_, "_doc", id]) => Some(id.to_string()),
-        _ => None,
-    }
-}
-
 async fn write(node: &Arc<ClusterNode>, req: &RestReq, index: &str) -> RestResp {
+    // ES parses `refresh` while building the request: an invalid value
+    // fails before the index is auto-created or the document written (and
+    // never after the primary executed and replicated the operation).
+    if let Err(e) = elasticsearch_http::validate_refresh(req.params().get("refresh").map(String::as_str)) {
+        return RestResp::json(e.status, &e.to_json_with_trace(false));
+    }
     let mut stable = req.clone();
     if let Err(e) = failure_store::prepare_single(&mut stable) { return err(e); }
     let req = &stable;
@@ -3296,22 +3644,16 @@ async fn write(node: &Arc<ClusterNode>, req: &RestReq, index: &str) -> RestResp 
             let conflict = r.body_json().map(|v| v["error"].clone()).unwrap_or(Value::Null);
             let params = req.params();
             let routing = params.get("routing").map(|r| encode_component(r));
-            if let Some(op) = &create {
-                let source = if op.generated { None } else { Some(req.json().unwrap_or(Value::Null)) };
-                if let Some(created) = match confirm_created(node, &conflict, index, &op.raw_id, routing.as_deref(), source.as_ref(), deadline).await {Ok(value)=>value,Err(error)=>return err(error)} {
+            if let Some(op) = create.as_ref().filter(|op| retry_conflict_provable(true, op.generated)) {
+                if let Some(created) = match confirm_created(node, &conflict, index, &op.raw_id, routing.as_deref(), deadline).await {Ok(value)=>value,Err(error)=>return err(error)} {
                     tracing::info!(index, id = %op.raw_id, "retried create already applied by an earlier attempt: returning its result");
                     return RestResp::json(201, &created);
                 }
-            } else if let (Some(id), Some(source)) = (indexed_id(req), req.json()) {
-                let cond = Condition { if_seq_no: params.get("if_seq_no").and_then(|v| v.parse().ok()), version: params.get("version").and_then(|v| v.parse().ok()) };
-                if let Some(written) = match confirm_written(node, &conflict, index, &id, routing.as_deref(), &source, cond, deadline).await {Ok(value)=>value,Err(error)=>return err(error)} {
-                    tracing::info!(index, id = %id, "retried conditional write already applied by an earlier attempt: returning its result");
-                    let status = if written["result"] == "created" { 201 } else { 200 };
-                    return RestResp::json(status, &written);
-                }
             }
             // The earlier attempt may be what this answer reflects and
-            // that cannot be told: the outcome is unknown, not a failure.
+            // that cannot be told (a client-supplied id or condition can be
+            // another writer's identical request): the outcome is unknown,
+            // neither a failure nor a success.
             tracing::info!(index, status = r.status, "retry answer may reflect the request's own earlier attempt: reporting the outcome as unknown");
             return lost.clone();
         }
@@ -3319,11 +3661,32 @@ async fn write(node: &Arc<ClusterNode>, req: &RestReq, index: &str) -> RestResp 
             return r;
         }
         if is_indeterminate(&r) {
+            // A scripted update that may have run is never run again: the
+            // outcome is unknown (production review #35).
+            if req.segments().get(1).map(String::as_str) == Some("_update") && replay_unsafe_update(std::str::from_utf8(&req.body).ok()) {
+                tracing::info!(index, "scripted update may have executed: reporting the outcome as unknown instead of replaying it");
+                return r;
+            }
             lost = Some(r.clone());
         }
         if !wait_state_change(node, deadline).await {
             return r;
         }
+    }
+}
+
+/// Whether an update request (its body) must not be replayed after an
+/// attempt that may have executed: a scripted update (`script`, also
+/// `scripted_upsert`) is not idempotent, as an increment shows, and no
+/// operation identity survives a change of primary that would recognise its
+/// first application. A partial-document update (`doc`, `upsert`,
+/// `doc_as_upsert`) re-applies to the same document, as a client's own
+/// retry would. Unparseable bodies are answered by the engine, never
+/// replayed blindly either.
+fn replay_unsafe_update(body: Option<&str>) -> bool {
+    match body.map(serde_json::from_str::<Value>) {
+        Some(Ok(v)) => v.get("script").is_some(),
+        _ => true,
     }
 }
 
@@ -3390,6 +3753,14 @@ async fn write_once(node: &Arc<ClusterNode>, req: &RestReq, index: &str, pinned:
         // in `write_path::by_query`); client requests have it stripped.
         None => crate::shard_engines::shard_of(&req.headers).unwrap_or(0),
     };
+    // `wait_for_active_shards` (else `index.write.wait_for_active_shards`):
+    // not enough active copies of the target shard is ES's retryable
+    // `UnavailableShardsException`, before anything is mutated
+    // (`ReplicationOperation.checkActiveShardCount`); the write loop waits
+    // for a state change until `timeout`.
+    if let Some(r) = wanted_active_shards(node, req, &concrete).and_then(|wanted| active_copies_shortfall(&node.state(), &concrete, shard, wanted, request_timeout(req))) {
+        return r;
+    }
     // A data stream write goes to the backing index this coordinator
     // resolved, by name, once it has run the data stream's own checks: the
     // primary's node never resolves the write index again (it may have
@@ -3643,6 +4014,10 @@ async fn bulk_route(node: &Arc<ClusterNode>, req: &RestReq, default_index: Optio
 }
 
 async fn bulk_route_held(node: &Arc<ClusterNode>, req: &RestReq, default_index: Option<&str>) -> RestResp {
+    // As for single-document writes: validated before any item runs.
+    if let Err(e) = elasticsearch_http::validate_refresh(req.params().get("refresh").map(String::as_str)) {
+        return RestResp::json(e.status, &e.to_json_with_trace(false));
+    }
     if let Some(b) = node.state().blocks.global_blocked("write") {
         return RestResp::error(503, "cluster_block_exception", &format!("blocked by: [SERVICE_UNAVAILABLE/{}/{}];", b.id, b.description));
     }
@@ -3687,6 +4062,8 @@ async fn bulk_route_held(node: &Arc<ClusterNode>, req: &RestReq, default_index: 
     let mut parts: Vec<(Vec<usize>, bulk::PartResult)> = Vec::new();
     let mut raw_sources = elasticsearch_engine::source_json::ResponseSources::default();
     let mut resolved: HashMap<(String, bool), Result<SharedText, RestResp>> = HashMap::new();
+    // Backing index → its data stream, for items sent through an alias.
+    let mut alias_streams: HashMap<String, Option<String>> = HashMap::new();
     let mut tsdb_routing = crate::shard_engines::TsdbRoutingCache::default();
     let mut internal_backing_writes = BTreeSet::new();
     let mut pending: Vec<usize> = (0..items.len()).collect();
@@ -3697,6 +4074,9 @@ async fn bulk_route_held(node: &Arc<ClusterNode>, req: &RestReq, default_index: 
         let mut by_node: std::collections::BTreeMap<(String, u32), Vec<usize>> = Default::default();
         let url_routing = req.params().get("routing").cloned();
         let mut waiting: Vec<(usize, bulk::PartResult)> = Vec::new();
+        // `wait_for_active_shards` per concrete index (the URL's, else the
+        // index's `index.write.wait_for_active_shards`).
+        let mut wanted_by_index: HashMap<String, Option<ActiveShards>> = HashMap::new();
         let st = node.state();
         for &i in &pending {
             let it = &items[i];
@@ -3855,16 +4235,27 @@ async fn bulk_route_held(node: &Arc<ClusterNode>, req: &RestReq, default_index: 
                     let stream_is_known = node.engine.data_stream(&key.0).is_some()
                         || node.state().metadata.customs.get("data_stream").and_then(Value::as_object)
                             .is_some_and(|streams| streams.contains_key(&key.0));
-                    if matches!(items[i].op.as_str(), "index" | "create") && stream_is_known {
+                    // A data stream alias resolved to its write data stream's
+                    // backing index: the item goes there too (a shard node
+                    // resolving the alias itself sees only the backing
+                    // indices it holds copies of).
+                    let stream: Option<String> = if stream_is_known {
+                        Some(key.0.clone())
+                    } else if concrete.as_str() != key.0 && matches!(items[i].op.as_str(), "index" | "create") {
+                        alias_streams.entry(concrete.as_str().to_string()).or_insert_with(|| node.engine.data_stream_of_index(concrete.as_str())).clone()
+                    } else {
+                        None
+                    };
+                    if let (true, Some(stream)) = (matches!(items[i].op.as_str(), "index" | "create"), stream.as_deref()) {
                         let checked = match (items[i].source_line.as_deref(), scan.as_ref()) {
-                            (Some(src), Some(scan)) => node.engine.check_data_stream_write_only_probed(&key.0, items[i].create, Some((src, scan))),
-                            (src, _) => node.engine.check_data_stream_write_only(&key.0, items[i].create, src),
+                            (Some(src), Some(scan)) => node.engine.check_data_stream_write_only_probed(stream, items[i].create, Some((src, scan))),
+                            (src, _) => node.engine.check_data_stream_write_only(stream, items[i].create, src),
                         };
                         if let Err(e) = checked {
                             let meta: Value = serde_json::from_str(&items[i].action_line).ok()
                                 .and_then(|line: Value| line.as_object().and_then(|object| object.values().next().cloned())).unwrap_or(Value::Null);
                             let routing = meta["routing"].as_str().map(str::to_string).or_else(|| url_routing.clone());
-                            let response = failure_store::bulk_prewrite_failure(node, req, &key.0, items[i].id.as_deref(),
+                            let response = failure_store::bulk_prewrite_failure(node, req, stream, items[i].id.as_deref(),
                                 routing.as_deref(), items[i].source_line.as_deref().unwrap_or_default(), e, i).await;
                             let mut result = response.body_json().unwrap_or(Value::Null);
                             let item = if response.is_success() {
@@ -3885,6 +4276,15 @@ async fn bulk_route_held(node: &Arc<ClusterNode>, req: &RestReq, default_index: 
                         }
                         items[i].retarget(concrete);
                         internal_backing_writes.insert(i);
+                    }
+                    // Not enough active copies of the item's shard: nothing is
+                    // sent; retried on the next state until `timeout`, as ES's
+                    // per-shard `checkActiveShardCount`.
+                    let wanted = *wanted_by_index.entry(concrete.as_str().to_string()).or_insert_with(|| wanted_active_shards(node, req, concrete.as_str()));
+                    if let Some(short) = wanted.and_then(|w| active_copies_shortfall(&state, concrete.as_str(), shard, w, request_timeout(req))) {
+                        let error = short.body_json().map(|v| v["error"].clone()).unwrap_or(Value::Null);
+                        waiting.push((i, bulk::PartResult::Failed { status: short.status, error }));
+                        continue;
                     }
                     match primary_node_of(node, concrete, shard) {
                         Some(n) => by_node.entry((n, shard)).or_default().push(i),
@@ -3964,11 +4364,20 @@ async fn bulk_route_held(node: &Arc<ClusterNode>, req: &RestReq, default_index: 
                     // out connection the group may have executed: remember
                     // that, so a create that then conflicts with its own
                     // first attempt is recognised below.
-                    if is_indeterminate(&r) {
+                    let lost = is_indeterminate(&r);
+                    if lost {
                         indeterminate.extend(positions.iter().map(|i| (*i, (r.status, err.clone()))));
                     }
                     for i in positions {
-                        retry.push((i, bulk::PartResult::Failed { status: r.status, error: err.clone() }));
+                        let failed = bulk::PartResult::Failed { status: r.status, error: err.clone() };
+                        // A scripted update item that may have run is not
+                        // run again: its outcome stays unknown (see
+                        // `replay_unsafe_update`).
+                        if lost && items[i].op == "update" && replay_unsafe_update(items[i].source_line.as_deref()) {
+                            parts.push((vec![i], failed));
+                        } else {
+                            retry.push((i, failed));
+                        }
                     }
                 } else {
                     parts.push((positions, bulk::PartResult::Failed { status: r.status, error: err }));
@@ -4008,19 +4417,14 @@ async fn bulk_route_held(node: &Arc<ClusterNode>, req: &RestReq, default_index: 
                 if !own_echo(it.op == "delete", inner["status"].as_u64().unwrap_or(0) as u16, &inner) {
                     continue;
                 }
-                let meta: Value = serde_json::from_str(&it.action_line).ok().and_then(|l: Value| l.as_object().and_then(|o| o.values().next().cloned())).unwrap_or(Value::Null);
-                let routing = meta["routing"].as_str().map(encode_component);
-                let sent: Option<Value> = it.source_line.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok());
+                // The item's effective routing (its own, else the URL's).
+                let routing = it.routing.clone().or_else(|| req.params().get("routing").cloned()).map(|r| encode_component(&r));
                 let index = it.index.clone().unwrap_or_default();
                 let mut confirmed: Option<Value> = None;
-                if let Some(id) = it.id.as_deref() {
-                    if it.create {
-                        let source = if it.generated { None } else { Some(sent.clone().unwrap_or(Value::Null)) };
-                        confirmed = match confirm_created(node, &inner["error"], &index, &encode_component(id), routing.as_deref(), source.as_ref(), deadline).await {Ok(value)=>value,Err(error)=>return err(error)};
-                    } else if let (true, Some(source)) = (it.op == "index", &sent) {
-                        let cond = Condition { if_seq_no: meta["if_seq_no"].as_i64(), version: meta["version"].as_i64() };
-                        confirmed = match confirm_written(node, &inner["error"], &index, &encode_component(id), routing.as_deref(), source, cond, deadline).await {Ok(value)=>value,Err(error)=>return err(error)};
-                    }
+                // Only a coordinator-generated id proves the conflict is the
+                // item's own attempt (see `retry_conflict_provable`).
+                if let (Some(id), true) = (it.id.as_deref(), retry_conflict_provable(it.create, it.generated)) {
+                    confirmed = match confirm_created(node, &inner["error"], &index, &encode_component(id), routing.as_deref(), deadline).await {Ok(value)=>value,Err(error)=>return err(error)};
                 }
                 let replacement = match confirmed {
                     Some(mut done) => {
@@ -4171,7 +4575,7 @@ async fn local_bulk_json(node: &Arc<ClusterNode>, req: &RestReq, names: BTreeSet
 fn ccs_endpoint(req: &RestReq) -> bool {
     let segs = req.segments();
     segs.len() == 2 && match segs[1].as_str() {
-        "_search" | "_count" | "_pit" => true,
+        "_search" | "_count" | "_pit" | "_terms_enum" => true,
         "_async_search" => req.method() == Method::POST,
         _ => false,
     }
@@ -4183,68 +4587,28 @@ fn encode_targets(targets: &str) -> String {
     targets.split(',').map(|part| encode_component(part).replace("%2A", "*")).collect::<Vec<_>>().join(",")
 }
 
-/// A local+remote read: the shared CCS plan fails a required remote, skips an
-/// optional one, and the local part runs as an ordinary cluster read (every
-/// shard, on whichever nodes hold it). Searches report `_clusters`.
+/// A read whose index expression names remote clusters: ES CCS
+/// (`ccs::read`).
 async fn ccs_read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp {
-    let started = std::time::Instant::now();
-    let plan = match elasticsearch_engine::ccr::remote::ccs_plan(&node.engine, targets) {
-        Ok(plan) => plan,
-        Err(error) => {
-            node.engine.ccs_stats.lock().record(started.elapsed().as_millis() as u64, &[], &[], false, true, targets.contains(['*', '?']));
-            return err(error);
-        }
-    };
-    let search = matches!(req.segments().last().map(String::as_str), Some("_search" | "_async_search"));
-    let Some(local) = plan.local_expr() else {
-        // Nothing of this cluster is read: the engine renders the empty
-        // (skipped) answer through the same plan, with no local shard.
-        return wrap_context_ids(node, req, local_canonical(node, req).await);
-    };
-    let rest = req.path().trim_start_matches('/').split_once('/').map(|(_, rest)| rest).unwrap_or("");
-    let query = req.query();
-    let mut local_req = req.clone();
-    if let Err(error) = local_req.set_uri_fmt(format_args!("/{}/{rest}{}{query}", encode_targets(&local), if query.is_empty() { "" } else { "?" })) {
-        return err(error);
+    ccs::read(node, req, targets).await
+}
+
+/// Whether `req` asks for unmerged per-shard results (the CCS reduce of a
+/// coordinating cluster merges them, `ccs`).
+pub(crate) fn ccs_parts(req: &RestReq) -> bool {
+    req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(crate::remote_cluster::CCS_PARTS_HEADER))
+}
+
+/// The DFS round a CCS parts request asks for (`ccs::dfs_header`).
+fn ccs_dfs(req: &RestReq) -> EsResult<Option<Dfs>> {
+    let Some((_, v)) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(crate::remote_cluster::CCS_DFS_HEADER)) else { return Ok(None) };
+    if v == "collect" {
+        return Ok(Some(Dfs::Collect));
     }
-    // The response is patched below: ask for it uncompressed.
-    if search {
-        if let Err(error) = local_req.retain_headers(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding")) { return err(error); }
-    }
-    // A submitted async search keeps the plan with its stored result, so a
-    // later `GET _async_search/{id}` still reports the skipped remotes. It
-    // runs as the cluster async search (the local part as an ordinary
-    // cluster `_search`), wherever the local shards are.
-    let submit = req.method() == Method::POST && req.segments().last().map(String::as_str) == Some("_async_search");
-    let mut resp = if submit {
-        let holders = Default::default();
-        async_search_ccs(node, &local_req, &holders, plan.clone()).await
-    } else {
-        Box::pin(read(node, &local_req, &local)).await
-    };
-    if search {
-        let aliases = plan.aliases();
-        node.engine.ccs_stats.lock().record(started.elapsed().as_millis() as u64, &aliases, &aliases, resp.is_success(),
-            req.params().get("ccs_minimize_roundtrips").is_none_or(|v| v != "false"), targets.contains(['*', '?']));
-        if resp.is_success() && !is_gzip(&resp) {
-            // Members are patched losslessly (hits keep their exact text).
-            use elasticsearch_engine::source_json::{raw_members, with_member};
-            let patched = std::str::from_utf8(&resp.body).ok().and_then(|text| {
-                // `POST _async_search` wraps the search response.
-                let wrapped = raw_members(text)?.into_iter().find(|(k, _)| k == "response").map(|(_, v)| v.get().to_string());
-                let inner = wrapped.as_deref().unwrap_or(text);
-                let summary: Value = serde_json::from_str(inner).ok()?;
-                let clusters = plan.clusters(Some(&summary)).to_string();
-                let inner = with_member(inner, "_clusters", &clusters, false)?;
-                match wrapped { Some(_) => with_member(text, "response", &inner, false), None => Some(inner) }
-            });
-            if let Some(body) = patched {
-                resp.replace_body(body.into_bytes());
-                resp.retain_headers(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-            }
-        }
-    }
-    resp
+    let bad = || elasticsearch_engine::error::EsError::illegal_argument("malformed cross-cluster DFS statistics");
+    let raw = v.strip_prefix("use:").and_then(elasticsearch_engine::ccr::remote::hex_decode).ok_or_else(bad)?;
+    let stats: elasticsearch_http::DfsStats = serde_json::from_slice(&raw).map_err(|_| bad())?;
+    Ok(Some(Dfs::Use(SharedDfsStats::try_new(&stats)?)))
 }
 
 /// Run a read on a node holding an active copy of every target index.
@@ -4273,18 +4637,30 @@ async fn read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp
     // A PIT search runs where the PIT lives.
     if let Some(pit) = request_body.and_then(|v| v["pit"]["id"].as_str().map(str::to_string)) {
         if let Some((_, inner)) = unwrap_id(&pit) {
+            // A cross-cluster point in time: every cluster's own.
+            if inner.starts_with(ccs::PIT_PREFIX) {
+                return Box::pin(ccs::search_pit(node, req, &pit, inner)).await;
+            }
             if inner.starts_with(contexts::PIT_PREFIX) {
                 if let Some(r) = contexts::search_pit(node, req, &pit, inner).await {
                     return r;
                 }
             }
         }
-        return context_forward(node, req, &pit, |body, inner| {
+        // A coordinating cluster's cross-cluster reduce: the shard context's
+        // own result (shard state kept).
+        let parts = ccs_parts(req);
+        let mut fwd = req.clone();
+        if parts {
+            if let Err(e) = fwd.replace_header(crate::shard_engines::PREFILTER_SHARDS_HEADER, "1") { return err(e); }
+        }
+        let r = context_forward(node, &fwd, &pit, |body, inner| {
             let mut v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             v["pit"]["id"] = json!(inner);
             serde_json::to_vec(&v).unwrap_or_default()
         })
         .await;
+        return if parts { ccs::single_pit_part(r) } else { r };
     }
     let st = node.state();
     if let Some(b) = st.blocks.global_blocked("read") {
@@ -4301,6 +4677,7 @@ async fn read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp
     if ccs_endpoint(req) && elasticsearch_engine::ccr::remote::has_remote_expression(targets) {
         return ccs_read(node, req, targets).await;
     }
+    let parts_mode = ccs_parts(req) && req.segments().last().map(String::as_str) == Some("_search");
     let opts = ResolveOpts::from_params(&req.params());
     // Resolve against a whole mirror (see `await_mirror`), else a
     // recovering node would answer for an index it momentarily lacks.
@@ -4317,10 +4694,23 @@ async fn read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp
     };
     let names = match resolved {
         Some(Ok(n)) if !n.is_empty() => n,
+        // A remote cluster's part that matches nothing: no shard result.
+        Some(Ok(_)) if parts_mode => return RestResp::json(200, &ccs::no_parts()),
         // Errors (index_not_found, ...) and empty matches render exactly
         // as the engine renders them.
         _ => return wrap_context_ids(node, req, local_canonical(node, req).await),
     };
+    // Runtime `lookup` fields (request-level or mapped on the targets): the
+    // coordinator resolves them on the merged hits (their target documents
+    // may live on any node).
+    if req.segments().last().map(String::as_str) == Some("_search") && !lookup_fields::planned(req) {
+        if let Some(body) = request_body {
+            let mapped = lookup_fields::mapped_lookups(&st, &names);
+            if let Some(plan) = lookup_fields::plan(body, &mapped) {
+                return lookup_fields::run(node, req, targets, plan).await;
+            }
+        }
+    }
     if matches!(req.segments().last().map(String::as_str), Some("_search" | "_count" | "_async_search")) {
         if let Some(body) = request_body.filter(|body| query_rewrite::needed(body)) {
             match query_rewrite::rewrite(node, req, body.clone()).await {
@@ -4332,6 +4722,13 @@ async fn read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp
                 Ok(None) => {}
                 Err(response) => return response,
             }
+        }
+    }
+    // A coordinating cluster's CCS reduce wants every shard's own result:
+    // always the per-shard fan-out (never one node's merged answer).
+    if parts_mode {
+        if let Some(r) = multi_shard_read(node, req, &names).await {
+            return r;
         }
     }
     let segs = req.segments();
@@ -4428,6 +4825,7 @@ async fn read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp
                     if let Err(e) = local.set_read_copies(&names.iter().cloned().collect::<Vec<_>>()) { return err(e); }
                     let bound = copies::copy_bound(&req.params(), &Value::Null);
                     let mut last = None;
+                    let mut last_node = String::new();
                     // Nodes the per-shard fallback does not try again: those
                     // that failed as nodes, and, for one index, every node
                     // that failed it (a hung node is not waited for twice).
@@ -4447,6 +4845,7 @@ async fn read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp
                         }
                         if last.as_ref().map_or(true, |prev| copies::replaces(prev, &r)) {
                             last = Some(r);
+                            last_node = c.clone();
                         }
                     }
                     // No such node answered. A search, count, scroll or PIT
@@ -4463,7 +4862,9 @@ async fn read(node: &Arc<ClusterNode>, req: &RestReq, targets: &str) -> RestResp
                             for (n, h) in &holders {
                                 let left: BTreeSet<String> = h.iter().filter(|c| !tried.contains(*c)).cloned().collect();
                                 if left.is_empty() && names.len() == 1 {
-                                    let failures = copies::ShardFailure::from_response(&r, std::slice::from_ref(n), 0, "");
+                                    // The node whose answer this is (ES names the
+                                    // shard's node in `failed_shards`).
+                                    let failures = copies::ShardFailure::from_response(&r, std::slice::from_ref(n), 0, &last_node);
                                     return copies::phase_failure("query", "all shards failed", &failures);
                                 }
                                 rest.insert(n.clone(), if left.is_empty() { h.clone() } else { left });
@@ -4703,6 +5104,9 @@ async fn multi_shard_read(node: &Arc<ClusterNode>, req: &RestReq, names: &BTreeS
                 }).filter(|(_, k)| only.as_ref().map_or(true, |s| s.contains(k))).collect()
             }
         };
+        if wanted.is_empty() && op.as_deref() == Some("_search") && ccs_parts(req) {
+            return Some(RestResp::json(200, &ccs::no_parts()));
+        }
         if wanted.is_empty() && matches!(op.as_deref(), Some("_count") | Some("_search")) && !params.contains_key("scroll") {
             let merged = if op.as_deref() == Some("_count") { fanout::merge_count(&[]) } else { fanout::merge_search(&[], &req.json().unwrap_or(json!({})), &params) };
             return Some(RestResp::json(200, &merged));
@@ -5210,17 +5614,143 @@ fn rank_search<'a>(node: &'a Arc<ClusterNode>, req: &'a RestReq) -> futures::fut
     Box::pin(rank_search_inner(node, req))
 }
 
+/// Test seam (hidden): `(index, millis)` a compound retriever search over
+/// `index` waits between its plan (child searches) and its final fetch.
+#[doc(hidden)]
+pub static RANK_PHASE_PAUSE: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+
+/// Target-selection parameters of a search, which move to the point in
+/// time a compound retrieval opens.
+const PIT_TARGET_PARAMS: &[&str] = &["routing", "preference", "ignore_unavailable", "allow_no_indices", "expand_wildcards", "ignore_throttled"];
+
+/// An implicit point in time for a compound retriever search (ES opens one
+/// shared by the sub-retrievers): opened over the request's indices unless
+/// it has its own `pit` or targets remote clusters. `None`: none needed or
+/// possible (the search runs as before).
+async fn implicit_pit(node: &Arc<ClusterNode>, req: &RestReq) -> Option<String> {
+    if req.json_ref().is_some_and(|b| b.get("pit").is_some()) {
+        return None;
+    }
+    let segs = req.segments();
+    let index = match segs.as_slice() {
+        [_search] if _search == "_search" => "_all".to_string(),
+        [index, _search] if _search == "_search" => index.clone(),
+        _ => return None,
+    };
+    if elasticsearch_engine::ccr::remote::has_remote_expression(&index) {
+        return None;
+    }
+    let params = req.params();
+    let mut uri = format!("/{}/_pit?keep_alive=1m", elasticsearch_engine::coord::path_segment(&index));
+    for k in PIT_TARGET_PARAMS {
+        if let Some(v) = params.get(*k) {
+            uri.push_str(&format!("&{k}={}", elasticsearch_engine::coord::path_segment(v)));
+        }
+    }
+    let mut open = req.clone();
+    open.retain_headers(|(k, _)| !k.eq_ignore_ascii_case(RANK_PLAN_HEADER) && !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("content-type")).ok()?;
+    open.set_method("POST").ok()?;
+    open.set_uri(&uri).ok()?;
+    open.set_body(b"").ok()?;
+    let resp = dispatch(node, open).await;
+    resp.body_json().and_then(|v| v["id"].as_str().map(str::to_string)).filter(|_| resp.is_success())
+}
+
+/// `req` searching point in time `pit` (`/_search`, its target selection
+/// moved to the point in time).
+fn with_pit(req: &RestReq, pit: &str) -> elasticsearch_engine::error::Result<RestReq> {
+    let mut out = req.clone();
+    let mut body = req.json().unwrap_or_else(|| json!({}));
+    body["pit"] = json!({"id": pit, "keep_alive": "1m"});
+    let query: Vec<&str> = req.query().split('&').filter(|p| !p.is_empty() && !PIT_TARGET_PARAMS.contains(&p.split('=').next().unwrap_or(""))).collect();
+    let uri = if query.is_empty() { "/_search".to_string() } else { format!("/_search?{}", query.join("&")) };
+    out.set_uri(&uri)?;
+    out.retain_headers(|(k, _)| !k.eq_ignore_ascii_case("content-length"))?;
+    out.set_json(&body)?;
+    Ok(out)
+}
+
 async fn rank_search_inner(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
+    // The child searches and the final fetch read one point in time.
+    let Some(pit) = implicit_pit(node, req).await else { return rank_search_phases(node, req, None).await };
+    let mut resp = rank_search_phases(node, req, Some(&pit)).await;
+    let mut close = req.clone();
+    let closed = async {
+        close.retain_headers(|(k, _)| !k.eq_ignore_ascii_case(RANK_PLAN_HEADER) && !k.eq_ignore_ascii_case("content-length")).ok()?;
+        close.set_method("DELETE").ok()?;
+        close.set_uri("/_pit").ok()?;
+        close.set_json(&json!({"id": pit})).ok()?;
+        Some(dispatch(node, close).await)
+    }.await;
+    if closed.is_none_or(|r| !r.is_success()) {
+        tracing::warn!("could not close the point in time of a compound retriever search");
+    }
+    // The caller asked for no point in time.
+    if let Some(mut v) = resp.body_json().filter(|_| resp.is_success()) {
+        if v.as_object_mut().and_then(|o| o.remove("pit_id")).is_some() {
+            resp.replace_json(&v);
+            resp.retain_headers(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+        }
+    }
+    resp
+}
+
+async fn rank_search_phases(node: &Arc<ClusterNode>, req: &RestReq, pit: Option<&str>) -> RestResp {
     let mut plan_req = req.clone();
     if let Err(e) = plan_req.replace_header(RANK_PLAN_HEADER, "plan") { return err(e); }
+    if let Some(pit) = pit {
+        if let Err(e) = plan_req.replace_header(RANK_PIT_HEADER, pit) { return err(e); }
+    }
     let planned = local_canonical(node, &plan_req).await;
     if !planned.is_success() {
         return planned;
     }
-    let Some(final_body) = planned.body_json().and_then(|mut v| v.get_mut("_rustic_final_body").map(Value::take)) else {
+    let mut planned_body = planned.body_json();
+    let Some(final_body) = planned_body.as_mut().and_then(|v| v.get_mut("_rustic_final_body").map(Value::take)) else {
         return planned;
     };
-    let mut final_req = req.clone();
+    // What the child searches missed: their shard failures and timeouts.
+    let mut incomplete = planned_body.as_mut().and_then(|v| v.get_mut(elasticsearch_http::CHILD_SHARDS_KEY).map(Value::take));
+    // Point-in-time searches report shard failures without their index:
+    // a search of one concrete index names it.
+    if let (Some(_), Some(failures)) = (pit, incomplete.as_mut().and_then(|c| c["failures"].as_array_mut())) {
+        if let Some(index) = req.segments().first().filter(|i| !i.starts_with('_') && !i.contains(',') && !i.contains('*')) {
+            for f in failures {
+                if f["index"].as_str().is_none_or(str::is_empty) {
+                    f["index"] = json!(index);
+                }
+            }
+        }
+    }
+    if let Some(failures) = incomplete.as_ref().and_then(|c| c["failures"].as_array()).filter(|f| !f.is_empty()) {
+        // A strict request: the ranking was computed without some shards.
+        if !copies::allow_partial(node, &req.params()) {
+            return RestResp::json(500, &json!({"error": {"root_cause": failures.iter().map(|f| f["reason"].clone()).collect::<Vec<_>>(),
+                "type": "search_phase_execution_exception", "reason": "Partial shards failure", "phase": "query", "grouped": true,
+                "failed_shards": failures}, "status": 500}));
+        }
+    }
+    let pause = RANK_PHASE_PAUSE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some((index, ms)) = pause {
+        if req.segments().first().is_some_and(|s| *s == index) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+    let mut final_req = match pit {
+        Some(pit) => match with_pit(req, pit) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        },
+        None => req.clone(),
+    };
+    let final_body = match pit {
+        Some(pit) => {
+            let mut b = final_body;
+            b["pit"] = json!({"id": pit, "keep_alive": "1m"});
+            b
+        }
+        None => final_body,
+    };
     if let Err(e) = final_req.set_json(&final_body) { return err(e); }
     if let Err(e) = final_req.retain_headers(|(k, _)| !k.eq_ignore_ascii_case(RANK_PLAN_HEADER) && !k.eq_ignore_ascii_case("content-length")) { return err(e); }
     if let Err(e) = final_req.push_header(RANK_PLAN_HEADER, "apply") { return err(e); }
@@ -5228,11 +5758,47 @@ async fn rank_search_inner(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
         if let Err(e) = final_req.push_header("content-type", &req.json_content_type()) { return err(e); }
     }
     let mut resp = dispatch(node, final_req).await;
+    if let Some(incomplete) = incomplete.filter(|_| resp.is_success()) {
+        resp = with_child_incompleteness(resp, &incomplete);
+    }
     for (k, v) in planned.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("warning")) {
         if !resp.headers.iter().any(|(rk, rv)| rk.eq_ignore_ascii_case(k) && rv == v) {
             resp.push_header((k.clone(), v.clone()));
         }
     }
+    resp
+}
+
+/// The final answer of a compound retriever search with what its child
+/// searches missed (`incomplete`: their `failures` and `timed_out`): their
+/// shard failures join the answer's (one per shard), `failed` and
+/// `successful` count them, and a child timeout times the answer out. The
+/// final phase may have found every shard well again, but the ranking it
+/// rendered was computed without those shards' candidates.
+fn with_child_incompleteness(mut resp: RestResp, incomplete: &Value) -> RestResp {
+    let Some(mut v) = resp.body_json() else { return resp };
+    if incomplete["timed_out"].as_bool() == Some(true) {
+        v["timed_out"] = json!(true);
+    }
+    let child: Vec<Value> = incomplete["failures"].as_array().cloned().unwrap_or_default();
+    if !child.is_empty() && v["_shards"].is_object() {
+        let shard_of = |f: &Value| (f["index"].as_str().unwrap_or_default().to_string(), f["shard"].as_i64().unwrap_or(-1));
+        let mut failures: Vec<Value> = v["_shards"]["failures"].as_array().cloned().unwrap_or_default();
+        let mut seen: BTreeSet<(String, i64)> = failures.iter().map(shard_of).collect();
+        for f in child {
+            if seen.insert(shard_of(&f)) {
+                failures.push(f);
+            }
+        }
+        let total = v["_shards"]["total"].as_u64().unwrap_or(0);
+        let failed = (seen.len() as u64).max(v["_shards"]["failed"].as_u64().unwrap_or(0));
+        v["_shards"]["failed"] = json!(failed);
+        let successful = v["_shards"]["successful"].as_u64().unwrap_or(0).min(total.saturating_sub(failed));
+        v["_shards"]["successful"] = json!(successful);
+        v["_shards"]["failures"] = Value::Array(failures);
+    }
+    resp.replace_json(&v);
+    resp.retain_headers(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
     resp
 }
 
@@ -5320,11 +5886,20 @@ async fn shard_fan_out(node: &Arc<ClusterNode>, req: &RestReq, op: &str, plan: &
     // as parsing it, and nothing here changes it.
     let empty = json!({});
     let body: &Value = req.json_ref().unwrap_or(&empty);
-    if op == "_search" && req.dfs != Dfs::Collect && is_rank_search(body, &params) {
+    // A coordinating cluster's CCS reduce: its body is already the shard
+    // body (`fanout::node_body`), and it merges the shard results itself.
+    let parts_mode = op == "_search" && ccs_parts(req);
+    // A cross-cluster DFS round arrives as a header (it crosses clusters).
+    let req_dfs = match if parts_mode { ccs_dfs(req) } else { Ok(None) } {
+        Ok(Some(d)) => d,
+        Ok(None) => req.dfs.clone(),
+        Err(e) => return err(e),
+    };
+    if op == "_search" && !parts_mode && req.dfs != Dfs::Collect && is_rank_search(body, &params) {
         return rank_search(node, req).await;
     }
     // A stats round (`Dfs::Collect`) only needs the shards' statistics.
-    if op == "_search" && req.dfs != Dfs::Collect {
+    if op == "_search" && !parts_mode && req.dfs != Dfs::Collect {
         if let Some(f) = fanout::unsupported_feature(body, &params) {
             return RestResp::error(500, "illegal_state_exception", &format!("{f} cannot be combined across shards yet"));
         }
@@ -5358,13 +5933,18 @@ async fn shard_fan_out(node: &Arc<ClusterNode>, req: &RestReq, op: &str, plan: &
         Some(w) => SharedText::try_format(format_args!("{}{}size={w}",UriJoin(parts.clone(),"&"),if parts.clone().next().is_some(){"&"}else{""})),
         None => SharedText::try_format(format_args!("{}",UriJoin(parts,"&"))),
     }{Ok(query)=>query,Err(error)=>return err(error)};
-    let n_shards = plan.copies.len() + plan.unavailable.len();
+    // A CCS part: the other clusters' shards count towards ES's can_match
+    // pre-filter threshold too.
+    let other_shards: usize = if parts_mode {
+        req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(crate::remote_cluster::CCS_OTHER_SHARDS_HEADER)).and_then(|(_, v)| v.parse().ok()).unwrap_or(0)
+    } else { 0 };
+    let n_shards = plan.copies.len() + plan.unavailable.len() + other_shards;
     // Every shard sub-request carries the same body: build it once. When
     // the per-node rewrite would not change it (no `from`, `size` already
     // the window, no aggregations), forward the original bytes: a kNN body
     // is thousands of floats, and re-parsing and re-serializing it per
     // shard cost more than the shard's graph search.
-    let shard_body: Option<Vec<u8>> = if op == "_search" {
+    let shard_body: Option<Vec<u8>> = if op == "_search" && !parts_mode {
         let window = from.saturating_add(size) as u64;
         let unchanged = url_window.is_some() || body.get("from").is_none_or(|f| f.as_u64() == Some(0))
             && match body.get("size") {
@@ -5417,8 +5997,8 @@ async fn shard_fan_out(node: &Arc<ClusterNode>, req: &RestReq, op: &str, plan: &
     let mut failures: Vec<copies::ShardFailure> = plan.unavailable.iter().map(|(i, k)| copies::ShardFailure::unavailable(i, *k)).collect();
     // ES's DFS phase: collect every shard's term statistics, merge them, and
     // score each shard with the global ones, on the copy that gave them.
-    let mut dfs = Dfs::None;
-    if op == "_search" && (req.dfs == Dfs::Collect || dfs_wanted(req, body, &params, units.len())) {
+    let mut dfs = if parts_mode && matches!(req_dfs, Dfs::Use(_)) { req_dfs.clone() } else { Dfs::None };
+    if op == "_search" && (req_dfs == Dfs::Collect || (!parts_mode && dfs_wanted(req, body, &params, units.len()))) {
         let collect = |idx: &[String], k: u32| dfs_collect_req(&make(idx, k)?);
         let round = futures::future::join_all(units.iter().map(|u| run_unit(node, plan, u, &collect, bound))).await;
         let mut stats = Vec::new();
@@ -5441,7 +6021,7 @@ async fn shard_fan_out(node: &Arc<ClusterNode>, req: &RestReq, op: &str, plan: &
             return copies::phase_failure("dfs", "all shards failed", &failures);
         }
         let merged = elasticsearch_http::merge_dfs(&stats);
-        if req.dfs == Dfs::Collect {
+        if req_dfs == Dfs::Collect {
             return RestResp::json(200, &serde_json::to_value(&merged).unwrap_or(Value::Null));
         }
         dfs = match SharedDfsStats::try_new(&merged) { Ok(stats) => Dfs::Use(stats), Err(e) => return err(e) };
@@ -5458,7 +6038,7 @@ async fn shard_fan_out(node: &Arc<ClusterNode>, req: &RestReq, op: &str, plan: &
     // every shard copy is on this node answers in one round instead
     // (`qtf::single_round`): the same response without a fetch round.
     let mut single_round = false;
-    if op == "_search" && qtf::eligible(req, body, &params, units.len()) {
+    if op == "_search" && !parts_mode && qtf::eligible(req, body, &params, units.len()) {
         let all_local = units.iter().all(|u| u.idx.iter().all(|i| plan.candidates(&format!("{i}#{}", u.k)).iter().all(|c| *c == node.local.id)));
         single_round = qtf::single_round(body, &params, all_local) && !large_hits(node, body, &units);
         if !single_round {
@@ -5479,13 +6059,13 @@ async fn shard_fan_out(node: &Arc<ClusterNode>, req: &RestReq, op: &str, plan: &
     };
     // Each answer is parsed on the task that received it, in parallel,
     // unless the merge may be memoized from the raw answers (below).
-    let parse = !(op == "_search" && !single_round && matches!(dfs, Dfs::None) && size == 0 && failures.is_empty() && body.get("profile").is_none());
+    let parse = parts_mode || !(op == "_search" && !single_round && matches!(dfs, Dfs::None) && size == 0 && failures.is_empty() && body.get("profile").is_none());
     let setup_us = started.elapsed().as_micros();
     let results: Vec<UnitResult> = run_units_concurrently(node, plan, &units, &round, bound, parse).await;
     let shards_us = started.elapsed().as_micros();
     // A `size: 0` search whose every shard answered as before (e.g. from
     // its request cache): the merge memoized for exactly these answers.
-    let memo_key = if op == "_search" && !single_round && matches!(dfs, Dfs::None) && size == 0 && failures.is_empty() && body.get("profile").is_none() {
+    let memo_key = if op == "_search" && !parts_mode && !single_round && matches!(dfs, Dfs::None) && size == 0 && failures.is_empty() && body.get("profile").is_none() {
         // Each answer is labelled with its node and the indices it answered
         // for: the merge counts a unit's shards by its indices
         // (`normalize_part_shards`), so two plans whose answers are the same
@@ -5576,6 +6156,16 @@ async fn shard_fan_out(node: &Arc<ClusterNode>, req: &RestReq, op: &str, plan: &
     let parsed_us = started.elapsed().as_micros();
     parts.sort_by_key(|(k, _)| *k);
     let parts: Vec<Value> = parts.into_iter().map(|(_, p)| p).collect();
+    if parts_mode {
+        // Unmerged, for the coordinating cluster: the shard results and
+        // the shards that failed (as `_shards.failures` entries).
+        let mut failed = json!({"_shards": {"total": 0, "successful": 0, "skipped": 0, "failed": 0}});
+        copies::add_failures(&mut failed, &failures);
+        let out = json!({"_ccs_parts": parts, "_ccs_failures": failed["_shards"], "took": started.elapsed().as_millis() as u64});
+        let mut raw = RestResp::json(200, &Value::Null);
+        raw.replace_body_vec(sources.render(&out));
+        return raw;
+    }
     let merged = match op {
         "_count" => fanout::merge_count(&parts),
         "_terms_enum" => merge_terms_enum(&parts, body, &params),
@@ -5901,7 +6491,15 @@ fn shard_read_uri(node: &ClusterNode, req: &RestReq, indices: &[String], op: &st
     let Some(expr) = segs.first().filter(|_| segs.len() > 1) else { return concrete() };
     if expr == "_all" || expr == "*" || node.engine.get_index(expr).is_some() { return concrete() }
     let Ok(targets) = node.engine.resolve(expr, ResolveOpts::from_params(&req.params())) else { return concrete() };
-    if !targets.iter().any(|t| t.alias_filter.is_some() || t.routing.is_some()) { return concrete() }
+    // With security, a shard reached through an alias is authorized by the
+    // alias's privileges (ES): keep the alias in the shard request. A data
+    // stream is not an alias: its backing indices are authorized by the
+    // stream's privileges under their concrete names, and a shard engine
+    // that holds only some backing indices cannot resolve the stream name
+    // (every shard but the local ones failed `no such index [<stream>]`).
+    let data_stream = |p: &str| node.engine.data_streams.read().contains_key(p.split("::").next().unwrap_or(p));
+    let via_alias = node.engine.security.enabled() && expr.split(',').any(|p| !p.starts_with('-') && !p.contains(['*', '?']) && node.engine.get_index(p).is_none() && !data_stream(p));
+    if !via_alias && !targets.iter().any(|t| t.alias_filter.is_some() || t.routing.is_some()) { return concrete() }
     let scoped=req.path().trim_start_matches('/').split('/').next().unwrap_or(expr);
     let excluded=targets.iter().filter(|t|!indices.contains(&t.svc.name));
     let has_excluded=excluded.clone().next().is_some();
@@ -5978,7 +6576,7 @@ async fn dfs_round<F: std::future::Future<Output = RestResp>>(round: impl IntoIt
 
 /// `req` with `search_type=dfs_query_then_fetch`: the knn-dfs rewrite's
 /// query keeps ES's forced DFS (the kNN clauses are gone from its body).
-fn force_dfs(mut req: RestReq) -> elasticsearch_engine::error::Result<RestReq> {
+pub(super) fn force_dfs(mut req: RestReq) -> elasticsearch_engine::error::Result<RestReq> {
     // Hold the immutable source payload independently while replacing the URI.
     // Formatting arguments borrow their inputs until the setter has encoded them.
     let source = req.clone();
@@ -5996,7 +6594,7 @@ fn shard_search<'a>(node: &'a Arc<ClusterNode>, req: RestReq, plan: &'a Arc<copi
 /// clause, each found by `run` as a lone kNN search (which merges exactly),
 /// folded into the request's query (`fanout::knn_rewrite`). `None` when the
 /// search needs no DFS phase.
-async fn knn_dfs<'a>(req: &RestReq, run: impl Fn(RestReq) -> futures::future::BoxFuture<'a, RestResp>) -> Result<Option<RestReq>, RestResp> {
+pub(super) async fn knn_dfs<'a>(req: &RestReq, run: impl Fn(RestReq) -> futures::future::BoxFuture<'a, RestResp>) -> Result<Option<RestReq>, RestResp> {
     let params = req.params();
     let empty = json!({});
     let body = req.json_ref().unwrap_or(&empty);
@@ -6004,7 +6602,7 @@ async fn knn_dfs<'a>(req: &RestReq, run: impl Fn(RestReq) -> futures::future::Bo
         return Ok(None);
     }
     let (_, size) = fanout::from_size(&body, &params);
-    let requests = fanout::knn_clauses(&body).iter().map(|c| req.try_rebuilt(&fanout::knn_dfs_body(c, size), |p| !["from", "size", "sort"].contains(&p) && !fanout::Q_PARAMS.contains(&p))).collect::<EsResult<Vec<_>>>().map_err(err)?;
+    let requests = fanout::knn_clauses(&body).iter().map(|c| req.try_rebuilt(&fanout::knn_dfs_body(c, size, &body), |p| !["from", "size", "sort"].contains(&p) && !fanout::Q_PARAMS.contains(&p))).collect::<EsResult<Vec<_>>>().map_err(err)?;
     let phases: Vec<_> = requests.into_iter().map(&run).collect();
     let mut top = Vec::new();
     for r in futures::future::join_all(phases).await {
@@ -6022,7 +6620,7 @@ async fn knn_dfs<'a>(req: &RestReq, run: impl Fn(RestReq) -> futures::future::Bo
 /// to its collapse value (`fanout::expand_body`). `None` when the request
 /// has no `collapse.inner_hits`, or when they are invalid: the caller then
 /// fans the request out unchanged so the engine raises ES's own error.
-async fn collapse_expand<'a>(req: &RestReq, run: impl Fn(RestReq) -> futures::future::BoxFuture<'a, RestResp>) -> Option<RestResp> {
+pub(super) async fn collapse_expand<'a>(req: &RestReq, run: impl Fn(RestReq) -> futures::future::BoxFuture<'a, RestResp>) -> Option<RestResp> {
     // Checked on the borrowed body: every search passes here, and copying a
     // large one (`large_terms`) costs as much as parsing it.
     if req.json_ref().and_then(|b| b.get("collapse")).and_then(|c| c.get("inner_hits")).is_none() {
@@ -6135,8 +6733,8 @@ fn async_search<'a>(node: &'a Arc<ClusterNode>, req: &'a RestReq, holders: &'a s
 /// The cross-cluster submit's async search, boxed as a `Send` future: it is
 /// awaited from `ccs_read`, which `read` reaches, and `async_search_inner`
 /// spawns `read`, so an unboxed call would make the future types cyclic.
-fn async_search_ccs<'a>(node: &'a Arc<ClusterNode>, req: &'a RestReq, holders: &'a std::collections::BTreeMap<String, BTreeSet<String>>, plan: elasticsearch_engine::ccr::remote::CcsPlan) -> futures::future::BoxFuture<'a, RestResp> {
-    Box::pin(async_search_inner(node, req, holders, Some(plan)))
+fn async_search_ccs<'a>(node: &'a Arc<ClusterNode>, req: &'a RestReq, holders: &'a std::collections::BTreeMap<String, BTreeSet<String>>, plan: Option<elasticsearch_engine::ccr::remote::CcsPlan>) -> futures::future::BoxFuture<'a, RestResp> {
+    Box::pin(async_search_inner(node, req, holders, plan))
 }
 
 /// A finished search response with the CCS plan's `_clusters` (the local
@@ -6192,6 +6790,14 @@ async fn async_search_inner(node: &Arc<ClusterNode>, req: &RestReq, holders: &st
     let filtered=match SharedText::try_format(format_args!("{uri}")){Ok(v)=>v,Err(e)=>return err(e)};
     if let Err(e) = sub.set_uri_fmt(format_args!("{base}/_search{}",FilteredQuery{query:filtered.strip_prefix('?').unwrap_or(&filtered),drop:&["filter_path","pretty","human","typed_keys"],append:"typed_keys=true"})) { return err(e); }
     let s = elasticsearch_engine::async_search::AsyncSearch::new(holders.len(), keep_alive);
+    // Bound to the submitter (ES `AsyncTaskIndexService` ownership); a
+    // subject that cannot be established owns nothing anyone can read.
+    if node.engine.security.enabled() {
+        s.set_owner(Some(match front_caller(node, req).await {
+            Some(a) => elasticsearch_engine::security::owner::ResourceOwner::of(&a),
+            None => elasticsearch_engine::security::owner::ResourceOwner { username: String::new(), realm_name: String::new(), realm_type: "_unauthenticated".into(), api_key_id: None },
+        }));
+    }
     let c = Arc::new(contexts::ClusterAsync { s: s.clone(), error: parking_lot::Mutex::new(None), warnings: parking_lot::Mutex::new(Vec::new()) });
     // The search reads the request's own targets (`/{targets}/_async_search`);
     // an empty expression would read every index.
@@ -6243,21 +6849,42 @@ fn async_time_param(params: &HashMap<String, String>, name: &str, default: &str)
 
 /// `GET|DELETE /_async_search[/status]/{node}.~a...`: a cluster async
 /// search kept by this (coordinating) node.
-async fn cluster_async_context(req: &RestReq, wrapped: &str, key: &str) -> RestResp {
+async fn cluster_async_context(node: &ClusterNode, req: &RestReq, wrapped: &str, key: &str) -> RestResp {
     let missing = || RestResp::error(404, "resource_not_found_exception", wrapped);
     let segs = req.segments();
     let is_status = segs.get(1).map(String::as_str) == Some("status");
     let params = req.params();
+    // Only the submitter reads or extends the search; `monitor` reads any
+    // status and `cancel_task` deletes any search (ES async-search security).
+    let caller = if node.engine.security.enabled() { front_caller(node, req).await } else { None };
+    let owned = |c: &contexts::ClusterAsync, use_: elasticsearch_http::security::owner::Use| -> bool {
+        if !node.engine.security.enabled() {
+            return true;
+        }
+        let Some(caller) = caller.clone() else { return false };
+        let stored = c.s.owner();
+        elasticsearch_http::security::owner::check_authn(&node.engine, &caller, None, stored.as_ref(), use_, || elasticsearch_engine::error::EsError::resource_not_found(wrapped.to_string())).is_ok()
+    };
     match req.method() {
-        Method::DELETE => match contexts::async_remove(key) {
-            Some(_) => {
-                search_task::async_cancel(key);
-                RestResp::json(200, &json!({"acknowledged": true}))
+        Method::DELETE => {
+            let Some(c) = contexts::async_get(key) else { return missing() };
+            if !owned(&c, elasticsearch_http::security::owner::Use::Delete) {
+                return missing();
             }
-            None => missing(),
-        },
+            match contexts::async_remove(key) {
+                Some(_) => {
+                    search_task::async_cancel(key);
+                    RestResp::json(200, &json!({"acknowledged": true}))
+                }
+                None => missing(),
+            }
+        }
         _ => {
             let Some(c) = contexts::async_get(key) else { return missing() };
+            let use_ = if is_status { elasticsearch_http::security::owner::Use::Status("cluster:monitor/async_search/status") } else { elasticsearch_http::security::owner::Use::Read };
+            if !owned(&c, use_) {
+                return missing();
+            }
             if is_status {
                 return crate::rest::util::postprocess(req, contexts::async_status(&c, wrapped));
             }
@@ -6514,6 +7141,13 @@ async fn context(node: &Arc<ClusterNode>, req: &RestReq, kind: ContextKind) -> R
                 let id = &ids[0];
                 let Some((owner, inner)) = unwrap_id(id) else { return bad(id) };
                 let scroll = body.as_ref().and_then(|v| v["scroll"].as_str().map(str::to_string)).or_else(|| params.get("scroll").cloned());
+                // A cross-cluster scroll lives on its coordinating node.
+                if inner.starts_with(ccs::SCROLL_PREFIX) {
+                    if owner != node.local.id {
+                        return forward(node, owner, req).await;
+                    }
+                    return ccs::continue_scroll(node, req, id, inner, scroll).await;
+                }
                 if inner.starts_with(contexts::SCROLL_PREFIX) {
                     return contexts::continue_scroll(node, req, owner, inner, scroll).await;
                 }
@@ -6553,6 +7187,13 @@ async fn context(node: &Arc<ClusterNode>, req: &RestReq, kind: ContextKind) -> R
             let futs = parsed.iter().map(|(id, owner, inner)| {
                 let (node, req) = (node.clone(), req.clone());
                 async move {
+                    if inner.starts_with(ccs::SCROLL_PREFIX) {
+                        if *owner == node.local.id {
+                            return Ok(ccs::clear_scroll(&node, &req, inner).await);
+                        }
+                        let r = contexts::json_req(&req, "DELETE", "/_search/scroll", &json!({"scroll_id": [id]}))?;
+                        return freed_contexts(forward(&node, owner, &r).await);
+                    }
                     if inner.starts_with(contexts::SCROLL_PREFIX) {
                         return contexts::clear_scroll(&node, &req, id, owner, inner).await;
                     }
@@ -6569,6 +7210,9 @@ async fn context(node: &Arc<ClusterNode>, req: &RestReq, kind: ContextKind) -> R
                 return local_engine(node, req).await;
             };
             if let Some((_, inner)) = unwrap_id(&id) {
+                if inner.starts_with(ccs::PIT_PREFIX) {
+                    return Box::pin(ccs::close_pit(node, req, &id, inner)).await;
+                }
                 if inner.starts_with(contexts::PIT_PREFIX) {
                     if let Some(r) = contexts::close_pit(node, req, inner).await {
                         return r;
@@ -6597,7 +7241,7 @@ async fn context(node: &Arc<ClusterNode>, req: &RestReq, kind: ContextKind) -> R
                 if owner != node.local.id {
                     return forward(node, owner, req).await;
                 }
-                return cluster_async_context(req, &id, inner).await;
+                return cluster_async_context(node, req, &id, inner).await;
             }
             let mut r = req.clone();
             let (base,replacement,suffix)=match req.uri.split_once(id.as_str()){Some((base,suffix))=>(base,inner,suffix),None=>(req.uri.as_str(),"","")};
@@ -6964,7 +7608,7 @@ mod tests {
     #[test]
     fn stored_ccs_async_result_reports_the_skipped_remote() {
         use elasticsearch_engine::ccr::remote::{CcsPlan, SkippedRemote};
-        let plan = CcsPlan { local: vec!["logs".into()], skipped: vec![SkippedRemote { alias: "far".into(), indices: "logs".into(), error_type: "connect_transport_exception".into(), reason: "unreachable".into() }] };
+        let plan = CcsPlan { local: vec!["logs".into()], skipped: vec![SkippedRemote { alias: "far".into(), indices: "logs".into(), error_type: "connect_transport_exception".into(), reason: "unreachable".into() }], remote: Vec::new() };
         let text = r#"{"took":3,"timed_out":false,"_shards":{"total":2,"successful":2,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"1","_score":1.0}]}}"#;
         let patched: Value = serde_json::from_str(&with_ccs_clusters(text, &plan).unwrap()).unwrap();
         assert_eq!(patched["hits"]["hits"][0]["_id"], "1");
@@ -7663,22 +8307,38 @@ mod tests {
         assert!(!own_echo(false, 400, &json!({})));
     }
 
+    /// Production review #14: a retry's conflict is turned into success only
+    /// for a create with a coordinator-generated id. A client-supplied id
+    /// create, a CAS (`if_seq_no`/`if_primary_term`) and an external-version
+    /// index can be another writer's identical request: never confirmed by
+    /// content, the outcome stays unknown.
     #[test]
-    fn a_conditional_write_recognises_its_own_document() {
-        let src = json!({"v": 7});
-        let doc = json!({"found": true, "_seq_no": 9694, "_version": 12, "_source": {"v": 7}});
-        let cas = Condition { if_seq_no: Some(9655), version: None };
-        assert!(is_own_write(&doc, &src, cas));
-        // Someone else's value, an untouched document, a missing document.
-        assert!(!is_own_write(&json!({"found": true, "_seq_no": 9694, "_source": {"v": 8}}), &src, cas));
-        assert!(!is_own_write(&json!({"found": true, "_seq_no": 9655, "_source": {"v": 7}}), &src, cas));
-        assert!(!is_own_write(&json!({"found": false}), &src, cas));
-        // External versioning: exactly the version sent.
-        let ext = Condition { if_seq_no: None, version: Some(12) };
-        assert!(is_own_write(&doc, &src, ext));
-        assert!(!is_own_write(&doc, &src, Condition { if_seq_no: None, version: Some(11) }));
-        // Without a condition there is nothing to recognise it by.
-        assert!(!is_own_write(&doc, &src, Condition::default()));
+    fn only_a_generated_id_create_confirms_a_retry_conflict() {
+        assert!(retry_conflict_provable(true, true));
+        assert!(!retry_conflict_provable(true, false), "client-supplied id create");
+        assert!(!retry_conflict_provable(false, false), "conditional / external-version index");
+        assert!(!retry_conflict_provable(false, true));
+    }
+
+    /// Production review #35: a scripted update that may have executed is
+    /// not replayed; a partial-document update is.
+    #[test]
+    fn only_scripted_updates_are_unsafe_to_replay() {
+        assert!(replay_unsafe_update(Some(r#"{"script": {"source": "ctx._source.n += 1"}}"#)));
+        assert!(replay_unsafe_update(Some(r#"{"script": "ctx._source.n += 1", "upsert": {"n": 0}, "scripted_upsert": true}"#)));
+        assert!(!replay_unsafe_update(Some(r#"{"doc": {"n": 1}}"#)));
+        assert!(!replay_unsafe_update(Some(r#"{"doc": {"n": 1}, "doc_as_upsert": true}"#)));
+        assert!(replay_unsafe_update(Some("{not json")));
+        assert!(replay_unsafe_update(None));
+    }
+
+    /// Production review #63: ES's `TimeValue` text in the
+    /// not-enough-active-copies reason.
+    #[test]
+    fn time_values_print_as_es_does() {
+        assert_eq!(time_value(Duration::from_secs(60)), "1m");
+        assert_eq!(time_value(Duration::from_secs(2)), "2s");
+        assert_eq!(time_value(Duration::from_millis(1500)), "1500ms");
     }
 
     /// flapping seed 1: a CAS on jepsen-a/r3 sent to n4 lost
@@ -7704,12 +8364,8 @@ mod tests {
         assert_eq!(preference, "_only_nodes:n2");
         assert_eq!(at, PrimaryAt { index: "jepsen-a".into(), shard: 0, node: "n2".into(), term: 2 });
         assert_eq!(primary_read(&st, "n2", "jepsen-a", 0).map(|p| p.0).as_deref(), Some("_only_local"));
-        // The stale copy shows this request's source; n2's copy does not.
-        let src = json!({"v": 20000000461i64});
-        let cas = Condition { if_seq_no: Some(4322), version: None };
-        let stale = json!({"found": true, "_seq_no": 4337, "_primary_term": 1, "_source": {"v": 20000000461i64}});
-        let on_primary = json!({"found": true, "_seq_no": 4333, "_primary_term": 2, "_source": {"v": 10000000417i64}});
-        assert!(is_own_write(&stale, &src, cas) && !is_own_write(&on_primary, &src, cas));
+        // (A CAS like this one is no longer confirmed by content at all:
+        // `only_a_generated_id_create_confirms_a_retry_conflict`.)
         // Acknowledged by the primary that served the read, in its term.
         assert_eq!(acked_decision(&at, &AckReply::Acked { term: 2 }), Durability::Durable);
         assert_eq!(acked_decision(&at, &AckReply::Failed), Durability::NotYet);
@@ -7734,13 +8390,6 @@ mod tests {
         let at = PrimaryAt { index: ".ds-logs-u-000001".into(), shard: 0, node: "c".into(), term: 2 };
         // The document carries term 1; only the primary's term and its ack count.
         assert_eq!(acked_decision(&at, &AckReply::Acked { term: 2 }), Durability::Durable);
-    }
-
-    #[test]
-    fn only_index_requests_have_a_confirmable_id() {
-        assert_eq!(indexed_id(&req("PUT", "/i/_doc/a?if_seq_no=3&if_primary_term=1")).as_deref(), Some("a"));
-        assert_eq!(indexed_id(&req("DELETE", "/i/_doc/a")), None);
-        assert_eq!(indexed_id(&req("POST", "/i/_update/a")), None);
     }
 
     #[test]
@@ -7776,7 +8425,9 @@ mod rollback_admission_tests {
     /// time out without removing that fence or becoming an in-flight API.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn waiting_api_times_out_without_bypassing_rollback() {
-        let dir = tempfile::tempdir().unwrap();
+        // The node outlives the test (its runtime is not shut down), so keep
+        // its data directory: a deleted one makes cluster-persist exit the process.
+        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let mut settings = crate::config::Settings::new();
         for (key, value) in [
             ("cluster.name", json!("rollback-admission")),
@@ -7922,5 +8573,27 @@ mod broadcast_body_tests {
         }
         let search = RestReq::try_new("POST", "/logs/_search", &[], b"{}", 0, Dfs::None, None).unwrap();
         assert!(broadcast_body_rejection(&search).is_none());
+    }
+}
+
+#[cfg(test)]
+mod internal_header_tests {
+    use super::*;
+
+    /// Every header the node's components exchange is recognised as internal
+    /// at the public edge; ordinary client headers are not.
+    #[test]
+    fn every_internal_header_is_dropped_at_the_edge() {
+        for h in INTERNAL_HEADERS {
+            assert!(is_internal_header(h), "{h}");
+            assert!(is_internal_header(&h.to_ascii_uppercase()), "{h} (case)");
+        }
+        // Prefix families cover headers added later.
+        for h in ["x-rustic-internal-anything-new", "X-ES-CLUSTER-future", "x-es-cluster-shard", "x-es-cluster-parent-task", "x-es-cluster-exec-local", "x-es-cluster-ack-through"] {
+            assert!(is_internal_header(h), "{h}");
+        }
+        for h in ["authorization", "content-type", "accept", "x-opaque-id", "es-security-runas-user", "x-elastic-product-origin", "traceparent", "x-elastic-client-meta"] {
+            assert!(!is_internal_header(h), "{h} is a client header");
+        }
     }
 }

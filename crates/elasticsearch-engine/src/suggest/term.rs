@@ -1,6 +1,6 @@
 //! The `term` suggester: Lucene's `DirectSpellChecker` per analyzed token.
 
-use super::distance::{osa, Dict, Distance};
+use super::distance::{levenshtein_within, osa_within, Dict, Distance};
 use super::{field_analyzer, jfloat, SuggestTarget};
 use crate::error::{EsError, Result};
 use serde_json::{json, Map, Value};
@@ -114,24 +114,24 @@ pub struct Word {
 
 /// `DirectSpellChecker.suggestSimilar`: up to `num_sug` corrections of
 /// `text`; `threshold` overrides `min_doc_freq` (phrase generators).
-pub fn suggest_similar(dict: &Dict, text: &str, num_sug: usize, s: &Spell, threshold: Option<f32>) -> Vec<Word> {
+pub fn suggest_similar(dict: &Dict, text: &str, num_sug: usize, s: &Spell, threshold: Option<f32>) -> Result<Vec<Word>> {
     let text = if s.lowercase { text.to_lowercase() } else { text.to_string() };
     let qchars: Vec<char> = text.chars().collect();
     if s.min_word_length > 0 && qchars.len() < s.min_word_length {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let (df0, _) = dict.stats(&text);
     let mut docfreq = df0;
     if s.mode == Mode::Missing && docfreq > 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let max_doc = dict.max_doc();
     if s.max_term_freq >= 1.0 {
         if docfreq as f32 > s.max_term_freq {
-            return Vec::new();
+            return Ok(Vec::new());
         }
     } else if docfreq as f64 > (s.max_term_freq as f64 * max_doc as f64).ceil() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if s.mode != Mode::Popular {
         docfreq = 0;
@@ -144,20 +144,20 @@ pub fn suggest_similar(dict: &Dict, text: &str, num_sug: usize, s: &Spell, thres
     }
     let inspections = num_sug * s.max_inspections;
     let mut found: HashMap<String, Word> = HashMap::new();
-    let first = pass(dict, &text, &qchars, inspections, docfreq, 1, s);
+    let first = pass(dict, &text, &qchars, inspections, docfreq, 1, s)?;
     let more = s.max_edits > 1 && first.len() < inspections;
     for w in first {
         found.insert(w.term.clone(), w);
     }
     if more {
-        for w in pass(dict, &text, &qchars, inspections, docfreq, s.max_edits, s) {
+        for w in pass(dict, &text, &qchars, inspections, docfreq, s.max_edits, s)? {
             found.entry(w.term.clone()).or_insert(w);
         }
     }
     let mut out: Vec<Word> = found.into_values().collect();
     sort_words(&mut out, s.sort_frequency);
     out.truncate(num_sug);
-    out
+    Ok(out)
 }
 
 pub fn sort_words(out: &mut [Word], by_freq: bool) {
@@ -170,10 +170,11 @@ pub fn sort_words(out: &mut [Word], by_freq: bool) {
 }
 
 /// One `FuzzyTermsEnum` pass with `ed` max edits.
-fn pass(dict: &Dict, text: &str, q: &[char], inspections: usize, docfreq: u64, ed: usize, s: &Spell) -> Vec<Word> {
+fn pass(dict: &Dict, text: &str, q: &[char], inspections: usize, docfreq: u64, ed: usize, s: &Spell) -> Result<Vec<Word>> {
     let prefix_len = s.prefix_length.max(ed.saturating_sub(1)).min(q.len());
     let prefix: String = q[..prefix_len].iter().collect();
     let mut out: Vec<Word> = Vec::new();
+    let mut polled = 0u64;
     for (cand, (df, _)) in dict.prefixed(&prefix) {
         if cand == text {
             continue;
@@ -182,8 +183,15 @@ fn pass(dict: &Dict, text: &str, q: &[char], inspections: usize, docfreq: u64, e
         if (c.len() as i64 - q.len() as i64).unsigned_abs() as usize > ed {
             continue;
         }
-        let d = osa(&q[prefix_len..], &c[prefix_len.min(c.len())..]);
-        if d > ed || d == 0 {
+        polled += 1;
+        if polled % 256 == 1 {
+            crate::search::check_cancelled()?;
+        }
+        // Banded: work and workspace follow the term length times `ed`,
+        // never the square of a long term's length.
+        let (qs, cs) = (&q[prefix_len..], &c[prefix_len.min(c.len())..]);
+        let Some(d) = osa_within(qs, cs, ed) else { continue };
+        if d == 0 {
             continue;
         }
         if df <= docfreq {
@@ -191,6 +199,16 @@ fn pass(dict: &Dict, text: &str, q: &[char], inspections: usize, docfreq: u64, e
         }
         let score = match s.distance {
             Distance::Internal => 1.0 - d as f32 / (c.len().min(q.len()).max(1)) as f32,
+            // The shared prefix does not change these distances: the
+            // suffixes' (bounded) distance is the terms' own.
+            Distance::DamerauLevenshtein => {
+                let m = c.len().min(q.len());
+                if m == 0 { if c.len() == q.len() { 1.0 } else { 0.0 } } else { 1.0 - d as f32 / m as f32 }
+            }
+            Distance::Levenshtein => {
+                let l = levenshtein_within(qs, cs, 2 * ed).unwrap_or(2 * ed + 1);
+                1.0 - l as f32 / c.len().max(q.len()).max(1) as f32
+            }
             other => other.similarity(text, &cand),
         };
         if score < s.accuracy {
@@ -200,7 +218,7 @@ fn pass(dict: &Dict, text: &str, q: &[char], inspections: usize, docfreq: u64, e
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.term.cmp(&b.term)));
     out.truncate(inspections);
-    out
+    Ok(out)
 }
 
 /// Run one `term` suggestion; returns the entries array.
@@ -230,7 +248,7 @@ pub fn run(text: &str, o: &Map<String, Value>, targets: &[SuggestTarget]) -> Res
         let toks = super::tokens(&analyzer, text);
         let fresh = entries.is_empty();
         for (i, tok) in toks.iter().enumerate() {
-            let words = suggest_similar(&dict, &tok.text, shard_size, &spell, None);
+            let words = suggest_similar(&dict, &tok.text, shard_size, &spell, None)?;
             if fresh {
                 entries.push((tok.text.clone(), tok.offset, tok.length, words));
             } else if let Some(e) = entries.get_mut(i) {

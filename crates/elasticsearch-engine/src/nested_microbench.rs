@@ -581,3 +581,36 @@ fn index_body(nested: bool) -> Value {
         }}
     })
 }
+
+/// Profiling loop: `NESTED_LOOP_TASK` (`sorted`, `histo_match`, `histo`)
+/// repeated for `NESTED_LOOP_SECS` seconds after indexing.
+#[test]
+#[ignore]
+fn nested_microbench_loop() {
+    let n = env("NESTED_BENCH_QUESTIONS", 200_000);
+    let secs = env("NESTED_LOOP_SECS", 20);
+    let task = std::env::var("NESTED_LOOP_TASK").unwrap_or_else(|_| "sorted".into());
+    let qs = generate(n, 0x5eed_0f_5011);
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::open(tmp.path()).unwrap();
+    node.create_index("sonested", &index_body(true)).unwrap();
+    let svc = node.get_index("sonested").unwrap();
+    index_docs(&svc, &qs);
+    let agg = json!({"answers": {"nested": {"path": "answers"}, "aggs": {"date_histo": {"date_histogram": {"field": "answers.date", "calendar_interval": "month"}}}}});
+    let bodies: Vec<Value> = match task.as_str() {
+        "histo" => vec![json!({"size": 0, "aggs": agg})],
+        "histo_match" => (0..4).map(|tg| json!({"size": 0, "query": {"match": {"tag": RALLY[tg].0}}, "aggs": agg})).collect(),
+        _ => pairs(35).iter().map(|&(tg, _)| json!({"query": {"match": {"tag": RALLY[tg].0}}, "sort": [{"answers.date": {"mode": "max", "order": "desc", "nested": {"path": "answers"}}}]})).collect(),
+    };
+    for b in &bodies {
+        search(&svc, b);
+    }
+    eprintln!("LOOP_START");
+    let t = Instant::now();
+    let mut k = 0usize;
+    while t.elapsed().as_secs() < secs as u64 {
+        search(&svc, &bodies[k % bodies.len()]);
+        k += 1;
+    }
+    eprintln!("LOOP {task}: {k} requests, {:.3} ms/request", t.elapsed().as_secs_f64() * 1e3 / k as f64);
+}

@@ -45,13 +45,21 @@ impl TokenFilter for EdgeNGramTokenFilter {
     }
 
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
+        self.filter_bounded(tokens, usize::MAX).expect("unbounded")
+    }
+
+    fn filter_bounded(&self, tokens: Vec<Token>, budget: usize) -> Option<Vec<Token>> {
         let mut out = Vec::new();
+        let mut push = |out: &mut Vec<Token>, t: Token| {
+            out.push(t);
+            out.len() <= budget
+        };
         for t in tokens {
             let chars: Vec<char> = t.text.chars().collect();
             let n = chars.len();
             if n < self.min {
-                if self.preserve_original {
-                    out.push(t);
+                if self.preserve_original && !push(&mut out, t) {
+                    return None;
                 }
                 continue;
             }
@@ -60,13 +68,15 @@ impl TokenFilter for EdgeNGramTokenFilter {
                     Side::Front => chars[..len].iter().collect(),
                     Side::Back => chars[n - len..].iter().collect(),
                 };
-                out.push(Token { text: gram, ..t.clone() });
+                if !push(&mut out, Token { text: gram, ..t.clone() }) {
+                    return None;
+                }
             }
-            if self.preserve_original && n > self.max {
-                out.push(t);
+            if self.preserve_original && n > self.max && !push(&mut out, t) {
+                return None;
             }
         }
-        out
+        Some(out)
     }
 }
 
@@ -94,29 +104,36 @@ impl TokenFilter for NGramTokenFilter {
     }
 
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
+        self.filter_bounded(tokens, usize::MAX).expect("unbounded")
+    }
+
+    fn filter_bounded(&self, tokens: Vec<Token>, budget: usize) -> Option<Vec<Token>> {
         let mut out = Vec::new();
+        let mut push = |out: &mut Vec<Token>, t: Token| {
+            out.push(t);
+            out.len() <= budget
+        };
         for t in tokens {
             let chars: Vec<char> = t.text.chars().collect();
             let n = chars.len();
             if n < self.min {
-                if self.preserve_original {
-                    out.push(t);
+                if self.preserve_original && !push(&mut out, t) {
+                    return None;
                 }
                 continue;
             }
             for len in self.min..=self.max.min(n) {
                 for start in 0..=n - len {
-                    out.push(Token {
-                        text: chars[start..start + len].iter().collect(),
-                        ..t.clone()
-                    });
+                    if !push(&mut out, Token { text: chars[start..start + len].iter().collect(), ..t.clone() }) {
+                        return None;
+                    }
                 }
             }
-            if self.preserve_original && n > self.max {
-                out.push(t);
+            if self.preserve_original && n > self.max && !push(&mut out, t) {
+                return None;
             }
         }
-        out
+        Some(out)
     }
 }
 
@@ -125,7 +142,7 @@ mod tests {
     use super::*;
 
     fn tok(text: &str, pos: u32) -> Token {
-        Token { text: text.into(), position: pos, offset_from: 10, offset_to: 10 + text.len() as u32 }
+        Token { text: text.into(), position: pos, offset_from: 10, offset_to: 10 + text.len() as u32, keyword: false }
     }
     fn texts(t: &[Token]) -> Vec<&str> {
         t.iter().map(|t| t.text.as_str()).collect()

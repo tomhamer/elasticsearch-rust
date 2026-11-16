@@ -34,6 +34,11 @@ rules:
   - apiGroups: [""]
     resources: ["services", "configmaps"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # The elastic user and the CA / certificate Secrets of every cluster, and
+  # the user's own HTTP certificate (spec.http.tls.certificate.secretName).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "delete"]

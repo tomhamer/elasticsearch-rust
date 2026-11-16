@@ -109,7 +109,10 @@ pub(super) async fn mirror(node: &Arc<ClusterNode>, id: String, doc: Option<Valu
             engine.create_index(INDEX, &json!({"settings":{"index":{"hidden":true,"number_of_shards":1,
                 "number_of_replicas":0,"auto_expand_replicas":"0-1"}},"aliases":{".security":{"is_hidden":true}}})).map(|_| ())
         }).await?;
-        if !node.wait_applied_everywhere(version, Duration::from_secs(30)).await {
+        // The publication that created the index, applied on every node
+        // (its customs need not be: a deferral for this very API in flight
+        // would otherwise hold the wait until it timed out).
+        if !node.wait_state_applied_everywhere(version, Duration::from_secs(30)).await {
             return Err(EsError::new(503, "timeout_exception", "security index creation was not applied everywhere"));
         }
     }
@@ -207,7 +210,12 @@ mod tests {
         // service while an old caller still owns its PrimaryCtx. The context
         // must keep its old service; accepting the new shell would reset its
         // sequencing/history and make a retry acknowledge a different store.
+        // The master tombstones the incarnation it replaces (ES IndexGraveyard);
+        // without one the old copy would be kept dangling, not deleted.
         let mut replacement = updated.clone();
+        let old_uuid = replacement.indices[INDEX].uuid.clone();
+        let stones = elasticsearch_cluster::graveyard::with_tombstone(&replacement, INDEX, &old_uuid, 1, 500);
+        replacement.customs.insert(elasticsearch_cluster::graveyard::CUSTOM.into(), stones);
         replacement.indices.get_mut(INDEX).unwrap().uuid = elasticsearch_engine::index::new_uuid();
         let report = mirror::apply_changes(&engine, &updated, &replacement, &mut uuids, false, &Default::default());
         assert!(report.errors.is_empty(), "{:?}", report.errors);

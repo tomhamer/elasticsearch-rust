@@ -284,6 +284,17 @@ impl Grant {
             Grant::Pattern(p) => glob(p, action),
         }
     }
+    /// Whether an index grant applies to an index's `::failures` component
+    /// (`failures`) or to its data: the failure-store privileges apply to
+    /// failures only, `all` to both, every other privilege (and action
+    /// pattern) to data only (ES 9 `IndexComponentSelectorPrivilege`).
+    pub fn applies_to(&self, failures: bool) -> bool {
+        match self {
+            Grant::Named(d) if d.name == "all" => true,
+            Grant::Named(d) => INDEX_PRIVS.iter().find(|(p, _)| p.name == d.name).map_or(!failures, |(_, data)| *data != failures),
+            Grant::Pattern(_) => !failures,
+        }
+    }
     pub fn name(&self) -> &str {
         match self {
             Grant::Named(d) => d.name,

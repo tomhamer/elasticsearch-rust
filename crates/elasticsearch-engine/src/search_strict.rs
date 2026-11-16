@@ -61,7 +61,10 @@ pub fn check_query(v: &Value, key: &str, within: Option<&str>) -> Result<()> {
     let (name, body) = o.iter().next().unwrap();
     // ES counts the depth as it meets each named query, before resolving it.
     let _depth = crate::query::limits::Depth::enter(&crate::query::limits::CHECK_DEPTH)?;
-    if !QUERY_NAMES.contains(&name.as_str()) && !matches!(name.as_str(), "mlt" | "rule_query") && !(name == "deprecated" && crate::warnings::has_test_module("x-pack-test-deprecated-query")) {
+    // `esql_single_value` is internal to ES|QL's pushdown: only a body
+    // carrying this process's token is known.
+    let internal = name == "esql_single_value" && crate::query::single_value::is_internal(body);
+    if !QUERY_NAMES.contains(&name.as_str()) && !matches!(name.as_str(), "mlt" | "rule_query") && !internal && !(name == "deprecated" && crate::warnings::has_test_module("x-pack-test-deprecated-query")) {
         return Err(EsError::unknown_named("unknown query", name, None, QUERY_NAMES));
     }
     if !body.is_object() {

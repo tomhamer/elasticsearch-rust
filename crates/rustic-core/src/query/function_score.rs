@@ -171,6 +171,17 @@ impl DecayKind {
     }
 }
 
+/// How a decay reduces the distances of a multi-valued field (ES
+/// `MultiValueMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MultiValueMode {
+    #[default]
+    Min,
+    Max,
+    Avg,
+    Sum,
+}
+
 /// One scoring function.
 #[derive(Clone, Debug)]
 pub enum ScoreFunction {
@@ -179,13 +190,19 @@ pub enum ScoreFunction {
     /// `modifier(factor * value)` of a numeric fast field; `missing` is used
     /// for docs without a value (1.0 when unset). Multi-valued fields use
     /// the first value.
-    FieldValueFactor { field: u16, factor: f32, modifier: FieldValueModifier, missing: Option<f64> },
+    /// `name`: the field's name, for the missing-value error.
+    FieldValueFactor { field: u16, name: String, factor: f32, modifier: FieldValueModifier, missing: Option<f64> },
     /// A deterministic pseudo-random value in `[0, 1)` per `(seed, doc)`.
     RandomScore { seed: u64 },
-    /// Decay with the distance of a numeric field from `origin` (dates are
-    /// i64 millis). Docs without a value score 1; multi-valued fields use
-    /// the closest value.
-    Decay { field: u16, origin: f64, scale: f64, offset: f64, decay: f64, kind: DecayKind },
+    /// A deterministic pseudo-random value in `[0, 1)` per `(seed, salt,
+    /// value of field)` (ES seeded `random_score` with a `field`): stable
+    /// for a document whatever its doc id (merges, other leaves), equal for
+    /// documents with the same value. `salt` separates indices / shards.
+    RandomField { seed: u64, salt: u64, field: u16 },
+    /// Decay with the distance of a numeric field from `origin` (dates in
+    /// the field's own unit). Docs without a value score 1; a multi-valued
+    /// field's distances are reduced by `mode` (ES `multi_value_mode`).
+    Decay { field: u16, origin: f64, scale: f64, offset: f64, decay: f64, kind: DecayKind, mode: MultiValueMode },
     /// `function` applies only to docs matching `filter`.
     Filtered { filter: Box<Query>, function: Box<ScoreFunction> },
     /// `function` multiplied by `weight` (ES per-function `weight`).
@@ -228,8 +245,67 @@ pub enum BoostMode {
     Min,
 }
 
+/// ES `FunctionScoreQuery.FunctionFactorScorer`'s combination of the
+/// functions that apply to a document: `push` each applicable function's
+/// (weighted) value and its weight in order, then [`FactorAcc::finish`].
+/// `avg` is `Σ(wᵢ·fᵢ) / Σwᵢ` over the applicable functions (the pushed
+/// values are already weighted); `first` is the first applicable one; a
+/// NaN value makes the factor NaN. Every function_score execution path
+/// (the generic scorer, the script and geo-decay scorers) combines with
+/// this, so they cannot drift apart.
+#[derive(Clone, Copy, Debug)]
+pub struct FactorAcc {
+    mode: ScoreMode,
+    acc: Option<f64>,
+    weights: f64,
+    nan: bool,
+}
+
+impl FactorAcc {
+    pub fn new(mode: ScoreMode) -> Self {
+        Self { mode, acc: None, weights: 0.0, nan: false }
+    }
+
+    /// Add an applicable function's weighted `value` and its `weight`;
+    /// false once no later function can change the factor (`first`, or a
+    /// NaN).
+    #[inline]
+    pub fn push(&mut self, value: f64, weight: f64) -> bool {
+        if value.is_nan() {
+            self.nan = true;
+            return false;
+        }
+        self.weights += weight;
+        self.acc = Some(match (self.acc, self.mode) {
+            (None, _) => value,
+            (Some(a), ScoreMode::Multiply) => a * value,
+            (Some(a), ScoreMode::Sum | ScoreMode::Avg) => a + value,
+            (Some(a), ScoreMode::First) => a,
+            (Some(a), ScoreMode::Max) => a.max(value),
+            (Some(a), ScoreMode::Min) => a.min(value),
+        });
+        self.mode != ScoreMode::First
+    }
+
+    /// The combined factor capped at `max_boost` (1 when no function
+    /// applied; Java `Math.min`: NaN propagates).
+    #[inline]
+    pub fn finish(&self, max_boost: f32) -> f64 {
+        if self.nan {
+            return f64::NAN;
+        }
+        let f = match self.acc {
+            None => 1.0,
+            Some(a) if self.mode == ScoreMode::Avg => a / self.weights,
+            Some(a) => a,
+        };
+        if f.is_nan() { f } else { f.min(max_boost as f64) }
+    }
+}
+
 impl BoostMode {
-    fn combine(&self, q: f64, f: f64) -> f64 {
+    /// The query score `q` combined with the function factor `f`.
+    pub fn combine(&self, q: f64, f: f64) -> f64 {
         // Java Math.min/max propagate NaN; Rust's min/max select the other
         // operand. Preserve invalid function scores for the scorer's error gate.
         if q.is_nan() || f.is_nan() {
@@ -249,9 +325,12 @@ impl BoostMode {
 /// One [`ScoreFunction`] bound to a leaf (doc-value columns opened once).
 pub enum Prepared {
     Weight(f64),
-    Fvf { values: NumericDv<'static>, factor: f64, modifier: FieldValueModifier, missing: Option<f64> },
+    /// `error`: where a document without a value (and no `missing`) records
+    /// ES's "Missing value for field [name]".
+    Fvf { values: NumericDv<'static>, factor: f64, modifier: FieldValueModifier, missing: Option<f64>, name: String, error: Option<std::sync::Arc<parking_lot::Mutex<Option<String>>>> },
     Random { seed: u64 },
-    Decay { values: NumericDv<'static>, origin: f64, scale: f64, offset: f64, decay: f64, kind: DecayKind },
+    RandomField { seed: u64, numbers: NumericDv<'static>, leaf: LeafReader<'static>, field: u16 },
+    Decay { values: NumericDv<'static>, origin: f64, scale: f64, offset: f64, decay: f64, kind: DecayKind, mode: MultiValueMode },
     Filtered { bits: Vec<u64>, inner: Box<Prepared> },
     Weighted { inner: Box<Prepared>, weight: f64 },
 }
@@ -273,20 +352,31 @@ impl Prepared {
     pub fn build(f: &ScoreFunction, leaf: &LeafReader<'_>, ctx: &SearchContext) -> Self {
         match f {
             ScoreFunction::Weight(w) => Prepared::Weight(*w as f64),
-            ScoreFunction::FieldValueFactor { field, factor, modifier, missing } => Prepared::Fvf {
+            ScoreFunction::FieldValueFactor { field, name, factor, modifier, missing } => Prepared::Fvf {
                 values: open_dv(leaf, *field),
                 factor: *factor as f64,
                 modifier: *modifier,
                 missing: *missing,
+                name: name.clone(),
+                error: Some(ctx.function_error.clone()),
             },
             ScoreFunction::RandomScore { seed } => Prepared::Random { seed: *seed },
-            ScoreFunction::Decay { field, origin, scale, offset, decay, kind } => Prepared::Decay {
+            ScoreFunction::RandomField { seed, salt, field } => Prepared::RandomField {
+                seed: splitmix64(*seed ^ splitmix64(*salt)),
+                numbers: open_dv(leaf, *field),
+                // SAFETY: as `open_dv`: the prepared function lives in a
+                // scorer / explain built for `leaf` and never outlives it.
+                leaf: unsafe { std::mem::transmute::<LeafReader<'_>, LeafReader<'static>>(*leaf) },
+                field: *field,
+            },
+            ScoreFunction::Decay { field, origin, scale, offset, decay, kind, mode } => Prepared::Decay {
                 values: open_dv(leaf, *field),
                 origin: *origin,
                 scale: *scale,
                 offset: *offset,
                 decay: *decay,
                 kind: *kind,
+                mode: *mode,
             },
             ScoreFunction::Filtered { filter, function } => {
                 let mut bits = vec![0u64; (leaf.num_docs() as usize).div_ceil(64)];
@@ -324,16 +414,48 @@ impl Prepared {
     pub fn value(&self, doc: DocId) -> Option<f64> {
         match self {
             Prepared::Weight(w) => Some(*w),
-            Prepared::Fvf { values, factor, modifier, missing } => {
-                let v = values.first(doc).or(*missing).unwrap_or(1.0);
+            Prepared::Fvf { values, factor, modifier, missing, name, error } => {
+                // ES `FieldValueFactorFunction`: the value, else `missing`,
+                // else the search fails (never an invented 1).
+                let v = match values.first(doc).or(*missing) {
+                    Some(v) => v,
+                    None => {
+                        if let Some(e) = error {
+                            e.lock().get_or_insert_with(|| format!("Missing value for field [{name}]"));
+                        }
+                        1.0
+                    }
+                };
                 Some(modifier.apply(factor * v))
             }
             Prepared::Random { seed } => Some(random_score(*seed, doc)),
-            Prepared::Decay { values, origin, scale, offset, decay, kind } => {
-                let mut d = f64::INFINITY;
-                if values.for_each(doc, |v| d = d.min(((v - origin).abs() - offset).max(0.0))) == 0 {
+            Prepared::RandomField { seed, numbers, leaf, field } => {
+                // The field's (minimum) value, numeric or keyword; none: 0.
+                let mut h: Option<u64> = None;
+                numbers.for_each(doc, |v| {
+                    let bits = splitmix64(v.to_bits());
+                    h = Some(h.map_or(bits, |x| x.min(bits)));
+                });
+                let h = h.or_else(|| leaf.keyword_values(*field, doc).iter().map(|k| k.bytes().fold(0xcbf2_9ce4_8422_2325u64, |a, b| (a ^ b as u64).wrapping_mul(0x100_0000_01b3))).min()).unwrap_or(0);
+                Some((splitmix64(seed ^ splitmix64(h)) >> 11) as f64 / (1u64 << 53) as f64)
+            }
+            Prepared::Decay { values, origin, scale, offset, decay, kind, mode } => {
+                let (mut min, mut max, mut sum) = (f64::INFINITY, 0f64, 0f64);
+                let n = values.for_each(doc, |v| {
+                    let d = ((v - origin).abs() - offset).max(0.0);
+                    min = min.min(d);
+                    max = max.max(d);
+                    sum += d;
+                });
+                if n == 0 {
                     return Some(1.0);
                 }
+                let d = match mode {
+                    MultiValueMode::Min => min,
+                    MultiValueMode::Max => max,
+                    MultiValueMode::Avg => sum / n as f64,
+                    MultiValueMode::Sum => sum,
+                };
                 Some(kind.eval(d, *scale, *decay))
             }
             Prepared::Filtered { bits, inner } => {
@@ -352,11 +474,12 @@ impl Prepared {
         let v = self.value(doc)?;
         let d = match self {
             Prepared::Weight(_) => "weight".into(),
-            Prepared::Fvf { values, factor, modifier, missing } => {
+            Prepared::Fvf { values, factor, modifier, missing, .. } => {
                 let x = values.first(doc).or(*missing).unwrap_or(1.0);
                 format!("field value function: {modifier:?}(doc value {x} * factor {factor})")
             }
             Prepared::Random { seed } => format!("random score function (seed: {seed})"),
+            Prepared::RandomField { field, .. } => format!("random score function (field: {field})"),
             Prepared::Decay { values, origin, offset, kind, .. } => {
                 let mut d = f64::INFINITY;
                 if values.for_each(doc, |x| d = d.min(((x - origin).abs() - offset).max(0.0))) == 0 {
@@ -449,44 +572,31 @@ impl PreparedFunctions {
             let value = f.value(doc).unwrap_or(1.0);
             return if value.is_nan() { value } else { value.min(self.params.max_boost as f64) };
         }
-        let mut acc: Option<f64> = None;
-        let mut wsum = 0.0;
+        let mut acc = FactorAcc::new(self.params.score_mode);
         for p in &self.funcs {
             let Some(v) = p.value(doc) else { continue };
-            if v.is_nan() {
-                return v;
-            }
-            if self.params.score_mode == ScoreMode::Avg {
-                wsum += p.weight_of();
-            }
-            acc = Some(match (acc, self.params.score_mode) {
-                (None, _) => v,
-                (Some(a), ScoreMode::Multiply) => a * v,
-                (Some(a), ScoreMode::Sum | ScoreMode::Avg) => a + v,
-                (Some(a), ScoreMode::First) => a,
-                (Some(a), ScoreMode::Max) => a.max(v),
-                (Some(a), ScoreMode::Min) => a.min(v),
-            });
-            if self.params.score_mode == ScoreMode::First {
+            if !acc.push(v, p.weight_of()) {
                 break;
             }
         }
-        let f = match acc {
-            None => 1.0,
-            Some(a) if self.params.score_mode == ScoreMode::Avg => a / wsum,
-            Some(a) => a,
-        };
-        if f.is_nan() { f } else { f.min(self.params.max_boost as f64) }
+        acc.finish(self.params.max_boost)
     }
 
     /// Final score of `doc` given its query score.
     #[inline]
     pub fn score(&self, doc: DocId, query_score: f32) -> f32 {
+        // ES `FunctionFactorScorer.score`: no functions, the query's score.
+        if self.funcs.is_empty() {
+            return query_score;
+        }
         self.params.boost_mode.combine(query_score as f64, self.factor_value(doc)) as f32
     }
 
     /// Explanation of [`PreparedFunctions::score`].
     pub fn explain(&self, doc: DocId, query: Explanation) -> Explanation {
+        if self.funcs.is_empty() {
+            return query;
+        }
         let (f, parts) = self.factor(doc);
         let value = self.params.boost_mode.combine(query.value as f64, f) as f32;
         let fdetails = parts.into_iter().map(|(v, d)| Explanation::leaf(v as f32, d)).collect();
@@ -565,7 +675,7 @@ impl Scorer for FunctionScoreScorer {
         let num_docs = self.match_all_docs?;
         let params = self.funcs.params;
         if k == 0 || params.min_score.is_some() || !params.max_boost.is_finite() || params.max_boost < 0.0 { return None; }
-        let [Prepared::Fvf { values, factor, modifier, missing }] = self.funcs.funcs.as_slice() else { return None };
+        let [Prepared::Fvf { values, factor, modifier, missing, name, error }] = self.funcs.funcs.as_slice() else { return None };
         if !factor.is_finite() || *factor <= 0.0 || !matches!(modifier, FieldValueModifier::Log1p | FieldValueModifier::Log2p | FieldValueModifier::Ln1p | FieldValueModifier::Ln2p) { return None; }
         let invalid = &self.funcs.invalid;
         let score = |doc: DocId, raw: f64| {
@@ -581,7 +691,12 @@ impl Scorer for FunctionScoreScorer {
         if let Some(out) = monotone_top_k_from_points(values, num_docs, k, deleted, score) {
             return Some(out);
         }
-        Some(monotone_top_k(num_docs, k, deleted, |doc| values.first(doc).or(*missing).unwrap_or(1.0), score))
+        Some(monotone_top_k(num_docs, k, deleted, |doc| values.first(doc).or(*missing).unwrap_or_else(|| {
+            if let Some(e) = error {
+                e.lock().get_or_insert_with(|| format!("Missing value for field [{name}]"));
+            }
+            1.0
+        }), score))
     }
 
     fn score(&mut self) -> f32 {
@@ -672,7 +787,7 @@ mod tests {
         use crate::query::{docset::AllDocSet, scorer::ConstScorer};
         let make = |missing, min_score, factor, match_all| {
             let funcs = PreparedFunctions {
-                funcs: vec![Prepared::Fvf { values: NumericDv::Empty, factor, modifier: FieldValueModifier::Log2p, missing: Some(missing) }],
+                funcs: vec![Prepared::Fvf { values: NumericDv::Empty, factor, modifier: FieldValueModifier::Log2p, missing: Some(missing), name: "f".into(), error: None }],
                 params: FunctionScoreParams { score_mode: ScoreMode::Avg, boost_mode: BoostMode::Multiply, max_boost: 100.0, min_score },
                 invalid: Default::default(),
             };

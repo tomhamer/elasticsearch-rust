@@ -230,3 +230,104 @@ async fn transform_continuous_checkpoints() {
     let (st, _) = es.delete("/_transform/cont").await;
     assert_eq!(st, 200);
 }
+
+/// Group keys that ES's `IdGenerator` serializes identically (`$` inside a
+/// value; null vs the literal `"__NULL_VALUE__"`) must still produce one
+/// destination document per group.
+#[tokio::test(flavor = "multi_thread")]
+async fn transform_distinct_groups_never_share_a_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let es = start(dir.path()).await;
+    let (st, v) = es.put("/kv", json!({"mappings": {"properties": {"a": {"type": "keyword"}, "b": {"type": "keyword"}, "v": {"type": "long"}}}})).await;
+    assert_eq!(st, 200, "{v}");
+    let docs = [json!({"a": "x$x", "b": "x", "v": 1}), json!({"a": "x", "b": "x$x", "v": 2}), json!({"b": "n", "v": 3}), json!({"a": "__NULL_VALUE__", "b": "n", "v": 4})];
+    let mut lines = Vec::new();
+    for (i, d) in docs.iter().enumerate() {
+        lines.push(json!({"index": {"_index": "kv", "_id": i.to_string()}}));
+        lines.push(d.clone());
+    }
+    let (st, v) = es.bulk("/_bulk?refresh=true", &lines).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es
+        .put(
+            "/_transform/collide",
+            json!({
+                "source": {"index": "kv"},
+                "dest": {"index": "kv-out"},
+                "pivot": {"group_by": {"a": {"terms": {"field": "a", "missing_bucket": true}}, "b": {"terms": {"field": "b"}}}, "aggs": {"total": {"sum": {"field": "v"}}}}
+            }),
+        )
+        .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.post_empty("/_transform/collide/_start").await;
+    assert_eq!(st, 200, "{v}");
+    wait_stopped(&es, "collide").await;
+    let (_, v) = es.post("/kv-out/_search", json!({"size": 10, "sort": [{"total": "asc"}]})).await;
+    let hits = v["hits"]["hits"].as_array().unwrap();
+    let totals: Vec<f64> = hits.iter().map(|h| h["_source"]["total"].as_f64().unwrap()).collect();
+    assert_eq!(totals, vec![1.0, 2.0, 3.0, 4.0], "one document per group: {v}");
+    let mut ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), 4, "{v}");
+    assert!(hits.iter().any(|h| h["_source"]["a"].is_null() && h["_source"]["total"] == 3.0), "{v}");
+    assert!(hits.iter().any(|h| h["_source"]["a"] == "__NULL_VALUE__" && h["_source"]["total"] == 4.0), "{v}");
+}
+
+async fn run_batch(es: &Es, id: &str, src: &str, mapping: Value, docs: &[Value], group_by: Value) -> Vec<(String, Value)> {
+    let (st, v) = es.put(&format!("/{src}"), json!({"mappings": {"properties": mapping}})).await;
+    assert_eq!(st, 200, "{v}");
+    let mut lines = Vec::new();
+    for d in docs {
+        lines.push(json!({"index": {"_index": src}}));
+        lines.push(d.clone());
+    }
+    let (st, v) = es.bulk("/_bulk?refresh=true", &lines).await;
+    assert_eq!(st, 200, "{v}");
+    let body = json!({"source": {"index": src}, "dest": {"index": format!("{id}-out")}, "pivot": {"group_by": group_by, "aggs": {"n": {"max": {"field": "nn"}}}}});
+    let (st, v) = es.put(&format!("/_transform/{id}"), body).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = es.post_empty(&format!("/_transform/{id}/_start")).await;
+    assert_eq!(st, 200, "{v}");
+    wait_stopped(es, id).await;
+    let (_, v) = es.post(&format!("/{id}-out/_search"), json!({"size": 100})).await;
+    let mut out: Vec<(String, Value)> = v["hits"]["hits"].as_array().unwrap().iter().map(|h| (h["_id"].as_str().unwrap().to_string(), h["_source"].clone())).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The same source data and transforms as a run on Elasticsearch 9.5.5
+/// produce the `_id`s ES wrote, for keyword, long, double, boolean,
+/// date_histogram and histogram groups; the groups ES merged (`$` inside a
+/// value, null vs `"__NULL_VALUE__"`) keep separate documents here.
+#[tokio::test(flavor = "multi_thread")]
+async fn transform_ids_match_elasticsearch() {
+    let dir = tempfile::tempdir().unwrap();
+    let es = start(dir.path()).await;
+    let strings = run_batch(
+        &es,
+        "ids-strings",
+        "ids-src-strings",
+        json!({"a": {"type": "keyword"}, "b": {"type": "keyword"}, "nn": {"type": "long"}}),
+        &[json!({"a": "x$x", "b": "x", "nn": 1}), json!({"a": "x", "b": "x$x", "nn": 1}), json!({"b": "n", "nn": 1}), json!({"a": "__NULL_VALUE__", "b": "n", "nn": 1}), json!({"a": "", "b": "e", "nn": 1}), json!({"a": "foo", "b": "bar", "nn": 1}), json!({"a": "\u{e9}t\u{e9}", "b": "z", "nn": 1})],
+        json!({"a": {"terms": {"field": "a", "missing_bucket": true}}, "b": {"terms": {"field": "b"}}}),
+    )
+    .await;
+    assert_eq!(strings.len(), 7, "every group has its own document: {strings:?}");
+    let id_of = |a: Value, b: &str| strings.iter().find(|(_, s)| s["a"] == a && s["b"] == b).map(|(i, _)| i.clone()).unwrap_or_else(|| panic!("no group ({a}, {b})"));
+    assert_eq!(id_of(json!(""), "e"), "X2X1ntn1ERb7y1eSYGEe5f62AAAAAAAA");
+    assert_eq!(id_of(json!("foo"), "bar"), "ZmKcNTRLxPl7G_pBVjBEFPK9AAAAAAAA");
+    assert_eq!(id_of(json!("\u{e9}t\u{e9}"), "z"), "w3rDu5_tv8fyvHsy4JlGobAFAAAAAAAA");
+    assert_eq!(id_of(Value::Null, "n"), "X27T7iu6vNuvZt4nWKq_a3PsAAAAAAAA");
+    let types = run_batch(
+        &es,
+        "ids-types",
+        "ids-src-types",
+        json!({"l": {"type": "long"}, "d": {"type": "double"}, "bo": {"type": "boolean"}, "t": {"type": "date"}, "nn": {"type": "long"}}),
+        &[json!({"l": 42, "d": 1.5, "bo": true, "t": "2017-02-18T01:30:00Z", "nn": 1}), json!({"l": -7, "d": 12.0, "bo": false, "t": "2017-02-18T03:00:00Z", "nn": 1}), json!({"l": 36, "d": 0.0, "bo": true, "t": 0, "nn": 1})],
+        json!({"l": {"terms": {"field": "l"}}, "d": {"terms": {"field": "d"}}, "bo": {"terms": {"field": "bo"}}, "dh": {"date_histogram": {"field": "t", "fixed_interval": "1h"}}, "h": {"histogram": {"field": "d", "interval": 5}}}),
+    )
+    .await;
+    let mut ids: Vec<&str> = types.iter().map(|(i, _)| i.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["AEAAQP8u1b9NfC2Xp544UGp1aZExAAAA", "AQAAAAAeV7qEQHy9WPK6apOqCP-DAAAA", "AT8AAAAsfPIvxC5blRKYQOolRSsJAAAA"], "{types:?}");
+}

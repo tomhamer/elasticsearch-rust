@@ -78,6 +78,13 @@ async fn public_coordinator_enforces_security_across_shards() {
     for path in ["/", "/_cluster/state", "/_cluster/health", "/_nodes", "/_cat/indices"] {
         assert_eq!(call(&client, None, Method::GET, path, None).await.0, 401, "{path}");
     }
+    // Dev (debug) builds: the request crosses the front, the engine router
+    // (security, authorization) and the front again, then the engine's
+    // nodes info; this overflowed the 2 MiB worker stack before the large
+    // dispatch futures were boxed.
+    let (status, all) = call(&client, Some("elastic"), Method::GET, "/_nodes", None).await;
+    assert_eq!(status, 200, "{all}");
+    assert_eq!(all["_nodes"]["successful"], 1, "{all}");
     let (status, info) = call(&client, Some("elastic"), Method::GET, "/_nodes/os,settings?flat_settings=true", None).await;
     assert_eq!(status, 200, "{info}");
     let entry = info["nodes"].as_object().unwrap().values().next().unwrap();

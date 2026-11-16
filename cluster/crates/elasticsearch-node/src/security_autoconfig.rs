@@ -933,20 +933,16 @@ pub fn banner(password: Option<&str>, ca_fingerprint: Option<&str>, kibana_token
     b
 }
 
-/// `ip:port` with the port of `published` (`host:port`).
-fn bound_with_port(ip: IpAddr, published: &str) -> Option<String> {
-    let port = published.rsplit(':').next()?.parse::<u16>().ok()?;
-    Some(std::net::SocketAddr::new(ip, port).to_string())
-}
-
 /// ES `InternalEnrollmentTokenGenerator`: the Kibana token and the node
 /// token (`Some("")` when the node binds only loopback addresses for
 /// transport or HTTP, `None` when creating it failed).
 async fn enrollment_tokens(node: &std::sync::Arc<crate::node::ClusterNode>) -> (Option<String>, Option<String>) {
     use crate::enrollment::{create_internal_token, split_addresses, KIBANA_ENROLLMENT_ACTION, NODE_ENROLLMENT_ACTION};
     let local = &node.local;
-    let http: Vec<String> = std::iter::once(local.http_address.clone()).chain(bound_with_port(node.config.http_bind, &local.http_address)).collect();
-    let transport: Vec<String> = std::iter::once(local.transport_address.clone()).chain(bound_with_port(node.config.transport_bind, &local.transport_address)).collect();
+    // Published addresses (any `<p>.publish_port` included), then where the
+    // listeners are bound.
+    let http: Vec<String> = std::iter::once(local.http_address.clone()).chain(node.http_bound_all.iter().map(|a| a.to_string())).collect();
+    let transport: Vec<String> = std::iter::once(local.transport_address.clone()).chain(node.transport.bound_addresses().iter().map(|a| a.to_string())).collect();
     let kibana = match create_internal_token(node, KIBANA_ENROLLMENT_ACTION, &http).await {
         Ok(t) => Some(t.encoded()),
         Err(e) => {

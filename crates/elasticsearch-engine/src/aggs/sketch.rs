@@ -472,6 +472,37 @@ impl TDigest {
     }
 
     /// Fold `other`'s centroids into this digest (shard reduce).
+    /// Add weighted points (`(value, count)`, a pre-aggregated histogram's
+    /// bins) with work proportional to the bins, not the counts: while the
+    /// digest is still exact and the total stays under its sample bound the
+    /// counts are recorded as samples (an exact digest, as for raw values);
+    /// otherwise the bins merge as centroids, as shard digests do.
+    pub fn add_weighted(&mut self, pts: &[(f64, u64)]) {
+        let total = pts.iter().fold(0u64, |a, p| a.saturating_add(p.1));
+        if let Some(s) = &self.samples {
+            if (s.len() as u64).saturating_add(total) < self.max_sorting as u64 {
+                for &(v, c) in pts {
+                    for _ in 0..c {
+                        self.add(v);
+                    }
+                }
+                return;
+            }
+        }
+        let extra: Vec<(f64, f64)> = pts.iter().filter(|p| p.0.is_finite() && p.1 > 0).map(|&(v, c)| (v, c as f64)).collect();
+        if extra.is_empty() {
+            return;
+        }
+        for &(v, _) in &extra {
+            self.min = self.min.min(v);
+            self.max = self.max.max(v);
+        }
+        if let Some(s) = self.samples.take() {
+            self.buffer.extend(s);
+        }
+        self.compress_with(extra);
+    }
+
     pub fn merge(&mut self, other: &mut TDigest) {
         let st = other.state();
         self.min = self.min.min(st.min.unwrap_or(f64::INFINITY));
@@ -1091,6 +1122,36 @@ mod tests {
     }
 
     use super::*;
+
+    /// #171: weighted bins feed the digest with work per bin, never per
+    /// counted observation; small totals stay exact (as sample adds).
+    #[test]
+    fn weighted_bins_cost_per_bin_not_per_count() {
+        let mut exact = TDigest::new(100.0);
+        let mut seq = TDigest::new(100.0);
+        let small = [(1.0, 1u64), (2.0, 2), (3.0, 1)];
+        exact.add_weighted(&small);
+        for (v, c) in small {
+            for _ in 0..c {
+                seq.add(v);
+            }
+        }
+        assert_eq!(exact.count(), 4);
+        for q in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert_eq!(exact.quantile(q), seq.quantile(q), "{q}");
+        }
+        // 5,000 bins of 10^12 observations each: 5 * 10^15 adds if replayed.
+        let bins: Vec<(f64, u64)> = (0..5_000).map(|i| (i as f64, 1_000_000_000_000)).collect();
+        let started = std::time::Instant::now();
+        let mut big = TDigest::new(100.0);
+        big.add_weighted(&bins);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(big.count(), 5_000 * 1_000_000_000_000);
+        let median = big.quantile(0.5).unwrap();
+        assert!((median - 2_500.0).abs() < 50.0, "{median}");
+        let st = big.state();
+        assert!(st.means.len() < 1_000, "compressed: {}", st.means.len());
+    }
 
     #[test]
     fn sketch_states_pack_and_read_both_forms() {

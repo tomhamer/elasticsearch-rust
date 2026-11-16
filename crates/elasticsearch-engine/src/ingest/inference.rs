@@ -47,6 +47,39 @@ fn text_of(v: &Value) -> String {
     }
 }
 
+/// The model input field of NLP models (`text_field`).
+const MODEL_INPUT: &str = "text_field";
+
+/// ES `InferenceResults.writeResultToField`: an absent destination is set,
+/// an existing one is appended to (finding 247: earlier results are kept).
+fn set_or_append(doc: &mut IngestDocument, path: &str, value: Value) -> Result<()> {
+    if doc.has(path) {
+        doc.append(path, value, true)
+    } else {
+        doc.set(path, value)
+    }
+}
+
+impl InferenceP {
+    /// The model's input text (finding 253): ES copies the document and
+    /// applies `field_map` with `putIfAbsent(model_field, value)`, so the
+    /// document's own `text_field` wins and a mapped field only supplies it
+    /// when absent.
+    fn input(&self, doc: &IngestDocument) -> Result<Value> {
+        if let Some(v) = doc.get(MODEL_INPUT)?.filter(|v| !v.is_null()) {
+            return Ok(v.clone());
+        }
+        for (src, dest) in &self.field_map {
+            if dest == MODEL_INPUT {
+                if let Some(v) = doc.get(src)?.filter(|v| !v.is_null()) {
+                    return Ok(v.clone());
+                }
+            }
+        }
+        Err(EsError::new(400, "status_exception", format!("Input field [{MODEL_INPUT}] does not exist in the source document")))
+    }
+}
+
 impl Processor for InferenceP {
     fn process(&self, doc: &mut IngestDocument, _: &PipelineContext) -> PResult {
         if !self.input_output.is_empty() {
@@ -55,17 +88,16 @@ impl Processor for InferenceP {
                     return Err(EsError::illegal_argument(format!("field [{inp}] doesn't exist")).into());
                 };
                 let r = embed_one(&self.model_id, &text_of(&v))?;
-                doc.set(out, r)?;
+                set_or_append(doc, out, r)?;
             }
             return Ok(());
         }
-        let from = self.field_map.first().map(|(f, _)| f.clone()).unwrap_or_else(|| "text_field".to_string());
-        let Some(v) = doc.get(&from)?.cloned() else {
-            return Err(EsError::illegal_argument(format!("field [{from}] doesn't exist")).into());
-        };
+        let v = self.input(doc)?;
         let r = embed_one(&self.model_id, &text_of(&v))?;
-        doc.set(&format!("{}.{}", self.target, self.results_field), r)?;
-        doc.set(&format!("{}.model_id", self.target), json!(self.model_id))?;
+        let mut result = Map::new();
+        result.insert(self.results_field.clone(), r);
+        result.insert("model_id".into(), json!(self.model_id));
+        set_or_append(doc, &self.target, Value::Object(result))?;
         Ok(())
     }
 }
@@ -98,4 +130,51 @@ pub fn build(cfg: &mut Cfg) -> Result<Box<dyn Processor>> {
     };
     cfg.ignore(&["ignore_missing"]);
     Ok(Box::new(InferenceP { model_id, target, results_field, field_map, input_output }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(v: Value) -> IngestDocument {
+        IngestDocument::new(v.as_object().unwrap().clone(), "i", None, None, "now".into())
+    }
+
+    fn processor(field_map: &[(&str, &str)]) -> InferenceP {
+        InferenceP {
+            model_id: "m".into(),
+            target: "ml.inference.m".into(),
+            results_field: "predicted_value".into(),
+            field_map: field_map.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+            input_output: Vec::new(),
+        }
+    }
+
+    /// Finding 253: the document's own `text_field` is the model input; a
+    /// `field_map` entry only supplies it when absent, whatever the order.
+    #[test]
+    fn field_map_supplies_a_missing_model_input_only() {
+        let p = processor(&[("fallback_text", "text_field"), ("other", "unrelated")]);
+        let d = doc(json!({"text_field": "current contract", "fallback_text": "old unrelated text"}));
+        assert_eq!(p.input(&d).unwrap(), json!("current contract"));
+        let d = doc(json!({"fallback_text": "old unrelated text", "other": "x"}));
+        assert_eq!(p.input(&d).unwrap(), json!("old unrelated text"));
+        let reversed = processor(&[("other", "unrelated"), ("fallback_text", "text_field")]);
+        assert_eq!(reversed.input(&d).unwrap(), json!("old unrelated text"));
+        assert!(p.input(&doc(json!({"x": 1}))).is_err());
+    }
+
+    /// Finding 247: an existing destination keeps its earlier result; the
+    /// new one is appended (ES `InferenceResults.writeResult`).
+    #[test]
+    fn results_are_appended_to_existing_outputs() {
+        let mut d = doc(json!({"ml": {"inference": {"m": {"predicted_value": [1.0], "model_id": "old", "note": "kept"}}}, "out": [0.5]}));
+        set_or_append(&mut d, "ml.inference.m", json!({"predicted_value": [2.0], "model_id": "m"})).unwrap();
+        let t = d.get("ml.inference.m").unwrap().unwrap();
+        assert_eq!(t, &json!([{"predicted_value": [1.0], "model_id": "old", "note": "kept"}, {"predicted_value": [2.0], "model_id": "m"}]));
+        set_or_append(&mut d, "fresh", json!({"predicted_value": 1})).unwrap();
+        assert_eq!(d.get("fresh").unwrap().unwrap(), &json!({"predicted_value": 1}));
+        set_or_append(&mut d, "out", json!([0.7])).unwrap();
+        assert_eq!(d.get("out").unwrap().unwrap(), &json!([0.5, 0.7]));
+    }
 }

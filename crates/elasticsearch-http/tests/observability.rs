@@ -381,6 +381,59 @@ async fn index_blocks() {
     assert_eq!(st, 403, "{v}");
 }
 
+/// The flood-stage block (`index.blocks.read_only_allow_delete`) rejects
+/// every document write, individual and bulk deletes included, with ES's
+/// 429 `cluster_block_exception`, appending nothing to the translog; only
+/// deleting the whole index goes through (ES's block "allows releasing
+/// resources", which `DELETE /{index}` checks, not document deletes).
+#[tokio::test(flavor = "multi_thread")]
+async fn flood_stage_block_allows_only_index_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    seed(&es).await;
+    let ops = |v: &Value| v["indices"]["books"]["primaries"]["translog"]["operations"].as_u64();
+    let (_, before) = es.get("/books/_stats/translog").await;
+    let (st, v) = es.put("/books/_settings", json!({"index.blocks.read_only_allow_delete": true})).await;
+    assert_eq!(st, 200, "{v}");
+    let blocked = "index [books] blocked by: [TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark, index has read-only-allow-delete block];";
+    // Index: blocked (as before).
+    let (st, v) = es.put("/books/_doc/9", json!({"title": "x"})).await;
+    assert_eq!((st, v["error"]["type"].as_str()), (429, Some("cluster_block_exception")), "{v}");
+    // Individual document delete: blocked.
+    let (st, v) = es.call(Method::DELETE, "/books/_doc/1", None).await;
+    assert_eq!((st, v["error"]["type"].as_str()), (429, Some("cluster_block_exception")), "{v}");
+    assert_eq!(v["error"]["reason"], blocked, "{v}");
+    // Bulk delete (alone, and mixed with an index): every item blocked.
+    for lines in [
+        "{\"delete\":{\"_index\":\"books\",\"_id\":\"2\"}}\n".to_string(),
+        "{\"delete\":{\"_index\":\"books\",\"_id\":\"3\"}}\n{\"index\":{\"_index\":\"books\",\"_id\":\"8\"}}\n{\"title\":\"y\"}\n".to_string(),
+    ] {
+        let r = es.c.post(format!("{}/_bulk", es.base)).header("content-type", "application/x-ndjson").body(lines).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["errors"], true, "{v}");
+        for item in v["items"].as_array().unwrap() {
+            let inner = item.as_object().unwrap().values().next().unwrap();
+            assert_eq!((inner["status"].as_u64(), inner["error"]["type"].as_str()), (Some(429), Some("cluster_block_exception")), "{v}");
+        }
+    }
+    // Nothing deleted and nothing appended.
+    let (st, v) = es.get("/books/_count").await;
+    assert_eq!((st, v["count"].as_u64()), (200, Some(3)), "{v}");
+    let (_, after) = es.get("/books/_stats/translog").await;
+    assert_eq!(ops(&after), ops(&before), "blocked writes appended to the translog: {before} -> {after}");
+    for id in 1..=3 {
+        let (st, v) = es.get(&format!("/books/_doc/{id}")).await;
+        assert_eq!((st, &v["found"]), (200, &json!(true)), "{v}");
+    }
+    // Deleting the whole index is allowed.
+    let (st, v) = es.call(Method::DELETE, "/books", None).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["acknowledged"], true, "{v}");
+    let (st, _) = es.get("/books").await;
+    assert_eq!(st, 404);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn validate_query_api() {
     let tmp = tempfile::tempdir().unwrap();

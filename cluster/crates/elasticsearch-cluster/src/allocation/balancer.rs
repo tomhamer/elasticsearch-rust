@@ -225,8 +225,12 @@ impl Allocation<'_> {
         let in_sync = self.meta(&c.index).and_then(|m| m.in_sync_allocation_ids.get(&c.shard).cloned()).unwrap_or_default();
         let listed: Vec<&super::StoreCopy> = self.stores.copies(&c.index, c.shard).iter().filter(|s| self.node(&s.node_id).is_some_and(|n| n.is_data())).collect();
         let copies: BTreeMap<String, Option<String>> = listed.iter().map(|s| (s.node_id.clone(), s.allocation_id.clone())).collect();
-        // in-sync copies only; former primaries first, then node id (ES PRIMARY_FIRST_COMPARATOR)
-        let mut ranked: Vec<&&super::StoreCopy> = listed.iter().filter(|s| s.allocation_id.as_ref().is_some_and(|a| in_sync.contains(a))).collect();
+        let corrupted: BTreeMap<&str, &str> = listed.iter().filter_map(|s| Some((s.node_id.as_str(), s.store_exception.as_deref()?))).collect();
+        // in-sync copies with no store exception only (ES drops copies whose
+        // store is corrupted); former primaries first, then node id (ES
+        // PRIMARY_FIRST_COMPARATOR)
+        let mut ranked: Vec<&&super::StoreCopy> = listed.iter()
+            .filter(|s| s.store_exception.is_none() && s.allocation_id.as_ref().is_some_and(|a| in_sync.contains(a))).collect();
         ranked.sort_by(|a, b| b.primary.cmp(&a.primary).then(a.node_id.cmp(&b.node_id)));
         let valid: Vec<(String, String)> = ranked.iter().map(|s| (s.node_id.clone(), s.allocation_id.clone().unwrap_or_default())).collect();
         let mut decisions: HashMap<String, Decision> = HashMap::new();
@@ -272,11 +276,14 @@ impl Allocation<'_> {
         if explain {
             let mut rows: Vec<(u8, NodeResult)> = Vec::new();
             for node in self.data_nodes() {
-                let store = match copies.get(&node.id) {
+                let mut store = match copies.get(&node.id) {
                     Some(Some(aid)) => json!({"in_sync": in_sync.contains(aid), "allocation_id": aid}),
                     Some(None) => json!({"in_sync": false}),
                     None => json!({"found": false}),
                 };
+                if let Some(reason) = corrupted.get(node.id.as_str()) {
+                    store["store_exception"] = json!({"type": "corrupt_index_exception", "reason": reason});
+                }
                 let (rank, decision, nd) = match decisions.remove(&node.id) {
                     Some(d) => {
                         let nd = d.kind.allocation_decision();

@@ -83,6 +83,9 @@ fn fmt_json_double(d: f64) -> String {
 /// A flattened field value: its leaves keyed by dotted path (sorted), all
 /// values as strings.
 pub fn flattened_json(v: &Value) -> String {
+    // Every scalar leaf with its dotted path: object arrays and nested
+    // arrays are walked through (a flattened field keys them all), and a
+    // path repeated across array elements keeps every value, in order.
     let mut leaves: Vec<(String, Value)> = Vec::new();
     fn walk(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
         match v {
@@ -92,17 +95,7 @@ pub fn flattened_json(v: &Value) -> String {
                     walk(&p, x, out);
                 }
             }
-            Value::Array(a) => {
-                let vals: Vec<Value> = a.iter().filter(|x| !x.is_null() && !x.is_object() && !x.is_array()).map(leaf).collect();
-                for x in a.iter().filter(|x| x.is_object()) {
-                    walk(prefix, x, out);
-                }
-                match vals.len() {
-                    0 => {}
-                    1 => out.push((prefix.to_string(), vals[0].clone())),
-                    _ => out.push((prefix.to_string(), Value::Array(vals))),
-                }
-            }
+            Value::Array(a) => a.iter().for_each(|x| walk(prefix, x, out)),
             Value::Null => {}
             other => out.push((prefix.to_string(), leaf(other))),
         }
@@ -114,8 +107,11 @@ pub fn flattened_json(v: &Value) -> String {
         }
     }
     walk("", v, &mut leaves);
-    leaves.sort_by(|a, b| a.0.cmp(&b.0));
-    let m: Map<String, Value> = leaves.into_iter().collect();
+    let mut grouped: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+    for (k, x) in leaves {
+        grouped.entry(k).or_default().push(x);
+    }
+    let m: Map<String, Value> = grouped.into_iter().map(|(k, mut vs)| (k, if vs.len() == 1 { vs.pop().unwrap() } else { Value::Array(vs) })).collect();
     Value::Object(m).to_string()
 }
 
@@ -139,4 +135,24 @@ pub fn tsid_encode(key: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod flattened_b7_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Review finding 600: repeated leaf paths across object arrays keep
+    /// every value and nested arrays are walked, so FIELD_EXTRACT sees all
+    /// of them (sorted, deduplicated).
+    #[test]
+    fn flattened_reconstruction_keeps_repeated_and_nested_values() {
+        let j = flattened_json(&json!({"items": [{"tag": "red"}, {"tag": "blue"}], "tags": [["red", "blue"]], "one": {"k": 1}}));
+        let v: Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v, json!({"items.tag": ["red", "blue"], "one.k": "1", "tags": ["red", "blue"]}));
+        let got = super::super::func2::field_extract(&j, "items.tag").unwrap();
+        assert_eq!(got, super::super::Val::Multi(vec![super::super::Val::Str("blue".into()), super::super::Val::Str("red".into())]));
+        let got = super::super::func2::field_extract(&j, "tags").unwrap();
+        assert_eq!(got, super::super::Val::Multi(vec![super::super::Val::Str("blue".into()), super::super::Val::Str("red".into())]));
+    }
 }

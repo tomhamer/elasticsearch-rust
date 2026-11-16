@@ -372,6 +372,37 @@ fn base64(data: &[u8]) -> Result<Text, ParseError> {
 }
 
 /// Two's-complement integer conversion with admitted byte/limb storage.
+/// `mantissa × 10^exp` as an exact JSON number (plain decimal notation,
+/// `BigDecimal.toPlainString`-like for moderate exponents; exponent notation
+/// beyond them). `None`: an exponent past any representable decimal.
+fn decimal_text(mantissa: &str, exp: i64) -> Option<String> {
+    const PLAIN: i64 = 64;
+    if exp.unsigned_abs() > 100_000 {
+        return None;
+    }
+    let (neg, digits) = match mantissa.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, mantissa),
+    };
+    let sign = if neg { "-" } else { "" };
+    if exp == 0 {
+        return Some(format!("{sign}{digits}"));
+    }
+    if exp > 0 {
+        return Some(if exp <= PLAIN { format!("{sign}{digits}{}", "0".repeat(exp as usize)) } else { format!("{sign}{digits}E{exp}") });
+    }
+    let scale = (-exp) as usize;
+    if scale > PLAIN as usize + digits.len() {
+        return Some(format!("{sign}{digits}E{exp}"));
+    }
+    Some(if digits.len() > scale {
+        let (int, frac) = digits.split_at(digits.len() - scale);
+        format!("{sign}{int}.{frac}")
+    } else {
+        format!("{sign}0.{}{digits}", "0".repeat(scale - digits.len()))
+    })
+}
+
 fn bigint_digits(bytes: &[u8]) -> Result<Text, ParseError> {
     let neg = bytes.first().is_some_and(|b| b & 0x80 != 0);
     let mut mag = Buffer::new(); mag.extend_from_slice(bytes)?;
@@ -1016,7 +1047,9 @@ mod cbor {
                 if major == 6 {
                     let save = self.p;
                     let tag = self.arg(info)?.unwrap_or(0);
-                    if tag != 2 && tag != 3 {
+                    // Big integers, decimal fractions and bigfloats are
+                    // numbers; other tags are transparent.
+                    if !matches!(tag, 2..=5) {
                         continue;
                     }
                     self.p = save;
@@ -1089,19 +1122,24 @@ mod cbor {
                     // Tags: big integers become numbers; others are transparent.
                     let tag = self.arg(info)?.unwrap_or(0);
                     if tag == 2 || tag == 3 {
-                        let c2 = self.byte()?;
-                        if c2 >> 5 != 2 {
-                            return Err(self.err(format_args!("Unexpected token after BigInteger tag")));
-                        }
-                        let d = self.text(c2 & 31, 2)?;
-                        let mut bytes = Buffer::new();
-                        bytes.push(0u8)?;
-                        bytes.extend_from_slice(&d)?;
-                        // CBOR negative bignums encode -1-n, exactly the
-                        // one's complement of a sign-extended positive n.
-                        if tag == 3 { for byte in bytes.iter_mut() { *byte = !*byte; } }
-                        let digits = bigint_digits(&bytes)?;
+                        let digits = self.bignum(tag)?;
                         out.b.extend_from_slice(digits.as_bytes());
+                    } else if tag == 4 {
+                        // Decimal fraction [exponent, mantissa] (Jackson
+                        // `CBORGenerator.writeNumber(BigDecimal)`): one exact
+                        // decimal number, as `CBORParser._handleTaggedArray`
+                        // reads it, never a two-element array.
+                        let c2 = self.byte()?;
+                        if c2 != 0x82 {
+                            return Err(self.err(format_args!("Unexpected token after decimal fraction tag: expected a two-element array")));
+                        }
+                        let exp = self.integer_text()?;
+                        let exp: i64 = exp.parse().map_err(|_| self.err(format_args!("Decimal fraction exponent out of range")))?;
+                        let mantissa = self.integer_text()?;
+                        let text = decimal_text(&mantissa, exp).ok_or_else(|| self.err(format_args!("Decimal fraction exponent out of range")))?;
+                        out.b.extend_from_slice(text.as_bytes());
+                    } else if tag == 5 {
+                        return Err(self.err(format_args!("Unsupported CBOR bigfloat (tag 5) value")));
                     }
                 }
                 _ => match info {
@@ -1130,6 +1168,46 @@ mod cbor {
             }
             out.b.check()?;
             Ok(())
+        }
+
+        /// The decimal digits of a CBOR big integer (tag 2 positive, 3 negative).
+        fn bignum(&mut self, tag: u64) -> Res<Text> {
+            let c2 = self.byte()?;
+            if c2 >> 5 != 2 {
+                return Err(self.err(format_args!("Unexpected token after BigInteger tag")));
+            }
+            let d = self.text(c2 & 31, 2)?;
+            let mut bytes = Buffer::new();
+            bytes.push(0u8)?;
+            bytes.extend_from_slice(&d)?;
+            // CBOR negative bignums encode -1-n, exactly the
+            // one's complement of a sign-extended positive n.
+            if tag == 3 { for byte in bytes.iter_mut() { *byte = !*byte; } }
+            bigint_digits(&bytes)
+        }
+
+        /// An integer (major type 0 / 1, or a big integer) as decimal text.
+        fn integer_text(&mut self) -> Res<String> {
+            let c = self.byte()?;
+            let (major, info) = (c >> 5, c & 31);
+            match major {
+                0 => {
+                    let n = self.arg(info)?.ok_or_else(|| self.err(format_args!("Invalid length indicator")))?;
+                    Ok(n.to_string())
+                }
+                1 => {
+                    let n = self.arg(info)?.ok_or_else(|| self.err(format_args!("Invalid length indicator")))?;
+                    Ok(format!("-{}", n as u128 + 1))
+                }
+                6 => {
+                    let tag = self.arg(info)?.unwrap_or(0);
+                    if tag != 2 && tag != 3 {
+                        return Err(self.err(format_args!("Unexpected tag {tag} in a decimal fraction")));
+                    }
+                    Ok(self.bignum(tag)?.to_string())
+                }
+                _ => Err(self.err(format_args!("Unexpected token in a decimal fraction: expected an integer"))),
+            }
         }
 
         fn key(&mut self) -> Res<Text> {
@@ -1472,7 +1550,13 @@ mod smile {
                     let i = (((c & 0x03) as usize) << 8) | self.byte()? as usize;
                     self.names.get(i).cloned().ok_or_else(|| self.err(format_args!("Invalid shared name reference {i}; only got {} names in buffer (invalid content)", self.names.len())))?
                 }
-                0x34 => self.until_end_marker()?,
+                // Smile registers every literal nonempty name, long ones too
+                // (Jackson `SmileParser._handleLongFieldName`).
+                0x34 => {
+                    let s = self.until_end_marker()?;
+                    self.add_name(&s)?;
+                    s
+                }
                 0x40..=0x7F => {
                     let i = (c & 0x3F) as usize;
                     self.names.get(i).cloned().ok_or_else(|| self.err(format_args!("Invalid shared name reference {i}; only got {} names in buffer (invalid content)", self.names.len())))?
@@ -1660,5 +1744,45 @@ mod failure_view_tests {
                 assert_eq!(serde_json::from_slice::<serde_json::Value>(&actual).unwrap(),expected.to_json());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cbor_decimal_tests {
+    use super::*;
+
+    fn json_of(body: &[u8]) -> Result<serde_json::Value, String> {
+        let d = decode(InFmt::Cbor, body).map_err(|e| e.reason)?;
+        if d.failure.is_some() {
+            return Err(String::from_utf8_lossy(&d.json).into_owned());
+        }
+        serde_json::from_slice(&d.json).map_err(|e| e.to_string())
+    }
+
+    /// Review finding 329: a CBOR decimal fraction (tag 4, as Jackson writes
+    /// a `BigDecimal`) is one exact number, never a two-element array; a
+    /// bigfloat (tag 5) is refused rather than indexed as an array.
+    #[test]
+    fn decimal_fractions_are_numbers() {
+        // {"price": 4([-2, 1234])} → 12.34
+        let mut body = vec![0xa1, 0x65];
+        body.extend(b"price");
+        body.extend([0xc4, 0x82, 0x21, 0x19, 0x04, 0xd2]);
+        let v = json_of(&body).unwrap();
+        assert!(v["price"].is_number(), "{v}");
+        assert_eq!(v["price"].to_string(), "12.34");
+        // 4([-3, -5]) → -0.005 ; 4([2, 7]) → 700 ; 4([-1, 2(0x0100)]) → 25.6
+        for (frac, want) in [(vec![0xc4, 0x82, 0x22, 0x24], "-0.005"), (vec![0xc4, 0x82, 0x02, 0x07], "700"), (vec![0xc4, 0x82, 0x20, 0xc2, 0x42, 0x01, 0x00], "25.6")] {
+            let mut body = vec![0x81];
+            body.extend(frac);
+            let v = json_of(&body).unwrap();
+            assert_eq!(v[0].to_string(), want, "{v}");
+        }
+        // Bigfloat: refused.
+        let body = [0x81, 0xc5, 0x82, 0x20, 0x03];
+        assert!(json_of(&body).is_err());
+        // A plain tagged value (tag 1, epoch) stays transparent.
+        let body = [0x81, 0xc1, 0x1a, 0x00, 0x01, 0x00, 0x00];
+        assert_eq!(json_of(&body).unwrap(), serde_json::json!([65536]));
     }
 }

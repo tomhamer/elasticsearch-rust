@@ -120,11 +120,71 @@ pub fn write_cond(req: &Req) -> Result<WriteCond, EsError> {
     Ok(c)
 }
 
+/// A bulk action's numeric metadata member, as ES `BulkRequestParser`
+/// reads it (`parser.longValue()`, coercing): a JSON number (a fraction is
+/// truncated) or a string holding one. Anything else fails the item before
+/// it writes (production review #136: a quoted `if_seq_no` was dropped and
+/// the write ran unconditionally).
+pub fn meta_long(meta: &Map<String, Value>, key: &str) -> Result<Option<i64>, EsError> {
+    let from_f64 = |f: f64, shown: &str| -> Result<i64, EsError> {
+        if f.is_finite() && f >= i64::MIN as f64 && f < i64::MAX as f64 {
+            Ok(f.trunc() as i64)
+        } else {
+            Err(EsError::illegal_argument(format!("Value [{shown}] is out of range for a long")))
+        }
+    };
+    match meta.get(key) {
+        None => Ok(None),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(v) => Ok(Some(v)),
+            None if n.is_u64() => Err(EsError::illegal_argument(format!("Value [{n}] is out of range for a long"))),
+            None => from_f64(n.as_f64().unwrap_or(f64::NAN), &n.to_string()).map(Some),
+        },
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if let Ok(v) = t.parse::<i64>() {
+                return Ok(Some(v));
+            }
+            match t.parse::<f64>() {
+                Ok(f) if !t.is_empty() && !t.eq_ignore_ascii_case("nan") && !t.to_ascii_lowercase().contains("inf") => from_f64(f, s).map(Some),
+                _ => Err(EsError::new(400, "number_format_exception", format!("For input string: \"{s}\""))),
+            }
+        }
+        Some(other) => {
+            let token = match other {
+                Value::Null => "VALUE_NULL",
+                Value::Bool(true) => "VALUE_TRUE",
+                Value::Bool(false) => "VALUE_FALSE",
+                Value::Array(_) => "START_ARRAY",
+                _ => "START_OBJECT",
+            };
+            Err(EsError::illegal_argument(format!("Malformed action/metadata line, expected a simple value for field [{key}] but found [{token}]")))
+        }
+    }
+}
+
+/// Internal header of a reindex's own bulk requests: their delete actions
+/// may carry [`REINDEX_VERSION_EQ`].
+pub const REINDEX_BULK_HEADER: &str = "x-rustic-internal-reindex-bulk";
+/// Bulk delete metadata only a reindex sends (with [`REINDEX_BULK_HEADER`]):
+/// ES's `VersionType.INTERNAL` version equality for a scripted delete.
+pub const REINDEX_VERSION_EQ: &str = "_rustic_reindex_version_eq";
+
 pub fn cond_from_meta(meta: &Map<String, Value>) -> Result<WriteCond, EsError> {
     let mut c = WriteCond::default();
-    c.if_seq_no = meta.get("if_seq_no").and_then(Value::as_i64);
-    c.if_primary_term = meta.get("if_primary_term").and_then(Value::as_u64);
-    c.version = meta.get("version").and_then(Value::as_u64);
+    c.version_eq = meta.get(REINDEX_VERSION_EQ).and_then(Value::as_u64);
+    c.if_seq_no = meta_long(meta, "if_seq_no")?;
+    c.if_primary_term = match meta_long(meta, "if_primary_term")? {
+        Some(t) if t < 0 => return Err(EsError::illegal_argument(format!("primary term must be non negative. got [{t}]"))),
+        t => t.map(|t| t as u64),
+    };
+    c.version = match meta_long(meta, "version")? {
+        Some(v) if v < 0 => {
+            let vt = meta.get("version_type").and_then(Value::as_str).unwrap_or("internal").to_ascii_uppercase();
+            return Err(EsError::illegal_argument(format!("illegal version value [{v}] for version type [{vt}]")));
+        }
+        v => v.map(|v| v as u64),
+    };
     if let Some(vt) = meta.get("version_type").and_then(Value::as_str) {
         c.version_type = Some(VersionType::parse(vt)?);
     }
@@ -190,6 +250,17 @@ fn defer_refresh(register: impl FnOnce(elasticsearch_engine::shard::RefreshCallb
     DEFERRED_REFRESH.with(|d| if let Some(pending) = d.borrow_mut().as_mut() { pending.push(rx) });
     register(Box::new(move |result| { let _ = tx.send(result); }));
     true
+}
+
+/// ES `WriteRequest.RefreshPolicy.parse`: the `refresh` option of a write
+/// request is parsed while the request is built (`RestIndexAction`,
+/// `RestDeleteAction`, `RestUpdateAction`, `RestBulkAction`), so an unknown
+/// value fails the request before anything is created, mapped or written.
+pub fn validate_refresh(param: Option<&str>) -> Result<(), EsError> {
+    match param {
+        None | Some("" | "true" | "false" | "wait_for") => Ok(()),
+        Some(o) => Err(EsError::illegal_argument(format!("Unknown value for refresh: [{o}]."))),
+    }
 }
 
 /// `refresh` parameter: returns whether a forced refresh happened.

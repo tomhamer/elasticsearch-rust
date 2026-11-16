@@ -78,7 +78,11 @@ impl AggPartial {
         let rc = Rc2 { now: req.now, max_buckets: req.max_buckets };
         let spec = req.aggs.as_object().ok_or_else(|| EsError::parsing_at("Expected [START_OBJECT] under [aggregations], but got a [VALUE_STRING]", 1, 1))?;
         let mut out = Value::Object(reduce_level(spec, &trees, &rc)?);
-        if (super::significant_text::present(&req.aggs) || super::frequent_items::present(&req.aggs)) && !crate::search::aggregation_shard_response() {
+        // ES `MultiBucketConsumer` on the final reduce: every bucket of the
+        // reduced tree counts against `search.max_buckets` (each shard only
+        // checked its own). A cluster shard response is a partial reduce;
+        // its coordinator checks the final tree.
+        if !crate::search::aggregation_shard_response() {
             super::significant_text::check_final_bucket_limit(&req.aggs, &out, req.max_buckets)?;
         }
         if req.typed_keys {
@@ -106,6 +110,7 @@ impl AggPartial {
 /// (ES reduces the same states).
 pub const SHARD_STATE_AGGS: &[&str] = &[
     "cardinality", "percentiles", "percentile_ranks", "geo_bounds", "boxplot", "median_absolute_deviation", "matrix_stats", "t_test", "geo_line",
+    "weighted_avg",
 ];
 
 /// Coordinator reduce of one [`SHARD_STATE_AGGS`] aggregation from shard
@@ -113,7 +118,10 @@ pub const SHARD_STATE_AGGS: &[&str] = &[
 /// older node). The result has no state; `meta` is the caller's.
 pub fn reduce_shard_states(name: &str, t: &str, conf: &Map<String, Value>, vals: &[&Value]) -> Option<Result<Value>> {
     if vals.is_empty() {
-        return None;
+        // No shard result at all: an empty population the reduce itself
+        // made (a histogram's filled empty bucket), not a response missing
+        // its state. Each metric's empty result (#577).
+        return Some(empty_state_result(name, t, conf));
     }
     if t == "geo_line" {
         // Shards keep their points' sort values (`include_sort`).
@@ -133,6 +141,7 @@ pub fn reduce_shard_states(name: &str, t: &str, conf: &Map<String, Value>, vals:
         "boxplot" | "median_absolute_deviation" => Ok(reduce_quantile_metric(t, vals)),
         "t_test" => Ok(reduce_t_test(vals)),
         "matrix_stats" => reduce_matrix_stats(name, vals),
+        "weighted_avg" => Ok(reduce_weighted_avg(vals)),
         _ => return None,
     };
     // Formatted like the shards rendered it.
@@ -142,6 +151,51 @@ pub fn reduce_shard_states(name: &str, t: &str, conf: &Map<String, Value>, vals:
         }
     }
     Some(out)
+}
+
+/// The result of a [`SHARD_STATE_AGGS`] aggregation over no documents (ES
+/// `buildEmptyAggregation`).
+fn empty_state_result(name: &str, t: &str, conf: &Map<String, Value>) -> Result<Value> {
+    Ok(match t {
+        "cardinality" => reduce_cardinality(&[]),
+        "percentiles" | "percentile_ranks" => return reduce_percentiles(name, t, conf, &[]),
+        "geo_bounds" => reduce_geo_bounds(conf, &[]),
+        "boxplot" | "median_absolute_deviation" => reduce_quantile_metric(t, &[]),
+        "t_test" => {
+            let ty = conf.get("type").and_then(Value::as_str).unwrap_or("heteroscedastic");
+            let tails = conf.get("tails").and_then(Value::as_i64).unwrap_or(2);
+            super::extra::t_test_value(ty, tails, (0, 0.0, 0.0), (0, 0.0, 0.0))
+        }
+        "matrix_stats" => {
+            let fields: Vec<String> = conf.get("fields").and_then(Value::as_array).map(|a| a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            super::analytics::render_matrix_stats(&fields, &super::analytics::Moments::new(fields.len()))
+        }
+        "weighted_avg" => reduce_weighted_avg(&[]),
+        "geo_line" => json!({"type": "Feature", "geometry": {"type": "LineString", "coordinates": []}, "properties": {"complete": true}}),
+        _ => json!({}),
+    })
+}
+
+/// `weighted_avg` (ES `InternalWeightedAvg.reduce`): the shards' weighted
+/// sums over their summed weights, each weight counted once per value.
+fn reduce_weighted_avg(vals: &[&Value]) -> Value {
+    let (mut sum, mut weight) = (0f64, 0f64);
+    let mut fmt = None;
+    for v in vals {
+        let st = state(v).unwrap_or(&Value::Null);
+        sum += num(st, "sum").unwrap_or(0.0);
+        weight += num(st, "weight").unwrap_or(0.0);
+        fmt = fmt.or_else(|| st.get("fmt").and_then(Value::as_str));
+    }
+    let value = (weight != 0.0).then(|| sum / weight);
+    let mut m = Map::new();
+    m.insert("value".into(), opt_num(value));
+    if let (Some(f), Some(x)) = (fmt, value) {
+        if let Ok(f) = DateFormatter::new(f) {
+            m.insert("value_as_string".into(), json!(f.format(x as i64, Tz::UTC)));
+        }
+    }
+    Value::Object(m)
 }
 
 /// Parent pipelines the coordinator runs with the engine's implementation
@@ -178,6 +232,13 @@ pub fn merge_pipeline_payloads(parts: &[&Value]) -> Option<Value> {
 /// keys); payloads stay for the caller to strip.
 pub fn engine_parent_pipeline(name: &str, t: &str, body: &Value, buckets: &mut [Map<String, Value>]) -> Result<()> {
     super::analytics::parent_pipeline(name, t, body, buckets)
+}
+
+/// Run every parent pipeline of one level (`sub`, the request's aggs map of
+/// the bucket aggregation) over merged buckets (plain keys), in dependency
+/// order with the local execution's gap-policy and selector semantics.
+pub fn run_parent_pipelines(sub: &Map<String, Value>, buckets: &mut Vec<Map<String, Value>>) -> Result<()> {
+    super::run_parent_pipelines(sub, buckets)
 }
 
 /// Run one [`ENGINE_SIBLING_PIPELINES`] pipeline over a level's reduced
@@ -246,8 +307,39 @@ fn nums(ctx: &Ctx, f: &FieldRef, docs: &Docs, missing: &Option<Key>) -> Result<V
 }
 
 impl<'a, 'b> Ctx<'a, 'b> {
+    /// The weighted points of a pre-aggregated histogram field of `o`
+    /// (`None`: an ordinary values source).
+    fn pre_aggregated(&self, o: &Map<String, Value>, docs: &Docs) -> Result<Option<Vec<(f64, u64)>>> {
+        let no_subs = |_: &Docs| -> Result<Map<String, Value>> { Ok(Map::new()) };
+        let host = crate::fieldtypes::aggs::Host { segs: self.segs, env: self.env, all_docs: self.env.all_docs, sub: &no_subs };
+        Ok(crate::fieldtypes::aggs::pre_aggregated_points(o, docs, &host))
+    }
+
+    /// Whether `o`'s field is an `aggregate_metric_double` somewhere: its
+    /// quantile aggregations are rejected by the normal path.
+    fn aggregate_metric_source(&self, o: &Map<String, Value>) -> bool {
+        let no_subs = |_: &Docs| -> Result<Map<String, Value>> { Ok(Map::new()) };
+        let host = crate::fieldtypes::aggs::Host { segs: self.segs, env: self.env, all_docs: self.env.all_docs, sub: &no_subs };
+        crate::fieldtypes::aggs::is_aggregate_metric(o, &host)
+    }
+
+    /// Whether `o`'s field is pre-aggregated (`aggregate_metric_double` or a
+    /// histogram type) in some searched index.
+    fn pre_aggregated_source(&self, o: &Map<String, Value>) -> bool {
+        if o.contains_key("script") {
+            return false;
+        }
+        let Some(name) = o.get("field").and_then(Value::as_str) else { return false };
+        self.segs.iter().any(|s| s.lookup.get(name).is_some_and(|f| f.declared == crate::mapping::EsType::AggregateMetricDouble || crate::fieldtypes::is_histogram(f.declared)))
+    }
+
     /// Partial-mode override of one aggregation (`None`: compute it normally).
     pub(super) fn partial_one(&self, name: &str, t: &str, o: &Map<String, Value>, sub: Option<&Map<String, Value>>, docs: &Docs) -> Result<Option<Value>> {
+        if matches!(t, "percentiles" | "percentile_ranks" | "boxplot" | "median_absolute_deviation") && self.aggregate_metric_source(o) {
+            // Never a silent empty sketch: the normal path decides (ES
+            // rejects these on `aggregate_metric_double`).
+            return Ok(None);
+        }
         Ok(Some(match t {
             "significant_text" => self.significant_text(name, o, sub, docs)?,
             "terms" => {
@@ -279,6 +371,20 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 b.insert("from".into(), json!(0));
                 b.insert("size".into(), json!(from + size));
                 self.top_hits(&Value::Object(b), docs)?
+            }
+            "avg" if self.pre_aggregated_source(o) => {
+                // `aggregate_metric_double` / histogram fields: their own sum
+                // and value count (the field type's aggregations), as state.
+                let no_subs = |_: &Docs| -> Result<Map<String, Value>> { Ok(Map::new()) };
+                let host = crate::fieldtypes::aggs::Host { segs: self.segs, env: self.env, all_docs: self.env.all_docs, sub: &no_subs };
+                let one = |kind: &str| -> Result<Value> {
+                    crate::fieldtypes::aggs::compute(name, kind, o, docs, &host)?.ok_or_else(|| EsError::internal(format!("no [{kind}] for a pre-aggregated field")))
+                };
+                let mut v = one("avg")?;
+                let sum = one("sum")?["value"].as_f64().unwrap_or(0.0);
+                let count = one("value_count")?["value"].as_u64().unwrap_or(0);
+                set_state(&mut v, json!({ "sum": sum, "count": count, "date": false, "fmt": "" }));
+                v
             }
             "avg" => {
                 let mut v = self.metric(name, t, o, docs)?;
@@ -319,22 +425,36 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 let f = self.source(o, name, t)?;
                 let missing = self.missing_key(&f, o.get("missing"))?;
                 let comp = o.get("tdigest").and_then(|t| t.get("compression")).and_then(Value::as_f64).unwrap_or(100.0);
-                let vals = nums(self, &f, docs, &missing)?;
                 let mut td = TDigest::new(comp);
                 let mut hdr = o.get("hdr").map(|h| Hdr::new(h.get("number_of_significant_value_digits").and_then(Value::as_u64).unwrap_or(3).min(5) as u32));
-                for x in &vals {
-                    match &mut hdr {
-                        Some(h) => h.add(*x),
-                        None => td.add(*x),
+                // A pre-aggregated histogram field: its bins (weighted), not
+                // the scalar values it has none of.
+                let n = match self.pre_aggregated(o, docs)? {
+                    Some(pts) => {
+                        match &mut hdr {
+                            Some(h) => pts.iter().for_each(|&(x, c)| h.add_count(x, c)),
+                            None => td.add_weighted(&pts),
+                        }
+                        pts.iter().fold(0u64, |a, p| a.saturating_add(p.1))
                     }
-                }
+                    None => {
+                        let vals = nums(self, &f, docs, &missing)?;
+                        for x in &vals {
+                            match &mut hdr {
+                                Some(h) => h.add(*x),
+                                None => td.add(*x),
+                            }
+                        }
+                        vals.len() as u64
+                    }
+                };
                 let fmt = o.get("format").and_then(Value::as_str).map(DateFormatter::new).transpose()?.or_else(|| f.format.clone()).unwrap_or_default();
                 let is_date = f.ty.map(|t| t.is_date()).unwrap_or(false);
                 let sketch = match &hdr {
                     Some(h) => json!({ "hdr": h.state() }),
                     None => json!({ "td": td.state() }),
                 };
-                set_state(&mut v, json!({ "sketch": sketch, "n": vals.len(), "date": is_date, "fmt": fmt.spec }));
+                set_state(&mut v, json!({ "sketch": sketch, "n": n, "date": is_date, "fmt": fmt.spec }));
                 v
             }
             "boxplot" | "median_absolute_deviation" => {
@@ -351,8 +471,13 @@ impl<'a, 'b> Ctx<'a, 'b> {
                     return Err(EsError::illegal_argument(format!("Invalid execution_hint [{h}], valid values are [default, high_accuracy]")));
                 }
                 let mut td = TDigest::new(comp);
-                for x in nums(self, &f, docs, &missing)? {
-                    td.add(x);
+                match self.pre_aggregated(o, docs)? {
+                    Some(pts) => td.add_weighted(&pts),
+                    None => {
+                        for x in nums(self, &f, docs, &missing)? {
+                            td.add(x);
+                        }
+                    }
                 }
                 set_state(&mut v, json!({ "td": td.state() }));
                 v
@@ -433,7 +558,15 @@ fn cmp_json(a: &Value, b: &Value) -> Ordering {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
-        (Value::Number(x), Value::Number(y)) => x.as_f64().unwrap_or(0.0).total_cmp(&y.as_f64().unwrap_or(0.0)),
+        // Integers compare exactly (64-bit keys above 2^53 stay distinct and
+        // ordered); floating point only for genuine floating keys.
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
+            (Some(a), Some(b), _, _) => a.cmp(&b),
+            (_, _, Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None, _, Some(_)) => Ordering::Less,
+            (None, Some(_), Some(_), _) => Ordering::Greater,
+            _ => x.as_f64().unwrap_or(0.0).total_cmp(&y.as_f64().unwrap_or(0.0)),
+        },
         (Value::String(x), Value::String(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::String(_), _) => Ordering::Greater,
         (_, Value::String(_)) => Ordering::Less,
@@ -1000,6 +1133,40 @@ fn cmp_buckets(a: &Map<String, Value>, b: &Map<String, Value>, order: &[(String,
     Ordering::Equal
 }
 
+/// A terms bucket key's identity across shards: equal numbers are one
+/// bucket whatever their JSON spelling (`1` from a long field, `1.0` from a
+/// double one: ES promotes mixed numeric types to double); other keys as
+/// their JSON text.
+pub fn terms_key_identity(k: &Value) -> String {
+    if let Value::Number(n) = k {
+        if let Some(i) = n.as_i64() {
+            return format!("n{i}");
+        }
+        if let Some(u) = n.as_u64() {
+            return format!("n{u}");
+        }
+        if let Some(f) = n.as_f64() {
+            if f.fract() == 0.0 && f.abs() < 9.2e18 {
+                return format!("n{}", f as i64);
+            }
+            return format!("f{}", f.to_bits());
+        }
+    }
+    k.to_string()
+}
+
+/// The merged bucket of keys spelled as long and as double carries the
+/// promoted (double) key, as ES renders a mixed long/double terms bucket.
+pub fn promote_numeric_key(m: &mut Map<String, Value>, members: &[&Value]) {
+    let floats = members.iter().any(|b| b["key"].as_number().is_some_and(|n| !n.is_i64() && !n.is_u64()));
+    let ints = members.iter().any(|b| b["key"].as_number().is_some_and(|n| n.is_i64() || n.is_u64()));
+    if floats && ints {
+        if let Some(f) = m.get("key").and_then(Value::as_f64) {
+            m.insert("key".into(), crate::values::java_double(f));
+        }
+    }
+}
+
 fn reduce_terms(conf: &Map<String, Value>, sub: Option<&Map<String, Value>>, vals: &[&Value], rc: &Rc2) -> Result<Value> {
     let (size, shard_size) = terms_sizes(conf);
     let min_doc_count = conf.get("min_doc_count").and_then(Value::as_u64).unwrap_or(1);
@@ -1027,7 +1194,7 @@ fn reduce_terms(conf: &Map<String, Value>, sub: Option<&Map<String, Value>>, val
         let own = v["doc_count_error_upper_bound"].as_i64().unwrap_or(0);
         shard_err.push(if own < 0 || trunc < 0 { -1 } else { own + trunc });
         for b in bs {
-            let g = *index.entry(b["key"].to_string()).or_insert_with(|| {
+            let g = *index.entry(terms_key_identity(&b["key"])).or_insert_with(|| {
                 groups.push((Vec::new(), Vec::new()));
                 groups.len() - 1
             });
@@ -1038,6 +1205,7 @@ fn reduce_terms(conf: &Map<String, Value>, sub: Option<&Map<String, Value>>, val
     let mut buckets: Vec<Map<String, Value>> = Vec::new();
     for (bs, shards) in &groups {
         let mut m = merge_bucket(bs, sub, rc)?;
+        promote_numeric_key(&mut m, bs);
         m.shift_remove("doc_count_error_upper_bound");
         if show_err {
             let mut e = 0i64;
@@ -1190,41 +1358,103 @@ fn reduce_fixed(sub: Option<&Map<String, Value>>, vals: &[&Value], rc: &Rc2) -> 
     Ok(Value::Object(out))
 }
 
+/// One composite key value of a shard response, compared like the shard
+/// compared its raw value: integers exactly (not through `f64`), booleans
+/// false first, strings by bytes.
+fn cmp_composite_value(x: &Value, y: &Value) -> Ordering {
+    match (x, y) {
+        (Value::Number(a), Value::Number(b)) => match (a.as_i64(), b.as_i64(), a.as_u64(), b.as_u64()) {
+            (Some(i), Some(j), _, _) => i.cmp(&j),
+            (_, _, Some(i), Some(j)) => i.cmp(&j),
+            (Some(_), None, _, Some(_)) => Ordering::Less,
+            (None, Some(_), Some(_), _) => Ordering::Greater,
+            _ => a.as_f64().unwrap_or(0.0).total_cmp(&b.as_f64().unwrap_or(0.0)),
+        },
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        _ => cmp_json(x, y),
+    }
+}
+
+/// ES `InternalComposite.reduce`: the union of the shards' pages in the
+/// sources' order (direction, `missing_order`, raw date values), the first
+/// `size` keys merged, and `after_key` the last bucket emitted, so replaying
+/// it neither skips nor repeats a bucket.
 fn reduce_composite(conf: &Map<String, Value>, sub: Option<&Map<String, Value>>, vals: &[&Value], rc: &Rc2) -> Result<Value> {
     let size = conf.get("size").and_then(Value::as_u64).unwrap_or(10) as usize;
-    // Per source: name, descending.
-    let mut srcs: Vec<(String, bool)> = Vec::new();
-    for s in conf.get("sources").and_then(Value::as_array).cloned().unwrap_or_default() {
+    // Per source: name, descending, nulls first, and for a formatted
+    // date_histogram the format and zone its keys were rendered with (the
+    // keys are compared as the instants they stand for, ES compares longs).
+    struct CSrc { name: String, desc: bool, nulls_first: bool, date: Option<(DateFormatter, Tz)> }
+    let mut srcs: Vec<CSrc> = Vec::new();
+    for s in conf.get("sources").and_then(Value::as_array).map(|a| a.as_slice()).unwrap_or(&[]) {
         if let Some((sname, def)) = s.as_object().and_then(|m| m.iter().next()) {
-            let desc = def.as_object().and_then(|d| d.values().next()).and_then(|d| d.get("order")).and_then(Value::as_str) == Some("desc");
-            srcs.push((sname.clone(), desc));
+            let (kind, spec) = match def.as_object().and_then(|d| d.iter().next()) {
+                Some((k, v)) => (k.as_str(), v.as_object()),
+                None => ("", None),
+            };
+            let (desc, nulls_first) = super::composite_source_order(spec);
+            let date = match (kind, spec.and_then(|s| s.get("format")).and_then(Value::as_str)) {
+                ("date_histogram", Some(f)) => DateFormatter::new(f).ok().map(|f| {
+                    let tz = spec.and_then(|s| s.get("time_zone")).and_then(Value::as_str).and_then(|z| Tz::parse(z).ok()).unwrap_or(Tz::UTC);
+                    (f, tz)
+                }),
+                _ => None,
+            };
+            srcs.push(CSrc { name: sname.clone(), desc, nulls_first, date });
         }
     }
-    let cmp = |a: &Value, b: &Value| -> Ordering {
-        for (n, desc) in &srcs {
-            let (x, y) = (&a[n.as_str()], &b[n.as_str()]);
-            let c = cmp_json(x, y);
-            let c = if *desc && !x.is_null() && !y.is_null() { c.reverse() } else { c };
+    // Decoded date keys, `stride` per bucket in one flat vector (empty
+    // without formatted date sources: no per-bucket allocation).
+    let date_srcs: Vec<usize> = srcs.iter().enumerate().filter(|(_, s)| s.date.is_some()).map(|(i, _)| i).collect();
+    let stride = date_srcs.len();
+    let mut items: Vec<(usize, &Value)> = Vec::with_capacity(vals.iter().map(|v| v["buckets"].as_array().map_or(0, |a| a.len())).sum());
+    let mut dates: Vec<Option<i64>> = Vec::new();
+    for v in vals {
+        for b in buckets_of(v) {
+            for &si in &date_srcs {
+                let (f, tz) = srcs[si].date.as_ref().unwrap();
+                dates.push(b["key"][srcs[si].name.as_str()].as_str().and_then(|s| f.parse_with_tz(s, *tz).ok()));
+            }
+            items.push((items.len(), b));
+        }
+    }
+    let key_types = super::composite_key_types(vals);
+    let cmp = |a: &(usize, &Value), b: &(usize, &Value)| -> Ordering {
+        let mut di = 0;
+        for s in &srcs {
+            let (x, y) = (&a.1["key"][s.name.as_str()], &b.1["key"][s.name.as_str()]);
+            let c = super::composite_source_cmp(x.is_null(), y.is_null(), s.desc, s.nulls_first, || {
+                if let Some(c) = super::composite_typed_cmp(key_types.get(&s.name).and_then(Value::as_str), x, y) {
+                    return c;
+                }
+                if s.date.is_some() {
+                    if let (Some(p), Some(q)) = (dates[a.0 * stride + di], dates[b.0 * stride + di]) {
+                        return p.cmp(&q);
+                    }
+                }
+                cmp_composite_value(x, y)
+            });
+            if s.date.is_some() {
+                di += 1;
+            }
             if c != Ordering::Equal {
                 return c;
             }
         }
         Ordering::Equal
     };
-    let mut groups: Vec<(Value, Vec<&Value>)> = Vec::new();
-    for v in vals {
-        for b in buckets_of(v) {
-            match groups.iter_mut().find(|(k, _)| cmp(k, &b["key"]) == Ordering::Equal) {
-                Some((_, g)) => g.push(b),
-                None => groups.push((b["key"].clone(), vec![b])),
-            }
-        }
-    }
-    groups.sort_by(|a, b| cmp(&a.0, &b.0));
-    groups.truncate(size);
+    items.sort_by(&cmp);
+    // Equal keys from several shards are adjacent: the first `size` groups.
     let mut buckets = Vec::new();
-    for (_, bs) in &groups {
-        buckets.push(merge_bucket(bs, sub, rc)?);
+    let mut i = 0;
+    while i < items.len() && buckets.len() < size {
+        let mut j = i + 1;
+        while j < items.len() && cmp(&items[i], &items[j]) == Ordering::Equal {
+            j += 1;
+        }
+        let group: Vec<&Value> = items[i..j].iter().map(|(_, b)| *b).collect();
+        buckets.push(merge_bucket(&group, sub, rc)?);
+        i = j;
     }
     apply_parent_pipelines(sub, &mut buckets)?;
     let mut r = Map::new();
@@ -1232,6 +1462,9 @@ fn reduce_composite(conf: &Map<String, Value>, sub: Option<&Map<String, Value>>,
         r.insert("after_key".into(), l["key"].clone());
     }
     r.insert("buckets".into(), Value::Array(buckets.into_iter().map(Value::Object).collect()));
+    if !key_types.is_empty() && crate::search::aggregation_shard_response() {
+        r.insert("__p".into(), json!({ "key_types": key_types }));
+    }
     Ok(Value::Object(r))
 }
 
@@ -1315,6 +1548,10 @@ fn reduce_cartesian_bounds(vals: &[&Value]) -> Value {
 }
 
 fn reduce_cartesian_centroid(vals: &[&Value]) -> Value {
+    // Shape centroids carry their weighted state.
+    if let Some(v) = super::geo_shape::reduce_cartesian_centroid_states(vals) {
+        return v;
+    }
     let (mut n, mut sx, mut sy) = (0u64, 0f64, 0f64);
     for v in vals {
         let c = count_of(v, "count");
@@ -1331,6 +1568,10 @@ fn reduce_cartesian_centroid(vals: &[&Value]) -> Value {
 }
 
 fn reduce_geo_centroid(vals: &[&Value]) -> Value {
+    // Shape centroids carry their weighted state.
+    if let Some(v) = super::geo_shape::reduce_centroid_states(vals) {
+        return v;
+    }
     let (mut n, mut slat, mut slon) = (0u64, 0f64, 0f64);
     for v in vals {
         let c = count_of(v, "count");
@@ -1587,7 +1828,7 @@ mod tests {
             .iter()
             .map(|&li| {
                 let l = &leaves[li];
-                AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: (0..l.num_docs()).map(|d| d as f32).collect() }
+                AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: (0..l.num_docs()).map(|d| d as f32).collect() }
             })
             .collect();
         let fetch = |si: usize, d: DocId, sc: f32, _spec: &Value| -> Result<Value> {
@@ -1596,7 +1837,7 @@ mod tests {
             Ok(json!({"_index": "idx", "_id": format!("{}", q.first().copied().unwrap_or(-1)), "_score": sc}))
         };
         let all = |si: usize| -> Vec<DocId> { (0..segs[si].leaf.num_docs()).collect() };
-        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
         body(&segs, &env)
     }
 
@@ -1738,6 +1979,63 @@ mod tests {
         }
     }
 
+    /// #216: a local partial `avg` over an `aggregate_metric_double` (and a
+    /// histogram) carries the field's own sum and value count: two shards
+    /// reduce to the single-shard average, not to an empty one.
+    #[test]
+    fn pre_aggregated_avg_partials_carry_sum_and_count() {
+        let reg = AnalysisRegistry::default();
+        let mapping = json!({"properties": {
+            "m": {"type": "aggregate_metric_double", "metrics": ["min", "max", "sum", "value_count"], "default_metric": "max"},
+            "h": {"type": "histogram"}
+        }});
+        let mut m = Mappings::parse(&mapping, &reg).unwrap();
+        m.assign_core_ids();
+        let lookup = FieldLookup::build(&m, &reg);
+        let mut index = Index::new("idx", lookup.core_schema(), IndexSettings::default());
+        let docs = [
+            json!({"m": {"min": 1.0, "max": 10.0, "sum": 30.0, "value_count": 5}, "h": {"values": [1, 2], "counts": [1, 3]}}),
+            json!({"m": {"min": 1.0, "max": 3.0, "sum": 5.0, "value_count": 2}, "h": {"values": [4], "counts": [2]}}),
+        ];
+        for (i, d) in docs.iter().enumerate() {
+            let (pd, upd) = parse_with_dynamic(d, &i.to_string(), &m, &lookup, 1000).unwrap();
+            assert!(upd.is_none());
+            index.add_document(&pd.doc).unwrap();
+            index.refresh().unwrap();
+        }
+        let f = Fx { index, lookup };
+        let spec = json!({"am": {"avg": {"field": "m"}}, "ah": {"avg": {"field": "h"}}});
+        let want = single(&f, &spec);
+        assert_eq!(want["am"]["value"], 5.0, "{want}");
+        assert!((want["ah"]["value"].as_f64().unwrap() - 15.0 / 6.0).abs() < 1e-9, "{want}");
+        let one = partial(&f, &[0], &spec);
+        assert_eq!(one.tree["am"]["__p"]["count"], 5, "{}", one.tree);
+        assert_eq!(one.tree["am"]["__p"]["sum"], 30.0);
+        let parts = vec![one, partial(&f, &[1], &spec)];
+        let got = AggPartial::reduce(parts, &req(&spec)).unwrap();
+        assert_eq!(got["am"]["value"], 5.0, "{got}");
+        assert!((got["ah"]["value"].as_f64().unwrap() - 15.0 / 6.0).abs() < 1e-9, "{got}");
+    }
+
+    /// #365: adjacent 64-bit keys above 2^53 keep their exact order in a
+    /// local terms reduce (whichever shard comes first).
+    #[test]
+    fn terms_reduce_orders_64_bit_keys_exactly() {
+        let lo = 9_007_199_254_740_992u64;
+        let hi = lo + 1;
+        assert_eq!(cmp_json(&json!(hi), &json!(lo)), Ordering::Greater);
+        assert_eq!(cmp_json(&json!(u64::MAX), &json!(i64::MAX)), Ordering::Greater);
+        assert_eq!(cmp_json(&json!(-1), &json!(u64::MAX)), Ordering::Less);
+        let part = |k: u64| AggPartial { version: PARTIAL_VERSION, tree: json!({"t": {"doc_count_error_upper_bound": 0, "sum_other_doc_count": 0, "buckets": [{"key": k, "doc_count": 1}]}}) };
+        for (order, want) in [("asc", lo), ("desc", hi)] {
+            let spec = json!({"t": {"terms": {"field": "qty", "size": 1, "order": {"_key": order}}}});
+            for parts in [vec![part(hi), part(lo)], vec![part(lo), part(hi)]] {
+                let got = AggPartial::reduce(parts, &req(&spec)).unwrap();
+                assert_eq!(got["t"]["buckets"][0]["key"], json!(want), "{order}: {got}");
+            }
+        }
+    }
+
     #[test]
     fn splitting_segments_into_partials_reduces_to_the_same_result() {
         let all: Vec<i64> = (0..60).collect();
@@ -1872,5 +2170,125 @@ mod tests {
         assert_eq!(t["buckets"].as_array().unwrap().len(), 2);
         assert!(t["doc_count_error_upper_bound"].as_i64().unwrap() > 0);
         assert!(t["buckets"][0].get("doc_count_error_upper_bound").is_some());
+    }
+
+    fn composite_spec(sources: &Value, size: usize, after: Option<&Value>) -> Value {
+        let mut c = json!({"size": size, "sources": sources});
+        if let Some(a) = after {
+            c["after"] = a.clone();
+        }
+        json!({"c": {"composite": c}})
+    }
+
+    /// Every bucket of `sources`, paging with `size: 1` and replaying each
+    /// `after_key`; fails when a cursor does not advance or paging never ends.
+    fn drain_composite(sources: &Value, cap: usize, page: impl Fn(&Value) -> Value) -> Vec<(Value, u64)> {
+        let mut out = Vec::new();
+        let mut after: Option<Value> = None;
+        for _ in 0..cap {
+            let r = page(&composite_spec(sources, 1, after.as_ref()));
+            let bs = r["c"]["buckets"].as_array().unwrap();
+            if bs.is_empty() {
+                return out;
+            }
+            out.extend(bs.iter().map(|b| (b["key"].clone(), b["doc_count"].as_u64().unwrap())));
+            let next = r["c"]["after_key"].clone();
+            assert_ne!(after.as_ref(), Some(&next), "{sources}: cursor did not advance past {next}");
+            after = Some(next);
+        }
+        panic!("{sources}: paging did not end after {cap} pages: {out:?}")
+    }
+
+    fn composite_reference(whole: &Fx, sources: &Value) -> Vec<(Value, u64)> {
+        let r = single(whole, &composite_spec(sources, 10_000, None));
+        r["c"]["buckets"].as_array().unwrap().iter().map(|b| (b["key"].clone(), b["doc_count"].as_u64().unwrap())).collect()
+    }
+
+    /// Review finding 97: the shard reduce orders composite keys like the
+    /// shards (`missing_order`, descending defaults, raw date values), so
+    /// `after_key` is the last emitted bucket and size-1 pages over two
+    /// local shards visit exactly the single-shard buckets in order.
+    #[test]
+    fn composite_pages_across_local_shards_match_single_shard() {
+        let all: Vec<i64> = (0..60).collect();
+        let whole = fixture(&all, false);
+        // Even ids (with the missing prices) on one shard, odd on the other.
+        let shards: Vec<Fx> = (0..2).map(|s| fixture(&all.iter().copied().filter(|i| i % 2 == s).collect::<Vec<_>>(), false)).collect();
+        let cases = [
+            json!([{"p": {"terms": {"field": "price", "missing_bucket": true, "missing_order": "last"}}}]),
+            json!([{"p": {"terms": {"field": "price", "missing_bucket": true, "order": "desc"}}}]),
+            json!([{"p": {"terms": {"field": "price", "missing_bucket": true, "order": "desc", "missing_order": "first"}}}]),
+            json!([{"p": {"histogram": {"field": "price", "interval": 20, "missing_bucket": true}}}]),
+            json!([{"t": {"terms": {"field": "tag"}}}, {"p": {"histogram": {"field": "price", "interval": 20, "missing_bucket": true, "missing_order": "first", "order": "desc"}}}]),
+            json!([{"p": {"terms": {"field": "price", "missing_bucket": true, "missing_order": "last"}}}, {"g": {"terms": {"field": "grp", "order": "desc"}}}]),
+            json!([{"q": {"terms": {"field": "qty", "order": "desc"}}}, {"o": {"terms": {"field": "ok"}}}]),
+            // Formatted dates whose text order is not their time order.
+            json!([{"d": {"date_histogram": {"field": "ts", "calendar_interval": "day", "format": "dd-MM-yyyy"}}}]),
+            json!([{"d": {"date_histogram": {"field": "ts", "calendar_interval": "day", "format": "dd-MM-yyyy", "time_zone": "-08:00", "order": "desc"}}}]),
+        ];
+        for sources in &cases {
+            let want = composite_reference(&whole, sources);
+            assert!(want.len() > 3, "{sources}");
+            let got = drain_composite(sources, want.len() + 5, |spec| {
+                AggPartial::reduce(shards.iter().map(|s| partial(s, &[0], spec)).collect(), &req(spec)).unwrap()
+            });
+            assert_eq!(got, want, "{sources}");
+        }
+    }
+
+    /// Review finding 98: a formatted date `after` is parsed with the
+    /// source's format and time zone (ES `DocValueFormat.DateTime`), so
+    /// daily pages in zones off UTC (fixed offsets either side, and DST)
+    /// advance strictly and cover each bucket once.
+    #[test]
+    fn formatted_composite_date_cursors_parse_in_the_source_zone() {
+        let all: Vec<i64> = (0..60).collect();
+        let whole = fixture(&all, true);
+        let shards: Vec<Fx> = (0..2).map(|s| fixture(&all.iter().copied().filter(|i| i % 2 == s).collect::<Vec<_>>(), false)).collect();
+        for tz in ["-08:00", "+05:30", "America/New_York", "Europe/London"] {
+            for fmt in ["yyyy-MM-dd", "dd/MM/yyyy"] {
+                for order in ["asc", "desc"] {
+                    let sources = json!([{"d": {"date_histogram": {"field": "ts", "calendar_interval": "day", "format": fmt, "time_zone": tz, "order": order}}}]);
+                    let want = composite_reference(&whole, &sources);
+                    assert!(want.len() > 3, "{sources}");
+                    let got = drain_composite(&sources, want.len() + 5, |spec| single(&whole, spec));
+                    assert_eq!(got, want, "{sources} (one shard)");
+                    let got = drain_composite(&sources, want.len() + 5, |spec| {
+                        AggPartial::reduce(shards.iter().map(|s| partial(s, &[0], spec)).collect(), &req(spec)).unwrap()
+                    });
+                    assert_eq!(got, want, "{sources} (two shards)");
+                }
+            }
+        }
+    }
+
+    /// Review finding 100: the local shard reduce counts the whole reduced
+    /// tree against `search.max_buckets` (ES `MultiBucketConsumer`), for
+    /// ordinary bucket aggregations too, although each shard is under it.
+    #[test]
+    fn local_reduce_enforces_max_buckets_on_the_whole_tree() {
+        let all: Vec<i64> = (0..60).collect();
+        let shards: Vec<Fx> = (0..2).map(|s| fixture(&all.iter().copied().filter(|i| i % 2 == s).collect::<Vec<_>>(), false)).collect();
+        let specs = [
+            json!({"t": {"terms": {"field": "qty", "size": 101, "shard_size": 101}}}),
+            json!({"t": {"terms": {"field": "tag"}, "aggs": {"q": {"terms": {"field": "qty", "size": 100}}}}}),
+            json!({"c": {"composite": {"size": 100, "sources": [{"q": {"terms": {"field": "qty"}}}]}}}),
+            json!({"f": {"filter": {"range": {"qty": {"gte": 0}}}, "aggs": {"r": {"range": {"field": "qty", "ranges": [{"to": 50}, {"from": 50}]}, "aggs": {"t": {"terms": {"field": "qty", "size": 100}}}}}}}),
+        ];
+        for spec in &specs {
+            let parts = || shards.iter().map(|s| partial(s, &[0], spec)).collect::<Vec<_>>();
+            let full = AggPartial::reduce(parts(), &req(spec)).unwrap();
+            // The reduced tree's bucket count: the smallest limit it passes.
+            let n = (1..=10_000).find(|&m| crate::aggs::significant_text::check_final_bucket_limit(spec, &full, m).is_ok()).unwrap();
+            for s in &shards {
+                let own = single(s, spec);
+                assert!(crate::aggs::significant_text::check_final_bucket_limit(spec, &own, n - 1).is_ok(), "{spec}: a shard alone is under the limit");
+            }
+            let limited = |max_buckets: usize| AggRequest { aggs: spec.clone(), typed_keys: false, max_buckets, now: 0 };
+            let err = AggPartial::reduce(parts(), &limited(n - 1)).unwrap_err();
+            assert_eq!(err.kind, "too_many_buckets_exception", "{spec}");
+            assert_eq!(err.status, 400);
+            assert_eq!(AggPartial::reduce(parts(), &limited(n)).unwrap(), full, "{spec}");
+        }
     }
 }

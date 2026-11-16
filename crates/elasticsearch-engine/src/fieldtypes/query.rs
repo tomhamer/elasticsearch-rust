@@ -269,13 +269,10 @@ pub fn term(f: &ResolvedField, v: &Value, ci: bool, ctx: &QueryContext) -> Resul
         }
         EsType::AnnotatedText => {
             let Some(id) = f.core_id else { return Ok(Some(Query::MatchNone)) };
-            // Annotation values are indexed verbatim; plain words analyzed.
-            let analyzed = f.search_analyzer.as_ref().map(|a| a.analyze(&s).into_iter().map(|t| t.text).collect::<Vec<_>>()).unwrap_or_default();
-            let mut qs = vec![Query::Term(Term::new_text(id, &s.replace(' ', super::TOKEN_JOIN)))];
-            if analyzed.len() == 1 && analyzed[0] != s {
-                qs.push(Query::Term(Term::new_text(id, &analyzed[0])));
-            }
-            any_of(qs)
+            // A term query is not analyzed (ES text field): it matches an
+            // annotation value or an indexed word exactly, so `Apple` (an
+            // entity) and `apple` (the word) stay distinct (finding 352).
+            Query::Term(Term::new_text(id, &s))
         }
         EsType::Murmur3 => return Err(shard_err(ctx, format!("Murmur3 fields are not searchable: [{}]", f.name))),
         EsType::Binary => return Err(shard_err(ctx, format!("Binary fields do not support searching"))),
@@ -346,6 +343,12 @@ pub(crate) fn nanos_value(f: &ResolvedField, v: &Value, ctx: &QueryContext) -> R
     nanos_bound(f, v, None, None, false, ctx)
 }
 
+/// A `distance_feature` origin on a date_nanos field (rounded up, as ES
+/// `parseToLong(origin, true, ..)`), nanoseconds kept.
+pub(crate) fn nanos_origin(f: &ResolvedField, v: &Value, ctx: &QueryContext) -> Result<i64> {
+    nanos_bound(f, v, None, None, true, ctx)
+}
+
 fn nanos_bound(f: &ResolvedField, v: &Value, format: Option<&str>, tz: Option<Tz>, round_up: bool, ctx: &QueryContext) -> Result<i64> {
     if let (Value::String(s), None) = (v, format) {
         if !s.contains("||") && !s.starts_with("now") {
@@ -356,10 +359,39 @@ fn nanos_bound(f: &ResolvedField, v: &Value, format: Option<&str>, tz: Option<Tz
             }
         }
     }
+    // A numeric bound is epoch millis unless the query names its format
+    // (ES `DateFieldType.parseToLong` forces `epoch_millis` for numbers),
+    // with its whole fraction kept (#468: the mapping's `epoch_second` was
+    // applied to a millisecond bound and fractions were cut to millis).
+    if let Value::Number(n) = v {
+        let unit = match format {
+            Some(spec) => DateFormatter::new(spec)?.epoch_unit_nanos(),
+            None => Some(1_000_000),
+        };
+        if let Some(unit) = unit {
+            if let Some(n) = crate::date::epoch_text_nanos(&n.to_string(), unit) {
+                let n = n.clamp(0, i64::MAX as i128) as i64;
+                // A whole-unit bound rounds up to the end of its unit.
+                let up = if round_up && unit > 1 && n % unit == 0 { unit - 1 } else { 0 };
+                return Ok(n.saturating_add(up));
+            }
+        }
+    }
     let fmt = match format {
         Some(spec) => DateFormatter::new(spec)?,
         None => f.date_format.clone(),
     };
+    // A bound with sub-millisecond digits in an explicit format keeps them
+    // (finding 445).
+    if let (Value::String(s), Some(_)) = (v, format) {
+        if !s.contains("||") && !s.starts_with("now") {
+            if let (Some(frac), Ok(ms)) = (rustic_core::fieldtypes::numeric::fraction_nanos(s), fmt.parse_with_tz(s, tz.unwrap_or(Tz::UTC))) {
+                if let Ok(n) = rustic_core::fieldtypes::numeric::nanos_from_parts(ms.div_euclid(1000), frac) {
+                    return Ok(n);
+                }
+            }
+        }
+    }
     let ms = match v {
         Value::Number(n) => {
             let x = n.as_f64().unwrap_or(0.0);
@@ -374,7 +406,43 @@ fn nanos_bound(f: &ResolvedField, v: &Value, format: Option<&str>, tz: Option<Tz
         _ => return Err(shard_err(ctx, "failed to create query: date value must be a string or a number")),
     };
     let ms = ms.max(0);
-    Ok(ms.saturating_mul(1_000_000).saturating_add(if round_up { 999_999 } else { 0 }))
+    // The sub-millisecond digits of an explicit-format value or a date-math
+    // anchor (ES parses the instant at the field's resolution): exact, never
+    // widened to the millisecond. A rounding (`/unit`) or `now` has none.
+    let exact = match v {
+        Value::String(s) if !s.starts_with("now") => {
+            let (anchor, math) = s.split_once("||").unwrap_or((s.as_str(), ""));
+            if math.contains('/') { None } else { sub_milli_nanos(anchor) }
+        }
+        _ => None,
+    };
+    Ok(ms.saturating_mul(1_000_000).saturating_add(match exact {
+        Some(sub) => sub as i64,
+        None if round_up => 999_999,
+        None => 0,
+    }))
+}
+
+/// The nanoseconds below the millisecond of a time with more than three
+/// fraction digits (`HH:mm:ss.SSSSSSSSS`, `.` or `,`); `None` with three or
+/// fewer.
+fn sub_milli_nanos(s: &str) -> Option<u32> {
+    let b = s.as_bytes();
+    for (i, _) in s.match_indices(':') {
+        let rest = &b[i + 1..];
+        if rest.len() >= 4 && rest[0].is_ascii_digit() && rest[1].is_ascii_digit() && (rest[2] == b'.' || rest[2] == b',') {
+            let digits: Vec<u8> = rest[3..].iter().take_while(|c| c.is_ascii_digit()).copied().collect();
+            if digits.len() <= 3 {
+                return None;
+            }
+            let mut n: u32 = 0;
+            for k in 0..9 {
+                n = n * 10 + digits.get(k).map(|d| (d - b'0') as u32).unwrap_or(0);
+            }
+            return Some(n % 1_000_000);
+        }
+    }
+    None
 }
 
 fn range_relation_query(id: u16, q: (u128, u128), rel: rng::Relation) -> Query {
@@ -604,7 +672,9 @@ fn multi_term(qname: &str, f: &ResolvedField, body: &Value, ctx: &QueryContext) 
             let ok = match qname {
                 "prefix" => cv.starts_with(&pv),
                 "wildcard" => ngram::wildcard_match(&pv, &cv, false),
-                "regexp" => regex::RegexBuilder::new(&format!("^(?:{value})$")).case_insensitive(ci).build().map(|r| r.is_match(&c)).unwrap_or(false),
+                // The Lucene regexp grammar and flags, as on any keyword.
+                "regexp" => crate::query::regexp::ValueMatcher::new(&value, o.get("flags").and_then(Value::as_str), ci)
+                    .map_err(|e| shard_err(ctx, format!("failed to create query: {e}")))?.is_match(&c),
                 _ => {
                     let fz = o.get("fuzziness").map(|v| scalar_string(v)).unwrap_or_else(|| "AUTO".into());
                     let max = match fz.trim().to_uppercase().as_str() {
@@ -628,11 +698,15 @@ fn multi_term(qname: &str, f: &ResolvedField, body: &Value, ctx: &QueryContext) 
                 "wildcard" => wildcard_query(f, id, &value, ci),
                 "prefix" => wildcard_query(f, id, &format!("{}*", escape_glob(&value)), ci),
                 "regexp" => {
-                    let re = regex::RegexBuilder::new(&format!("^(?:{value})$"))
-                        .case_insensitive(ci)
-                        .build()
+                    // The Lucene regexp grammar and flags (`.` spans line
+                    // breaks, `@`, quoting, `&`, `~`), verified per value; the
+                    // n-gram prefilter requires only literals every match
+                    // contains (read from the parsed pattern).
+                    let re = crate::query::regexp::ValueMatcher::new(&value, o.get("flags").and_then(Value::as_str), ci)
                         .map_err(|e| shard_err(ctx, format!("failed to create query: {e}")))?;
-                    let grams = if ci { Vec::new() } else { ngram::regex_required_ngrams(&value) };
+                    let mut grams: Vec<String> = re.required.iter().filter(|r| r.chars().count() >= ngram::NGRAM).flat_map(|r| ngram::ngrams(r)).collect();
+                    grams.sort();
+                    grams.dedup();
                     let cand = match f.aux_id("ngram") {
                         Some(g) if !grams.is_empty() => filter_all(grams.iter().map(|t| Query::Term(Term::new_text(g, t))).collect()),
                         _ => Some(Query::Exists { field: id }),
@@ -697,7 +771,7 @@ fn flattened_sub(name: &str, f: &ResolvedField, body: &Value, ctx: &QueryContext
                 other => (scalar_string(other), Map::new()),
             };
             let ci = o.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false);
-            let re = regex::RegexBuilder::new(&format!("^(?:{value})$")).case_insensitive(ci).build().map_err(|e| shard_err(ctx, format!("failed to create query: {e}")))?;
+            let re = crate::query::regexp::ValueMatcher::new(&value, o.get("flags").and_then(Value::as_str), ci).map_err(|e| shard_err(ctx, format!("failed to create query: {e}")))?;
             let p = prefix.clone();
             Ok(Some(
                 FilterQuery::constant("regexp", Some(Query::Prefix { field: id, prefix: p.clone().into_bytes(), max_expansions: usize::MAX, case_insensitive: false, rewrite: MultiTermRewrite::ConstantScore }), move |leaf: &LeafReader<'_>, d: DocId| {
@@ -983,9 +1057,13 @@ fn rank_feature(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     let field = o.get("field").and_then(Value::as_str).ok_or_else(|| EsError::illegal_argument("Required [field]"))?;
     let boost = boost_of(o);
     // (core id, Some(token) for rank_features)
+    let mut positive = true;
     let (id, tok): (u16, Option<String>) = match ctx.lookup.get(field) {
         Some(f) if f.declared == EsType::RankFeature => match f.core_id {
-            Some(id) => (id, None),
+            Some(id) => {
+                positive = f.ext.as_ref().map(|e| e.bool("positive_score_impact", true)).unwrap_or(true);
+                (id, None)
+            }
             None => return Ok(Query::MatchNone),
         },
         Some(f) => return Err(shard_err(ctx, format!("failed to create query: [rank_feature] query only works on [rank_feature] fields and features of [rank_features] fields, not [{}]", f.declared.name()))),
@@ -1043,6 +1121,12 @@ fn rank_feature(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
             Some(p) => p,
             None => pivot_default(),
         } },
+        // ES `RankFeatureQueryBuilder.ScoreFunction.Log.toQuery`. (The other
+        // functions take their parameters as given, on the stored values:
+        // the reciprocal for a negative impact, as ES does.)
+        Some("log") if !positive => {
+            return Err(shard_err(ctx, "failed to create query: Cannot use the [log] function with a field that has a negative score impact as it would trigger negative scores".to_string()));
+        }
         Some("log") => FeatureFunction::Log { scaling_factor: num(o["log"].get("scaling_factor"), "scaling_factor")?.ok_or_else(|| EsError::parsing("[log] requires [scaling_factor]"))? },
         Some("sigmoid") => FeatureFunction::Sigmoid {
             pivot: num(o["sigmoid"].get("pivot"), "pivot")?.ok_or_else(|| EsError::parsing("[sigmoid] requires [pivot]"))?,
@@ -1083,10 +1167,14 @@ fn shape_parse_error(msg: &str, wkt: bool) -> EsError {
     build()
 }
 
+/// The index an `indexed_shape` without `index` is read from (ES
+/// `AbstractGeometryQueryBuilder.DEFAULT_SHAPE_INDEX_NAME`).
+pub const DEFAULT_SHAPE_INDEX: &str = "shapes";
+
 fn shape_query(qname: &str, o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
     let ignore_unmapped = o.get("ignore_unmapped").and_then(Value::as_bool).unwrap_or(false);
-    // Unlike most queries a geo_shape scores 0 unless a `boost` is given.
-    let score = o.get("boost").and_then(Value::as_f64).map(|b| b as f32).unwrap_or(0.0);
+    // ES: a `ConstantScoreQuery` under the query's boost (default 1).
+    let score = o.get("boost").and_then(Value::as_f64).map(|b| b as f32).unwrap_or(1.0);
     let (field, spec) = o
         .iter()
         .filter(|(k, _)| !matches!(k.as_str(), "boost" | "_name" | "ignore_unmapped"))
@@ -1110,7 +1198,8 @@ fn shape_query(qname: &str, o: &Map<String, Value>, ctx: &QueryContext) -> Resul
             let Some(id) = is.get("id").map(scalar_string) else {
                 return Err(EsError::illegal_argument("either shape or indexedShapeId is required"));
             };
-            let index = is.get("index").and_then(Value::as_str).unwrap_or(ctx.index_name);
+            // `AbstractGeometryQueryBuilder.DEFAULT_SHAPE_INDEX_NAME`.
+            let index = is.get("index").and_then(Value::as_str).unwrap_or(DEFAULT_SHAPE_INDEX);
             let explicit_path = is.get("path").and_then(Value::as_str);
             let path = explicit_path.unwrap_or("shape");
             let routing = is.get("routing").and_then(Value::as_str);
@@ -1128,7 +1217,8 @@ fn shape_query(qname: &str, o: &Map<String, Value>, ctx: &QueryContext) -> Resul
     let qg = if geo {
         shape::parse_query_shape(&shape_v)
     } else {
-        shape::parse(&shape_v, &shape::ParseOpts { geo: false, coerce: true, ignore_z: true })
+        // Cartesian query geometries in the fields' float encoding.
+        shape::parse(&shape_v, &shape::ParseOpts { geo: false, coerce: true, ignore_z: true }).and_then(|g| g.to_xy_float())
     }
     .map_err(|e| shape_parse_error(&e, wkt))?;
     // A `geo_shape` runtime field: its values related as one shape doc value.
@@ -1228,8 +1318,10 @@ fn shape_query(qname: &str, o: &Map<String, Value>, ctx: &QueryContext) -> Resul
             let owned = leaf.keyword_values(id, d);
             let mut doc_shapes: Vec<shape::Geometry> = Vec::with_capacity(owned.len());
             for v in &owned {
+                // Related in the single-precision encoding ES indexes
+                // (`XYEncodingUtils`), as the query geometry is.
                 if let Some(g) = shape::decode(v) {
-                    doc_shapes.push(g);
+                    doc_shapes.push(g.to_xy_float().unwrap_or(g));
                 }
             }
             if owned.is_empty() {

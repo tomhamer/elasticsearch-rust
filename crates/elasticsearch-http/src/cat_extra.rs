@@ -80,7 +80,7 @@ fn fielddata(node: &Node, req: &Req, arg: Option<&str>) -> R {
                 }
             }
             // Only fielddata a sort or aggregation loaded on this node.
-            if !elasticsearch_engine::fielddata_cache::loaded(&svc.name, &f) {
+            if !elasticsearch_engine::fielddata_cache::loaded(&svc.uuid, &f) {
                 continue;
             }
             let Some(id) = lk.get(&f).and_then(|r| r.core_id) else { continue };

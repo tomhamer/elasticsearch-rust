@@ -131,6 +131,14 @@ impl EsClient for FakeEs {
     async fn voting_exclusions(&self) -> Result<Vec<String>, EsError> {
         Ok(self.with(|s| s.voting_exclusions.clone()))
     }
+    /// The fake reconfigures at once: its voting configuration is every
+    /// live master-eligible node not excluded.
+    async fn coordination(&self) -> Result<Option<serde_json::Value>, EsError> {
+        Ok(Some(self.with(|s| {
+            let ids: Vec<String> = s.nodes.iter().filter(|(n, x)| x.1 && x.3 && !s.voting_exclusions.contains(n)).map(|(_, x)| x.0.clone()).collect();
+            serde_json::json!({"last_committed_config": ids, "last_accepted_config": ids, "voting_config_exclusions": []})
+        })))
+    }
     async fn add_voting_exclusions(&self, names: &[String]) -> Result<(), EsError> {
         self.with(|s| {
             s.voting_exclusions.extend(names.iter().cloned());

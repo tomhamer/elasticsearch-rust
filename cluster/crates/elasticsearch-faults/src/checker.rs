@@ -95,6 +95,26 @@ pub struct Input<'a> {
     pub grace: f64,
     pub converged: Result<f64, String>,
     pub crashes: &'a [(usize, f64, String)],
+    /// What the run must have collected to qualify (production review
+    /// #459, #460).
+    pub evidence: Evidence,
+}
+
+/// Required evidence: the indices the run set up (each must have a final
+/// copy read), whether the final read stabilised or failed, and whether
+/// the scenario's fault was actually applied. `Default`: nothing required.
+#[derive(Clone, Debug)]
+pub struct Evidence {
+    pub expected_indices: Vec<String>,
+    pub final_stable: bool,
+    pub final_error: Option<String>,
+    pub scenario: Result<(), String>,
+}
+
+impl Default for Evidence {
+    fn default() -> Self {
+        Evidence { expected_indices: Vec::new(), final_stable: true, final_error: None, scenario: Ok(()) }
+    }
 }
 
 fn v(g: &str, kind: &str, detail: String, key: Option<(&str, &str)>, t: Option<f64>) -> Violation {
@@ -243,6 +263,25 @@ pub fn check(inp: &Input) -> Verdict {
                 }
             }
         }
+    }
+
+    // Missing evidence is a failed qualification, never a pass: a final
+    // read that failed or never stabilised, a set-up index without any
+    // copy read, a scenario whose fault never happened.
+    if let Some(e) = &inp.evidence.final_error {
+        viol.push(v("G5", "final-read-failed", e.clone(), None, None));
+    }
+    if !inp.evidence.final_stable {
+        viol.push(v("G5", "final-read-unstable", "the final copy read never had two identical passes".into(), None, None));
+    }
+    for ix in &inp.evidence.expected_indices {
+        if !by_index.contains_key(ix.as_str()) {
+            let acked = inp.ops.iter().filter(|o| o.index == *ix && is_write(o.kind) && o.outcome == Outcome::Ok).count();
+            viol.push(v("G5", "index-missing", format!("{ix}: no copy in the final read ({acked} acknowledged writes unchecked)"), None, None));
+        }
+    }
+    if let Err(e) = &inp.evidence.scenario {
+        viol.push(v("COVERAGE", "fault-not-applied", e.clone(), None, None));
     }
 
     // ------------------------------------------- per-key write checks (G3)
@@ -523,7 +562,7 @@ mod tests {
     }
     fn run(ops: &[Op], copies: &[Copy], obs: &[Obs], windows: &[Window]) -> Verdict {
         let samples = BTreeMap::new();
-        check(&Input { ops, copies, obs, samples: &samples, events: &[], windows, grace: 5.0, converged: Ok(0.0), crashes: &[] })
+        check(&Input { ops, copies, obs, samples: &samples, events: &[], windows, grace: 5.0, converged: Ok(0.0), crashes: &[], evidence: Evidence::default() })
     }
     fn kinds(v: &Verdict) -> Vec<String> {
         v.violations.iter().map(|x| x.kind.clone()).collect()

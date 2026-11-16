@@ -5,11 +5,17 @@
 //! parts / vocabularies under `<path.data>/ml-models/<id>/`; deployments
 //! (`TrainedModelAssignment`s) in `deployments.json`. The prepackaged
 //! `lang_ident_model_1` is always listed. Built-in `.multilingual-e5-small`
-//! and `.elser_model_2` are "downloaded" by a model import task when put
-//! and then run on the CPU fallbacks in [`super::local`]; uploaded PyTorch
-//! models run on the TorchScript interpreter in [`super::torch`].
+//! and `.elser_model_2` are registered by a model import task when put (no
+//! weights are downloaded); a deployment of one runs only where its
+//! implementation can ([`super::backend`]: the real E5 model with the
+//! `candle-models` feature and installed files, or the built-in stand-ins
+//! when the node enables `xpack.inference.builtin_fallback`). Uploaded
+//! PyTorch models run on the TorchScript interpreter in [`super::torch`].
 
+use super::backend::{self, Builtin};
 use super::local;
+use super::model_store;
+use super::real;
 use super::torch;
 use crate::error::{EsError, Result};
 use base64::Engine as _;
@@ -30,6 +36,40 @@ fn root(state_dir: &Path) -> PathBuf {
     state_dir.parent().unwrap_or(state_dir).join("ml-models")
 }
 
+/// The packaged models (ids starting with `.`) this node knows. Every other
+/// model id must be a valid user id ([`valid_ml_id`]).
+pub const PACKAGED_MODELS: &[&str] = &[
+    ".elser_model_1",
+    ".elser_model_2",
+    ".elser_model_2_linux-x86_64",
+    ".multilingual-e5-small",
+    ".multilingual-e5-small_linux-x86_64",
+    ".rerank-v1",
+];
+
+/// Is `id` a model id that may name a model (and its artifact directory)?
+pub fn acceptable_model_id(id: &str) -> bool {
+    valid_ml_id(id) || PACKAGED_MODELS.contains(&id)
+}
+
+/// The artifact directory of model `id`: only for an acceptable id, and
+/// only a direct child of the model root (no separators, `.`/`..` or
+/// absolute components can reach outside it).
+fn model_dir(state_dir: &Path, id: &str) -> Result<PathBuf> {
+    let bad = || bad_request(format!("Invalid model_id; '{id}' can contain lowercase alphanumeric (a-z and 0-9), hyphens or underscores; must start and end with alphanumeric"));
+    if !acceptable_model_id(id) {
+        return Err(bad());
+    }
+    let r = root(state_dir);
+    let dir = r.join(id);
+    let mut comps = Path::new(id).components();
+    let single = matches!((comps.next(), comps.next()), (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(id));
+    if !single || dir.parent() != Some(r.as_path()) {
+        return Err(bad());
+    }
+    Ok(dir)
+}
+
 fn read_map(path: PathBuf) -> Map<String, Value> {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default()
 }
@@ -37,16 +77,74 @@ fn read_map(path: PathBuf) -> Map<String, Value> {
 fn write_map(state_dir: &Path, file: &str, m: &Map<String, Value>) -> Result<()> {
     let r = root(state_dir);
     std::fs::create_dir_all(&r)?;
-    std::fs::write(r.join(file), serde_json::to_vec_pretty(&Value::Object(m.clone()))?)?;
+    // Atomic: a concurrent reader (cluster-state extraction) never sees half a file.
+    let tmp = r.join(format!("{file}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&Value::Object(m.clone()))?)?;
+    std::fs::rename(&tmp, r.join(file))?;
     Ok(())
 }
 
-fn load(state_dir: &Path) -> Map<String, Value> {
-    read_map(root(state_dir).join("models.json"))
+/// The node whose model indices hold the models of `state_dir`, after
+/// migrating the legacy files once (see [`model_store`]).
+fn store(state_dir: &Path) -> Option<Arc<crate::node::Node>> {
+    let node = model_store::bound(state_dir)?;
+    if let Err(e) = model_store::migrate_legacy(&node, &root(state_dir)) {
+        tracing::error!("failed to migrate trained models into the model indices: {e}");
+    }
+    Some(node)
 }
 
-fn save(state_dir: &Path, m: &Map<String, Value>) -> Result<()> {
-    write_map(state_dir, "models.json", m)
+#[cfg(test)]
+thread_local! {
+    /// Tests: fail this thread's next catalog read (a transient store error).
+    static FAIL_NEXT_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Every stored model config, by id. A catalog that cannot be read is an
+/// error, never an empty catalog: a mutation built on an empty image would
+/// delete every model it does not mention (finding 156).
+fn load(state_dir: &Path) -> Result<Map<String, Value>> {
+    #[cfg(test)]
+    if FAIL_NEXT_LOAD.with(|f| f.replace(false)) {
+        return Err(EsError::new(503, "status_exception", "trained model configs are temporarily unavailable"));
+    }
+    match store(state_dir) {
+        Some(node) => model_store::load_configs(&node),
+        None => {
+            let path = root(state_dir).join("models.json");
+            match std::fs::read(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+                Err(e) => Err(EsError::new(500, "status_exception", format!("failed to read trained model configs: {e}"))),
+                Ok(b) => serde_json::from_slice::<Value>(&b)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+                    .ok_or_else(|| EsError::new(500, "status_exception", "failed to read trained model configs: the catalog is not a JSON object")),
+            }
+        }
+    }
+}
+
+/// Store the changes from `before` (the catalog image the mutation started
+/// from) to `after`: only the models that differ are written or deleted, so
+/// a model the mutation never saw is never removed.
+fn save(state_dir: &Path, before: &Map<String, Value>, after: &Map<String, Value>) -> Result<()> {
+    match store(state_dir) {
+        Some(node) => model_store::save_configs(&node, before, after),
+        None => {
+            // The file holds the whole catalog: apply the change to what it
+            // holds now (under the management lock).
+            let mut now = load(state_dir)?;
+            for (id, cfg) in after {
+                if before.get(id) != Some(cfg) {
+                    now.insert(id.clone(), cfg.clone());
+                }
+            }
+            for id in before.keys().filter(|k| !after.contains_key(*k)) {
+                now.remove(id);
+            }
+            write_map(state_dir, "models.json", &now)
+        }
+    }
 }
 
 fn not_found(id: &str) -> EsError {
@@ -59,7 +157,10 @@ fn bad_request(msg: impl Into<String>) -> EsError {
 
 /// Does a trained model `id` exist (stored or built-in downloaded)?
 pub fn exists(state_dir: &Path, id: &str) -> bool {
-    load(state_dir).contains_key(id)
+    match store(state_dir) {
+        Some(node) => model_store::get_config(&node, id).ok().flatten().is_some(),
+        None => load(state_dir).is_ok_and(|m| m.contains_key(id)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +222,7 @@ pub fn put_alias(state_dir: &Path, model_id: &str, alias: &str, reassign: bool) 
         let refs: Vec<&str> = errors.iter().map(String::as_str).collect();
         return Err(EsError::action_validation(&refs));
     }
-    let models = load(state_dir);
+    let models = load(state_dir)?;
     let model = if model_id == "lang_ident_model_1" { lang_ident() } else { models.get(model_id).cloned().ok_or_else(|| not_found(model_id))? };
     if models.contains_key(alias) || alias == "lang_ident_model_1" {
         return Err(EsError::new(400, "status_exception", format!("requested model_alias [{alias}] is the same as an existing model_id. Model Ids and model_aliases must be unique")));
@@ -229,7 +330,7 @@ pub struct GetOpts {
 /// Expand an id expression (aliases, wildcards, `_all`) to the sorted
 /// matching configs.
 fn expand(state_dir: &Path, id: Option<&str>, allow_no_match: bool, tags: &[String]) -> Result<Vec<Value>> {
-    let stored = load(state_dir);
+    let stored = load(state_dir)?;
     let al = aliases(state_dir);
     let mut all: Vec<Value> = vec![lang_ident()];
     all.extend(stored.values().cloned());
@@ -345,10 +446,22 @@ fn compress(v: &Value) -> Result<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(gz.finish()?))
 }
 
+/// Largest expanded `compressed_definition` accepted.
+pub const MAX_DEFINITION_BYTES: usize = 1 << 30;
+
 fn decompress(s: &str) -> Option<Value> {
+    decompress_within(s, MAX_DEFINITION_BYTES)
+}
+
+/// A base64 gzip JSON definition, expanded through a bounded reader: `None`
+/// when malformed or larger than `limit` bytes once expanded.
+fn decompress_within(s: &str, limit: usize) -> Option<Value> {
     let raw = base64::engine::general_purpose::STANDARD.decode(s.trim()).ok()?;
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut out).ok()?;
+    flate2::read::GzDecoder::new(&raw[..]).take(limit as u64 + 1).read_to_end(&mut out).ok()?;
+    if out.len() > limit {
+        return None;
+    }
     serde_json::from_slice(&out).ok()
 }
 
@@ -532,6 +645,10 @@ pub fn put(state_dir: &Path, id: &str, body: &Value) -> Result<Value> {
 pub fn put_with(state_dir: &Path, id: &str, body: &Value, opts: &PutOpts) -> Result<Value> {
     let o = body.as_object().cloned().unwrap_or_default();
     let packaged = id.starts_with('.');
+    // Ids starting with `.` are reserved for the packaged models.
+    if packaged && !PACKAGED_MODELS.contains(&id) {
+        return Err(EsError::action_validation(&[&format!("Invalid model_id; '{id}' can contain lowercase alphanumeric (a-z and 0-9), hyphens or underscores; must start and end with alphanumeric")]));
+    }
     // Parsing: the named inference config.
     let mut inference_config = None;
     if let Some((kind, c)) = o.get("inference_config").and_then(Value::as_object).and_then(|m| m.iter().next()) {
@@ -615,7 +732,8 @@ pub fn put_with(state_dir: &Path, id: &str, body: &Value, opts: &PutOpts) -> Res
         size_ops = Some((ram + serde_json::to_vec(def).map(|v| v.len() as i64).unwrap_or(0), ops));
     }
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut m = load(state_dir);
+    let mut m = load(state_dir)?;
+    let before = m.clone();
     if aliases(state_dir).contains_key(id) {
         return Err(bad_request(format!("requested model_id [{id}] is the same as an existing model_alias. Model model_aliases and ids must be unique")));
     }
@@ -699,7 +817,7 @@ pub fn put_with(state_dir: &Path, id: &str, body: &Value, opts: &PutOpts) -> Res
         cfg[DOWNLOAD_KEY] = json!(until);
     }
     m.insert(id.to_string(), cfg);
-    save(state_dir, &m)?;
+    save(state_dir, &before, &m)?;
     drop(_g);
     if packaged && opts.wait_for_completion {
         wait_for_download(state_dir, id, None);
@@ -711,7 +829,16 @@ pub fn put_with(state_dir: &Path, id: &str, body: &Value, opts: &PutOpts) -> Res
 fn wait_for_download(state_dir: &Path, id: &str, timeout_ms: Option<i64>) -> bool {
     let deadline = timeout_ms.map(|t| crate::date::now_millis() + t);
     loop {
-        let Some(cfg) = load(state_dir).get(id).cloned() else { return true };
+        // A catalog read that fails is retried until the deadline.
+        let cfg = match load(state_dir) {
+            Ok(m) => m.get(id).cloned(),
+            Err(_) if deadline.is_some_and(|d| crate::date::now_millis() >= d) => return false,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+        };
+        let Some(cfg) = cfg else { return true };
         if !downloading(&cfg) {
             return true;
         }
@@ -765,7 +892,8 @@ pub fn delete_checked(state_dir: &Path, id: &str, force: bool, referenced: &std:
     if id == "lang_ident_model_1" {
         return Err(EsError::new(409, "status_exception", format!("Unable to delete model [{id}] as it is a prepackaged model")));
     }
-    let mut m = load(state_dir);
+    let mut m = load(state_dir)?;
+    let before = m.clone();
     if !m.contains_key(id) {
         return Err(not_found(id));
     }
@@ -791,14 +919,25 @@ pub fn delete_checked(state_dir: &Path, id: &str, force: bool, referenced: &std:
         save_deployments(state_dir, &d)?;
     }
     m.shift_remove(id);
-    save(state_dir, &m)?;
+    save(state_dir, &before, &m)?;
     let mut a = aliases(state_dir);
     let before = a.len();
     a.retain(|_, v| v.as_str() != Some(id));
     if a.len() != before {
         save_aliases(state_dir, &a)?;
     }
-    let _ = std::fs::remove_dir_all(root(state_dir).join(id));
+    // A built-in model's directory holds its installed weights, not
+    // uploaded parts: deleting the config keeps them.
+    if Builtin::of(id).is_none() {
+        match store(state_dir) {
+            Some(node) => model_store::delete_artifacts(&node, id)?,
+            None => {
+                if let Ok(dir) = model_dir(state_dir, id) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+    }
     program_cache().lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| k.1 != id);
     Ok(json!({"acknowledged": true}))
 }
@@ -809,12 +948,15 @@ pub fn delete_checked(state_dir: &Path, id: &str, force: bool, referenced: &std:
 /// Reset user model artifacts through the normal forced deletion path, which
 /// also drops deployments, aliases and cached programs. Built-ins remain.
 pub fn reset(state_dir: &Path) -> Result<()> {
-    let ids: Vec<_> = load(state_dir).keys().filter(|id| id.as_str() != "lang_ident_model_1").cloned().collect();
+    let ids: Vec<_> = load(state_dir)?.keys().filter(|id| id.as_str() != "lang_ident_model_1").cloned().collect();
     for id in ids { delete_with(state_dir, &id, true)?; }
     let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     for deployment in deployments(state_dir).keys() { runtime_drop(state_dir, deployment); }
     save_deployments(state_dir, &Map::new())?;
     save_aliases(state_dir, &Map::new())?;
+    if let Some(node) = store(state_dir) {
+        model_store::reset(&node)?;
+    }
     Ok(())
 }
 
@@ -823,9 +965,15 @@ pub fn put_vocabulary(state_dir: &Path, id: &str, body: &Value) -> Result<Value>
     if !exists(state_dir, id) {
         return Err(not_found(id));
     }
-    let dir = root(state_dir).join(id);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("vocabulary.json"), serde_json::to_vec(body)?)?;
+    let dir = model_dir(state_dir, id)?;
+    match store(state_dir) {
+        Some(node) => model_store::put_vocabulary(&node, id, body)?,
+        None => {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("vocabulary.json"), serde_json::to_vec(body)?)?;
+        }
+    }
+    vocab_cache().lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| k.1 != id);
     Ok(json!({"acknowledged": true}))
 }
 
@@ -834,16 +982,27 @@ pub fn put_definition_part(state_dir: &Path, id: &str, part: u64, body: &Value) 
     if !exists(state_dir, id) {
         return Err(not_found(id));
     }
-    let dir = root(state_dir).join(id);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(format!("definition-{part}.json")), serde_json::to_vec(body)?)?;
+    let dir = model_dir(state_dir, id)?;
+    match store(state_dir) {
+        Some(node) => model_store::put_definition_part(&node, id, part, body)?,
+        None => {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("definition-{part}.json")), serde_json::to_vec(body)?)?;
+        }
+    }
     program_cache().lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| k.1 != id);
     Ok(json!({"acknowledged": true}))
 }
 
 /// The definition parts of `id` (part number, body), by part number.
 fn parts(state_dir: &Path, id: &str) -> Vec<(u64, Value)> {
-    let dir = root(state_dir).join(id);
+    let Ok(dir) = model_dir(state_dir, id) else { return Vec::new() };
+    if let Some(node) = store(state_dir) {
+        return model_store::definition_parts(&node, id).unwrap_or_else(|e| {
+            tracing::error!("failed to read the definition of trained model [{id}]: {e}");
+            Vec::new()
+        });
+    }
     let mut out: Vec<(u64, Value)> = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
@@ -900,6 +1059,9 @@ fn definition_bytes(state_dir: &Path, id: &str) -> Vec<u8> {
 }
 
 type ProgramKey = (PathBuf, String);
+/// `(state dir, model id, config create_time)`: a model re-created under
+/// the same id (on any node) is a new key.
+type CacheKey = (PathBuf, String, i64);
 
 struct SendProgram(torch::Program);
 // SAFETY: a parsed `Program` is immutable data (no `Rc` inside); tensors
@@ -907,13 +1069,13 @@ struct SendProgram(torch::Program);
 unsafe impl Send for SendProgram {}
 unsafe impl Sync for SendProgram {}
 
-fn program_cache() -> &'static Mutex<HashMap<ProgramKey, Arc<SendProgram>>> {
-    static C: std::sync::OnceLock<Mutex<HashMap<ProgramKey, Arc<SendProgram>>>> = std::sync::OnceLock::new();
+fn program_cache() -> &'static Mutex<HashMap<CacheKey, Arc<SendProgram>>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<CacheKey, Arc<SendProgram>>>> = std::sync::OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn program(state_dir: &Path, id: &str) -> Result<Arc<SendProgram>> {
-    let key = (state_dir.to_path_buf(), id.to_string());
+fn program(state_dir: &Path, id: &str, stamp: i64) -> Result<Arc<SendProgram>> {
+    let key = (state_dir.to_path_buf(), id.to_string(), stamp);
     if let Some(p) = program_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Ok(p.clone());
     }
@@ -922,12 +1084,56 @@ fn program(state_dir: &Path, id: &str) -> Result<Arc<SendProgram>> {
     Ok(p)
 }
 
-fn vocabulary(state_dir: &Path, id: &str) -> Vec<String> {
-    std::fs::read(root(state_dir).join(id).join("vocabulary.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v["vocabulary"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect()))
-        .unwrap_or_default()
+fn vocab_cache() -> &'static Mutex<HashMap<CacheKey, Arc<torch::NlpVocab>>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<CacheKey, Arc<torch::NlpVocab>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: fail this thread's next vocabulary read.
+    static FAIL_NEXT_VOCAB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The vocabulary of model `id` (cached per model incarnation). A
+/// vocabulary that cannot be read, is missing, empty or lacks the tokens
+/// WordPiece needs is an error: tokenizing with a substitute would turn
+/// ordinary text into unknown tokens and answer a wrong, cacheable
+/// prediction (finding 159). Failures are never cached.
+fn vocabulary(state_dir: &Path, id: &str, stamp: i64, family: &str) -> Result<Arc<torch::NlpVocab>> {
+    let key = (state_dir.to_path_buf(), id.to_string(), stamp);
+    if let Some(v) = vocab_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(v.clone());
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_VOCAB.with(|f| f.replace(false)) {
+        return Err(EsError::new(503, "status_exception", format!("the vocabulary of model [{id}] could not be read")));
+    }
+    let body = match store(state_dir) {
+        Some(node) => model_store::vocabulary(&node, id)?,
+        None => match model_dir(state_dir, id)?.join("vocabulary.json") {
+            path if !path.exists() => None,
+            path => {
+                let bytes = std::fs::read(&path).map_err(|e| EsError::new(503, "status_exception", format!("the vocabulary of model [{id}] could not be read: {e}")))?;
+                Some(serde_json::from_slice::<Value>(&bytes).map_err(|_| EsError::new(500, "status_exception", format!("the vocabulary of model [{id}] is not valid JSON")))?)
+            }
+        },
+    };
+    let body = body.ok_or_else(|| bad_request(format!("Model [{id}] has no vocabulary; put its vocabulary before inference")))?;
+    let tokens = body["vocabulary"].as_array().ok_or_else(|| bad_request(format!("the vocabulary of model [{id}] has no [vocabulary] list")))?;
+    if tokens.iter().any(|t| !t.is_string()) {
+        return Err(bad_request(format!("the vocabulary of model [{id}] holds a non-string token")));
+    }
+    let v = torch::NlpVocab::from_body(&body);
+    // Unmatched words map to the family's unknown token: without it, the
+    // tokenizer would invent token 0 (finding 159).
+    let unk = torch::unknown_token(family);
+    if v.tokens.is_empty() || !v.tokens.iter().any(|x| x == unk) {
+        return Err(bad_request(format!("the vocabulary of model [{id}] does not contain the {unk} token")));
+    }
+    let v = Arc::new(v);
+    vocab_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(key, v.clone());
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +1145,50 @@ fn deployments(state_dir: &Path) -> Map<String, Value> {
 
 fn save_deployments(state_dir: &Path, d: &Map<String, Value>) -> Result<()> {
     write_map(state_dir, "deployments.json", d)
+}
+
+/// The cluster-state form of the master's deployments and model aliases
+/// (ES `TrainedModelAssignmentMetadata` / `ModelAliasMetadata`), one entry
+/// per deployment (`deployment:<id>`) and alias (`alias:<name>`).
+pub fn cluster_state(state_dir: &Path) -> Value {
+    // Not under `LOCK`: an API holding it may wait for a publication that
+    // reads this (files are replaced atomically).
+    let mut out = Map::new();
+    for (k, v) in deployments(state_dir) {
+        out.insert(format!("deployment:{k}"), v);
+    }
+    for (k, v) in aliases(state_dir) {
+        out.insert(format!("alias:{k}"), v);
+    }
+    Value::Object(out)
+}
+
+/// Make this node's deployments and model aliases the published ones (a
+/// node that is not the master; the next master starts from them).
+pub fn restore_cluster_state(state_dir: &Path, state: &Value) -> Result<()> {
+    // Not under `LOCK` (shared by every in-process node, held by APIs that
+    // wait for cluster-state application): only non-masters apply.
+    static APPLY: Mutex<()> = Mutex::new(());
+    let _g = APPLY.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut deps, mut als) = (Map::new(), Map::new());
+    for (k, v) in state.as_object().into_iter().flatten() {
+        if let Some(id) = k.strip_prefix("deployment:") {
+            deps.insert(id.to_string(), v.clone());
+        } else if let Some(a) = k.strip_prefix("alias:") {
+            als.insert(a.to_string(), v.clone());
+        }
+    }
+    let cur = deployments(state_dir);
+    if cur != deps {
+        for gone in cur.keys().filter(|k| !deps.contains_key(*k)) {
+            runtime_drop(state_dir, gone);
+        }
+        save_deployments(state_dir, &deps)?;
+    }
+    if aliases(state_dir) != als {
+        save_aliases(state_dir, &als)?;
+    }
+    Ok(())
 }
 
 /// `ByteSizeValue.parseBytesSizeValue`: (bytes, `getStringRep`).
@@ -1174,6 +1424,10 @@ pub fn start_deployment_with(state_dir: &Path, id: &str, o: &StartOpts) -> Resul
         return Err(EsError::new(408, "status_exception", format!("Model download task is currently running. Wait for trained model [{model_id}] download task to complete then try again")));
     }
     let packaged = builtin_config(&model_id).is_some();
+    // A built-in model deploys only where something can run it.
+    if let Some(b) = Builtin::of(&model_id) {
+        backend::resolve(state_dir, b).map_err(|why| EsError::new(500, "status_exception", format!("Could not start deployment [{deployment_id}] of model [{model_id}]: {why}")))?;
+    }
     let model_bytes = if packaged { cfg["model_size_bytes"].as_u64().unwrap_or(0) } else { definition_length(state_dir, &model_id)? };
     let (cache_bytes, cache_rep) = cache.unwrap_or_else(|| (model_bytes, if model_bytes == 0 { "0".into() } else { format!("{model_bytes}b") }));
     let per_dep = cfg["per_deployment_memory_bytes"].as_i64().unwrap_or(0);
@@ -1313,6 +1567,7 @@ pub fn clear_cache(state_dir: &Path, id: &str) -> Result<Value> {
     if let Some(r) = rt.get_mut(&(state_dir.to_path_buf(), id.to_string())) {
         r.cache.clear();
         r.cache_used = 0;
+        r.cache_epoch += 1;
     }
     Ok(json!({"cleared": true}))
 }
@@ -1322,6 +1577,10 @@ pub fn clear_cache(state_dir: &Path, id: &str) -> Result<Value> {
 
 #[derive(Default)]
 struct Runtime {
+    /// The deployment incarnation this runtime belongs to ([`generation`]).
+    generation: String,
+    /// Bumped by a cache clear: results computed before it are not cached.
+    cache_epoch: u64,
     inference_count: u64,
     cache_hits: u64,
     errors: u64,
@@ -1334,6 +1593,13 @@ struct Runtime {
 fn runtimes() -> &'static Mutex<HashMap<ProgramKey, Runtime>> {
     static R: std::sync::OnceLock<Mutex<HashMap<ProgramKey, Runtime>>> = std::sync::OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The incarnation of a deployment: its model and start time. A deployment
+/// id stopped and started again (with another model) is a new incarnation,
+/// whose runtime never takes an old in-flight call's result (finding 161).
+fn generation(dep: &Value) -> String {
+    format!("{}\u{0}{}", dep["model_id"].as_str().unwrap_or(""), dep["start_time"].as_i64().unwrap_or(0))
 }
 
 fn runtime_drop(state_dir: &Path, deployment_id: &str) {
@@ -1439,7 +1705,20 @@ pub fn stats_named(state_dir: &Path, id: Option<&str>, allow_no_match: bool, fro
                 ds.insert("adaptive_allocations".into(), d["adaptive_allocations"].clone());
             }
             ds.insert("queue_capacity".into(), d["queue_capacity"].clone());
-            ds.insert("state".into(), json!("started"));
+            match Builtin::of(mid).map(|b| backend::resolve(state_dir, b)) {
+                // rustic: the implementation serving a built-in model.
+                Some(Ok(imp)) => {
+                    ds.insert("state".into(), json!("started"));
+                    ds.insert("implementation".into(), json!(imp.name()));
+                }
+                Some(Err(why)) => {
+                    ds.insert("state".into(), json!("failed"));
+                    ds.insert("reason".into(), json!(why));
+                }
+                None => {
+                    ds.insert("state".into(), json!("started"));
+                }
+            }
             let allocs = d["number_of_allocations"].clone();
             ds.insert("allocation_status".into(), json!({"allocation_count": allocs, "target_allocation_count": allocs, "state": "fully_allocated"}));
             if let Some(cs) = d["cache_size"].as_str() {
@@ -1485,31 +1764,56 @@ fn input_text(doc: &Value, field: &str) -> Result<String> {
     }
 }
 
+/// The NLP tasks whose model output this node cannot decode.
+const UNDECODED_TASKS: &[&str] = &["text_classification", "zero_shot_classification", "ner", "fill_mask", "question_answering", "text_similarity"];
+
+fn unsupported_task(model_id: &str, kind: &str) -> EsError {
+    bad_request(format!("Inference for task [{kind}] is not supported on this node: the output of model [{model_id}] cannot be decoded for this task"))
+}
+
 /// Run an NLP model over one text (no counters).
 fn run_nlp(state_dir: &Path, cfg: &Value, text: &str, kind: &str) -> Result<Value> {
     let mid = cfg["model_id"].as_str().unwrap_or("");
     let ic = cfg["inference_config"].as_object().and_then(|o| o.get(kind)).cloned().unwrap_or(json!({}));
     let results_field = ic.get("results_field").and_then(Value::as_str).unwrap_or("predicted_value").to_string();
-    if builtin_config(mid).is_some() {
-        return Ok(match kind {
-            "text_expansion" => json!({results_field: local::embed_sparse(text), "is_truncated": false}),
-            _ => json!({results_field: local::embed_dense(text, None)}),
+    if let Some(b) = Builtin::of(mid).filter(|_| builtin_config(mid).is_some()) {
+        let imp = backend::resolve(state_dir, b).map_err(|why| backend::not_deployed(mid, &why))?;
+        if imp.is_fallback() {
+            crate::warnings::add(backend::warning(mid, imp));
+        }
+        // Trained-model inference shares the model's default endpoint's
+        // implementation record (the `inference` ingest processor embeds
+        // through that endpoint).
+        if b != Builtin::Rerank {
+            backend::check_pin(state_dir, b.default_endpoint(), imp)?;
+        }
+        return Ok(match (b, imp) {
+            (Builtin::Elser, _) => json!({results_field: local::embed_sparse(text), "is_truncated": false}),
+            (Builtin::E5, backend::Implementation::Candle) => {
+                let mut rows = real::embed(&backend::model_dir(state_dir, b), &[text.to_string()], "")
+                    .map_err(|e| EsError::new(500, "status_exception", format!("Failed to run inference with model [{mid}]: {e}")))?;
+                json!({results_field: rows.pop().unwrap_or_default()})
+            }
+            (Builtin::E5, _) => json!({results_field: local::embed_dense(text, None)}),
+            (Builtin::Rerank, _) => return Err(bad_request(format!("model [{mid}] cannot run [{kind}] inference"))),
         });
     }
-    let vocab = vocabulary(state_dir, mid);
-    let tok = ic.get("tokenization").and_then(Value::as_object).and_then(|t| t.values().next()).cloned().unwrap_or(json!({}));
-    let lower = tok.get("do_lower_case").and_then(Value::as_bool).unwrap_or(false);
-    let special = tok.get("with_special_tokens").and_then(Value::as_bool).unwrap_or(true);
-    let max_len = tok.get("max_sequence_length").and_then(Value::as_u64).unwrap_or(512) as usize;
-    let (ids, truncated) = torch::wordpiece(text, &vocab, lower, special, max_len);
-    let prog = program(state_dir, mid)?;
+    if UNDECODED_TASKS.contains(&kind) {
+        return Err(unsupported_task(mid, kind));
+    }
+    let stamp = cfg["create_time"].as_i64().unwrap_or(0);
+    // The configured tokenizer family, not always BERT's (finding 343).
+    let (family, tok) = ic.get("tokenization").and_then(Value::as_object).and_then(|t| t.iter().next()).map(|(k, v)| (k.clone(), v.clone())).unwrap_or_else(|| ("bert".into(), json!({})));
+    let vocab = vocabulary(state_dir, mid, stamp, &family)?;
+    let (ids, truncated) = torch::tokenize(&family, &tok, text, &vocab)?;
+    let prog = program(state_dir, mid, stamp)?;
     let out = prog.0.run(&ids)?.as_3d();
     let first = out.first().and_then(|r| r.first()).cloned().unwrap_or_default();
     let num = |x: f64| crate::values::java_double(x);
     let mut res = match kind {
         "text_embedding" => json!({ results_field.clone(): first.iter().map(|x| num(*x)).collect::<Vec<_>>() }),
         "text_expansion" => {
-            let mut toks: Vec<(String, f64)> = first.iter().enumerate().filter(|(_, w)| **w > 0.0).map(|(i, w)| (vocab.get(i).cloned().unwrap_or_else(|| i.to_string()), *w)).collect();
+            let mut toks: Vec<(String, f64)> = first.iter().enumerate().filter(|(_, w)| **w > 0.0).map(|(i, w)| (vocab.tokens.get(i).cloned().unwrap_or_else(|| i.to_string()), *w)).collect();
             toks.sort_by(|a, b| b.1.total_cmp(&a.1));
             let m: Map<String, Value> = toks.into_iter().map(|(t, w)| (t, num(w as f32 as f64))).collect();
             json!({ results_field.clone(): m })
@@ -1518,12 +1822,10 @@ fn run_nlp(state_dir: &Path, cfg: &Value, text: &str, kind: &str) -> Result<Valu
             let rows: Vec<Value> = out.first().map(|r| r.iter().map(|row| Value::Array(row.iter().map(|x| num(*x)).collect())).collect()).unwrap_or_default();
             json!({ results_field.clone(): rows })
         }
-        "text_classification" | "zero_shot_classification" => json!({ results_field.clone(): "", "prediction_probability": 0.0, "top_classes": [] }),
-        "ner" => json!({ results_field.clone(): text, "entities": [] }),
-        "fill_mask" => json!({ results_field.clone(): "", "prediction_probability": 0.0, "top_classes": [] }),
-        "question_answering" => json!({ results_field.clone(): "", "start_offset": 0, "end_offset": 0, "prediction_probability": 0.0 }),
-        "text_similarity" => json!({ results_field.clone(): 0.0 }),
-        _ => json!({}),
+        // These tasks need decoders this node does not have (labels from
+        // logits, entity spans, answer offsets, mask tokens): refused rather
+        // than answered with placeholder predictions (finding 158).
+        other => return Err(unsupported_task(mid, other)),
     };
     if truncated {
         res["is_truncated"] = json!(true);
@@ -1534,28 +1836,52 @@ fn run_nlp(state_dir: &Path, cfg: &Value, text: &str, kind: &str) -> Result<Valu
 /// Infer one text through deployment `dep` (counters and cache updated).
 fn infer_deployed(state_dir: &Path, dep: &Value, cfg: &Value, text: &str, kind: &str) -> Result<Value> {
     let did = dep["deployment_id"].as_str().unwrap_or("").to_string();
-    let key = (state_dir.to_path_buf(), did);
+    let key = (state_dir.to_path_buf(), did.clone());
     let cache_key = format!("{kind}\u{0}{text}");
-    {
+    let incarnation = generation(dep);
+    let epoch = {
         let mut rts = runtimes().lock().unwrap_or_else(|e| e.into_inner());
         let rt = rts.entry(key.clone()).or_default();
+        if rt.generation != incarnation {
+            // A runtime left by an earlier incarnation of this id.
+            *rt = Runtime { generation: incarnation.clone(), ..Default::default() };
+        }
         rt.last_access = Some(crate::date::now_millis());
         if let Some((_, v, _)) = rt.cache.iter().find(|(k, _, _)| *k == cache_key) {
             rt.inference_count += 1;
             rt.cache_hits += 1;
             return Ok(v.clone());
         }
-    }
+        rt.cache_epoch
+    };
     let t0 = std::time::Instant::now();
     let res = run_nlp(state_dir, cfg, text, kind);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    record(state_dir, &did, &incarnation, epoch, &cache_key, &res, ms, dep["cache_bytes"].as_u64().unwrap_or(0));
+    res
+}
+
+/// Count a finished call and cache its result, only into the incarnation
+/// (and cache epoch) it started in: a call that outlived a stop/start or a
+/// cache clear leaves the new runtime alone.
+#[allow(clippy::too_many_arguments)]
+fn record(state_dir: &Path, did: &str, incarnation: &str, epoch: u64, cache_key: &str, res: &Result<Value>, ms: f64, cap: u64) {
+    let current = deployments(state_dir).get(did).map(generation);
+    if current.as_deref() != Some(incarnation) {
+        return;
+    }
     let mut rts = runtimes().lock().unwrap_or_else(|e| e.into_inner());
-    let rt = rts.entry(key).or_default();
-    match &res {
+    let Some(rt) = rts.get_mut(&(state_dir.to_path_buf(), did.to_string())) else { return };
+    if rt.generation != incarnation {
+        return;
+    }
+    match res {
         Ok(v) => {
             rt.inference_count += 1;
             rt.total_ms += ms;
-            let cap = dep["cache_bytes"].as_u64().unwrap_or(0);
+            if rt.cache_epoch != epoch {
+                return;
+            }
             let sz = (cache_key.len() + serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0)) as u64;
             if cap > 0 && sz <= cap {
                 while rt.cache_used + sz > cap {
@@ -1564,13 +1890,12 @@ fn infer_deployed(state_dir: &Path, dep: &Value, cfg: &Value, text: &str, kind: 
                         None => break,
                     }
                 }
-                rt.cache.push_back((cache_key, v.clone(), sz));
+                rt.cache.push_back((cache_key.to_string(), v.clone(), sz));
                 rt.cache_used += sz;
             }
         }
         Err(_) => rt.errors += 1,
     }
-    res
 }
 
 /// `POST _ml/trained_models/{id}/_infer`: `docs: [{<input field>: ..}]`.
@@ -1586,6 +1911,12 @@ pub fn infer(state_dir: &Path, id: &str, body: &Value) -> Result<Value> {
     };
     let cfgs = get(state_dir, Some(&model_id), false)?;
     let cfg = cfgs["trained_model_configs"][0].clone();
+    // Cached results skip the model: report a stand-in on every call.
+    if let Some(Ok(imp)) = Builtin::of(&model_id).map(|b| backend::resolve(state_dir, b)) {
+        if imp.is_fallback() {
+            crate::warnings::add(backend::warning(&model_id, imp));
+        }
+    }
     let ic = cfg["inference_config"].as_object().cloned().unwrap_or_default();
     let body_ic = body.get("inference_config").and_then(Value::as_object);
     let kind = body_ic.and_then(|o| o.keys().next()).or_else(|| ic.keys().next()).map(String::as_str).unwrap_or("text_embedding").to_string();
@@ -1601,15 +1932,26 @@ pub fn infer(state_dir: &Path, id: &str, body: &Value) -> Result<Value> {
         }
         return Ok(json!({"inference_results": out}));
     }
-    let results_field = ic.get(&kind).and_then(|c| c.get("results_field")).and_then(Value::as_str).unwrap_or("predicted_value").to_string();
-    let mut out = Vec::new();
+    if matches!(kind.as_str(), "text_embedding" | "text_expansion") {
+        return Err(bad_request(format!("Model [{model_id}] of type [{}] cannot run [{kind}] inference", cfg["model_type"].as_str().unwrap_or("unknown"))));
+    }
+    // Tree / ensemble models are evaluated (finding 157); a model this node
+    // cannot evaluate is an error, never an empty prediction.
+    if cfg["model_type"] != "tree_ensemble" {
+        return Err(bad_request(format!("Model [{model_id}] of type [{}] cannot be used for inference on this node", cfg["model_type"].as_str().unwrap_or("unknown"))));
+    }
+    let stored = config_of(&load(state_dir)?, &model_id).ok_or_else(|| not_found(&model_id))?;
+    let definition = stored.get(DEFINITION_KEY).cloned().ok_or_else(|| bad_request(format!("Model [{model_id}] has no definition to run inference with")))?;
+    // The request's inference config overrides the model's settings.
+    let mut settings = ic.get(&kind).and_then(Value::as_object).cloned().unwrap_or_default();
+    if let Some(o) = body_ic.and_then(|o| o.get(&kind)).and_then(Value::as_object) {
+        for (k, v) in o {
+            settings.insert(k.clone(), v.clone());
+        }
+    }
+    let mut out = Vec::with_capacity(docs.len());
     for d in docs {
-        let text = d.get(&field).or_else(|| d.get("text_field")).and_then(Value::as_str).unwrap_or("");
-        out.push(match kind.as_str() {
-            "text_embedding" => json!({results_field.clone(): local::embed_dense(text, None)}),
-            "text_expansion" => json!({results_field.clone(): local::embed_sparse(text), "is_truncated": false}),
-            _ => json!({}),
-        });
+        out.push(super::tree_infer::infer(&definition, &kind, &settings, d)?);
     }
     Ok(json!({"inference_results": out}))
 }
@@ -1623,7 +1965,7 @@ pub fn infer_text(state_dir: &Path, id: &str, text: &str) -> Result<Value> {
         Some(d) => d["model_id"].as_str().unwrap_or(id).to_string(),
         None => resolve_alias(state_dir, id).unwrap_or_else(|| id.to_string()),
     };
-    let models = load(state_dir);
+    let models = load(state_dir)?;
     let cfg = config_of(&models, &model_id).ok_or_else(|| not_found(id))?;
     let Some(dep) = dep else {
         return Err(EsError::new(409, "status_exception", format!("Model [{id}] must be deployed to use. Please deploy with the start trained model deployment API.")));
@@ -1664,7 +2006,7 @@ fn infer_text_on(c: &crate::coord::Coordinator, id: &str, text: &str) -> Option<
 /// The `results_field` of a model's inference config (`predicted_value`).
 pub fn results_field(state_dir: &Path, id: &str) -> String {
     let mid = deployment_for(state_dir, id).and_then(|d| d["model_id"].as_str().map(str::to_string)).unwrap_or_else(|| resolve_alias(state_dir, id).unwrap_or_else(|| id.to_string()));
-    config_of(&load(state_dir), &mid)
+    config_of(&load(state_dir).unwrap_or_default(), &mid)
         .and_then(|c| c["inference_config"].as_object().and_then(|o| o.values().next()).and_then(|v| v.get("results_field")).and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| "predicted_value".into())
 }
@@ -1699,7 +2041,7 @@ mod tests {
         let model_dir = root(&state).join("saved-model");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("definition-part-0"), b"saved definition").unwrap();
-        save(&state, &json!({"saved-model":{"model_id":"saved-model", "model_type":"tree_ensemble"}}).as_object().unwrap().clone()).unwrap();
+        save(&state, &Map::new(), &json!({"saved-model":{"model_id":"saved-model", "model_type":"tree_ensemble"}}).as_object().unwrap().clone()).unwrap();
         save_aliases(&state, &json!({"saved-alias":"saved-model", "builtin-alias":"lang_ident_model_1"}).as_object().unwrap().clone()).unwrap();
         save_deployments(&state, &json!({"saved-deployment":{"model_id":"saved-model"}}).as_object().unwrap().clone()).unwrap();
         reset(&state).unwrap();
@@ -1708,7 +2050,7 @@ mod tests {
         assert!(aliases(&state).is_empty());
         assert!(deployments(&state).is_empty());
         assert!(!model_dir.exists());
-        assert!(load(&state).is_empty());
+        assert!(load(&state).unwrap().is_empty());
     }
 
     #[test]
@@ -1717,5 +2059,173 @@ mod tests {
         assert_eq!(parse_byte_size("0", "x").unwrap(), (0, "0".into()));
         assert_eq!(byte_size_human("1630b"), "1.5kb");
         assert_eq!(byte_size_human("10kb"), "10kb");
+    }
+
+    #[test]
+    fn compressed_definitions_expand_within_a_budget() {
+        use std::io::Write;
+        let json = format!("{{\"pad\":\"{}\"}}", "x".repeat(10_000));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(json.as_bytes()).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(gz.finish().unwrap());
+        assert!(decompress_within(&b64, json.len()).is_some());
+        assert!(decompress_within(&b64, json.len() - 1).is_none());
+        assert!(decompress_within(&b64[..b64.len() / 2], 1 << 20).is_none());
+        assert!(decompress_within("not base64!", 1 << 20).is_none());
+    }
+
+    /// Finding 156: a catalog read that fails transiently fails the
+    /// mutation (nothing is written), and a later mutation changes only the
+    /// model it addresses: unrelated models are never deleted.
+    #[test]
+    fn a_failed_catalog_read_never_deletes_other_models() {
+        let d = tempfile::tempdir().unwrap();
+        let st = d.path().join("_state");
+        std::fs::create_dir_all(&st).unwrap();
+        let body = json!({"input": {"field_names": ["t"]}, "inference_config": {"text_embedding": {}}, "model_type": "pytorch"});
+        put(&st, "model-a", &body).unwrap();
+        put(&st, "model-b", &body).unwrap();
+        let before = load(&st).unwrap();
+        FAIL_NEXT_LOAD.with(|f| f.set(true));
+        let e = put(&st, "model-c", &body).unwrap_err();
+        assert_eq!(e.status, 503, "{}", e.reason);
+        assert_eq!(load(&st).unwrap(), before, "a failed mutation changes nothing");
+        // Deleting under a failed read fails too, and deletes nothing.
+        FAIL_NEXT_LOAD.with(|f| f.set(true));
+        assert!(delete_with(&st, "model-a", true).is_err());
+        assert_eq!(load(&st).unwrap(), before);
+        // Recovered: the retry adds only its own model.
+        put(&st, "model-c", &body).unwrap();
+        let after = load(&st).unwrap();
+        assert_eq!(after.len(), before.len() + 1);
+        for (id, cfg) in &before {
+            assert_eq!(after.get(id), Some(cfg), "{id} changed");
+        }
+        // A mutation built on an image without model-b leaves model-b alone.
+        let stale: Map<String, Value> = after.iter().filter(|(k, _)| k.as_str() != "model-b").map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut next = stale.clone();
+        next.insert("model-d".into(), json!({"model_id": "model-d", "model_type": "pytorch"}));
+        save(&st, &stale, &next).unwrap();
+        let now = load(&st).unwrap();
+        assert!(now.contains_key("model-b") && now.contains_key("model-d"));
+    }
+
+    /// Finding 157: accepted tree models are evaluated: a constant-leaf
+    /// regression and a small known classifier return their exact
+    /// predictions through `_infer`, and nothing answers an empty object.
+    #[test]
+    fn tree_models_return_their_predictions() {
+        let d = tempfile::tempdir().unwrap();
+        let st = d.path().join("_state");
+        std::fs::create_dir_all(&st).unwrap();
+        put(&st, "const-reg", &json!({"input": {"field_names": ["f"]}, "inference_config": {"regression": {}},
+            "definition": {"trained_model": {"tree": {"feature_names": [], "tree_structure": [{"node_index": 0, "leaf_value": 42.5}], "target_type": "regression"}}}})).unwrap();
+        let r = infer(&st, "const-reg", &json!({"docs": [{"f": 1.0}, {"other": "x"}]})).unwrap();
+        assert_eq!(r, json!({"inference_results": [{"predicted_value": 42.5}, {"predicted_value": 42.5}]}));
+        put(&st, "clf", &json!({"input": {"field_names": ["f"]}, "inference_config": {"classification": {"num_top_classes": 1}},
+            "definition": {"trained_model": {"tree": {"feature_names": ["f"], "target_type": "classification", "classification_labels": ["low", "high"], "tree_structure": [
+                {"node_index": 0, "split_feature": 0, "threshold": 10.0, "decision_type": "lte", "default_left": true, "left_child": 1, "right_child": 2},
+                {"node_index": 1, "leaf_value": [1.0, 0.0]},
+                {"node_index": 2, "leaf_value": [0.0, 1.0]}
+            ]}}}})).unwrap();
+        let r = infer(&st, "clf", &json!({"docs": [{"f": 3.0}, {"f": 30.0}]})).unwrap();
+        let p = 1f64.exp() / (1f64.exp() + 1.0);
+        assert_eq!(r["inference_results"][0]["predicted_value"], "low");
+        assert_eq!(r["inference_results"][1]["predicted_value"], "high");
+        assert!((r["inference_results"][1]["prediction_probability"].as_f64().unwrap() - p).abs() < 1e-12);
+        assert_eq!(r["inference_results"][1]["top_classes"].as_array().unwrap().len(), 1);
+        // The request's config overrides the model's.
+        let r = infer(&st, "clf", &json!({"docs": [{"f": 30.0}], "inference_config": {"classification": {"num_top_classes": 2, "results_field": "label"}}})).unwrap();
+        assert_eq!(r["inference_results"][0]["label"], "high");
+        assert_eq!(r["inference_results"][0]["top_classes"].as_array().unwrap().len(), 2);
+        // The built-in language model is not evaluated here: an error, not `{}`.
+        assert!(infer(&st, "lang_ident_model_1", &json!({"docs": [{"text": "hello"}]})).is_err());
+    }
+
+    /// Finding 159: a vocabulary that cannot be read, is missing or lacks
+    /// `[UNK]` fails inference instead of tokenizing everything as unknown;
+    /// a failure is not cached and the next read recovers.
+    #[test]
+    fn unavailable_vocabulary_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let st = d.path().join("_state");
+        std::fs::create_dir_all(&st).unwrap();
+        put(&st, "nlp", &json!({"input": {"field_names": ["t"]}, "inference_config": {"text_embedding": {}}, "model_type": "pytorch"})).unwrap();
+        // None stored yet.
+        assert_eq!(vocabulary(&st, "nlp", 1, "bert").unwrap_err().status, 400);
+        put_vocabulary(&st, "nlp", &json!({"vocabulary": ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello"]})).unwrap();
+        FAIL_NEXT_VOCAB.with(|f| f.set(true));
+        assert_eq!(vocabulary(&st, "nlp", 1, "bert").unwrap_err().status, 503);
+        // Recovered: the real vocabulary, with its ids.
+        let v = vocabulary(&st, "nlp", 1, "bert").unwrap();
+        assert_eq!(v.tokens.iter().position(|t| t == "hello"), Some(4));
+        assert_eq!(torch::wordpiece("hello", &v.tokens, false, true, 8).0, vec![2, 4, 3]);
+        // A vocabulary without [UNK] is refused.
+        put_vocabulary(&st, "nlp", &json!({"vocabulary": ["hello"]})).unwrap();
+        assert!(vocabulary(&st, "nlp", 2, "bert").unwrap_err().reason.contains("[UNK]"));
+    }
+
+    /// Finding 161: a call that started under deployment `d` of model A
+    /// and finishes after `d` was stopped and started with model B (or after
+    /// a cache clear) never fills the new runtime's cache.
+    #[test]
+    fn stale_calls_never_fill_a_replacement_deployment() {
+        let d = tempfile::tempdir().unwrap();
+        let st = d.path().join("_state");
+        std::fs::create_dir_all(&st).unwrap();
+        let dep_a = json!({"deployment_id": "d", "model_id": "model-a", "start_time": 1, "cache_bytes": 1 << 20});
+        let dep_b = json!({"deployment_id": "d", "model_id": "model-b", "start_time": 2, "cache_bytes": 1 << 20});
+        let key = (st.clone(), "d".to_string());
+        let cached = |text: &str| runtimes().lock().unwrap().get(&key).and_then(|r| r.cache.iter().find(|(k, _, _)| k == &format!("text_embedding\u{0}{text}")).map(|(_, v, _)| v.clone()));
+        save_deployments(&st, &Map::from_iter([("d".to_string(), dep_a.clone())])).unwrap();
+        // A's call starts (runtime of A's incarnation)...
+        {
+            let mut rts = runtimes().lock().unwrap();
+            rts.insert(key.clone(), Runtime { generation: generation(&dep_a), ..Default::default() });
+        }
+        // ... d is stopped and started with B, whose runtime begins.
+        runtime_drop(&st, "d");
+        save_deployments(&st, &Map::from_iter([("d".to_string(), dep_b.clone())])).unwrap();
+        runtimes().lock().unwrap().insert(key.clone(), Runtime { generation: generation(&dep_b), ..Default::default() });
+        // A's call finishes: nothing of it reaches B's runtime.
+        record(&st, "d", &generation(&dep_a), 0, "text_embedding\u{0}T", &Ok(json!({"predicted_value": [1.0]})), 1.0, 1 << 20);
+        assert_eq!(cached("T"), None);
+        assert_eq!(runtimes().lock().unwrap()[&key].inference_count, 0);
+        // B's own call is cached.
+        record(&st, "d", &generation(&dep_b), 0, "text_embedding\u{0}T", &Ok(json!({"predicted_value": [2.0]})), 1.0, 1 << 20);
+        assert_eq!(cached("T"), Some(json!({"predicted_value": [2.0]})));
+        // A call that started before a cache clear is counted, not cached.
+        clear_cache(&st, "d").unwrap();
+        record(&st, "d", &generation(&dep_b), 0, "text_embedding\u{0}U", &Ok(json!({"predicted_value": [3.0]})), 1.0, 1 << 20);
+        assert_eq!(cached("U"), None);
+        runtime_drop(&st, "d");
+    }
+
+    /// Model ids cannot name paths outside the model store.
+    #[test]
+    fn model_ids_are_contained() {
+        let d = tempfile::tempdir().unwrap();
+        let st = d.path().join("data").join("_state");
+        std::fs::create_dir_all(&st).unwrap();
+        // A sibling directory that an escaping id would reach.
+        let victim = d.path().join("data").join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep"), b"x").unwrap();
+        for id in ["../victim", "..", ".", "a/../../victim", "/tmp", "..%2Fvictim", ".hidden", ".elser_model_3", "a\\b", "Upper"] {
+            assert!(model_dir(&st, id).is_err(), "{id}");
+            assert!(put(&st, id, &json!({"input": {"field_names": ["t"]}, "inference_config": {"text_embedding": {}}, "model_type": "pytorch"})).is_err(), "{id}");
+            assert!(put_vocabulary(&st, id, &json!({"vocabulary": ["a"]})).is_err(), "{id}");
+            assert!(put_definition_part(&st, id, 0, &json!({"definition": "", "total_definition_length": 0, "total_parts": 1})).is_err(), "{id}");
+            let _ = delete_with(&st, id, true);
+        }
+        // A model stored under a bad id by an older version is never used as a path.
+        let mut m = load(&st).unwrap();
+        let before = m.clone();
+        m.insert("../victim".into(), json!({"model_id": "../victim", "model_type": "pytorch"}));
+        save(&st, &before, &m).unwrap();
+        delete_with(&st, "../victim", true).unwrap();
+        assert!(victim.join("keep").exists());
+        assert!(model_dir(&st, "good-id_1.x").is_ok());
+        assert!(model_dir(&st, ".multilingual-e5-small").is_ok());
     }
 }

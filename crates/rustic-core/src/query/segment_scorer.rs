@@ -105,6 +105,8 @@ enum NormsData {
     Mapped(crate::codec::directory::FileSlice),
     /// A constant column's bytes: a process-wide run of its byte.
     Static(&'static [u8]),
+    /// A constant column's run, owned by its segment (admitted).
+    Shared(std::sync::Arc<crate::codec::fastfields::ConstRun>),
 }
 
 impl Norms {
@@ -117,6 +119,7 @@ impl Norms {
                 (s.as_ptr(), s.len())
             }
             NormsData::Static(s) => (s.as_ptr(), s.len()),
+            NormsData::Shared(r) => (r.bytes().as_ptr(), r.bytes().len()),
         };
         Self { data, ptr, len, avg }
     }
@@ -135,6 +138,11 @@ impl Norms {
     /// [`crate::codec::fastfields::NormsReader::open_constant`]).
     pub fn constant(bytes: &'static [u8], avg: f32) -> Self {
         Self::build(NormsData::Static(bytes), avg)
+    }
+
+    /// Norms of a constant column over its segment's admitted run.
+    pub fn constant_shared(run: std::sync::Arc<crate::codec::fastfields::ConstRun>, avg: f32) -> Self {
+        Self::build(NormsData::Shared(run), avg)
     }
 
     /// Norms from raw per-doc lengths (encoded to norm bytes).
@@ -487,21 +495,18 @@ impl PhraseScorer {
             }
             self.left.len() as u32
         } else {
-            // Anchor (query position 0) positions with every other position
-            // group within `slop` after normalisation.
-            let a = self.anchor;
-            self.load(a, true);
+            // A joint sloppy match (Lucene `SloppyPhraseMatcher`): one
+            // occurrence per query position, no two on the same document
+            // position (repeated terms), all within `slop` once normalised.
+            let mut lists: Vec<Vec<u32>> = Vec::with_capacity(k);
             for i in 0..k {
-                if i == a {
-                    continue;
-                }
                 self.load(i, false);
-                filter_within(&mut self.left, &self.right, self.slop);
-                if self.left.is_empty() {
-                    return 0;
-                }
+                lists.push(std::mem::take(&mut self.right));
             }
-            self.left.len() as u32
+            let freq = sloppy_freq(&lists, &self.shift, self.slop);
+            // Hand a buffer back for the next doc.
+            self.right = lists.pop().unwrap_or_default();
+            freq
         }
     }
 
@@ -552,25 +557,65 @@ fn intersect_in_place(a: &mut Vec<u32>, b: &[u32]) {
     a.truncate(c);
 }
 
-/// Keep anchors `x` in `a` with some `y` in `b`, |x - y| <= slop.
-#[inline]
-fn filter_within(a: &mut Vec<u32>, b: &[u32], slop: u32) {
-    let (mut j, mut c) = (0, 0);
-    for i in 0..a.len() {
-        let x = a[i];
-        while j < b.len() && b[j].saturating_add(slop) < x {
-            j += 1;
+/// Matches of a sloppy phrase in one doc: `lists[i]` are query position
+/// `i`'s normalised positions (document position plus `shift[i]`, sorted).
+/// The smallest-window sweep of Lucene's `SloppyPhraseMatcher`: each slot
+/// holds one occurrence; the window from the lowest to the highest is a
+/// match when it spans at most `slop`; the lowest slot then moves on. Slots
+/// never share a document position (a repeated term is a different
+/// occurrence for each of its query positions). Linear in the positions.
+pub(crate) fn sloppy_freq(lists: &[Vec<u32>], shift: &[u32], slop: u32) -> u32 {
+    let k = lists.len();
+    if k == 0 || lists.iter().any(Vec::is_empty) {
+        return 0;
+    }
+    let mut idx = vec![0usize; k];
+    let orig = |idx: &[usize], i: usize| lists[i][idx[i]].wrapping_sub(shift[i]);
+    // Two slots on one document position (a repeated term): the one later
+    // in the phrase (the lower normalised value) moves to its next
+    // occurrence (Lucene `advanceRpts` / `lesser`); false once exhausted.
+    let fix = |idx: &mut [usize]| -> bool {
+        loop {
+            let mut clash = None;
+            'find: for i in 0..k {
+                for j in i + 1..k {
+                    if orig(idx, i) == orig(idx, j) {
+                        clash = Some(if lists[i][idx[i]] <= lists[j][idx[j]] { i } else { j });
+                        break 'find;
+                    }
+                }
+            }
+            let Some(x) = clash else { return true };
+            idx[x] += 1;
+            if idx[x] >= lists[x].len() {
+                return false;
+            }
         }
-        if j == b.len() {
-            break;
+    };
+    if !fix(&mut idx) {
+        return 0;
+    }
+    let mut freq = 0u32;
+    loop {
+        let (mut mi, mut lo, mut hi) = (0usize, u32::MAX, 0u32);
+        for i in 0..k {
+            let v = lists[i][idx[i]];
+            if v < lo {
+                lo = v;
+                mi = i;
+            }
+            hi = hi.max(v);
         }
-        if b[j] <= x.saturating_add(slop) {
-            a[c] = x;
-            c += 1;
+        if hi - lo <= slop {
+            freq += 1;
+        }
+        idx[mi] += 1;
+        if idx[mi] >= lists[mi].len() || !fix(&mut idx) {
+            return freq;
         }
     }
-    a.truncate(c);
 }
+
 
 impl DocSet for PhraseScorer {
     fn advance(&mut self) -> DocId {
@@ -718,6 +763,64 @@ impl<S: Scorer> Scorer for Scaled<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #331: a sloppy match is one joint alignment: a repeated term needs
+    /// as many occurrences as query positions, and every slot sits in one
+    /// window of `slop` (checked against brute force on random docs).
+    #[test]
+    fn sloppy_phrase_needs_a_joint_match() {
+        // Normalised lists of a phrase over doc positions: slot i at
+        // offset i, `shift[i] = max_offset - i`.
+        let lists_of = |doc: &[u8], phrase: &[u8]| -> (Vec<Vec<u32>>, Vec<u32>) {
+            let k = phrase.len() as u32;
+            let shift: Vec<u32> = (0..k).map(|i| k - 1 - i).collect();
+            let lists = phrase.iter().enumerate().map(|(i, t)| doc.iter().enumerate().filter(|(_, d)| *d == t).map(|(p, _)| p as u32 + shift[i]).collect()).collect();
+            (lists, shift)
+        };
+        // "very very" over a doc with one "very": no match, with two: a match.
+        let (l, sh) = lists_of(b"xvx", b"vv");
+        assert_eq!(sloppy_freq(&l, &sh, 1), 0);
+        let (l, sh) = lists_of(b"xvvx", b"vv");
+        assert!(sloppy_freq(&l, &sh, 1) > 0);
+        let (l, sh) = lists_of(b"aa", b"aa");
+        assert!(sloppy_freq(&l, &sh, 0) > 0, "two occurrences in order: an exact match");
+        // Brute force: an assignment of distinct positions with spread <= slop.
+        let brute = |doc: &[u8], phrase: &[u8], slop: u32| -> bool {
+            fn go(doc: &[u8], phrase: &[u8], i: usize, chosen: &mut Vec<usize>, slop: u32) -> bool {
+                if i == phrase.len() {
+                    let rel: Vec<i64> = chosen.iter().enumerate().map(|(j, &p)| p as i64 - j as i64).collect();
+                    return (rel.iter().max().unwrap() - rel.iter().min().unwrap()) as u32 <= slop;
+                }
+                for p in 0..doc.len() {
+                    if doc[p] == phrase[i] && !chosen.contains(&p) {
+                        chosen.push(p);
+                        if go(doc, phrase, i + 1, chosen, slop) {
+                            return true;
+                        }
+                        chosen.pop();
+                    }
+                }
+                false
+            }
+            go(doc, phrase, 0, &mut Vec::new(), slop)
+        };
+        let mut seed = 9u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..4000 {
+            let doc: Vec<u8> = (0..2 + next() % 9).map(|_| b"abc"[next() % 3]).collect();
+            // Distinct terms (repeats are the cases above).
+            let mut phrase: Vec<u8> = b"abc".to_vec();
+            let start = next() % 3;
+            phrase.rotate_left(start);
+            phrase.truncate(2 + next() % 2);
+            let slop = (next() % 4) as u32;
+            let (l, sh) = lists_of(&doc, &phrase);
+            assert_eq!(sloppy_freq(&l, &sh, slop) > 0, brute(&doc, &phrase, slop), "{:?} {:?} {slop}", String::from_utf8_lossy(&doc), String::from_utf8_lossy(&phrase));
+        }
+    }
     use crate::codec::directory::RamDirectory;
     use crate::query::collector::collect_top_k;
     use crate::segment::SegmentWriter;

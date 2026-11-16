@@ -616,7 +616,7 @@ fn shapes_section(n: usize, runs: usize, t: &mut Table) {
     // error: its row's check fails, the suite goes on.
     let esql = |q: &str| esql_try(q).unwrap_or_else(|e| {
         eprintln!("ES|QL error: {q}: {e:?}");
-        crate::esql::EsqlResult { table: crate::esql::Table { cols: Vec::new(), rows: Vec::new() }, warnings: vec![format!("ERROR {e:?}")], features: Default::default(), functions: Default::default(), took_ms: 0, documents_found: 0, values_loaded: 0, rows_emitted: 0, settings: Default::default(), col_meta: Default::default(), all_columns: None }
+        crate::esql::EsqlResult { table: crate::esql::Table { cols: Vec::new(), rows: Vec::new() }, warnings: vec![format!("ERROR {e:?}")], features: Default::default(), functions: Default::default(), took_ms: 0, documents_found: 0, values_loaded: 0, rows_emitted: 0, settings: Default::default(), col_meta: Default::default(), all_columns: None, clusters: Vec::new() }
     });
     let col = |r: &crate::esql::EsqlResult, name: &str| r.table.cols.iter().position(|c| c.name == name);
     let long = |v: &crate::esql::Val| match v {
@@ -1412,7 +1412,7 @@ fn point_shape_section(n: usize, runs: usize, t: &mut Table) {
     }
     let esql = |q: &str| crate::esql::run(&node, q, crate::esql::EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }).unwrap_or_else(|e| {
         eprintln!("ES|QL error: {q}: {e:?}");
-        crate::esql::EsqlResult { table: crate::esql::Table { cols: Vec::new(), rows: Vec::new() }, warnings: vec![format!("ERROR {e:?}")], features: Default::default(), functions: Default::default(), took_ms: 0, documents_found: 0, values_loaded: 0, rows_emitted: 0, settings: Default::default(), col_meta: Default::default(), all_columns: None }
+        crate::esql::EsqlResult { table: crate::esql::Table { cols: Vec::new(), rows: Vec::new() }, warnings: vec![format!("ERROR {e:?}")], features: Default::default(), functions: Default::default(), took_ms: 0, documents_found: 0, values_loaded: 0, rows_emitted: 0, settings: Default::default(), col_meta: Default::default(), all_columns: None, clusters: Vec::new() }
     });
     let long = |v: &crate::esql::Val| match v {
         crate::esql::Val::Long(x) | crate::esql::Val::Int(x) => *x as u64,

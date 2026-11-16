@@ -1374,6 +1374,10 @@ fn eval_const(n: &Node) -> Option<f64> {
 
 /// Compile `src` for `ctx` into a [`Program`].
 pub fn compile(src: &str, ctx: ScriptContext) -> Result<Program, Box<ScriptErr>> {
+    crate::parse_depth::guarded(|| compile_unguarded(src, ctx))
+}
+
+fn compile_unguarded(src: &str, ctx: ScriptContext) -> Result<Program, Box<ScriptErr>> {
     let (root, var_texts) = parse(src).map_err(|mut e| {
         e.compile = true;
         e

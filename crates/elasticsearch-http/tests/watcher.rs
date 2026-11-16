@@ -87,7 +87,7 @@ async fn scheduled_watch_fires_indexes_and_records_history() {
         .wait_for(
             "history record",
             |v| v["hits"]["hits"].as_array().map(|a| a.len() >= 2).unwrap_or(false),
-            "/.watcher-history-17*/_search?size=10&sort=@timestamp:asc",
+            "/.watcher-history-18*/_search?size=10&sort=@timestamp:asc",
             Some(json!({"query": {"term": {"watch_id": "errors"}}})),
         )
         .await;
@@ -163,4 +163,52 @@ async fn execute_modes_conditions_and_errors() {
     let (st, e) = es.get("/_watcher/watch/missing").await;
     assert_eq!(st, 404);
     assert_eq!(e["found"], false);
+}
+
+/// ES 9.5.5 diff: the watcher registry installs `watch-history-ilm-policy-16`
+/// (ES's body, version 1) and `.watch-history-18` at startup, not with the
+/// first history record; `ml-size-based-ilm-policy` is built in too.
+#[tokio::test]
+async fn watcher_registry_policy_exists_from_the_start() {
+    let t = tempfile::tempdir().unwrap();
+    let es = start(t.path()).await;
+    let (st, v) = es.get("/_ilm/policy/watch-history-ilm-policy-16").await;
+    assert_eq!(st, 200, "{v}");
+    let p = &v["watch-history-ilm-policy-16"];
+    assert_eq!(p["version"], 1, "{v}");
+    assert_eq!(p["policy"]["phases"], json!({
+        "hot": {"min_age": "0ms", "actions": {"rollover": {"max_age": "3d", "max_primary_shard_size": "50gb"}}},
+        "delete": {"min_age": "4d", "actions": {"delete": {"delete_searchable_snapshot": true}}}
+    }), "{v}");
+    assert_eq!(p["policy"]["_meta"], json!({"managed": true, "description": "default policy for the watcher history indices"}), "{v}");
+    assert_eq!(p["in_use_by"]["composable_templates"], json!([".watch-history-18"]), "{v}");
+    let (st, v) = es.get("/_index_template/.watch-history-18").await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["index_templates"][0]["index_template"]["index_patterns"], json!([".watcher-history-18*"]), "{v}");
+    let (st, v) = es.get("/_ilm/policy/ml-size-based-ilm-policy").await;
+    assert_eq!(st, 200, "{v}");
+}
+
+/// ES `WatcherIndexTemplateRegistry`: only a node with watcher enabled
+/// installs `watch-history-ilm-policy-16` (it is not a built-in lifecycle
+/// policy); with `xpack.watcher.enabled: false` there is none.
+#[tokio::test]
+async fn watcher_disabled_node_has_no_history_policy() {
+    let t = tempfile::tempdir().unwrap();
+    let node = Node::open(t.path()).unwrap();
+    node.node_settings.write().insert("xpack.license.self_generated.type".into(), json!("trial"));
+    node.node_settings.write().insert("xpack.watcher.enabled".into(), json!("false"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = elasticsearch_http::serve_listener(node, listener).await;
+    });
+    let es = Es { base: format!("http://{addr}"), c: Client::new() };
+    let (st, v) = es.get("/_ilm/policy/watch-history-ilm-policy-16").await;
+    assert_eq!(st, 404, "{v}");
+    let (st, _) = es.get("/_index_template/.watch-history-18").await;
+    assert_eq!(st, 404);
+    // The other built-in policies are there.
+    let (st, v) = es.get("/_ilm/policy/ml-size-based-ilm-policy").await;
+    assert_eq!(st, 200, "{v}");
 }

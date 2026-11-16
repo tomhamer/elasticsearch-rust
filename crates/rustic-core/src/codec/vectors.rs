@@ -480,6 +480,24 @@ pub fn encode_vector_segment(p: &VectorSegmentParts<'_>) -> Vec<u8> {
 /// the default create_output adapter still buffer until publication.
 pub fn write_vector_segment_streamed(dir: &dyn super::directory::Directory, name: &str, p: &VectorSegmentParts<'_>) -> Result<()> {
     assert_eq!(p.vectors.len(), p.points.len() * p.dim as usize);
+    write_vector_segment_column(dir, name, p, &mut p.vectors.chunks(16384).map(|chunk| -> &[f32] { chunk }))
+}
+
+/// [`write_vector_segment_streamed`] with the f32 column taken row by row
+/// from `rows` (one per point, `dim` cells each, in ordinal order) instead
+/// of [`VectorSegmentParts::vectors`] (ignored): no flattened copy of the
+/// column is ever held, so writing a segment needs no memory proportional
+/// to its vectors (they are written from where the caller keeps them).
+pub fn write_vector_segment_rows(dir: &dyn super::directory::Directory, name: &str, p: &VectorSegmentParts<'_>, rows: &[(u64, &[f32])]) -> Result<()> {
+    assert_eq!(rows.len(), p.points.len());
+    assert!(rows.iter().all(|(_, v)| v.len() == p.dim as usize), "vector dim mismatch");
+    write_vector_segment_column(dir, name, p, &mut rows.iter().map(|(_, v)| *v))
+}
+
+/// The canonical format, the f32 column given in pieces (`column`, in
+/// ordinal order, `points.len() * dim` cells in all).
+fn write_vector_segment_column<'c>(dir: &dyn super::directory::Directory, name: &str, p: &VectorSegmentParts<'_>, column: &mut dyn Iterator<Item = &'c [f32]>) -> Result<()> {
+    let column_len = p.points.len() * p.dim as usize;
     let quant = p.int8.or(p.int4).unwrap_or(&[]);
     let qflag = if p.int8.is_some() { FLAG_INT8 } else if p.int4.is_some() { FLAG_INT4 } else { 0 };
     let mut header = Vec::with_capacity(RVEC_HEADER);
@@ -491,7 +509,7 @@ pub fn write_vector_segment_streamed(dir: &dyn super::directory::Directory, name
     header.extend_from_slice(&p.dim.to_le_bytes());
     header.extend_from_slice(&(p.points.len() as u32).to_le_bytes());
     let table_at = header.len(); header.resize(RVEC_HEADER, 0);
-    let lengths = [p.points.len()*8, p.vectors.len()*4, p.hnsw.map_or(0, |x|x.len()), quant.len()];
+    let lengths = [p.points.len()*8, column_len*4, p.hnsw.map_or(0, |x|x.len()), quant.len()];
     let mut offsets = [0usize;4]; let mut end=RVEC_HEADER;
     for i in 0..4 {
         end=(end+7)&!7; offsets[i]=end;
@@ -509,7 +527,17 @@ pub fn write_vector_segment_streamed(dir: &dyn super::directory::Directory, name
         emit(&[0u8;8][..pad])?;
         match i {
             0=>for chunk in p.points.chunks(8192){buffer.clear();for x in chunk {buffer.extend_from_slice(&x.to_le_bytes())}emit(&buffer)?},
-            1=>for chunk in p.vectors.chunks(16384){buffer.clear();for x in chunk {buffer.extend_from_slice(&x.to_le_bytes())}emit(&buffer)?},
+            1=>{
+                let mut cells=0usize;
+                buffer.clear();
+                for piece in &mut *column {
+                    cells+=piece.len();
+                    for x in piece {buffer.extend_from_slice(&x.to_le_bytes())}
+                    if buffer.len()>=65536 {emit(&buffer)?;buffer.clear();}
+                }
+                if !buffer.is_empty() {emit(&buffer)?;buffer.clear();}
+                assert_eq!(cells,column_len,"vector data size");
+            }
             _=>for chunk in (if i==2 {p.hnsw.unwrap_or(&[])} else {quant}).chunks(65536){emit(chunk)?},
         }
     }

@@ -6,6 +6,7 @@
 //! the synonyms API (`_synonyms`).
 
 use crate::search_api::run_search;
+use crate::security::owner;
 use crate::{blocking, method_not_allowed, Req, Resp, RespBody, R};
 use axum::http::Method;
 use elasticsearch_engine::error::{EsError, Result};
@@ -26,7 +27,7 @@ pub async fn handle(node: Arc<Node>, req: Req, index: Option<String>) -> R {
     blocking(move || route(&node, &req, index.as_deref())).await
 }
 
-fn route(node: &Node, req: &Req, index: Option<&str>) -> R {
+fn route(node: &Arc<Node>, req: &Req, index: Option<&str>) -> R {
     let off = if index.is_some() { 1 } else { 0 };
     let api = req.seg(off).to_string();
     let a = req.seg(off + 1).to_string();
@@ -362,7 +363,18 @@ fn msearch_template(node: &Node, req: &Req, index: Option<&str>) -> R {
                 params.insert(k.into(), v.into());
             }
         }
-        let r = rendered_body(node, &tbody, None).and_then(|b| run_search(node, &b, &params, idx.as_deref(), ResolveOpts::from_params(&params), req.access.as_deref()));
+        // The header's index options and per-search options apply to its
+        // search (#334), as in a plain msearch.
+        let mut resolve_params = params.clone();
+        if let Some(o) = header.as_object() {
+            for (k, v) in o {
+                if matches!(k.as_str(), "ignore_unavailable" | "allow_no_indices" | "expand_wildcards") {
+                    resolve_params.insert(k.clone(), elasticsearch_engine::query::dsl::scalar_string(v));
+                }
+            }
+        }
+        crate::search_api::project_msearch_header(&header, &mut params);
+        let r = rendered_body(node, &tbody, None).and_then(|b| run_search(node, &b, &params, idx.as_deref(), ResolveOpts::from_params(&resolve_params), req.access.as_deref()));
         match r {
             Ok(mut s) => {
                 s.pop();
@@ -700,7 +712,7 @@ fn esql_opts<'a>(req: &Req, body: &'a Value) -> Result<EsqlOptions<'a>> {
         }))
     } else { None };
     let shards = req.extensions.get::<esql::remote::ShardSourceExt>().map(|s| s.0.clone());
-    Ok(EsqlOptions { params: Params::from_json(body.get("params"))?, filter: body.get("filter"), locale: body.get("locale").and_then(Value::as_str).map(str::to_string), body_settings, restrict, shards, ..Default::default() })
+    Ok(EsqlOptions { params: Params::from_json(body.get("params"))?, filter: body.get("filter"), locale: body.get("locale").and_then(Value::as_str).map(str::to_string), body_settings, restrict, authorize: query_authz(req), shards, ..Default::default() })
 }
 
 /// A cluster node's read of this node's shards for a query it runs
@@ -734,10 +746,14 @@ struct EsqlRun {
 
 fn run_esql(node: &Node, req: &Req, body: &Value, is_async: bool) -> Result<EsqlRun> {
     check_body_fields(req, body, if is_async { "esql/async_query" } else { "esql/query" }, if is_async { ESQL_ASYNC_BODY_FIELDS } else { ESQL_BODY_FIELDS }, ESQL_BOOL_FIELDS)?;
-    // `allow_partial_results` (URL only, default true since 9.0): a single
-    // node never has failed shards, so the result is never partial; the
-    // flag is validated only.
-    req.flag("allow_partial_results")?;
+    // `allow_partial_results` (URL only, default true since 9.0): an
+    // internal search that loses shards fails the query when false, marks
+    // the result `is_partial` when true (review finding 544).
+    let allow_partial = match req.param("allow_partial_results") {
+        Some(_) => req.flag("allow_partial_results")?,
+        None => true,
+    };
+    let partial = esql::partial_scope(allow_partial);
     let q = body.get("query").and_then(Value::as_str).ok_or_else(|| EsError::action_validation(&["[query] is required"]))?;
     if q.trim().is_empty() {
         return Err(EsError::action_validation(&["[query] is required"]));
@@ -757,6 +773,8 @@ fn run_esql(node: &Node, req: &Req, body: &Value, is_async: bool) -> Result<Esql
     // The sync response renders a result narrowed to its non-null columns
     // (`render_table`); the async one stores the table as it is.
     let res = esql_opts(req, body).and_then(|o| esql::run(node, q, EsqlOptions { drop_null_columns: drop_null, sparse_nulls: !is_async, ..o }));
+    let is_partial = esql::partial_seen();
+    drop(partial);
     ext(node).esql_running.lock().remove(&task_key);
     let res = match res {
         Ok(r) => r,
@@ -790,7 +808,7 @@ fn run_esql(node: &Node, req: &Req, body: &Value, is_async: bool) -> Result<Esql
     let end_ms = elasticsearch_engine::date::now_millis();
     let mut meta = Map::new();
     meta.insert("took".into(), json!(res.took_ms));
-    meta.insert("is_partial".into(), json!(false));
+    meta.insert("is_partial".into(), json!(is_partial));
     meta.insert("completion_time_in_millis".into(), json!(end_ms));
     meta.insert("documents_found".into(), json!(res.documents_found));
     meta.insert("values_loaded".into(), json!(res.values_loaded));
@@ -811,10 +829,40 @@ fn run_esql(node: &Node, req: &Req, body: &Value, is_async: bool) -> Result<Esql
     if !res.col_meta.is_empty() {
         meta.insert("__col_meta".into(), Value::Object(res.col_meta.clone().into_iter().collect()));
     }
-    if body.get("include_ccs_metadata").and_then(Value::as_bool) == Some(true) {
+    let flag = |k: &str| body.get(k).and_then(Value::as_bool) == Some(true);
+    if !res.clusters.is_empty() {
+        // A cross-cluster query (ES `EsqlExecutionInfo`): partial when a
+        // `skip_unavailable` remote was skipped.
+        let skipped = res.clusters.iter().filter(|c| c.status == "skipped").count();
+        meta.insert("is_partial".into(), json!(skipped > 0));
+        if flag("include_ccs_metadata") || flag("include_execution_metadata") {
+            meta.insert("_clusters".into(), esql_clusters(&res.clusters, res.took_ms));
+        }
+    } else if flag("include_ccs_metadata") {
         meta.insert("_clusters".into(), json!({"total": 1, "successful": 1, "running": 0, "skipped": 0, "partial": 0, "failed": 0, "details": {"(local)": {"status": "successful", "indices": "*", "took": res.took_ms, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0}}}}));
     }
     Ok(EsqlRun { table: res.table, all_columns: res.all_columns, meta, warnings: res.warnings, zone: res.settings.time_zone })
+}
+
+/// `_clusters` of a cross-cluster ES|QL response (ES
+/// `EsqlExecutionInfo.toXContent`): per-cluster status, index expression,
+/// took and shard counts; a skipped cluster carries its failure.
+fn esql_clusters(clusters: &[esql::EsqlCluster], took_ms: u64) -> Value {
+    let mut details = Map::new();
+    for c in clusters {
+        let name = if c.alias.is_empty() { "(local)".to_string() } else { c.alias.clone() };
+        let ok = c.status == "successful";
+        let mut d = json!({
+            "status": c.status, "indices": c.indices, "took": if ok { took_ms } else { 0 },
+            "_shards": {"total": c.shards, "successful": if ok { c.shards } else { 0 }, "skipped": 0, "failed": 0}
+        });
+        if let Some((kind, reason)) = &c.failure {
+            d["failures"] = json!([{"shard": -1, "index": null, "reason": {"type": kind, "reason": reason}}]);
+        }
+        details.insert(name, d);
+    }
+    let count = |s: &str| clusters.iter().filter(|c| c.status == s).count();
+    json!({"total": clusters.len(), "successful": count("successful"), "running": 0, "skipped": count("skipped"), "partial": 0, "failed": 0, "details": details})
 }
 
 /// The `profile` section of an ES|QL response, shaped like ES's (query and
@@ -862,7 +910,16 @@ fn esql_profile(q: &str, res: &esql::EsqlResult) -> Value {
     })
 }
 
-fn esql_route(node: &Node, req: &Req, a: &str, b: &str, c: &str) -> R {
+/// An ES|QL async query still running (`EsqlQueryResponse` with
+/// `is_running`, no columns or values yet).
+fn esql_running_response(id: &str) -> Resp {
+    let mut r = Resp::ok(json!({"id": id, "is_running": true, "is_partial": true, "documents_found": 0, "values_loaded": 0}));
+    r.headers.push(("X-Elasticsearch-Async-Id", id.to_string()));
+    r.headers.push(("X-Elasticsearch-Async-Is-Running", "?1".to_string()));
+    r
+}
+
+fn esql_route(node: &Arc<Node>, req: &Req, a: &str, b: &str, c: &str) -> R {
     let drop_null = req.flag("drop_null_columns")?;
     match (a, b, c, &req.method) {
         ("", "", "", &Method::POST) => {
@@ -877,37 +934,64 @@ fn esql_route(node: &Node, req: &Req, a: &str, b: &str, c: &str) -> R {
         }
         ("", "", "", _) => method_not_allowed(req, &["POST"]),
         ("async", "", "", &Method::POST) => {
+            // A cluster node's shard read for an async query it runs (the
+            // fetch reuses the query's request).
+            if let Some(fetch) = req.extensions.get::<esql::remote::FetchRequest>() {
+                return serve_esql_fetch(node, req, fetch);
+            }
             let body = body_obj(req)?;
-            let EsqlRun { table: t, mut meta, warnings, zone, .. } = run_esql(node, req, &body, true)?;
-            let _zone = esql::set_zone(zone);
             let columnar = body.get("columnar").and_then(Value::as_bool).unwrap_or(false);
             let keep = body.get("keep_on_completion").and_then(Value::as_bool).unwrap_or(false);
-            meta.insert("is_running".into(), json!(false));
-            let mut headers = vec![("X-Elasticsearch-Async-Is-Running", "?0".to_string())];
-            headers.extend(esql_warning_headers(&warnings));
-            if keep {
-                let (id, doc) = new_id();
-                // Stored for GET (row-major JSON).
-                let mut stored = meta.clone();
-                stored.insert("__id".into(), json!(id));
-                if !warnings.is_empty() {
-                    stored.insert("__warnings".into(), json!(warnings));
+            // ES|QL async: waits 1s by default, keeps saved results 5d.
+            let wait = crate::async_query::duration(body.get("wait_for_completion_timeout").and_then(Value::as_str).or(req.param("wait_for_completion_timeout")), 1000);
+            let keep_alive = crate::async_query::duration(body.get("keep_alive").and_then(Value::as_str).or(req.param("keep_alive")), 5 * 86_400_000);
+            let (id, key) = new_id();
+            let owner = result_owner(node, req);
+            let job_body = body.clone();
+            let outcome = crate::async_query::submit(node, req, crate::async_query::Lang::Esql, id, key, owner, wait, keep, keep_alive,
+                move |node, req| run_esql(node, req, &job_body, true),
+                |run: &EsqlRun| {
+                    let _zone = esql::set_zone(run.zone);
+                    let mut stored = run.meta.clone();
+                    stored.insert("is_running".into(), json!(false));
+                    if !run.warnings.is_empty() {
+                        stored.insert("__warnings".into(), json!(run.warnings));
+                    }
+                    fmt::columns_values(&run.table, false, false, &mut stored);
+                    Value::Object(stored)
+                })?;
+            match outcome {
+                crate::async_query::Outcome::Done { id, value: EsqlRun { table: t, mut meta, warnings, zone, .. } } => {
+                    let _zone = esql::set_zone(zone);
+                    meta.insert("is_running".into(), json!(false));
+                    let mut headers = vec![("X-Elasticsearch-Async-Is-Running", "?0".to_string())];
+                    headers.extend(esql_warning_headers(&warnings));
+                    if keep {
+                        let mut m2 = Map::new();
+                        m2.insert("id".into(), json!(id));
+                        m2.extend(meta);
+                        meta = m2;
+                        headers.push(("X-Elasticsearch-Async-Id", id));
+                    }
+                    render_table(req, &t, None, meta, columnar, drop_null, "values", headers)
                 }
-                fmt::columns_values(&t, false, false, &mut stored);
-                ext(node).esql_async.lock().insert(doc, Value::Object(stored));
-                let mut m2 = Map::new();
-                m2.insert("id".into(), json!(id));
-                m2.extend(meta);
-                meta = m2;
-                headers.push(("X-Elasticsearch-Async-Id", id));
+                crate::async_query::Outcome::Running { id } => Ok(esql_running_response(&id)),
             }
-            render_table(req, &t, None, meta, columnar, drop_null, "values", headers)
         }
         ("async", id, "", &Method::GET) if !id.is_empty() => {
             let key = async_key(id)?;
-            let v = ext(node).esql_async.lock().get(&key).cloned().ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            let wait = req.param("wait_for_completion_timeout").map(|w| crate::async_query::duration(Some(w), 0));
+            let v = crate::async_query::get(node, crate::async_query::Lang::Esql, &key, wait).filter(|v| owns(node, req, v, owner::Use::Read)).ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            if crate::async_query::is_running(&v) {
+                return Ok(esql_running_response(id));
+            }
+            if let Some(failed) = crate::async_query::failure(&v) {
+                return Ok(failed);
+            }
+            let v = crate::async_query::public(v);
             let t = table_from_json(&v);
             let mut meta = v.as_object().cloned().unwrap_or_default();
+            meta.remove("__owner");
             let sid = meta.remove("__id").and_then(|x| x.as_str().map(str::to_string)).unwrap_or_else(|| id.to_string());
             let warnings: Vec<String> = meta.remove("__warnings").and_then(|w| serde_json::from_value(w).ok()).unwrap_or_default();
             meta.remove("columns");
@@ -921,9 +1005,17 @@ fn esql_route(node: &Node, req: &Req, a: &str, b: &str, c: &str) -> R {
         }
         ("async", id, "stop", &Method::POST) | ("async", id, "stop", &Method::GET) if !id.is_empty() => {
             let key = async_key(id)?;
-            let v = ext(node).esql_async.lock().get(&key).cloned().ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            let v = crate::async_query::get(node, crate::async_query::Lang::Esql, &key, None).filter(|v| owns(node, req, v, owner::Use::Read)).ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            if crate::async_query::is_running(&v) {
+                return Ok(esql_running_response(id));
+            }
+            if let Some(failed) = crate::async_query::failure(&v) {
+                return Ok(failed);
+            }
+            let v = crate::async_query::public(v);
             let t = table_from_json(&v);
             let mut meta = v.as_object().cloned().unwrap_or_default();
+            meta.remove("__owner");
             meta.remove("__id");
             meta.remove("__warnings");
             meta.remove("columns");
@@ -932,9 +1024,16 @@ fn esql_route(node: &Node, req: &Req, a: &str, b: &str, c: &str) -> R {
         }
         ("async", id, "", &Method::DELETE) if !id.is_empty() => {
             let key = async_key(id)?;
-            if ext(node).esql_async.lock().remove(&key).is_none() {
+            let removed = {
+                let state = ext(node);
+                let mut stored = state.esql_async.lock();
+                if stored.get(&key).is_some_and(|v| owns(node, req, v, owner::Use::Delete)) { stored.remove(&key) } else { None }
+            };
+            if removed.is_none() {
                 return Err(EsError::resource_not_found(id.to_string()));
             }
+            // A query still running is cancelled with its result.
+            crate::async_query::cancel(&key);
             Ok(Resp::ack())
         }
         ("view", name, "", &Method::PUT) if !name.is_empty() => put_view(node, req, name),
@@ -1046,31 +1145,72 @@ pub fn esql_usage(node: &Node) -> Value {
     })
 }
 
+/// The caller's index privileges over the index expressions a query resolves.
+fn query_authz(req: &Req) -> Option<esql::exec::AuthorizeIndices> {
+    req.extensions.get::<crate::QueryIndexAuthz>().map(|a| a.0.clone())
+}
+
+/// The authenticated subject a stored query result (async result, SQL
+/// cursor) belongs to: only the same subject may read or remove it, as ES
+/// binds them (`None` with security off).
+fn result_owner(node: &Node, req: &Req) -> Value {
+    json!(owner::owner_of(node, req))
+}
+
+/// May the caller `use_` the stored result `stored` (its `__owner`)? ES's
+/// async-result rules (`security::owner`): the creator, `monitor` for
+/// status, `cancel_task` for delete. An unreadable owner matches no one.
+fn owns(node: &Node, req: &Req, stored: &Value, use_: owner::Use) -> bool {
+    let stored_owner = match stored.get("__owner") {
+        None | Some(Value::Null) => None,
+        Some(o) => match serde_json::from_value::<elasticsearch_engine::security::owner::ResourceOwner>(o.clone()) {
+            Ok(o) => Some(o),
+            Err(_) => return false,
+        },
+    };
+    owner::check(node, req, stored_owner.as_ref(), use_, || EsError::internal("not the result owner")).is_ok()
+}
+
 /// The caller's DLS/FLS over the targets a SQL query reads.
 fn access_restrict(req: &Req) -> Option<esql::exec::Restrict> {
     let access = req.access.clone().filter(|a| a.is_restricted())?;
     Some(std::sync::Arc::new(move |targets| access.apply(targets)))
 }
 
+/// The SQL request's `runtime_mappings` (an object, or none).
+fn sql_runtime_mappings(body: &Value) -> Result<Option<&Value>> {
+    match body.get("runtime_mappings") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v @ Value::Object(_)) => Ok(Some(v)),
+        Some(_) => Err(EsError::x_content_parse("[runtime_mappings] must be an object")),
+    }
+}
+
 fn sql_stat(node: &Node, k: &str) {
     *ext(node).sql_stats.lock().entry(k.to_string()).or_insert(0) += 1;
 }
 
-fn sql_route(node: &Node, req: &Req, a: &str, b: &str, c: &str) -> R {
+fn sql_route(node: &Arc<Node>, req: &Req, a: &str, b: &str, c: &str) -> R {
     match (a, b, c, &req.method) {
         ("", "", "", &Method::POST) | ("", "", "", &Method::GET) => sql_query(node, req),
         ("translate", "", "", &Method::POST) | ("translate", "", "", &Method::GET) => {
             let body = body_obj(req)?;
             let q = body.get("query").and_then(Value::as_str).ok_or_else(|| EsError::action_validation(&["query is required"]))?;
+            let rt = sql_runtime_mappings(&body)?;
             let fetch = body.get("fetch_size").and_then(Value::as_u64).unwrap_or(1000) as usize;
+            let _zone = esql::set_sql_zone(sql_time_zone(req, &body, "sql/translate")?);
             sql_stat(node, "translate");
-            Ok(Resp::ok(sql::translate(node, q, body.get("params"), fetch)?))
+            Ok(Resp::ok(esql::exec::with_sql_runtime(rt, || sql::translate_filtered(node, q, body.get("params"), body.get("filter"), fetch, query_authz(req)))?))
         }
         ("close", "", "", &Method::POST) => {
             let body = body_obj(req)?;
             let cur = body.get("cursor").and_then(Value::as_str).filter(|c| !c.is_empty()).ok_or_else(|| EsError::action_validation(&["[cursor] is required"]))?;
             esql::async_id::check_sql_cursor(cur)?;
-            let removed = ext(node).sql_cursors.lock().remove(cur);
+            let removed = {
+                let state = ext(node);
+                let mut cursors = state.sql_cursors.lock();
+                if cursors.get(cur).is_some_and(|c| owner::check(node, req, c.owner.as_ref(), owner::Use::Read, || EsError::internal("not the cursor owner")).is_ok()) { cursors.remove(cur) } else { None }
+            };
             let ok = removed.is_some();
             drop(removed);
             Ok(Resp::ok(json!({ "succeeded": ok })))
@@ -1096,32 +1236,45 @@ fn sql_route(node: &Node, req: &Req, a: &str, b: &str, c: &str) -> R {
         }
         ("async", "status", id, &Method::GET) if !id.is_empty() => {
             let key = async_key(id)?;
-            let v = ext(node).sql_async.lock().get(&key).cloned().ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
-            Ok(Resp::ok(json!({"id": v["id"], "is_running": false, "is_partial": false, "start_time_in_millis": v["start"], "expiration_time_in_millis": v["expires"], "completion_status": 200})))
+            let v = crate::async_query::get(node, crate::async_query::Lang::Sql, &key, None).filter(|v| owns(node, req, v, owner::Use::Status("cluster:monitor/xpack/sql/async/status"))).ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            if crate::async_query::is_running(&v) {
+                return Ok(Resp::ok(json!({"id": v["id"], "is_running": true, "is_partial": true, "start_time_in_millis": v["__start"], "expiration_time_in_millis": v["__expires"]})));
+            }
+            let status = v["__status"].as_u64().unwrap_or(200);
+            Ok(Resp::ok(json!({"id": v["id"], "is_running": false, "is_partial": false, "start_time_in_millis": v["__start"], "expiration_time_in_millis": v["__expires"], "completion_status": status})))
         }
         ("async", "delete", id, &Method::DELETE) if !id.is_empty() => {
             let key = async_key(id)?;
-            if ext(node).sql_async.lock().remove(&key).is_none() {
+            let removed = {
+                let state = ext(node);
+                let mut stored = state.sql_async.lock();
+                if stored.get(&key).is_some_and(|v| owns(node, req, v, owner::Use::Delete)) { stored.remove(&key) } else { None }
+            };
+            if removed.is_none() {
                 return Err(EsError::resource_not_found(id.to_string()));
             }
+            // A query still running is cancelled with its result.
+            crate::async_query::cancel(&key);
             Ok(Resp::ack())
         }
         ("async", id, "", &Method::GET) if !id.is_empty() => {
             let key = async_key(id)?;
-            let v = ext(node).sql_async.lock().get(&key).cloned().ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
-            let t = table_from_json(&json!({"columns": v["columns"], "values": v["rows"]}));
-            let mut meta = Map::new();
-            meta.insert("id".into(), v["id"].clone());
-            meta.insert("is_partial".into(), json!(false));
-            meta.insert("is_running".into(), json!(false));
-            render_table(req, &t, None, meta, false, false, "rows", vec![])
+            let wait = req.param("wait_for_completion_timeout").map(|w| crate::async_query::duration(Some(w), 0));
+            let v = crate::async_query::get(node, crate::async_query::Lang::Sql, &key, wait).filter(|v| owns(node, req, v, owner::Use::Read)).ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            if crate::async_query::is_running(&v) {
+                return sql_running_response(req, id);
+            }
+            if let Some(failed) = crate::async_query::failure(&v) {
+                return Ok(failed);
+            }
+            sql_render_async(req, v["id"].as_str().unwrap_or(id), &v, false)
         }
         ("", ..) => method_not_allowed(req, &["GET", "POST"]),
         _ => crate::not_found_handler(req),
     }
 }
 
-fn sql_query(node: &Node, req: &Req) -> R {
+fn sql_query(node: &Arc<Node>, req: &Req) -> R {
     let body = body_obj(req)?;
     sql_stat(node, "total");
     let columnar = body.get("columnar").and_then(Value::as_bool).unwrap_or(false);
@@ -1133,14 +1286,26 @@ fn sql_query(node: &Node, req: &Req) -> R {
     if let Some(cur) = body.get("cursor").and_then(Value::as_str).filter(|c| !c.is_empty()) {
         esql::async_id::check_sql_cursor(cur)?;
         sql_stat(node, "paging");
-        let removed = ext(node).sql_cursors.lock().remove(cur);
+        // Another subject's cursor is not there for the caller (and stays).
+        let removed = {
+            let state = ext(node);
+            let mut cursors = state.sql_cursors.lock();
+            if cursors.get(cur).is_some_and(|c| owner::check(node, req, c.owner.as_ref(), owner::Use::Read, || EsError::internal("not the cursor owner")).is_ok()) { cursors.remove(cur) } else { None }
+        };
         let cursor = removed.filter(|cursor| cursor.expires > Instant::now())
             .ok_or_else(|| EsError::new(404, "search_phase_execution_exception", "all shards failed")
                 .with("phase", json!("query")).with("grouped", json!(true))
                 .caused_by(EsError::new(404, "search_context_missing_exception", format!("No search context found for SQL cursor [{cur}]"))))?;
-        return sql_page(node, req, cursor.columns, cursor.rows, cursor.fetch, columnar, false, page_timeout);
+        // Later pages evaluate and render in the zone the query ran in.
+        let _zone = esql::set_sql_zone(cursor.zone);
+        return sql_page(node, req, cursor.columns, cursor.rows, cursor.fetch, columnar, false, page_timeout, cursor.lenient);
     }
     let q = body.get("query").and_then(Value::as_str).ok_or_else(|| EsError::action_validation(&["one of [query] or [cursor] is required"]))?;
+    let rt = sql_runtime_mappings(&body)?;
+    let lenient = body.get("field_multi_value_leniency").and_then(Value::as_bool).unwrap_or(false);
+    // ES SQL's session zone: date functions, extraction, truncation, date
+    // strings and rendered dates all use it (UTC by default).
+    let _zone = esql::set_sql_zone(sql_time_zone(req, &body, "sql/query")?);
     let fetch = body.get("fetch_size").and_then(Value::as_u64).unwrap_or(1000).max(1) as usize;
     let upper = q.to_ascii_uppercase();
     for (kw, stat) in [(" WHERE ", "where"), (" GROUP BY ", "groupby"), (" HAVING ", "having"), (" ORDER BY ", "orderby"), (" LIMIT ", "limit")] {
@@ -1149,13 +1314,52 @@ fn sql_query(node: &Node, req: &Req) -> R {
         }
     }
     let shards = req.extensions.get::<esql::remote::ShardSourceExt>().map(|s| s.0.clone());
-    if !body.get("wait_for_completion_timeout").is_some_and(|v| !v.is_null()) {
-        if let Some(scan) = sql::scan_with(node, q, body.get("params"), body.get("filter"), access_restrict(req), shards.clone())? {
-            let cols = scan.columns.clone();
-            return sql_page(node, req, cols, search_ext::SqlRows::Scan(scan), fetch, columnar, true, page_timeout);
-        }
+    // ES runs a SQL query asynchronously only when `wait_for_completion_timeout`
+    // is set: on a background worker (`async_query`), answering with its first
+    // page (`fetch_size` rows, a cursor for the rest) or a running handle; the
+    // id is always returned, the response kept with `keep_on_completion` (or
+    // when it did not complete within the wait).
+    if let Some(wait) = body.get("wait_for_completion_timeout").filter(|v| !v.is_null()) {
+        let wait = crate::async_query::duration(wait.as_str(), 0);
+        let keep = body.get("keep_on_completion").and_then(Value::as_bool).unwrap_or(false);
+        let keep_alive = crate::async_query::duration(body.get("keep_alive").and_then(Value::as_str), 5 * 86_400_000);
+        let (id, key) = new_id();
+        let owner = result_owner(node, req);
+        let (q, job_body, zone) = (q.to_string(), body.clone(), esql::zone());
+        let outcome = crate::async_query::submit(node, req, crate::async_query::Lang::Sql, id, key, owner, wait, keep, keep_alive,
+            move |node, req| -> Result<Value> {
+                let _zone = esql::set_sql_zone(zone);
+                let rt = sql_runtime_mappings(&job_body)?;
+                let t = match esql::exec::with_sql_runtime(rt, || sql::execute_with(node, &q, job_body.get("params"), job_body.get("filter"), access_restrict(req), query_authz(req), shards)) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        sql_stat(node, "failed");
+                        return Err(e);
+                    }
+                };
+                let cols: Vec<Value> = t.cols.iter().map(|c| json!({"name": c.name, "type": c.ty})).collect();
+                let (rows, cursor) = sql_take_page(node, req, &cols, search_ext::SqlRows::Table(t.rows.into_iter()), fetch, page_timeout, lenient)?;
+                let mut doc = json!({"columns": cols, "rows": rows, "is_partial": false, "is_running": false});
+                if let Some(c) = cursor {
+                    doc["cursor"] = json!(c);
+                }
+                Ok(doc)
+            },
+            |doc: &Value| doc.clone())?;
+        return match outcome {
+            crate::async_query::Outcome::Done { id, value } => sql_render_async(req, &id, &value, columnar),
+            crate::async_query::Outcome::Running { id } => sql_running_response(req, &id),
+        };
     }
-    let t = match sql::execute_with(node, q, body.get("params"), body.get("filter"), access_restrict(req), shards) {
+    if let Some(scan) = esql::exec::with_sql_runtime(rt, || sql::scan_with(node, q, body.get("params"), body.get("filter"), access_restrict(req), query_authz(req), shards.clone()))? {
+        let cols = scan.columns.clone();
+        return sql_page(node, req, cols, search_ext::SqlRows::Scan(scan), fetch, columnar, true, page_timeout, lenient);
+    }
+    let rt = sql_runtime_mappings(&body)?;
+    // Request runtime fields apply to projections, predicates and
+    // aggregates (ES SQL `runtime_mappings`); later cursor pages hold the
+    // materialized rows.
+    let t = match esql::exec::with_sql_runtime(rt, || sql::execute_with(node, q, body.get("params"), body.get("filter"), access_restrict(req), query_authz(req), shards)) {
         Ok(t) => t,
         Err(e) => {
             sql_stat(node, "failed");
@@ -1163,30 +1367,57 @@ fn sql_query(node: &Node, req: &Req) -> R {
         }
     };
     let cols: Vec<Value> = t.cols.iter().map(|c| json!({"name": c.name, "type": c.ty})).collect();
-    // ES runs a SQL query asynchronously only when `wait_for_completion_timeout` is set;
-    // the id is always returned, the response is kept only with `keep_on_completion`.
-    if body.get("wait_for_completion_timeout").is_some_and(|v| !v.is_null()) {
-        // Release each materialized row as it is converted, rather than keeping
-        // both complete tables alive until the response has been built.
-        let rows: Vec<Value> = t.rows.into_iter().map(|r| Value::Array(r.into_iter().map(|v| v.to_json()).collect())).collect();
-        let (id, doc) = new_id();
-        if body.get("keep_on_completion").and_then(Value::as_bool).unwrap_or(false) {
-            let now = elasticsearch_engine::date::now_millis();
-            let ka = body.get("keep_alive").and_then(Value::as_str).and_then(elasticsearch_engine::date::parse_time_value).unwrap_or(5 * 86_400_000);
-            ext(node).sql_async.lock().insert(doc, json!({"id": id, "columns": cols, "rows": rows, "start": now, "expires": now + ka}));
-        }
-        let t2 = table_from_json(&json!({"columns": cols, "values": rows}));
-        let mut meta = Map::new();
-        meta.insert("id".into(), json!(id));
-        meta.insert("is_partial".into(), json!(false));
-        meta.insert("is_running".into(), json!(false));
-        let format = fmt::pick_format(req.param("format"), req.headers.get("accept").and_then(|v| v.to_str().ok()))?;
-        // The async status travels in headers for the text formats only.
-        let headers = if matches!(format.as_str(), "json" | "yaml" | "cbor" | "smile") { vec![] } else { vec![("Async-ID", id.clone()), ("Async-partial", "false".into()), ("Async-running", "false".into())] };
-        return render_table(req, &t2, None, meta, columnar, false, "rows", headers);
-    }
     // Rows a page does not return stay executor values until their page.
-    sql_page(node, req, cols, search_ext::SqlRows::Table(t.rows.into_iter()), fetch, columnar, true, page_timeout)
+    sql_page(node, req, cols, search_ext::SqlRows::Table(t.rows.into_iter()), fetch, columnar, true, page_timeout, lenient)
+}
+
+/// A completed async SQL result (`doc`: `columns`, the first page's
+/// `rows`, `cursor` for the rest) as the submit or GET answers it.
+fn sql_render_async(req: &Req, id: &str, doc: &Value, columnar: bool) -> R {
+    let t = table_from_json(&json!({"columns": doc["columns"], "values": doc["rows"]}));
+    let mut meta = Map::new();
+    meta.insert("id".into(), json!(id));
+    meta.insert("is_partial".into(), json!(false));
+    meta.insert("is_running".into(), json!(false));
+    if let Some(c) = doc.get("cursor").and_then(Value::as_str) {
+        meta.insert("cursor".into(), json!(c));
+    }
+    let format = fmt::pick_format(req.param("format"), req.headers.get("accept").and_then(|v| v.to_str().ok()))?;
+    // The async status travels in headers for the text formats only.
+    let mut headers = if matches!(format.as_str(), "json" | "yaml" | "cbor" | "smile") { vec![] } else { vec![("Async-ID", id.to_string()), ("Async-partial", "false".into()), ("Async-running", "false".into())] };
+    if let Some(c) = doc.get("cursor").and_then(Value::as_str) {
+        headers.push(("Cursor", c.to_string()));
+    }
+    render_table(req, &t, None, meta, columnar, false, "rows", headers)
+}
+
+/// An async SQL query still running.
+fn sql_running_response(req: &Req, id: &str) -> R {
+    let format = fmt::pick_format(req.param("format"), req.headers.get("accept").and_then(|v| v.to_str().ok()))?;
+    let mut r = Resp::ok(json!({"id": id, "is_partial": true, "is_running": true, "rows": []}));
+    if !matches!(format.as_str(), "json" | "yaml" | "cbor" | "smile") {
+        r.headers.extend([("Async-ID", id.to_string()), ("Async-partial", "true".into()), ("Async-running", "true".into())]);
+    }
+    Ok(r)
+}
+
+/// The request's `time_zone` (`Z` when absent): a `java.time.ZoneId`.
+fn sql_time_zone(req: &Req, body: &Value, parser: &str) -> Result<elasticsearch_engine::date::Tz> {
+    let loc = top_level_location(req.body_str().unwrap_or(""), "time_zone", true)
+        .map(|(line, column)| format!("[{line}:{column}] ")).unwrap_or_default();
+    match body.get("time_zone") {
+        None => Ok(elasticsearch_engine::date::Tz::UTC),
+        Some(Value::String(zone)) => elasticsearch_engine::date::Tz::parse_query_option(zone).map_err(|cause|
+            EsError::x_content_parse(format!("{loc}[{parser}] failed to parse field [time_zone]")).caused_by(cause)),
+        Some(value) => {
+            let token = match value {
+                Value::Null => "VALUE_NULL", Value::Bool(true) => "VALUE_TRUE",
+                Value::Bool(false) => "VALUE_FALSE", Value::Number(_) => "VALUE_NUMBER",
+                Value::Array(_) => "START_ARRAY", _ => "START_OBJECT",
+            };
+            Err(EsError::x_content_parse(format!("{loc}[{parser}] time_zone doesn't support values of type: {token}")))
+        }
+    }
 }
 
 fn sql_page_timeout(req: &Req, body: &Value) -> Result<Duration> {
@@ -1231,16 +1462,45 @@ fn sql_timeout_millis(value: &str) -> Result<i64> {
     Ok(((number as i128 * multiplier) / divisor).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
-fn sql_page(node: &Node, req: &Req, cols: Vec<Value>, mut remaining: search_ext::SqlRows, fetch: usize, columnar: bool, first: bool, page_timeout: Duration) -> R {
-    let rows = remaining.page(node, fetch)?;
+/// ES SQL `field_multi_value_leniency` on a page's cells: a field holding
+/// several values is an error (strict, the default), or its first value
+/// (lenient); SQL columns are scalars, never arrays.
+fn multi_value_leniency(cols: &[Value], rows: &mut [Value], lenient: bool) -> Result<()> {
+    for row in rows.iter_mut() {
+        let Some(cells) = row.as_array_mut() else { continue };
+        for (i, cell) in cells.iter_mut().enumerate() {
+            let Value::Array(a) = cell else { continue };
+            if !lenient {
+                let name = cols.get(i).and_then(|c| c["name"].as_str()).unwrap_or_default();
+                return Err(EsError::new(400, "ql_illegal_argument_exception", format!("Arrays (returned by [{name}]) are not supported")));
+            }
+            *cell = a.first().cloned().unwrap_or(Value::Null);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// One page of `remaining` (`fetch` rows), the rest kept behind a new
+/// cursor owned by the caller (`None` when nothing is left).
+#[allow(clippy::too_many_arguments)]
+fn sql_take_page(node: &Node, req: &Req, cols: &[Value], mut remaining: search_ext::SqlRows, fetch: usize, page_timeout: Duration, lenient: bool) -> Result<(Vec<Value>, Option<String>)> {
+    let mut rows = remaining.page(node, fetch)?;
+    multi_value_leniency(cols, &mut rows, lenient)?;
     let cursor = if remaining.len() == 0 {
         None
     } else {
         let id = esql::async_id::new_sql_cursor();
         let expires = Instant::now().checked_add(page_timeout).ok_or_else(|| EsError::illegal_argument("page_timeout is too large"))?;
-        ext(node).sql_cursors.lock().insert(id.clone(), search_ext::SqlCursor { columns: cols.clone(), rows: remaining, fetch, expires });
+        ext(node).sql_cursors.lock().insert(id.clone(), search_ext::SqlCursor { columns: cols.to_vec(), rows: remaining, fetch, expires, owner: owner::owner_of(node, req), zone: esql::zone(), lenient });
         Some(id)
     };
+    Ok((rows, cursor))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sql_page(node: &Node, req: &Req, cols: Vec<Value>, remaining: search_ext::SqlRows, fetch: usize, columnar: bool, first: bool, page_timeout: Duration, lenient: bool) -> R {
+    let (rows, cursor) = sql_take_page(node, req, &cols, remaining, fetch, page_timeout, lenient)?;
     let t = table_from_json(&json!({"columns": cols, "values": rows}));
     let format = fmt::pick_format(req.param("format"), req.headers.get("accept").and_then(|v| v.to_str().ok()))?;
     let mut headers = vec![];
@@ -1288,7 +1548,43 @@ fn eql_path(index: &str) -> String {
     index.bytes().map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-fn eql_route(node: &Node, req: &Req, index: Option<&str>, b: &str, c: &str) -> R {
+/// One EQL search of `ix` (`body`: the request body).
+fn eql_run(node: &Node, req: &Req, ix: &str, body: &Value) -> Result<Value> {
+    // On a cluster every index search runs over all its shards: through
+    // the coordinator, unless this node holds every shard of every
+    // target and the caller reads them unrestricted (no document or
+    // field security to apply), when the stage searches read the
+    // local shards directly (no REST round trip, JSON response and
+    // parse per stage search).
+    let all_local = req.access.is_none()
+        && !elasticsearch_engine::ccr::remote::has_remote_expression(ix)
+        && node.resolve(ix, {
+            // As the EQL search resolves its targets (`eql_resolve_opts`).
+            let mut o = ResolveOpts::from_params(&req.params);
+            if !req.params.contains_key("ignore_unavailable") {
+                o.ignore_unavailable = true;
+            }
+            o
+        }).is_ok_and(|ts| !ts.is_empty() && ts.iter().all(|t| !t.svc.is_sparse()));
+    let remote = req.extensions.get::<crate::ClusterRest>().filter(|_| !all_local).cloned().map(|rest| -> eql::RemoteSearch {
+        Arc::new(move |index: &str, routing: Option<&str>, body: &Value| {
+            let mut path = format!("/{}/_search?ignore_unavailable=true", eql_path(index));
+            if let Some(routing) = routing { path.push_str(&format!("&routing={}", eql_path(routing))); }
+            (rest.0)("POST", &path, Some(body.clone()))
+        })
+    });
+    let scope = eql::remote_scope(remote);
+    let resp = eql::search(node, ix, &req.params, body)?;
+    drop(scope);
+    Ok(resp)
+}
+
+/// An EQL async search still running.
+fn eql_running(id: &str) -> Value {
+    json!({"id": id, "is_partial": true, "is_running": true, "timed_out": false, "took": 0, "hits": {}})
+}
+
+fn eql_route(node: &Arc<Node>, req: &Req, index: Option<&str>, b: &str, c: &str) -> R {
     match (index, b, c, &req.method) {
         (Some(ix), "", "", &Method::GET) | (Some(ix), "", "", &Method::POST) => {
             let body = body_obj(req)?;
@@ -1298,32 +1594,6 @@ fn eql_route(node: &Node, req: &Req, index: Option<&str>, b: &str, c: &str) -> R
             for k in ["allow_partial_search_results", "allow_partial_sequence_results"] {
                 req.flag(k)?;
             }
-            // On a cluster every index search runs over all its shards: through
-            // the coordinator, unless this node holds every shard of every
-            // target and the caller reads them unrestricted (no document or
-            // field security to apply), when the stage searches read the
-            // local shards directly (no REST round trip, JSON response and
-            // parse per stage search).
-            let all_local = req.access.is_none()
-                && !elasticsearch_engine::ccr::remote::has_remote_expression(ix)
-                && node.resolve(ix, {
-                    // As the EQL search resolves its targets (`eql_resolve_opts`).
-                    let mut o = ResolveOpts::from_params(&req.params);
-                    if !req.params.contains_key("ignore_unavailable") {
-                        o.ignore_unavailable = true;
-                    }
-                    o
-                }).is_ok_and(|ts| !ts.is_empty() && ts.iter().all(|t| !t.svc.is_sparse()));
-            let remote = req.extensions.get::<crate::ClusterRest>().filter(|_| !all_local).cloned().map(|rest| -> eql::RemoteSearch {
-                Arc::new(move |index: &str, routing: Option<&str>, body: &Value| {
-                    let mut path = format!("/{}/_search?ignore_unavailable=true", eql_path(index));
-                    if let Some(routing) = routing { path.push_str(&format!("&routing={}", eql_path(routing))); }
-                    (rest.0)("POST", &path, Some(body.clone()))
-                })
-            });
-            let scope = eql::remote_scope(remote);
-            let mut resp = eql::search(node, ix, &req.params, &body)?;
-            drop(scope);
             let flag = |k: &str| -> Result<bool> {
                 match req.param(k) {
                     Some(_) => req.flag(k),
@@ -1332,43 +1602,62 @@ fn eql_route(node: &Node, req: &Req, index: Option<&str>, b: &str, c: &str) -> R
             };
             let keep = flag("keep_on_completion")?;
             // ES runs the search asynchronously (and returns an id) only when
-            // `wait_for_completion_timeout` is set; the response is kept only
-            // with `keep_on_completion`.
+            // `wait_for_completion_timeout` is set: on a background worker
+            // (`async_query`); the response is kept with `keep_on_completion`
+            // (or when it did not complete within the wait).
             let wfct = req.param("wait_for_completion_timeout").map(str::to_string).or_else(|| body.get("wait_for_completion_timeout").and_then(Value::as_str).map(str::to_string));
-            if wfct.is_some() {
-                let (id, doc) = new_id();
-                let mut m = Map::new();
-                m.insert("id".into(), json!(id));
-                m.extend(resp.as_object().cloned().unwrap_or_default());
-                resp = Value::Object(m);
-                if keep {
-                    let now = elasticsearch_engine::date::now_millis();
-                    let ka = req.param("keep_alive").or_else(|| body.get("keep_alive").and_then(Value::as_str)).and_then(elasticsearch_engine::date::parse_time_value).unwrap_or(5 * 86_400_000);
-                    let mut stored = resp.clone();
-                    stored["__expires"] = json!(now + ka);
-                    ext(node).eql_async.lock().insert(doc, stored);
+            let Some(wfct) = wfct else { return Ok(Resp::ok(eql_run(node, req, ix, &body)?)) };
+            let wait = crate::async_query::duration(Some(&wfct), 0);
+            let keep_alive = crate::async_query::duration(req.param("keep_alive").or_else(|| body.get("keep_alive").and_then(Value::as_str)), 5 * 86_400_000);
+            let (id, key) = new_id();
+            let owner = result_owner(node, req);
+            let (job_ix, job_body) = (ix.to_string(), body.clone());
+            let outcome = crate::async_query::submit(node, req, crate::async_query::Lang::Eql, id, key, owner, wait, keep, keep_alive,
+                move |node, req| eql_run(node, req, &job_ix, &job_body),
+                |resp: &Value| resp.clone())?;
+            match outcome {
+                crate::async_query::Outcome::Done { id, value } => {
+                    let mut m = Map::new();
+                    m.insert("id".into(), json!(id));
+                    m.extend(value.as_object().cloned().unwrap_or_default());
+                    Ok(Resp::ok(Value::Object(m)))
                 }
+                crate::async_query::Outcome::Running { id } => Ok(Resp::ok(eql_running(&id))),
             }
-            Ok(Resp::ok(resp))
         }
         (None, "status", id, &Method::GET) if !id.is_empty() => {
             let key = async_key(id)?;
-            let v = ext(node).eql_async.lock().get(&key).cloned().ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
-            Ok(Resp::ok(json!({"id": v["id"], "is_running": false, "is_partial": false, "expiration_time_in_millis": v["__expires"], "completion_status": 200})))
+            let v = crate::async_query::get(node, crate::async_query::Lang::Eql, &key, None).filter(|v| owns(node, req, v, owner::Use::Status("cluster:monitor/eql/async/status"))).ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            if crate::async_query::is_running(&v) {
+                return Ok(Resp::ok(json!({"id": v["id"], "is_running": true, "is_partial": true, "start_time_in_millis": v["__start"], "expiration_time_in_millis": v["__expires"]})));
+            }
+            let status = v["__status"].as_u64().unwrap_or(200);
+            Ok(Resp::ok(json!({"id": v["id"], "is_running": false, "is_partial": false, "expiration_time_in_millis": v["__expires"], "completion_status": status})))
         }
         (None, id, "", &Method::GET) if !id.is_empty() => {
             let key = async_key(id)?;
-            let mut v = ext(node).eql_async.lock().get(&key).cloned().ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
-            if let Some(o) = v.as_object_mut() {
-                o.remove("__expires");
+            let wait = req.param("wait_for_completion_timeout").map(|w| crate::async_query::duration(Some(w), 0));
+            let v = crate::async_query::get(node, crate::async_query::Lang::Eql, &key, wait).filter(|v| owns(node, req, v, owner::Use::Read)).ok_or_else(|| EsError::resource_not_found(id.to_string()))?;
+            if crate::async_query::is_running(&v) {
+                return Ok(Resp::ok(eql_running(id)));
             }
-            Ok(Resp::ok(v))
+            if let Some(failed) = crate::async_query::failure(&v) {
+                return Ok(failed);
+            }
+            Ok(Resp::ok(crate::async_query::public(v)))
         }
         (None, id, "", &Method::DELETE) if !id.is_empty() => {
             let key = async_key(id)?;
-            if ext(node).eql_async.lock().remove(&key).is_none() {
+            let removed = {
+                let state = ext(node);
+                let mut stored = state.eql_async.lock();
+                if stored.get(&key).is_some_and(|v| owns(node, req, v, owner::Use::Delete)) { stored.remove(&key) } else { None }
+            };
+            if removed.is_none() {
                 return Err(EsError::resource_not_found(id.to_string()));
             }
+            // A query still running is cancelled with its result.
+            crate::async_query::cancel(&key);
             Ok(Resp::ack())
         }
         _ => crate::not_found_handler(req),
@@ -1565,6 +1854,27 @@ fn validate_app_template(tpl: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// The concrete indices of application `name` (ES `getAliasIndices`): the
+/// indices its alias is on now; without the alias, the saved expressions
+/// resolved (a wildcard names its matching indices, never itself).
+fn app_indices(node: &Node, name: &str, app: &Value) -> Vec<String> {
+    let mut on_alias: Vec<String> = node.all_indices().iter().filter(|s| s.aliases().contains_key(name)).map(|s| s.name.clone()).collect();
+    if !on_alias.is_empty() {
+        on_alias.sort();
+        return on_alias;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for ix in app["indices"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        match node.resolve(ix, ResolveOpts { ignore_unavailable: true, allow_no_indices: true, ..Default::default() }) {
+            Ok(ts) => out.extend(ts.iter().map(|t| t.svc.name.clone())),
+            Err(_) => out.push(ix.to_string()),
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn app_not_found(name: &str) -> EsError {
     EsError::resource_not_found(format!("Search Application [{name}] not found"))
 }
@@ -1634,7 +1944,7 @@ fn search_app_route(node: &Node, req: &Req, name: &str, sub: &str) -> R {
                 _ => warn = true,
             }
             // The application is an alias over its indices.
-            let previous: Vec<String> = st.search_apps.read().get(n).and_then(|a| a["indices"].as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            let previous: Vec<String> = st.search_apps.read().get(n).map(|a| app_indices(node, n, a)).unwrap_or_default();
             let mut actions: Vec<Value> = previous.iter().filter(|p| !indices.contains(p)).filter(|p| node.get_index(p).is_some()).map(|p| json!({"remove": {"index": p, "alias": n}})).collect();
             actions.extend(indices.iter().map(|ix| json!({"add": {"index": ix, "alias": n}})));
             node.update_aliases(&actions)?;
@@ -1648,6 +1958,8 @@ fn search_app_route(node: &Node, req: &Req, name: &str, sub: &str) -> R {
         }
         (n, "", &Method::GET) if !n.is_empty() => {
             let mut app = st.search_apps.read().get(n).cloned().ok_or_else(|| app_not_found(n))?;
+            // ES `getSearchApplication`: the alias's current indices.
+            app["indices"] = json!(app_indices(node, n, &app));
             let mut r = Resp::ok(Value::Null);
             if app.get("template").is_none_or(Value::is_null) {
                 app["template"] = default_app_template();
@@ -1661,7 +1973,7 @@ fn search_app_route(node: &Node, req: &Req, name: &str, sub: &str) -> R {
                 return Err(app_not_found(n));
             };
             st.persist()?;
-            let actions: Vec<Value> = app["indices"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|ix| node.get_index(ix).is_some_and(|s| s.aliases().contains_key(n))).map(|ix| json!({"remove": {"index": ix, "alias": n}})).collect();
+            let actions: Vec<Value> = app_indices(node, n, &app).iter().filter(|ix| node.get_index(ix).is_some_and(|s| s.aliases().contains_key(n))).map(|ix| json!({"remove": {"index": ix, "alias": n}})).collect();
             if !actions.is_empty() {
                 let _ = node.update_aliases(&actions);
             }
@@ -1671,8 +1983,8 @@ fn search_app_route(node: &Node, req: &Req, name: &str, sub: &str) -> R {
             let app = st.search_apps.read().get(n).cloned().ok_or_else(|| app_not_found(n))?;
             let body = body_obj(req)?;
             let rendered = app_render(&app, body.get("params"))?;
-            let rendered = search_ext::rewrite_query(node, &rendered)?;
-            let indices: Vec<String> = app["indices"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            let rendered = search_ext::preprocess_search_body(node, &rendered)?.unwrap_or(rendered);
+            let indices = app_indices(node, n, &app);
             let json = if let Some(plan) = req.extensions.get::<crate::PreparedSearchApplication>() {
                 if plan.indices.iter().any(|index| !indices.contains(index)) {
                     return Err(EsError::illegal_argument("application query targets changed during execution"));
@@ -1983,5 +2295,73 @@ fn synonyms_route(node: &Node, req: &Req, set: &str, rule: &str) -> R {
             Ok(Resp::ok(out))
         }
         _ => crate::not_found_handler(req),
+    }
+}
+
+#[cfg(test)]
+mod sql_runtime_mappings_tests {
+    use super::*;
+
+    #[test]
+    fn sql_runtime_mappings_must_be_an_object() {
+        assert!(sql_runtime_mappings(&json!({"query": "SELECT 1"})).unwrap().is_none());
+        assert!(sql_runtime_mappings(&json!({"runtime_mappings": {"v": {"type": "long"}}})).unwrap().is_some());
+        assert!(sql_runtime_mappings(&json!({"runtime_mappings": [1]})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sql_leniency_tests {
+    use super::*;
+
+    /// Review finding 398: SQL columns are scalars: a multivalued cell is
+    /// an error (strict, the default) or its first value (lenient).
+    #[test]
+    fn multivalued_cells_follow_field_multi_value_leniency() {
+        let cols = vec![json!({"name": "n", "type": "long"}), json!({"name": "k", "type": "keyword"})];
+        let mut rows = vec![json!([[3, 1], "a"]), json!([2, ["x", "y"]])];
+        let e = multi_value_leniency(&cols, &mut rows.clone(), false).unwrap_err();
+        assert!(e.reason.contains("Arrays (returned by [n]) are not supported"), "{}", e.reason);
+        multi_value_leniency(&cols, &mut rows, true).unwrap();
+        assert_eq!(rows, vec![json!([3, "a"]), json!([2, "x"])]);
+        let mut single = vec![json!([1, "a"])];
+        assert!(multi_value_leniency(&cols, &mut single, false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod app_target_tests {
+    use super::*;
+
+    fn req(method: Method, body: Value) -> Req {
+        Req { method, path: "/_application/search_application/app".into(), segs: vec!["_application".into(), "search_application".into(), "app".into()], params: Default::default(),
+            body: body.to_string().into_bytes().into(), headers: Default::default(), access: None, extensions: axum::http::Extensions::new(), api_version: crate::RestApiVersion::V9 }
+    }
+
+    /// #408: a wildcard-backed application searches (and reports) the
+    /// concrete indices its alias is on, through the cluster executor too.
+    #[test]
+    fn wildcard_application_targets_concrete_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        node.create_index("products-2026", &json!({})).unwrap();
+        search_app_route(&node, &req(Method::PUT, json!({"indices": ["products-*"]})), "app", "").unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let mut r = req(Method::POST, json!({}));
+        let s2 = seen.clone();
+        r.extensions.insert(crate::SearchApplicationExecutor(Arc::new(move |indices: &[String], _q: &Value, _p: &HashMap<String, String>| {
+            *s2.lock().unwrap() = indices.to_vec();
+            Ok(json!({"hits": {"hits": []}}).to_string())
+        })));
+        search_app_route(&node, &r, "app", "_search").unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["products-2026".to_string()]);
+        let got = search_app_route(&node, &req(Method::GET, json!({})), "app", "").unwrap();
+        let RespBody::Json(v) = got.body else { panic!("json body") };
+        assert_eq!(v["indices"], json!(["products-2026"]), "{v}");
+        // The alias moves to a new generation: the application follows it.
+        node.create_index("products-2027", &json!({})).unwrap();
+        node.update_aliases(&[json!({"remove": {"index": "products-2026", "alias": "app"}}), json!({"add": {"index": "products-2027", "alias": "app"}})]).unwrap();
+        search_app_route(&node, &r, "app", "_search").unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["products-2027".to_string()]);
     }
 }

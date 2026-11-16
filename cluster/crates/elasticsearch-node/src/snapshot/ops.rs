@@ -61,7 +61,7 @@ pub fn index_metadata_json(im: &IndexMetadata) -> Value {
     settings.insert("index.number_of_shards".into(), json!(im.number_of_shards.to_string()));
     let mappings = if im.mappings.as_object().map(|o| o.len() == 1 && o.contains_key("_doc")).unwrap_or(false) { (*im.mappings).clone() } else { json!({"_doc": im.mappings}) };
     let primary_terms: Map<String, Value> = (0..im.number_of_shards.max(1)).map(|k| (k.to_string(), json!(im.primary_term(k)))).collect();
-    json!({
+    let mut out = json!({
         "version": im.version,
         "mapping_version": im.mapping_version,
         "settings_version": im.settings_version,
@@ -77,7 +77,20 @@ pub fn index_metadata_json(im: &IndexMetadata) -> Value {
         "routing_num_shards": im.routing_num_shards,
         "in_sync_allocations": {},
         "creation_date": im.creation_date,
-    })
+    });
+    // The lifecycle execution state and rollover info (ES's `ilm` custom
+    // and `rollover_info`): a restore continues the index's lifecycle
+    // where it was instead of restarting its phases from a new age.
+    if let Some(state) = im.lifecycle.as_deref() {
+        let (ilm, rollover) = elasticsearch_engine::ilm::lifecycle_snapshot_fields(state);
+        if let Some(ilm) = ilm {
+            out["ilm"] = ilm;
+        }
+        if let Some(rollover) = rollover {
+            out["rollover_info"] = rollover;
+        }
+    }
+    out
 }
 
 /// Global metadata stored with a snapshot.
@@ -129,12 +142,57 @@ fn resolve_indices(node: &ClusterNode, p: &CreateSnapshotParams) -> Result<(Vec<
         Err(e) => return Err(RestResp::json(e.status, &e.to_json_with_trace(false))),
     }
     let mut streams = Vec::new();
+    let mut failure_indices = Vec::new();
     for (name, ds) in node.engine.data_streams.read().iter() {
         if ds.indices.iter().any(|i| names.contains(i)) {
             streams.push(name.clone());
+            // A snapshotted stream takes its failure store along (ES).
+            failure_indices.extend(ds.failure_indices.iter().cloned());
         }
     }
+    names.extend(failure_indices);
     Ok((names.into_iter().collect(), streams))
+}
+
+/// The requested `feature_states`, each with the system indices it
+/// selects (ES `SnapshotsService` feature-state resolution). `none` (or
+/// `[]`) selects none; with global state and no index expression ES
+/// includes every feature, as `_all` here does explicitly. An unknown
+/// feature is an error.
+fn resolve_features(node: &ClusterNode, p: &CreateSnapshotParams) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut wanted: Vec<String> = p.feature_states.iter().filter(|f| !f.is_empty()).cloned().collect();
+    if wanted.iter().any(|f| f == "none" || f == "_none") {
+        if wanted.len() > 1 {
+            return Err("the feature_states value [none] indicates that no feature states should be snapshotted, but other feature states were requested".into());
+        }
+        return Ok(Vec::new());
+    }
+    if wanted.iter().any(|f| f == "_all") {
+        wanted = elasticsearch_http::system_features::all_feature_names().iter().map(|s| s.to_string()).collect();
+    }
+    let unknown: Vec<&String> = wanted.iter().filter(|f| elasticsearch_http::system_features::feature_index_patterns(f).is_none()).collect();
+    if !unknown.is_empty() {
+        return Err(format!("requested feature states [{}] are not present in the cluster", unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    let opts = elasticsearch_engine::node::ResolveOpts { ignore_unavailable: true, allow_no_indices: true, expand_open: true, expand_closed: true, expand_hidden: true };
+    let mut out = Vec::new();
+    for f in wanted {
+        let patterns = elasticsearch_http::system_features::feature_index_patterns(&f).unwrap_or_default();
+        let mut ix: Vec<String> = node.engine.resolve(&patterns.join(","), opts).map(|ts| ts.iter().map(|t| t.svc.name.clone()).collect()).unwrap_or_default();
+        ix.sort();
+        ix.dedup();
+        out.push((f, ix));
+    }
+    Ok(out)
+}
+
+/// A progress entry's feature states.
+fn feature_states_of(e: &Value) -> Vec<(String, Vec<String>)> {
+    e["feature_states"].as_array().into_iter().flatten().filter_map(|f| {
+        let name = f["feature_name"].as_str()?.to_string();
+        let ix = f["indices"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        Some((name, ix))
+    }).collect()
 }
 
 /// A running create: the pending entry and the task finishing it.
@@ -162,7 +220,18 @@ pub async fn start_create(node: &Arc<ClusterNode>, repo: &str, name: &str, param
     if data.snapshot_by_name(name).is_some() {
         return Err(err(&SnapshotError::invalid_snapshot_name(repo, name, "snapshot with the same name already exists")));
     }
-    let (indices, data_streams) = resolve_indices(node, &params)?;
+    let (mut indices, data_streams) = resolve_indices(node, &params)?;
+    // Requested feature states: their system indices join the snapshot
+    // (production review #393: the selection was accepted and ignored).
+    let features = resolve_features(node, &params).map_err(|e| RestResp::error(400, "illegal_argument_exception", &e))?;
+    for (_, ix) in &features {
+        for i in ix {
+            if !indices.contains(i) {
+                indices.push(i.clone());
+            }
+        }
+    }
+    indices.sort();
     // A primary that is assigned but still initializing is waited for, as
     // ES's snapshot shard state `WAITING` does: only a primary with no copy
     // anywhere makes the snapshot fail. (The master may also apply the
@@ -182,6 +251,7 @@ pub async fn start_create(node: &Arc<ClusterNode>, repo: &str, name: &str, param
         partial: params.partial,
         indices: indices.clone(),
         data_streams: data_streams.clone(),
+        feature_states: features.clone(),
         metadata: params.metadata.clone(),
         start_time: now_millis(),
         assigned: indices.iter().flat_map(|i| (0..shards_of(&st.metadata, i)).filter_map(|k| primary_node(&st, i, k).map(|n| (assigned_key(i, k), n)))).collect(),
@@ -194,6 +264,7 @@ pub async fn start_create(node: &Arc<ClusterNode>, repo: &str, name: &str, param
         "repository": repo, "snapshot": name, "uuid": uuid, "state": "STARTED",
         "include_global_state": params.include_global_state, "partial": params.partial,
         "start_time_millis": pending.start_time, "indices": indices, "data_streams": data_streams,
+        "feature_states": features.iter().map(|(f, ix)| json!({"feature_name": f, "indices": ix})).collect::<Vec<_>>(),
         "master": node.local.id, "repository_state_id": data.generation,
         "metadata": params.metadata, "shards": pending.assigned,
     });
@@ -238,11 +309,17 @@ async fn run_create(node: Arc<ClusterNode>, svc: Arc<SnapshotsService>, p: Arc<P
             // make the snapshot PARTIAL (ES semantics).
             partial: true,
             metadata: p.metadata.clone(),
-            feature_states: vec![],
+            feature_states: p.feature_states.iter().map(|(f, ix)| elasticsearch_snapshots::snapshot::FeatureState { feature_name: f.clone(), indices: ix.clone() }).collect(),
             data_streams: p.data_streams.clone(),
             node_id: Some(node.local.id.clone()),
             // Every other node's primaries are snapshotted by their node.
             remote: Some(RemoteUploader(Arc::new(super::upload::Uploader { node: node.clone() }))),
+            // Finalized with the index metadata current once every image is
+            // captured (ES `metadataForSnapshot`; production review #131).
+            current_index_metadata: Some({
+                let node = node.clone();
+                elasticsearch_snapshots::service::IndexMetadataSource(Arc::new(move |name: &str| node.state().metadata.indices.get(name).map(index_metadata_json)))
+            }),
         };
         let (_, h) = svc.start_snapshot(req).await?;
         p.in_service.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -453,6 +530,7 @@ fn pending_of(node: &ClusterNode, svc: &SnapshotsService, repo: &str) -> Vec<Arc
             partial: e["partial"].as_bool().unwrap_or(false),
             indices: strs("indices"),
             data_streams: strs("data_streams"),
+            feature_states: feature_states_of(&e),
             metadata: e.get("metadata").and_then(Value::as_object).cloned(),
             start_time: e["start_time_millis"].as_i64().unwrap_or_else(now_millis),
             assigned: BTreeMap::new(),
@@ -473,7 +551,7 @@ fn pending_info(p: &Pending, st: &ClusterState) -> SnapshotInfo {
         version: Some(ES_VERSION.into()),
         indices: p.indices.clone(),
         data_streams: p.data_streams.clone(),
-        feature_states: vec![],
+        feature_states: p.feature_states.iter().map(|(f, ix)| elasticsearch_snapshots::snapshot::FeatureState { feature_name: f.clone(), indices: ix.clone() }).collect(),
         include_global_state: Some(p.include_global_state),
         metadata: p.metadata.clone(),
         state: Some(SnapshotState::InProgress),
@@ -607,6 +685,16 @@ pub async fn delete(node: &Arc<ClusterNode>, repo: &str, snaps: &str) -> RestRes
         return err(&e);
     }
     let names: Vec<String> = snaps.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    // A snapshot an active restore still reads cannot be deleted (ES
+    // `SnapshotDeletionStartBatcher`: restore sources are checked like
+    // clone sources; production review #381: its unread files were
+    // removed mid-restore). SLM retention runs this handler too and tries
+    // again on its next run.
+    let st = node.state();
+    if let Some(e) = common::progress_entries(&st, "restore").into_iter().find(|e| e["repository"].as_str() == Some(repo) && e["snapshot"].as_str().is_some_and(|s| name_matches(&names, s, false))) {
+        let snap = e["snapshot"].as_str().unwrap_or_default();
+        return RestResp::error(503, "concurrent_snapshot_execution_exception", &format!("[{repo}:{snap}] cannot delete snapshot during a restore in progress in [[{repo}:{snap}]]"));
+    }
     // Snapshots orphaned by a master change become local tasks first, so
     // they are aborted like any other running snapshot.
     resume_orphans(node).await;
@@ -713,6 +801,7 @@ pub async fn resume_orphans(node: &Arc<ClusterNode>) {
             partial: e["partial"].as_bool().unwrap_or(false),
             indices: strings(&e["indices"]),
             data_streams: strings(&e["data_streams"]),
+            feature_states: feature_states_of(&e),
             metadata: e.get("metadata").and_then(Value::as_object).cloned(),
             start_time: e["start_time_millis"].as_i64().unwrap_or_else(now_millis),
             assigned: e["shards"].as_object().map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|n| (k.clone(), n.to_string()))).collect()).unwrap_or_default(),

@@ -1,6 +1,10 @@
-//! Allocation accounting enabled only for scripted-metric execution. Owners
-//! retain reservations, so aliases do not double-charge and dropping a
-//! temporary collection gives its bytes back before the script finishes.
+//! Allocation accounting of script execution. Every executor run installs
+//! collection accounting ([`ExecutorAccounting`]: lists, maps, arrays,
+//! streams and bulk built-ins are admitted on the request breaker before
+//! they grow); scripted-metric execution installs the full scope, which
+//! also accounts decoded and produced scalars. Owners retain reservations,
+//! so aliases do not double-charge and dropping a temporary collection
+//! gives its bytes back before the script finishes.
 use super::error::{SResult, ScriptErr};
 use crate::memory::{Breakers, Reservation};
 use std::cell::RefCell;
@@ -47,13 +51,31 @@ const SWEEP_MIN: usize = 64;
 
 pub(crate) struct Registry {
     breakers: &'static Breakers,
+    /// Scalar (decoded / produced text) accounting too: scripted metrics.
+    full: bool,
     storage: RefCell<Vec<Storage>>,
     scalars: RefCell<std::collections::HashMap<usize,(ScalarOwner,Allocation)>>,
     scalar_metadata: RefCell<Option<Reservation>>,
     reservation: RefCell<Option<Reservation>>,
     /// Scalar count at which the next amortized sweep runs.
     sweep_at: std::cell::Cell<usize>,
+    /// Collection accounting (not `full`): one breaker reservation the
+    /// executor's allocations draw from, grown by doubling when they need
+    /// more and held for the executor's life, instead of a breaker
+    /// reservation and release per allocation (several per document of a
+    /// filter script). The breaker always holds at least what is in use.
+    pool: RefCell<Pool>,
 }
+
+#[derive(Default)]
+struct Pool {
+    reservation: Option<Reservation>,
+    used: u64,
+}
+
+/// The first reservation of a collection-accounting pool.
+const POOL_CHUNK: u64 = 64 * 1024;
+const POOL_LABEL: &str = "<script collection>";
 thread_local! {
     static ACTIVE: RefCell<Option<Rc<Registry>>> = const { RefCell::new(None) };
 }
@@ -67,9 +89,11 @@ pub(crate) struct Scope {
 }
 impl Scope {
     pub(crate) fn enter() -> Self {
-        let previous = Self::current();
+        // Nested in a full scope: share it. Inside an executor's collection
+        // accounting (a runtime callback entering a metric): a root of its own.
+        let previous = Self::current().filter(|p| p.full);
         let root = previous.is_none();
-        let active = previous.clone().or_else(|| Some(Rc::new(Registry { breakers: crate::memory::breakers(), storage: RefCell::new(Vec::new()), scalars: RefCell::new(std::collections::HashMap::new()), scalar_metadata: RefCell::new(None), reservation: RefCell::new(None), sweep_at: std::cell::Cell::new(SWEEP_MIN) })));
+        let active = previous.clone().or_else(|| Some(Registry::new(crate::memory::breakers(), true)));
         let mut scope = Self::install(active);
         scope.root = root;
         scope
@@ -79,12 +103,15 @@ impl Scope {
         Self { previous, active, root: false }
     }
     pub(crate) fn current() -> Option<Rc<Registry>> { ACTIVE.with(|slot| slot.borrow().clone()) }
+    /// Whether any accounting (collection or full) is installed.
+    #[inline]
+    pub(crate) fn installed() -> bool { ACTIVE.with(|slot| slot.borrow().is_some()) }
     /// Whether allocation accounting is installed on this thread (without
     /// the `Rc` round trip of [`Self::current`]). Interpreter fast paths
     /// that skip the accounting hooks run only when this is false; the hooks
     /// are all no-ops then.
     #[inline]
-    pub(crate) fn active() -> bool { ACTIVE.with(|slot| slot.borrow().is_some()) }
+    pub(crate) fn active() -> bool { ACTIVE.with(|slot| slot.borrow().as_ref().is_some_and(|r| r.full)) }
     fn register(storage: Storage) -> SResult<()> {
         let Some(active) = Self::current() else { return Ok(()) };
         let mut entries = active.storage.borrow_mut();
@@ -116,6 +143,9 @@ impl Scope {
     /// live ones (plus a small floor), and a breaker trip sweeps everything
     /// and retries before it fails (see [`Allocation::reserve`]).
     pub(super) fn collect_dead() {
+        // Scalars are registered in full (scripted-metric) scopes only; the
+        // collection scope every executor run installs has none to sweep.
+        if !Self::active() {return}
         if let Some(scope)=Self::current() {
             if let Ok(mut scalars)=scope.scalars.try_borrow_mut() {
                 if scalars.len()>=scope.sweep_at.get() {Self::sweep(&scope,&mut scalars);}
@@ -135,7 +165,7 @@ impl Scope {
         scope.sweep_at.set(scalars.len().saturating_mul(2).max(SWEEP_MIN));
     }
     fn scalar(owner:ScalarOwner,bytes:u64)->SResult<()> {
-        let Some(scope)=Self::current() else {return Ok(())};
+        let Some(scope)=Self::current().filter(|s|s.full) else {return Ok(())};
         let id=owner.id();
         // A dead entry may share the address of a new buffer: replace it.
         {
@@ -168,7 +198,7 @@ impl Scope {
     /// transient before-decode reservation. Weak scalar entries follow aliases
     /// retained in metric state, without retaining dead document buffers.
     pub(super) fn adopt(value:&Val)->SResult<()> {
-        if Self::current().is_none() {return Ok(())}
+        if !Self::active() {return Ok(())}
         fn walk(v:&Val,depth:usize)->SResult<()> {
             if depth>=128 {return Err(ScriptErr::breaker(crate::error::EsError::new(429,"circuit_breaking_exception","decoded script value nesting exceeds limit")));}
             match v {
@@ -212,25 +242,98 @@ impl Scope {
     }
 
 }
+impl Registry {
+    fn new(breakers: &'static Breakers, full: bool) -> Rc<Registry> {
+        Rc::new(Registry { breakers, full, storage: RefCell::new(Vec::new()), scalars: RefCell::new(std::collections::HashMap::new()), scalar_metadata: RefCell::new(None), reservation: RefCell::new(None), sweep_at: std::cell::Cell::new(SWEEP_MIN), pool: RefCell::new(Pool::default()) })
+    }
+    /// Draw `bytes` from the pool, growing its breaker reservation (doubled,
+    /// at least [`POOL_CHUNK`]; exactly what is needed when doubling would
+    /// trip) when it holds too little.
+    fn take(&self, bytes: u64) -> SResult<()> {
+        let mut pool = self.pool.borrow_mut();
+        let need = pool.used.saturating_add(bytes);
+        let held = pool.reservation.as_ref().map_or(0, Reservation::bytes);
+        if need > held {
+            let target = need.max(held.saturating_mul(2)).max(POOL_CHUNK);
+            if let Some(r) = pool.reservation.as_mut() {
+                r.grow(target - held, POOL_LABEL).or_else(|_| r.grow(need - held, POOL_LABEL)).map_err(ScriptErr::breaker)?;
+            } else {
+                let r = self.breakers.reserve_request(target, POOL_LABEL).or_else(|_| self.breakers.reserve_request(need, POOL_LABEL)).map_err(ScriptErr::breaker)?;
+                pool.reservation = Some(r);
+            }
+        }
+        pool.used = need;
+        Ok(())
+    }
+    fn give(&self, bytes: u64) {
+        if let Ok(mut pool) = self.pool.try_borrow_mut() {
+            pool.used = pool.used.saturating_sub(bytes);
+        }
+    }
+    /// Break the reference cycles still alive among registered collections
+    /// so their reservations drop with them.
+    fn teardown(&self) {
+        let drained: Vec<Storage> = self.storage.borrow_mut().drain(..).collect();
+        for storage in drained {
+            match storage {
+                Storage::List(storage) => if let Some(data) = storage.upgrade() { let old = std::mem::take(&mut *data.borrow_mut()); drop(old); },
+                Storage::Map(storage) => if let Some(data) = storage.upgrade() { let old = std::mem::take(&mut *data.borrow_mut()); drop(old); },
+            }
+        }
+    }
+}
 impl Drop for Scope {
     fn drop(&mut self) {
         if self.root {
             if let Some(active) = &self.active {
-                for storage in active.storage.borrow_mut().drain(..) {
-                    match storage {
-                        Storage::List(storage) => if let Some(data) = storage.upgrade() { data.borrow_mut().clear(); },
-                        Storage::Map(storage) => if let Some(data) = storage.upgrade() { data.borrow_mut().clear(); },
-                    }
-                }
+                active.teardown();
             }
         }
         ACTIVE.with(|slot| slot.replace(self.previous.take()));
     }
 }
 
+/// Collection accounting owned by one [`super::Executor`] (every script
+/// context: filter, field, score, sort, update, ingest, watcher...). Created
+/// on the first run that is not already inside an accounting scope (a
+/// scripted metric's), installed for each such run, torn down (cycles
+/// broken, reservations released) when the executor drops.
+#[derive(Default)]
+pub(crate) struct ExecutorAccounting {
+    registry: Option<Rc<Registry>>,
+}
+impl ExecutorAccounting {
+    /// Install this executor's accounting for one run; `None` when an
+    /// enclosing scope already accounts the run.
+    #[inline]
+    pub(crate) fn enter(&mut self) -> Option<Scope> {
+        if Scope::installed() { return None; }
+        let registry = self.registry.get_or_insert_with(|| Registry::new(crate::memory::breakers(), false)).clone();
+        Some(Scope::install(Some(registry)))
+    }
+}
+impl Drop for ExecutorAccounting {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.take() {
+            registry.teardown();
+        }
+    }
+}
+
 pub(super) struct Allocation {
     breakers: Option<&'static Breakers>,
     reservation: RefCell<Option<Reservation>>,
+    /// Under collection accounting: the executor's pool this allocation
+    /// draws from (see [`Registry::take`]), and how much it holds.
+    pool: Option<Rc<Registry>>,
+    pooled: std::cell::Cell<u64>,
+}
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.pool {
+            pool.give(self.pooled.get());
+        }
+    }
 }
 impl std::fmt::Debug for Allocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -239,7 +342,30 @@ impl std::fmt::Debug for Allocation {
 }
 impl Allocation {
     pub(super) fn new() -> Self {
-        Self { breakers: Scope::current().map(|scope| scope.breakers), reservation: RefCell::new(None) }
+        match Scope::current() {
+            Some(scope) if !scope.full => Self { breakers: Some(scope.breakers), reservation: RefCell::new(None), pool: Some(scope), pooled: std::cell::Cell::new(0) },
+            scope => Self { breakers: scope.map(|scope| scope.breakers), reservation: RefCell::new(None), pool: None, pooled: std::cell::Cell::new(0) },
+        }
+    }
+    /// Scalar (decode / text) accounting: enabled in full (scripted-metric)
+    /// scopes only.
+    pub(super) fn scalar() -> Self {
+        // (No `Rc` clone: this runs on every doc-value decode.)
+        let breakers = ACTIVE.with(|slot| slot.borrow().as_ref().filter(|scope| scope.full).map(|scope| scope.breakers));
+        Self { breakers, reservation: RefCell::new(None), pool: None, pooled: std::cell::Cell::new(0) }
+    }
+    /// No accounting (scalar copies outside a scripted-metric scope).
+    pub(super) fn disabled() -> Self {
+        Self { breakers: None, reservation: RefCell::new(None), pool: None, pooled: std::cell::Cell::new(0) }
+    }
+    /// [`Self::values`] for an allocation whose size the script chose
+    /// (`nCopies`, nested arrays): admitted on the request breaker before
+    /// anything is allocated, even with no accounting scope installed.
+    pub(super) fn values_checked(count: u64) -> SResult<Self> {
+        let bytes = count.saturating_mul(std::mem::size_of::<super::Val>() as u64).saturating_add(256);
+        let a = Self { breakers: Some(Scope::current().map(|scope| scope.breakers).unwrap_or_else(crate::memory::breakers)), reservation: RefCell::new(None), pool: None, pooled: std::cell::Cell::new(0) };
+        a.reserve(bytes)?;
+        Ok(a)
     }
     pub(super) fn values(count: usize) -> SResult<Self> {
         let a = Self::new();
@@ -279,7 +405,7 @@ impl Allocation {
     /// adopts the resulting scalar owner before dropping this guard.
     pub(super) fn scalar_text(values:&[&Val])->SResult<Self> {
         Scope::collect_dead();
-        let allocation=Self::new();
+        let allocation=Self::scalar();
         if allocation.enabled() {
             let mut bytes=0u64;
             for value in values {bytes=bytes.saturating_add(serialization_bound(value)?);}
@@ -289,7 +415,7 @@ impl Allocation {
     }
     pub(super) fn text_copy(value:&Val)->SResult<Self> {
         Scope::collect_dead();
-        let allocation=Self::new();
+        let allocation=Self::scalar();
         if allocation.enabled() {allocation.reserve(serialization_bound(value)?)?;}
         Ok(allocation)
     }
@@ -303,6 +429,14 @@ impl Allocation {
         }
     }
     fn reserve_once(&self, total: u64) -> SResult<()> {
+        if let Some(pool) = &self.pool {
+            let held = self.pooled.get();
+            if total > held {
+                pool.take(total - held)?;
+                self.pooled.set(total);
+            }
+            return Ok(());
+        }
         let Some(breakers) = self.breakers else { return Ok(()) };
         let mut reservation = self.reservation.borrow_mut();
         match reservation.as_mut() {

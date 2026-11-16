@@ -2,9 +2,11 @@
 //! strings whose byte order is semver precedence. Numeric components carry
 //! a length prefix (so `1.10` sorts after `1.9`), a release sorts after its
 //! pre-releases and before longer versions (`1.2.3-a` < `1.2.3` < `1.2.3.4`),
-//! numeric pre-release identifiers sort before alphanumeric ones, build
-//! metadata is ignored for precedence. Strings that are not valid versions
-//! sort after every valid one, in byte order.
+//! numeric pre-release identifiers sort before alphanumeric ones, and build
+//! metadata is kept (`+build`, ASCII order, after the same version without
+//! it), so the encoding is reversible (production review #444). Leading
+//! zeros make a version invalid (`01.2`, `1.0.0-01`), as in ES. Strings that
+//! are not valid versions sort after every valid one, in byte order.
 
 fn enc_num(digits: &str, out: &mut String) {
     let d = digits.trim_start_matches('0');
@@ -22,6 +24,12 @@ pub fn is_valid(s: &str) -> bool {
 struct Parsed<'a> {
     main: Vec<&'a str>,
     pre: Option<Vec<&'a str>>,
+    build: Option<&'a str>,
+}
+
+/// ES `VersionEncoder.LEGAL_VERSION_PATTERN` numbers: `0|[1-9]\d*`.
+fn canonical_number(c: &str) -> bool {
+    !c.is_empty() && c.chars().all(|c| c.is_ascii_digit()) && (c == "0" || !c.starts_with('0'))
 }
 
 fn parse(s: &str) -> Option<Parsed<'_>> {
@@ -36,20 +44,26 @@ fn parse(s: &str) -> Option<Parsed<'_>> {
         None => (core.0, None),
     };
     let main: Vec<&str> = main.split('.').collect();
-    if main.is_empty() || main.iter().any(|c| c.is_empty() || !c.chars().all(|c| c.is_ascii_digit())) {
+    if main.is_empty() || !main.iter().all(|c| canonical_number(c)) {
         return None;
     }
     let pre = match pre {
         Some(p) => {
             let ids: Vec<&str> = p.split('.').collect();
-            if ids.iter().any(|id| id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
+            // A numeric identifier has no leading zero; others have a
+            // letter or `-` (`\d*[a-zA-Z-][a-zA-Z0-9-]*`).
+            if ids.iter().any(|id| {
+                id.is_empty()
+                    || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    || (id.chars().all(|c| c.is_ascii_digit()) && !canonical_number(id))
+            }) {
                 return None;
             }
             Some(ids)
         }
         None => None,
     };
-    Some(Parsed { main, pre })
+    Some(Parsed { main, pre, build: core.1 })
 }
 
 /// Sortable encoding of a version string.
@@ -82,11 +96,14 @@ pub fn encode(s: &str) -> String {
             }
         }
     }
+    if let Some(b) = p.build {
+        out.push('+');
+        out.push_str(b);
+    }
     out
 }
 
-/// The version string of an [`encode`]d value (valid versions come back
-/// without leading zeros and build metadata, which the encoding drops).
+/// The version string of an [`encode`]d value (the encoding is reversible).
 pub fn decode(e: &str) -> String {
     if let Some(raw) = e.strip_prefix('2') {
         return raw.to_string();
@@ -111,7 +128,13 @@ pub fn decode(e: &str) -> String {
                 out.push('.');
                 i += 1;
             }
-            b'-' => return out,
+            b'-' => {
+                if let Some(build) = body[i + 1..].strip_prefix('+') {
+                    out.push('+');
+                    out.push_str(build);
+                }
+                return out;
+            }
             b',' => {
                 i += 1;
                 out.push('-');
@@ -132,12 +155,16 @@ pub fn decode(e: &str) -> String {
                         }
                         Some(b'2') => {
                             i += 1;
-                            let end = body[i..].find('.').map(|p| i + p).unwrap_or(b.len());
+                            let end = body[i..].find(['.', '+']).map(|p| i + p).unwrap_or(b.len());
                             out.push_str(&body[i..end]);
                             i = end;
                         }
                         _ => break,
                     }
+                }
+                if let Some(build) = body[i.min(b.len())..].strip_prefix('+') {
+                    out.push('+');
+                    out.push_str(build);
                 }
                 return out;
             }
@@ -160,7 +187,17 @@ mod tests {
         for w in ordered.windows(2) {
             assert!(encode(w[0]) < encode(w[1]), "{} < {}", w[0], w[1]);
         }
-        assert_eq!(encode("1.0.0+build.1"), encode("1.0.0"));
+        // Production review #444: build metadata is kept (ASCII order after
+        // the bare version), leading zeros are invalid strings.
+        assert!(encode("1.0.0") < encode("1.0.0+build.1"));
+        assert!(encode("1.0.0+build.1") < encode("1.0.0+build.2"));
+        assert!(encode("1.0.0+build.2") < encode("1.0.0.1"));
+        assert!(encode("1.0.0-rc.1+b") < encode("1.0.0-rc.1.x"));
+        assert!(!is_valid("01.2") && !is_valid("1.0.0-01"));
+        assert!(encode("01.2") > encode("99.0"));
+        for v in ["1.2.3+build.1", "1.2.3-rc.1+b5", "1.2.3-alpha+exp.sha.5114f85", "01.2", "1.0.0-01", "0.0.1"] {
+            assert_eq!(decode(&encode(v)), v);
+        }
         for v in ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-beta.11", "1.10.0", "11.0.0", "2.0.0-rc.1-x", "a-invalid", "1.el6"] {
             assert_eq!(decode(&encode(v)), v);
         }

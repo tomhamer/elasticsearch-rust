@@ -25,6 +25,7 @@ md-5 = "0.10"
 hex = "0.4"
 regex = "1"
 percent-encoding = "2"
+http-body = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

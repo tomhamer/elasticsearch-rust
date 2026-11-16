@@ -531,8 +531,146 @@ pub struct CurrentNode {
     pub info: Option<NodeInfo>,
 }
 
+/// One shard copy as the storage deciders see it.
+#[derive(Debug, Clone)]
+pub struct WorkShard {
+    pub index: String,
+    pub shard: u32,
+    /// The node holding it (`None`: unassigned).
+    pub node: Option<String>,
+    /// Its store size (an unassigned copy: its primary's).
+    pub bytes: u64,
+    pub primary: bool,
+    /// `index.routing.allocation.include._tier_preference`.
+    pub tiers: Vec<String>,
+}
+
+/// One index as the frozen and proactive deciders see it.
+#[derive(Debug, Clone, Default)]
+pub struct WorkIndex {
+    pub name: String,
+    pub creation_ms: i64,
+    /// `number_of_shards` and copies per shard (`number_of_replicas + 1`).
+    pub shards: u64,
+    pub copies: u64,
+    /// `FrozenUtils.isFrozenIndex` / in the ILM `frozen` phase.
+    pub frozen: bool,
+    pub frozen_phase: bool,
+}
+
+/// What the master gathered for the deciders: shard copies and their
+/// sizes, indices, the data nodes' disks, the data streams, the ML jobs and
+/// the settings they read.
+#[derive(Debug, Clone)]
+pub struct Workload {
+    pub shards: Vec<WorkShard>,
+    pub indices: BTreeMap<String, WorkIndex>,
+    pub disks: BTreeMap<String, elasticsearch_engine::autoscaling::NodeDisk>,
+    /// Each data stream's backing indices, oldest first.
+    pub streams: Vec<Vec<String>>,
+    pub ml_jobs: Vec<elasticsearch_engine::autoscaling::MlJob>,
+    pub thresholds: elasticsearch_engine::autoscaling::DiskThresholds,
+    pub ml: elasticsearch_engine::autoscaling::MlSettings,
+    pub now_ms: i64,
+}
+
+impl Default for Workload {
+    fn default() -> Self {
+        Workload { shards: Vec::new(), indices: BTreeMap::new(), disks: BTreeMap::new(), streams: Vec::new(), ml_jobs: Vec::new(),
+            thresholds: Default::default(), ml: Default::default(), now_ms: 0 }
+    }
+}
+
+/// Whether an unassigned copy with tier preference `tiers` belongs to a
+/// policy with `roles`: its first preferred tier is one of them (`data`
+/// holds every data tier).
+fn wants_tier(tiers: &[String], roles: &BTreeSet<String>) -> bool {
+    let first = tiers.first().map(String::as_str).unwrap_or("data_content");
+    roles.contains(first) || (roles.contains("data") && first.starts_with("data_"))
+}
+
+/// Each policy's ML scale-down timer (ES `ScaleTimer`), by its roles.
+fn ml_timers() -> &'static parking_lot::Mutex<BTreeMap<String, elasticsearch_engine::autoscaling::ScaleTimer>> {
+    static TIMERS: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<String, elasticsearch_engine::autoscaling::ScaleTimer>>> = std::sync::OnceLock::new();
+    TIMERS.get_or_init(Default::default)
+}
+
+fn decision(d: elasticsearch_engine::autoscaling::Decision) -> DeciderResult {
+    let required = d.capacity.map(|c| {
+        let total = Resources { storage: c.total_storage.map(|b| b as i64), memory: c.total_memory.map(|b| b as i64), processors: None };
+        let node = (c.node_storage.is_some() || c.node_memory.is_some())
+            .then(|| Resources { storage: c.node_storage.map(|b| b as i64), memory: c.node_memory.map(|b| b as i64), processors: None });
+        Capacity { total, node }
+    });
+    DeciderResult { required, reason: Some((d.summary, d.details)) }
+}
+
+/// One decider of policy `p` over its current `nodes`.
+fn run_decider(name: &str, settings: &BTreeMap<String, String>, p: &Policy, nodes: &[CurrentNode], current: Capacity, work: &Workload) -> DeciderResult {
+    use elasticsearch_engine::autoscaling as a;
+    let tier: Vec<&CurrentNode> = nodes.iter().filter(|n| n.data).collect();
+    let slot = |id: &str| tier.iter().position(|n| n.id == id);
+    let disks: Vec<a::NodeDisk> = tier.iter().map(|n| work.disks.get(&n.id).copied()
+        .unwrap_or_else(|| { let total = n.info.map(|i| i.storage).unwrap_or(0); a::NodeDisk { total, free: total } })).collect();
+    let copies: Vec<a::ShardCopy> = work.shards.iter().filter_map(|s| {
+        let node = match &s.node { Some(n) => Some(slot(n)?), None => { if !wants_tier(&s.tiers, &p.roles) { return None; } None } };
+        Some(a::ShardCopy { id: format!("[{}][{}]", s.index, s.shard), bytes: s.bytes, node })
+    }).collect();
+    let current_storage = current.total.storage.map(|b| b.max(0) as u64);
+    let time = |key: &str, default: u64| settings.get(key).and_then(|v| elasticsearch_engine::date::parse_time_value(v)).filter(|v| *v >= 0).map(|v| v as u64).unwrap_or(default);
+    let frozen = || work.indices.values().filter(|i| i.frozen);
+    match name {
+        "fixed" => fixed(settings),
+        "reactive_storage" => decision(a::reactive_storage(current_storage, &disks, &copies, &work.thresholds)),
+        "proactive_storage" => {
+            let ids: BTreeSet<&str> = tier.iter().map(|n| n.id.as_str()).collect();
+            let streams: Vec<a::StreamIndices> = work.streams.iter().map(|backing| a::StreamIndices {
+                indices: backing.iter().filter_map(|name| work.indices.get(name)).map(|i| {
+                    let index_copies: Vec<&WorkShard> = work.shards.iter().filter(|s| s.index == i.name).collect();
+                    a::BackingIndex {
+                        name: i.name.clone(),
+                        creation_ms: i.creation_ms,
+                        bytes: index_copies.iter().map(|s| s.bytes.max(1024)).sum(),
+                        copies: i.shards * i.copies,
+                        on_tier: index_copies.iter().any(|s| s.node.as_deref().is_some_and(|n| ids.contains(n))),
+                        off_tier: index_copies.iter().any(|s| s.node.as_deref().is_some_and(|n| !ids.contains(n))),
+                    }
+                }).collect(),
+            }).collect();
+            decision(a::proactive_storage(current_storage, &disks, &copies, &streams, time("forecast_window", 1_800_000), work.now_ms, &work.thresholds))
+        }
+        "frozen_existence" => {
+            let names: Vec<String> = work.indices.values().filter(|i| i.frozen_phase).map(|i| i.name.clone()).collect();
+            decision(a::frozen_existence(&names))
+        }
+        "frozen_shards" => {
+            let per_shard = settings.get("memory_per_shard").and_then(|v| parse_bytes(v, "memory_per_shard").ok()).map(|b| b as u64).unwrap_or(a::DEFAULT_MEMORY_PER_SHARD);
+            decision(a::frozen_shards(frozen().map(|i| i.shards * i.copies).sum(), per_shard))
+        }
+        "frozen_storage" => {
+            let pct = settings.get("percentage").and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(a::DEFAULT_FROZEN_STORAGE_PERCENTAGE);
+            // `estimateSize`: each shard's size times its copies.
+            let data_set: u64 = frozen().map(|i| work.shards.iter().filter(|s| s.index == i.name && s.primary).map(|s| s.bytes * i.copies).sum::<u64>()).sum();
+            decision(a::frozen_storage(data_set, pct))
+        }
+        "ml" => {
+            let queue = |key: &str| settings.get(key).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+            let s = a::MlSettings { anomaly_queue: queue("num_anomaly_jobs_in_queue"), analytics_queue: queue("num_analytics_jobs_in_queue"),
+                down_scale_delay_ms: time("down_scale_delay", 3_600_000), ..work.ml };
+            let memory: Vec<u64> = nodes.iter().filter_map(|n| n.info.map(|i| i.memory)).collect();
+            let input = a::MlInput { jobs: &work.ml_jobs, node_memory: &memory,
+                current_tier_memory: current.total.memory.unwrap_or(0).max(0) as u64, current_node_memory: current.node.and_then(|n| n.memory).unwrap_or(0).max(0) as u64 };
+            let key = p.roles.iter().cloned().collect::<Vec<_>>().join(",");
+            let mut timers = ml_timers().lock();
+            decision(a::ml(&input, &s, timers.entry(key).or_default(), work.now_ms))
+        }
+        // Validation accepts only the deciders above.
+        other => DeciderResult { required: None, reason: Some((format!("unknown decider [{other}]"), json!({}))) },
+    }
+}
+
 /// `calculateForPolicy` given the nodes whose role set equals the policy's.
-pub fn calculate_policy(p: &Policy, nodes: &[CurrentNode]) -> Value {
+pub fn calculate_policy(p: &Policy, nodes: &[CurrentNode], work: &Workload) -> Value {
     let known = role_names();
     if p.roles.iter().any(|r| !known.contains(r.as_str())) {
         return json!({"current_capacity": Capacity::ZERO.to_json(), "current_nodes": [], "deciders": {"_unknown_role": {}}});
@@ -550,7 +688,7 @@ pub fn calculate_policy(p: &Policy, nodes: &[CurrentNode]) -> Value {
         .reduce(|a, b| Capacity { total: Resources::sum(a.total, b.total), node: Some(Resources::max(a.node.unwrap_or_default(), b.node.unwrap_or_default())) })
         .unwrap_or(Capacity::ZERO);
     let results: BTreeMap<String, DeciderResult> =
-        with_defaults(p).iter().map(|(d, s)| (d.clone(), if d == "fixed" { fixed(s) } else { DeciderResult { required: None, reason: None } })).collect();
+        with_defaults(p).iter().map(|(d, s)| (d.clone(), run_decider(d, s, p, nodes, current, work))).collect();
     let required = results.values().map(|r| r.required).collect::<Option<Vec<_>>>().and_then(|v| v.into_iter().reduce(Capacity::upper_bound));
     let mut sorted: Vec<&CurrentNode> = nodes.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
@@ -686,6 +824,10 @@ async fn capacity(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
     }
     let state = node.state();
     let all = policies(&state);
+    let work = match workload(node, &state).await {
+        Ok(w) => w,
+        Err(e) => return RestResp::from_es_error(&e),
+    };
     let mut info_cache: BTreeMap<String, Option<NodeInfo>> = BTreeMap::new();
     let mut out = Map::new();
     for (name, p) in &all {
@@ -701,9 +843,61 @@ async fn capacity(node: &Arc<ClusterNode>, req: &RestReq) -> RestResp {
             }
             current.push(CurrentNode { name: n.name.clone(), id: id.clone(), data: n.is_data(), info: info_cache[id] });
         }
-        out.insert(name.clone(), calculate_policy(p, &current));
+        out.insert(name.clone(), calculate_policy(p, &current, &work));
     }
     RestResp::json(200, &json!({"policies": out}))
+}
+
+/// The deciders' inputs, gathered by the master (shard sizes and disks from
+/// every data node, the ML jobs and data streams from its engine).
+async fn workload(node: &Arc<ClusterNode>, state: &ClusterState) -> Result<Workload, elasticsearch_engine::error::EsError> {
+    use elasticsearch_engine::autoscaling as a;
+    let stats = super::gather_shard_doc_stats(node, state).await?;
+    let size_of = |c: &elasticsearch_cluster::state::ShardRouting| c.allocation_id().and_then(|id| stats.get(id)).map(|s| s.store_bytes).unwrap_or(0);
+    let setting = |key: &str| state.metadata.setting(key).and_then(Value::as_str).map(str::to_string)
+        .or_else(|| node.config.settings.get(key).and_then(Value::as_str).map(str::to_string));
+    let mut work = Workload {
+        thresholds: a::DiskThresholds::from_settings(&setting),
+        ml: a::MlSettings {
+            max_machine_memory_percent: setting("xpack.ml.max_machine_memory_percent").and_then(|v| v.trim().parse().ok()).unwrap_or(30),
+            use_auto: setting("xpack.ml.use_auto_machine_memory_percent").as_deref() == Some("true"),
+            max_ml_node_size: setting("xpack.ml.max_ml_node_size").and_then(|v| parse_bytes(&v, "xpack.ml.max_ml_node_size").ok()).map(|b| b.max(0) as u64).unwrap_or(0),
+            ..Default::default()
+        },
+        now_ms: elasticsearch_engine::date::now_millis(),
+        ..Default::default()
+    };
+    for (name, meta) in &state.metadata.indices {
+        let tier = meta.setting("index.routing.allocation.include._tier_preference");
+        work.indices.insert(name.clone(), WorkIndex {
+            name: name.clone(),
+            creation_ms: meta.creation_date,
+            shards: meta.number_of_shards as u64,
+            copies: meta.number_of_replicas as u64 + 1,
+            frozen: a::is_frozen_index(tier),
+            frozen_phase: meta.lifecycle.as_ref().is_some_and(|l| l["ilm"]["phase"].as_str() == Some("frozen")),
+        });
+    }
+    for (index, irt) in &state.routing_table.indices {
+        let tiers: Vec<String> = state.metadata.indices.get(index).and_then(|m| m.setting("index.routing.allocation.include._tier_preference"))
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_else(|| vec!["data_content".into()]);
+        for t in &irt.shards {
+            let primary_bytes = t.copies.iter().filter(|c| c.primary && c.node_id.is_some()).map(&size_of).max().unwrap_or(0);
+            for c in &t.copies {
+                let bytes = match size_of(c) { 0 if !c.primary || c.node_id.is_none() => primary_bytes, b => b };
+                work.shards.push(WorkShard { index: index.clone(), shard: t.shard, node: c.node_id.clone(), bytes, primary: c.primary, tiers: tiers.clone() });
+            }
+        }
+    }
+    for n in state.data_nodes() {
+        if let Ok(Some(d)) = crate::rest::nodes::fetch_disk(node, &n.id).await {
+            work.disks.insert(n.id.clone(), a::NodeDisk { total: d.total_bytes, free: d.free_bytes });
+        }
+    }
+    work.streams = node.engine.data_streams.read().values().map(|ds| ds.indices.clone()).collect();
+    work.ml_jobs = a::ml_jobs(&node.engine);
+    Ok(work)
 }
 
 // ------------------------------------------------------------ tests
@@ -821,30 +1015,68 @@ mod tests {
     #[test]
     fn capacity_shapes() {
         let p = Policy { roles: roles(&["voting_only"]), deciders: [("fixed".to_string(), [("storage".to_string(), "1337b".to_string())].into_iter().collect())].into_iter().collect() };
-        let v = calculate_policy(&p, &[]);
+        let v = calculate_policy(&p, &[], &Workload::default());
         assert_eq!(v["required_capacity"]["total"]["storage"], 1337);
         assert_eq!(v["current_capacity"]["total"]["processors"], 0.0);
         assert_eq!(v["current_capacity"]["node"]["storage"], 0);
         assert_eq!(v["current_nodes"], json!([]));
         assert_eq!(v["deciders"]["fixed"]["reason_details"]["nodes"], 1);
         let unknown = Policy { roles: roles(&["warp_drive"]), deciders: BTreeMap::new() };
-        assert_eq!(calculate_policy(&unknown, &[])["deciders"], json!({"_unknown_role": {}}));
-        // Default deciders without a computed capacity make the policy's
-        // required capacity unknown.
+        assert_eq!(calculate_policy(&unknown, &[], &Workload::default())["deciders"], json!({"_unknown_role": {}}));
+        // #417: the default storage deciders of a data policy compute its
+        // required capacity.
         let data = Policy { roles: roles(&["data"]), deciders: BTreeMap::new() };
         let info = NodeInfo { memory: 100, processors: 4.0, storage: 1000 };
         let nodes = vec![
             CurrentNode { name: "b".into(), id: "2".into(), data: true, info: Some(info) },
             CurrentNode { name: "a".into(), id: "1".into(), data: true, info: Some(info) },
         ];
-        let v = calculate_policy(&data, &nodes);
-        assert!(v.get("required_capacity").is_none());
+        let v = calculate_policy(&data, &nodes, &Workload::default());
+        assert_eq!(v["required_capacity"]["total"]["storage"], 2000, "{v}");
         assert_eq!(v["current_capacity"]["total"]["storage"], 2000);
         assert_eq!(v["current_capacity"]["node"]["storage"], 1000);
         assert_eq!(v["current_capacity"]["total"]["processors"], 8.0);
         assert_eq!(v["current_nodes"], json!([{"name": "a"}, {"name": "b"}]));
-        assert_eq!(v["deciders"]["reactive_storage"], json!({}));
-        assert_eq!(v["deciders"]["proactive_storage"], json!({}));
+        assert_eq!(v["deciders"]["reactive_storage"]["reason_summary"], "storage ok");
+        assert_eq!(v["deciders"]["proactive_storage"]["reason_summary"], "storage ok");
+    }
+
+    /// #417 closure: an ordinary data policy, the same with a fixed
+    /// override, and an ML policy with healthy nodes and pending work all
+    /// return a required capacity from their deciders.
+    #[test]
+    fn data_and_ml_policies_calculate_their_required_capacity() {
+        use elasticsearch_engine::autoscaling::{MlJob, NodeDisk};
+        const GB: u64 = 1 << 30;
+        let info = NodeInfo { memory: 8 * GB, processors: 4.0, storage: 100 * GB };
+        let nodes = vec![CurrentNode { name: "d1".into(), id: "d1".into(), data: true, info: Some(info) },
+            CurrentNode { name: "d2".into(), id: "d2".into(), data: true, info: Some(info) }];
+        let mut work = Workload::default();
+        work.disks.insert("d1".into(), NodeDisk { total: 100 * GB, free: 40 * GB });
+        work.disks.insert("d2".into(), NodeDisk { total: 100 * GB, free: 40 * GB });
+        let shard = |node: Option<&str>, bytes: u64| WorkShard { index: "logs".into(), shard: 0, node: node.map(str::to_string), bytes, primary: node.is_some(), tiers: vec!["data_hot".into()] };
+        work.shards = vec![shard(Some("d1"), 50 * GB), shard(None, 100 * GB)];
+        let data = Policy { roles: roles(&["data_hot"]), deciders: BTreeMap::new() };
+        let v = calculate_policy(&data, &nodes, &work);
+        // 200 GB now; the 100 GB replica fits no node (40 GB free each).
+        assert_eq!(v["required_capacity"]["total"]["storage"], json!(300 * GB), "{v}");
+        assert!(v["deciders"]["reactive_storage"]["reason_summary"].as_str().unwrap().starts_with("not enough storage"), "{v}");
+        // A fixed override is combined, not suppressed by the defaults.
+        let fixed_data = Policy { roles: roles(&["data_hot"]), deciders: [("fixed".to_string(), [("storage".to_string(), "1tb".to_string()), ("memory".to_string(), "1gb".to_string())].into_iter().collect())].into_iter().collect() };
+        let v = calculate_policy(&fixed_data, &nodes, &work);
+        assert_eq!(v["required_capacity"]["total"]["storage"], json!(1u64 << 40), "{v}");
+        assert_eq!(v["required_capacity"]["total"]["memory"], json!(GB), "{v}");
+        // ML: a running job and one waiting past the queue allowance.
+        work.ml_jobs = vec![MlJob { bytes: 330 << 20, assigned: true, analytics: false }, MlJob { bytes: 630 << 20, assigned: false, analytics: false }];
+        let ml_nodes = vec![CurrentNode { name: "m1".into(), id: "m1".into(), data: false, info: Some(NodeInfo { memory: 2 * GB, processors: 2.0, storage: 0 }) }];
+        let ml = Policy { roles: roles(&["ml"]), deciders: BTreeMap::new() };
+        let v = calculate_policy(&ml, &ml_nodes, &work);
+        // ES `checkForScaleUp`: current ML memory (2gb x 30% less the 30mb
+        // code overhead) less the free memory left, plus the unassignable
+        // job: 960mb native, as a node size at 30% with the overhead.
+        let wanted = ((100.0 / 30.0) * (990u64 << 20) as f64).ceil() as u64;
+        assert_eq!(v["required_capacity"]["total"]["memory"], json!(wanted), "{v}");
+        assert!(v["deciders"]["ml"]["reason_summary"].as_str().unwrap().contains("scale up"), "{v}");
     }
 
     #[test]

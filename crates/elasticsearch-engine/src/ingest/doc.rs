@@ -64,10 +64,33 @@ fn split(path: &str) -> Result<(Root, Vec<&str>), EsError> {
         (Root::Ctx, path)
     };
     let segs: Vec<&str> = if rest.is_empty() { Vec::new() } else { rest.split('.').collect() };
-    if segs.iter().any(|s| s.is_empty()) {
+    // Flexible paths have no list index syntax yet (`parseFlexibleFields`).
+    let flexible = super::flexible_access();
+    if segs.iter().any(|s| s.is_empty() || (flexible && (s.contains('[') || s.contains(']')))) {
         return Err(ia(format!("path [{path}] is not valid")));
     }
     Ok((root, segs))
+}
+
+/// One container step of ES's flexible field access in an object whose
+/// keys `has` answers, at path element `i` of `segs` (elements before
+/// `limit` are containers): the key that matched (the element itself, else
+/// the shortest run of following elements joined with dots, up to
+/// `limit - 1`) and the next element, or the joined key tried last when
+/// nothing matched (`IngestDocument.resolve` / `setFieldValue`, FLEXIBLE).
+pub(crate) fn flexible_step(has: impl Fn(&str) -> bool, segs: &[&str], i: usize, limit: usize) -> Result<(String, usize), String> {
+    if has(segs[i]) {
+        return Ok((segs[i].to_string(), i + 1));
+    }
+    let mut combined = segs[i].to_string();
+    for (j, seg) in segs.iter().enumerate().take(limit).skip(i + 1) {
+        combined.push('.');
+        combined.push_str(seg);
+        if has(&combined) {
+            return Ok((combined, j + 1));
+        }
+    }
+    Err(combined)
 }
 
 fn index_of(seg: &str, path: &str, len: usize) -> Result<usize, EsError> {
@@ -141,6 +164,39 @@ impl IngestDocument {
 
     /// `Ok(Err(segment))` names the missing segment.
     fn lookup(&self, path: &str) -> Result<Result<&Value, String>, EsError> {
+        if super::flexible_access() {
+            return self.lookup_flexible(path);
+        }
+        self.lookup_classic(path)
+    }
+
+    /// [`Self::lookup`] with ES's flexible access pattern: a key missing in
+    /// an object is looked up joined with the following path elements
+    /// (literal dotted field names); lists cannot be indexed.
+    fn lookup_flexible(&self, path: &str) -> Result<Result<&Value, String>, EsError> {
+        let (root, segs) = split(path)?;
+        let mut cur = self.root(root);
+        let mut i = 0;
+        while i < segs.len() {
+            cur = match cur {
+                Value::Object(m) => match flexible_step(|k| m.contains_key(k), &segs, i, segs.len()) {
+                    Ok((key, next)) => {
+                        i = next;
+                        m.get(key.as_str()).expect("key found above")
+                    }
+                    Err(missing) => return Ok(Err(missing)),
+                },
+                Value::Array(_) => return Err(ia(format!("path [{path}] is not valid"))),
+                Value::Null => return Ok(Err(segs[i].to_string())),
+                other => return Err(ia(format!("cannot resolve [{}] from object of type [{}] as part of path [{path}]", segs[i], type_name(other)))),
+            };
+        }
+        Ok(Ok(cur))
+    }
+
+    /// [`Self::lookup`] with the classic access pattern (also what mustache
+    /// templates resolve names with, whatever the pipeline's pattern).
+    fn lookup_classic(&self, path: &str) -> Result<Result<&Value, String>, EsError> {
         let (root, segs) = split(path)?;
         let mut cur = self.root(root);
         for s in segs {
@@ -184,6 +240,9 @@ impl IngestDocument {
     }
 
     fn set_inner(&mut self, path: &str, value: Value, append: bool, allow_dup: bool) -> Result<(), EsError> {
+        if super::flexible_access() {
+            return self.set_flexible(path, value, append, allow_dup);
+        }
         let (root, segs) = split(path)?;
         if segs.is_empty() {
             if root == Root::Ingest && value.is_object() && !append {
@@ -245,8 +304,111 @@ impl IngestDocument {
         }
     }
 
+    /// ES `setFieldValue` with the flexible access pattern: missing objects
+    /// are not created; the remaining elements become one dotted key in
+    /// the deepest object that exists.
+    fn set_flexible(&mut self, path: &str, value: Value, append: bool, allow_dup: bool) -> Result<(), EsError> {
+        let (root, segs) = split(path)?;
+        let Some((last, _)) = segs.split_last() else {
+            if root == Root::Ingest && value.is_object() && !append {
+                self.ingest = value;
+                return Ok(());
+            }
+            return Err(ia(format!("cannot set [{path}]")));
+        };
+        let limit = segs.len() - 1;
+        let mut leaf = last.to_string();
+        let mut at_root = true;
+        let mut cur = self.root_mut(root);
+        let mut i = 0;
+        while i < limit {
+            let step = match &*cur {
+                Value::Object(m) => flexible_step(|k| m.contains_key(k), &segs, i, limit),
+                Value::Array(_) => return Err(ia(format!("path [{path}] is not valid"))),
+                Value::Null => return Err(ia(format!("cannot resolve [{}] from null as part of path [{path}]", segs[i]))),
+                other => return Err(ia(format!("cannot resolve [{}] from object of type [{}] as part of path [{path}]", segs[i], type_name(other)))),
+            };
+            match step {
+                Ok((key, next)) => {
+                    cur = cur.as_object_mut().and_then(|m| m.get_mut(&key)).expect("key found above");
+                    at_root = false;
+                    i = next;
+                }
+                Err(combined) => {
+                    leaf = format!("{combined}.{leaf}");
+                    break;
+                }
+            }
+        }
+        match cur {
+            Value::Object(m) => {
+                if root == Root::Ctx && at_root && !append && METADATA_KEYS.contains(&leaf.as_str()) {
+                    validate_meta(&leaf, &value)?;
+                }
+                if append {
+                    match m.get_mut(&leaf) {
+                        Some(existing) => append_values(existing, value, allow_dup),
+                        None => {
+                            let mut l = Value::Array(Vec::new());
+                            append_values(&mut l, value, allow_dup);
+                            m.insert(leaf, l);
+                        }
+                    }
+                } else {
+                    m.insert(leaf, value);
+                }
+                Ok(())
+            }
+            Value::Array(_) => Err(ia(format!("path [{path}] is not valid"))),
+            Value::Null => Err(ia(format!("cannot set [{leaf}] with null parent as part of path [{path}]"))),
+            other => Err(ia(format!("cannot set [{leaf}] with parent object of type [{}] as part of path [{path}]", type_name(other)))),
+        }
+    }
+
+    /// ES `removeField` with the flexible access pattern.
+    fn remove_flexible(&mut self, path: &str) -> Result<Value, EsError> {
+        let (root, segs) = split(path)?;
+        let Some((last, _)) = segs.split_last() else {
+            return Err(ia(format!("cannot remove [{path}]")));
+        };
+        if root == Root::Ctx && segs.len() == 1 && *last == "_version" {
+            return Err(ia("_version cannot be removed".into()));
+        }
+        let limit = segs.len() - 1;
+        let mut leaf = last.to_string();
+        let mut cur = self.root_mut(root);
+        let mut i = 0;
+        while i < limit {
+            let step = match &*cur {
+                Value::Object(m) => flexible_step(|k| m.contains_key(k), &segs, i, limit),
+                Value::Array(_) => return Err(ia(format!("path [{path}] is not valid"))),
+                Value::Null => return Err(ia(format!("field [{}] not present as part of path [{path}]", segs[i]))),
+                other => return Err(ia(format!("cannot resolve [{}] from object of type [{}] as part of path [{path}]", segs[i], type_name(other)))),
+            };
+            match step {
+                Ok((key, next)) => {
+                    cur = cur.as_object_mut().and_then(|m| m.get_mut(&key)).expect("key found above");
+                    i = next;
+                }
+                Err(combined) => {
+                    leaf = format!("{combined}.{leaf}");
+                    break;
+                }
+            }
+        }
+        match cur {
+            Value::Object(m) => m.shift_remove(&leaf).ok_or_else(|| ia(format!("field [{leaf}] not present as part of path [{path}]"))),
+            Value::Array(_) => Err(ia(format!("path [{path}] is not valid"))),
+            Value::Null => Err(ia(format!("cannot remove [{leaf}] from null as part of path [{path}]"))),
+            other => Err(ia(format!("cannot remove [{leaf}] from object of type [{}] as part of path [{path}]", type_name(other)))),
+        }
+    }
+
     /// Remove `path`, returning the old value.
     pub fn remove(&mut self, path: &str) -> Result<Value, EsError> {
+        if super::flexible_access() {
+            return self.remove_flexible(path);
+        }
         let (root, segs) = split(path)?;
         let Some((leaf, parents)) = segs.split_last() else {
             return Err(ia(format!("cannot remove [{path}]")));
@@ -310,7 +472,7 @@ impl IngestDocument {
                 }
             }
         }
-        self.get(name).ok().flatten().cloned()
+        self.lookup_classic(name).ok().and_then(Result::ok).cloned()
     }
 
     fn render_toks(&self, toks: &[Tok], stack: &mut Vec<Value>, media: MediaType, out: &mut String) {

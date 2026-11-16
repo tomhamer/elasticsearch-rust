@@ -46,7 +46,7 @@ mod shutdown;
 mod tests;
 
 pub use commands::{RerouteCommandsResult, RerouteFlags};
-pub use deciders::{restores_snapshot_files, Decision, DecisionType, Single, SNAPSHOT_FILE_RESTORE_ATTR};
+pub use deciders::{lifecycle_routing, restores_snapshot_files, tier_preference, Decision, DecisionType, LifecycleRouting, Single, SNAPSHOT_FILE_RESTORE_ATTR};
 pub use explain::ExplainOptions;
 pub use settings::AllocSettings;
 pub use shutdown::ShardMigrationStatus;
@@ -143,6 +143,9 @@ pub struct StoreCopy {
     pub allocation_id: Option<String>,
     /// Whether the copy was a primary (shard state file); ES prefers these.
     pub primary: bool,
+    /// Why the copy cannot be used (ES `storeException`): its store is
+    /// marked corrupted. Such a copy is never chosen as a primary.
+    pub store_exception: Option<String>,
 }
 
 /// What data nodes hold on disk (ES's async-fetched `NodeGatewayStartedShards`).
@@ -164,7 +167,16 @@ impl ShardStoreInfo {
     pub fn add_copy(&mut self, index: &str, shard: u32, node_id: &str, allocation_id: Option<&str>, primary: bool) {
         let v = self.copies.entry((index.to_string(), shard)).or_default();
         v.retain(|c| c.node_id != node_id);
-        v.push(StoreCopy { node_id: node_id.to_string(), allocation_id: allocation_id.map(String::from), primary });
+        v.push(StoreCopy { node_id: node_id.to_string(), allocation_id: allocation_id.map(String::from), primary, store_exception: None });
+    }
+
+    /// Record that the copy of `index`/`shard` on `node_id` is unusable:
+    /// its store is marked corrupted (`reason`).
+    pub fn add_store_exception(&mut self, index: &str, shard: u32, node_id: &str, allocation_id: Option<&str>, reason: &str) {
+        let v = self.copies.entry((index.to_string(), shard)).or_default();
+        let primary = v.iter().find(|c| c.node_id == node_id).is_some_and(|c| c.primary);
+        v.retain(|c| c.node_id != node_id);
+        v.push(StoreCopy { node_id: node_id.to_string(), allocation_id: allocation_id.map(String::from), primary, store_exception: Some(reason.to_string()) });
     }
 
     pub fn mark_pending(&mut self, index: &str, shard: u32) {
@@ -427,6 +439,15 @@ impl AllocationService {
     /// copy UNASSIGNED / `INDEX_CREATED`, primaries `EMPTY_STORE`, replicas `PEER`.
     pub fn add_index_routing(&self, state: &ClusterState, index: &str, now_millis: i64) -> Result<ClusterState, String> {
         lifecycle::add_routing(state, index, UnassignedReason::IndexCreated, None, now_millis)
+    }
+
+    /// Routing for an imported dangling index (ES
+    /// `LocalAllocateDangledIndices`): primaries recover from the existing
+    /// stores of the index's in-sync copies, reason `DANGLING_INDEX_IMPORTED`.
+    pub fn add_imported_index_routing(&self, state: &ClusterState, index: &str, now_millis: i64) -> Result<ClusterState, String> {
+        // Per shard: the existing stores of its in-sync copies, or empty
+        // when no copy of it was found (the import accepted the data loss).
+        lifecycle::add_routing(state, index, UnassignedReason::DanglingIndexImported, None, now_millis)
     }
 
     /// Routing for an index restored from a snapshot: primaries recover from

@@ -86,6 +86,9 @@ impl BulkItem {
 const META_KEYS: &[&str] = &[
     "_index", "_id", "routing", "version", "version_type", "if_seq_no", "if_primary_term", "pipeline", "require_alias", "require_data_stream",
     "retry_on_conflict", "_source", "dynamic_templates", "dynamic_template_params", "list_executed_pipelines", "op_type",
+    // A reindex's scripted delete (accepted by the engine only on the
+    // reindex's own bulks: `elasticsearch_http::util::REINDEX_BULK_HEADER`).
+    elasticsearch_http::util::REINDEX_VERSION_EQ,
 ];
 
 /// Parse the NDJSON body into items; `None` means "don't split".

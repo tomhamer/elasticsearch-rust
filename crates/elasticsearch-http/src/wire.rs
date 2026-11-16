@@ -30,10 +30,11 @@ pub fn encode(w: Wire, v: &Value) -> Vec<u8> {
             cbor(v, &mut o);
             o
         }
+        // One Smile encoder (the streaming one): the value-token ranges,
+        // BigInteger and name dictionary of the Smile format.
         Wire::Smile => {
-            let mut o = vec![0x3a, 0x29, 0x0a, 0x05];
-            let mut names = Vec::new();
-            smile(v, &mut o, &mut names);
+            let mut o = Vec::new();
+            admitted::encode(Wire::Smile, v, &mut o).expect("encoding into a Vec");
             o
         }
     }
@@ -393,131 +394,6 @@ fn cbor(v: &Value, o: &mut Vec<u8>) {
 // Smile
 // ---------------------------------------------------------------------------
 
-fn smile_vint(mut n: u64, o: &mut Vec<u8>) {
-    let last = (n & 0x3f) as u8 | 0x80;
-    n >>= 6;
-    let mut groups = Vec::new();
-    while n > 0 {
-        groups.push((n & 0x7f) as u8);
-        n >>= 7;
-    }
-    groups.reverse();
-    o.extend(groups);
-    o.push(last);
-}
-
-fn smile_str(s: &str, o: &mut Vec<u8>) {
-    let b = s.as_bytes();
-    if b.is_empty() {
-        o.push(0x20);
-        return;
-    }
-    let ascii = b.is_ascii();
-    if ascii && b.len() <= 32 {
-        o.push(0x40 + (b.len() - 1) as u8);
-        o.extend(b);
-    } else if ascii && b.len() <= 64 {
-        o.push(0x60 + (b.len() - 33) as u8);
-        o.extend(b);
-    } else if !ascii && b.len() <= 33 {
-        o.push(0xc0 + (b.len() - 2) as u8);
-        o.extend(b);
-    } else if !ascii && b.len() <= 65 {
-        o.push(0xe0 + (b.len() - 34) as u8);
-        o.extend(b);
-    } else {
-        o.push(if ascii { 0xe0 } else { 0xe4 });
-        o.extend(b);
-        o.push(0xfc);
-    }
-}
-
-fn smile_name(k: &str, o: &mut Vec<u8>, names: &mut Vec<String>) {
-    if k.is_empty() {
-        o.push(0x20);
-        return;
-    }
-    let b = k.as_bytes();
-    if b.len() <= 64 {
-        if let Some(i) = names.iter().position(|n| n == k) {
-            if i < 64 {
-                o.push(0x40 + i as u8);
-            } else {
-                o.push(0x30 + (i >> 8) as u8);
-                o.push((i & 0xff) as u8);
-            }
-            return;
-        }
-        if names.len() >= 1024 {
-            names.clear();
-        }
-        names.push(k.to_string());
-        if b.is_ascii() {
-            o.push(0x80 + (b.len() - 1) as u8);
-        } else if b.len() >= 2 && b.len() <= 57 {
-            o.push(0xc0 + (b.len() - 2) as u8);
-        } else {
-            o.push(0x34);
-            o.extend(b);
-            o.push(0xfc);
-            return;
-        }
-        o.extend(b);
-    } else {
-        o.push(0x34);
-        o.extend(b);
-        o.push(0xfc);
-    }
-}
-
-fn smile(v: &Value, o: &mut Vec<u8>, names: &mut Vec<String>) {
-    match v {
-        Value::Null => o.push(0x21),
-        Value::Bool(b) => o.push(if *b { 0x23 } else { 0x22 }),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                let z = ((i << 1) ^ (i >> 63)) as u64;
-                if (-16..=15).contains(&i) {
-                    o.push(0xc0 + z as u8);
-                } else if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    o.push(0x24);
-                    smile_vint(z, o);
-                } else {
-                    o.push(0x25);
-                    smile_vint(z, o);
-                }
-            } else if let Some(u) = n.as_u64() {
-                // beyond i64: BigInteger encoding is rare here; fall back to a long's bit pattern
-                o.push(0x25);
-                smile_vint(u, o);
-            } else {
-                let bits = n.as_f64().unwrap_or(0.0).to_bits();
-                o.push(0x29);
-                o.push((bits >> 63) as u8);
-                for shift in (0..9).rev() {
-                    o.push(((bits >> (shift * 7)) & 0x7f) as u8);
-                }
-            }
-        }
-        Value::String(s) => smile_str(s, o),
-        Value::Array(a) => {
-            o.push(0xf8);
-            for x in a {
-                smile(x, o, names);
-            }
-            o.push(0xf9);
-        }
-        Value::Object(m) => {
-            o.push(0xfa);
-            for (k, x) in m {
-                smile_name(k, o, names);
-                smile(x, o, names);
-            }
-            o.push(0xfb);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +442,83 @@ mod tests {
         let v = json!({"a": "x", "n": {"k": 1}, "l": [1, {"p": 1, "q": 2}], "e": [], "9x": null});
         // Jackson quotes YAML 1.1 boolean-ish keys (y/n/on/no/true/null): ES emits `"n":`.
         assert_eq!(yaml(&v), "---\na: \"x\"\n\"n\":\n  k: 1\nl:\n- 1\n- p: 1\n  q: 2\ne: []\n\"9x\": null\n");
+    }
+}
+
+#[cfg(test)]
+mod smile_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn smile(v: &Value) -> Vec<u8> {
+        encode(Wire::Smile, v)
+    }
+
+    fn smile_in(b: &[u8]) -> Vec<u8> {
+        match crate::xcontent_in::decode(crate::xcontent_in::InFmt::Smile, b) {
+            Ok(d) => d.json.to_vec(),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    /// Review finding 317: non-ASCII string values use Smile's Unicode value
+    /// tokens (`0x80` tiny, `0xa0` short, `0xe4` long), never the small-int
+    /// or control ranges, at each size-class boundary; the bytes decode back.
+    #[test]
+    fn unicode_values_use_the_unicode_value_tokens() {
+        let cases: Vec<(String, u8)> = vec![
+            ("é".into(), 0x80),                       // 2 bytes
+            (format!("{}a", "é".repeat(16)), 0x9f),   // 33 bytes
+            ("é".repeat(17), 0xa0),                   // 34 bytes
+            (format!("{}a", "é".repeat(32)), 0xbf),   // 65 bytes
+            ("é".repeat(33), 0xe4),                   // 66 bytes: long
+        ];
+        for (s, token) in cases {
+            let out = smile(&json!([s]));
+            assert_eq!(out[5], token, "{} bytes", s.len());
+            let decoded = smile_in(&out);
+            assert_eq!(serde_json::from_slice::<Value>(&decoded).unwrap(), json!([s]));
+        }
+    }
+
+    /// Review finding 318: integers above `i64::MAX` are Smile BigIntegers
+    /// (`0x26`), exact: they decode to the same values, never signed ones.
+    #[test]
+    fn unsigned_longs_above_i64_are_big_integers() {
+        for u in [9_223_372_036_854_775_808u64, 9_223_372_036_854_775_809, u64::MAX] {
+            let out = smile(&json!([u]));
+            assert_eq!(out[5], 0x26, "{u}");
+            let decoded = smile_in(&out);
+            assert_eq!(std::str::from_utf8(&decoded).unwrap(), format!("[{u}]"));
+        }
+        // A signed long keeps the zigzag long token.
+        assert_eq!(smile(&json!([i64::MIN]))[5], 0x25);
+    }
+
+    /// Review finding 319: a literal field name longer than 64 bytes takes
+    /// a dictionary slot like every other (both directions), so later
+    /// shared references name the right fields.
+    #[test]
+    fn long_field_names_take_a_dictionary_slot() {
+        let long = "l".repeat(70);
+        let v = json!([{long.clone(): 1, "s": 2}, {long.clone(): 3, "s": 4}]);
+        let out = smile(&v);
+        // Second object: both names by shared reference, `s` at index 1.
+        let second = out.iter().rposition(|b| *b == 0xfa).unwrap();
+        assert_eq!(out[second + 1], 0x40, "the long name is entry 0");
+        assert_eq!(out[second + 3], 0x41, "the short name is entry 1");
+        let decoded = smile_in(&out);
+        assert_eq!(serde_json::from_slice::<Value>(&decoded).unwrap(), v);
+        // A conforming writer's stream: long name L, short s, then a shared
+        // reference to L (index 0) and to s (index 1).
+        let mut stream = vec![0x3a, 0x29, 0x0a, 0x01, 0xfa, 0x34];
+        stream.extend(long.as_bytes());
+        stream.extend([0xfc, 0xc2, 0x80, b's', 0xc4, 0xfb, 0xfa, 0x40, 0xc6, 0x41, 0xc8, 0xfb]);
+        let mut stream_arr = vec![0x3a, 0x29, 0x0a, 0x01, 0xf8];
+        stream_arr.extend(&stream[4..]);
+        stream_arr.push(0xf9);
+        let decoded = smile_in(&stream_arr);
+        assert_eq!(serde_json::from_slice::<Value>(&decoded).unwrap(), json!([{long.clone(): 1, "s": 2}, {long: 3, "s": 4}]));
     }
 }
 

@@ -13,6 +13,17 @@ use std::time::Instant;
 
 #[path = "fast.rs"]
 mod fast;
+
+/// Tests: the fast paths' switches ([`fast`] is private to this module).
+#[cfg(test)]
+pub(crate) mod fast_switches {
+    /// Columnar STATS off (`true`), returning the previous setting.
+    pub fn no_columnar(v: bool) -> bool { super::fast::NO_COLUMNAR.with(|c| c.replace(v)) }
+    /// Every fast path off (`true`), returning the previous setting.
+    pub fn disabled(v: bool) -> bool { super::fast::DISABLED.with(|c| c.replace(v)) }
+    /// The streaming threshold, returning the previous one.
+    pub fn residual_min(v: u64) -> u64 { super::fast::RESIDUAL_MIN.with(|c| c.replace(v)) }
+}
 #[path = "sql_pivot.rs"]
 mod sql_pivot_stream;
 
@@ -68,6 +79,9 @@ pub struct EsqlOptions<'a> {
     pub body_settings: super::settings::BodySettings,
     /// The caller's document-/field-level security, stamped on every index read.
     pub restrict: Option<Restrict>,
+    /// The caller's index privileges over every index expression the query
+    /// resolves (`None`: unrestricted).
+    pub authorize: Option<AuthorizeIndices>,
     /// Cluster: where each wanted shard is read ([`super::remote`]).
     pub shards: Option<super::remote::SharedShardSource>,
     /// The response drops all-null columns (`drop_null_columns`): the result
@@ -85,9 +99,81 @@ pub struct EsqlOptions<'a> {
 /// Stamps resolved targets with the caller's DLS/FLS (errors deny the read).
 pub type Restrict = std::sync::Arc<dyn Fn(Vec<crate::search::Target>) -> Result<Vec<crate::search::Target>> + Send + Sync>;
 
+/// An index expression narrowed to what the caller may use.
+#[derive(Debug, Default)]
+pub struct AuthorizedIndices {
+    /// The names the caller may use (wildcards expanded to authorized names).
+    pub names: Vec<String>,
+    /// Explicit names the caller may not use, reported as unknown indices.
+    pub unknown: Vec<String>,
+}
+
+/// The caller's authorization of what a query reads.
+pub trait QueryAuthorizer: Send + Sync {
+    /// An index expression the query names, resolved under the caller's
+    /// privileges as ES's `IndicesAndAliasesResolver` resolves the query's
+    /// indices: wildcards narrowed to authorized names, unauthorized
+    /// explicit names unknown (ES|QL) or dropped (SQL's lenient field caps).
+    /// With `read` the names will be read (a name the caller may resolve
+    /// but not read fails the call with a `security_exception`); without,
+    /// only their mappings are used. `Ok(None)`: the caller is
+    /// unrestricted, the expression stands as is.
+    fn indices(&self, expr: &str, opts: &ResolveOpts, read: bool) -> Result<Option<AuthorizedIndices>>;
+    /// An `ENRICH` lookup through `policy` (ES's enrich lookup service
+    /// requires the caller's `monitor_enrich` cluster privilege).
+    fn enrich(&self, policy: &str) -> Result<()>;
+}
+
+/// See [`QueryAuthorizer`].
+pub type AuthorizeIndices = std::sync::Arc<dyn QueryAuthorizer>;
+
+/// An authorizer whose index expressions are only described (their
+/// mappings read), never read.
+struct MetadataOnly(AuthorizeIndices);
+
+impl QueryAuthorizer for MetadataOnly {
+    fn indices(&self, expr: &str, opts: &ResolveOpts, _read: bool) -> Result<Option<AuthorizedIndices>> {
+        self.0.indices(expr, opts, false)
+    }
+    fn enrich(&self, policy: &str) -> Result<()> {
+        self.0.enrich(policy)
+    }
+}
+
+/// `expr` narrowed to the names the caller may use ([`AuthorizeIndices`]),
+/// or `Err(names)`: the unknown index the caller is told about (the
+/// unauthorized explicit names, else the whole expression when it leaves
+/// no index).
+pub(crate) fn authorized_expr(authorize: Option<&AuthorizeIndices>, expr: &str, opts: &ResolveOpts, read: bool) -> Result<std::result::Result<String, String>> {
+    let Some(authorize) = authorize else { return Ok(Ok(expr.to_string())) };
+    // Remote clusters' parts (`alias:index`) are authorized there, as the
+    // caller (ES: the local cluster checks only its own indices).
+    // Only true remote parts: a selector (`index::data`) or date math with a
+    // `:` names a local index and is authorized here.
+    let (remote, local): (Vec<&str>, Vec<&str>) = expr.split(',').map(str::trim).filter(|p| !p.is_empty()).partition(|p| crate::ccr::remote::is_remote_part(p));
+    if !remote.is_empty() {
+        if local.is_empty() {
+            return Ok(Ok(expr.to_string()));
+        }
+        let local_expr = local.join(",");
+        return Ok(match authorize.indices(&local_expr, opts, read)? {
+            None => Ok(expr.to_string()),
+            Some(r) if !r.unknown.is_empty() => Err(r.unknown.join(",")),
+            Some(r) if r.names.is_empty() => Err(local_expr),
+            Some(r) => Ok(r.names.iter().map(String::as_str).chain(remote).collect::<Vec<_>>().join(",")),
+        });
+    }
+    Ok(match authorize.indices(expr, opts, read)? {
+        None => Ok(expr.to_string()),
+        Some(r) if !r.unknown.is_empty() => Err(r.unknown.join(",")),
+        Some(r) if r.names.is_empty() => Err(expr.to_string()),
+        Some(r) => Ok(r.names.join(",")),
+    })
+}
+
 impl Default for EsqlOptions<'_> {
     fn default() -> Self {
-        EsqlOptions { params: Params::default(), filter: None, default_limit: 1000, max_limit: 10_000, locale: None, body_settings: Default::default(), restrict: None, shards: None, drop_null_columns: false, sparse_nulls: false }
+        EsqlOptions { params: Params::default(), filter: None, default_limit: 1000, max_limit: 10_000, locale: None, body_settings: Default::default(), restrict: None, authorize: None, shards: None, drop_null_columns: false, sparse_nulls: false }
     }
 }
 
@@ -111,6 +197,23 @@ pub struct EsqlResult {
     /// when `table` holds only those with a non-null value (the
     /// `all_columns` / `columns` of the response).
     pub all_columns: Option<Vec<Column>>,
+    /// Cross-cluster queries: the clusters `FROM` read (`_clusters`), in
+    /// the order resolved; empty for a query of this cluster only.
+    pub clusters: Vec<EsqlCluster>,
+}
+
+/// One cluster of a cross-cluster ES|QL query (ES `EsqlExecutionInfo.Cluster`).
+#[derive(Clone, Debug, Default)]
+pub struct EsqlCluster {
+    /// The remote cluster's alias; empty for this cluster (`(local)`).
+    pub alias: String,
+    /// The index expression read there.
+    pub indices: String,
+    /// `successful` or `skipped` (an unavailable `skip_unavailable` remote).
+    pub status: &'static str,
+    pub shards: u64,
+    /// Why the cluster was skipped (`type`, `reason`).
+    pub failure: Option<(String, String)>,
 }
 
 pub struct Ctx<'a> {
@@ -142,6 +245,9 @@ pub struct Ctx<'a> {
     pub ts_done: bool,
     /// Time series dimension columns of the `TS` source.
     pub ts_dims: Vec<String>,
+    /// The `TS` source's `index.time_series.temporality_field` (a
+    /// dimension): series whose value is `delta` hold delta counters.
+    pub ts_temporality: Option<String>,
     /// `_meta` of output columns (`column_metadata`), by column name.
     pub col_meta: std::cell::RefCell<HashMap<String, Value>>,
     /// Views being expanded (cycle detection), and whether any was read.
@@ -151,6 +257,8 @@ pub struct Ctx<'a> {
     pub extra_load: Vec<String>,
     /// The caller's DLS/FLS ([`EsqlOptions::restrict`]).
     pub restrict: Option<Restrict>,
+    /// The caller's index privileges ([`EsqlOptions::authorize`]).
+    pub authorize: Option<AuthorizeIndices>,
     /// Cluster: where each wanted shard is read ([`EsqlOptions::shards`]).
     pub shards: Option<super::remote::SharedShardSource>,
     /// Request-breaker accounting of the query's pages (ES `BlockFactory`):
@@ -164,6 +272,8 @@ pub struct Ctx<'a> {
     pub drop_null_columns: bool,
     /// Every column of a result that dropped its all-null ones.
     pub all_columns: Option<Vec<Column>>,
+    /// The clusters of a cross-cluster `FROM` ([`EsqlResult::clusters`]).
+    pub clusters: std::cell::RefCell<Vec<EsqlCluster>>,
 }
 
 /// The request-breaker label of ES|QL's memory (ES `BlockFactory`).
@@ -219,17 +329,19 @@ pub fn run(node: &Node, query: &str, opts: EsqlOptions) -> Result<EsqlResult> {
         esql: true,
         ts: false,
         ts_done: false,
-        ts_dims: Vec::new(),
+        ts_dims: Vec::new(), ts_temporality: None,
         col_meta: Default::default(),
         view_stack: Vec::new(),
         used_views: false,
         extra_load: Vec::new(),
         restrict: opts.restrict.clone(),
+        authorize: opts.authorize.clone(),
         shards: opts.shards.clone(),
         mem: Default::default(),
         table_bytes: Default::default(),
         drop_null_columns: false,
         all_columns: None,
+        clusters: Default::default(),
     };
     ctx.drop_null_columns = (opts.drop_null_columns || opts.sparse_nulls) && super::approx::enabled(&ctx.settings.approximation).is_none();
     let mut table = run_cmds(&mut ctx, &cmds)?;
@@ -287,6 +399,7 @@ pub fn run(node: &Node, query: &str, opts: EsqlOptions) -> Result<EsqlResult> {
         settings: ctx.settings.clone(),
         col_meta,
         all_columns,
+        clusters: std::mem::take(&mut *ctx.clusters.borrow_mut()),
     })
 }
 
@@ -370,6 +483,39 @@ pub(crate) fn unsupported_err(ctx: &Ctx, name: &str, pos: usize, ty: &str) -> Es
 }
 
 /// The conversion function a `::type` cast stands for.
+/// A SQL CAST / CONVERT from or to TIME or an interval type, bound as ES
+/// converts it (`None`: neither, the ordinary cast applies). A pair ES
+/// cannot convert is its `Cannot cast [FROM] to [TO]` verification error.
+fn sql_time_cast(ctx: &Ctx, a: &Expr, t: &str, cols: &[Column]) -> Result<Option<Expr>> {
+    use super::sqltime as st;
+    let b = bind(ctx, a, cols)?;
+    let from = type_of(&b, cols).unwrap_or_else(|| "null".into());
+    let from = if from == "datetime" { "date".to_string() } else { from };
+    let to = if t == "datetime" || t == "timestamp" { "date" } else { t };
+    let Some(ok) = st::can_convert(&from, to) else { return Ok(None) };
+    if !ok {
+        let at = expr_pos(a).unwrap_or(0);
+        return Err(verification_err(ctx.full, at, format!("Cannot cast [{}] to [{}]", st::type_label(&from), st::type_label(to))));
+    }
+    Ok(Some(if from == to {
+        b
+    } else if from == "time" && !matches!(to, "keyword" | "text") {
+        // TIME to a number or boolean: its millis of the day first.
+        Expr::Cast(Box::new(Expr::Cast(Box::new(b), TIME_MILLIS.into())), t.to_string())
+    } else if st::is_interval(&from) {
+        Expr::Cast(Box::new(b), INTERVAL_TEXT.into())
+    } else {
+        Expr::Cast(Box::new(b), t.to_string())
+    }))
+}
+
+/// Internal casts: a TIME's millis of the day; an interval's SQL text.
+pub(crate) const TIME_MILLIS: &str = "\u{0}time_millis";
+pub(crate) const INTERVAL_TEXT: &str = "\u{0}interval_text";
+/// Internal casts: an interval as a `date_period` / `time_duration` value.
+pub(crate) const PERIOD_VALUE: &str = "\u{0}period_value";
+pub(crate) const DURATION_VALUE: &str = "\u{0}duration_value";
+
 fn cast_fn(ty: &str) -> &'static str {
     match func::cast_type(ty) {
         "long" => "TO_LONG",
@@ -439,6 +585,10 @@ pub fn bind(ctx: &Ctx, e: &Expr, cols: &[Column]) -> Result<Expr> {
             Some(r) => Expr::Call(name.clone(), vec![r?], *p),
             None => Expr::Call(name.clone(), vec![bind(ctx, &args[0], cols)?], *p),
         },
+        // An ES SQL interval literal: already its value.
+        Expr::Cast(a, t) if t.starts_with(super::sqltime::LITERAL_PREFIX) => Expr::Cast(Box::new(bind(ctx, a, cols)?), t.clone()),
+        // ES SQL TIME and INTERVAL_* conversions (`SqlDataTypeConverter`).
+        Expr::Cast(a, t) if !ctx.esql && sql_time_cast(ctx, a, t, cols)?.is_some() => sql_time_cast(ctx, a, t, cols)?.unwrap(),
         Expr::Cast(a, t) => match bind_converted(ctx, cast_fn(t), a, cols) {
             Some(r) => Expr::Cast(Box::new(r?), t.clone()),
             None => {
@@ -467,6 +617,30 @@ pub fn bind(ctx: &Ctx, e: &Expr, cols: &[Column]) -> Result<Expr> {
                     }
                 }
             }
+            // Dense-vector arithmetic works on the vector (ES `Add` & co.
+            // dispatch to coordinate evaluators), never on its coordinates
+            // as an ordinary multivalue (which is null).
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && [&ba, &bb].iter().any(|e| type_of(e, cols).as_deref() == Some("dense_vector")) {
+                let sym = match op { BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*", _ => "/" };
+                let p = expr_pos(a).unwrap_or(0);
+                return Ok(Expr::Call(func::VECTOR_ARITH.into(), vec![Expr::Lit(Val::Str(sym.into())), ba, bb], p));
+            }
+            // ES SQL datetime ± interval (`DateTimeArithmeticOperation`):
+            // the interval as the date period / time duration it is.
+            if !ctx.esql && matches!(op, BinOp::Add | BinOp::Sub) {
+                let (ta, tb) = (type_of(&ba, cols).unwrap_or_default(), type_of(&bb, cols).unwrap_or_default());
+                let value = |e: Expr, t: &str| if super::sqltime::is_interval(t) { Expr::Cast(Box::new(e), if t.contains("year") || t == "interval_month" { PERIOD_VALUE } else { DURATION_VALUE }.into()) } else { e };
+                if super::sqltime::is_interval(&ta) || super::sqltime::is_interval(&tb) {
+                    return Ok(Expr::Bin(*op, Box::new(value(ba, &ta)), Box::new(value(bb, &tb))));
+                }
+            }
+            // `version` / `ip` order by their typed encoding (ES compares
+            // the encoded BytesRef), not by their rendered text.
+            if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                if let Some(ty) = ordered_type(&ba, &bb, cols) {
+                    return Ok(Expr::Bin(*op, Box::new(typed_key_expr(ba, ty)), Box::new(typed_key_expr(bb, ty))));
+                }
+            }
             Expr::Bin(*op, Box::new(ba), Box::new(bb))
         }
         Expr::Neg(a) => Expr::Neg(Box::new(bind(ctx, a, cols)?)),
@@ -474,18 +648,59 @@ pub fn bind(ctx: &Ctx, e: &Expr, cols: &[Column]) -> Result<Expr> {
         Expr::IsNull(a, n) => Expr::IsNull(Box::new(bind(ctx, a, cols)?), *n),
         Expr::In(a, l, n) => Expr::In(Box::new(bind(ctx, a, cols)?), l.iter().map(|x| bind(ctx, x, cols)).collect::<Result<_>>()?, *n),
         Expr::Like(a, p, n, r) => Expr::Like(Box::new(bind(ctx, a, cols)?), p.clone(), *n, *r),
-        Expr::Between(a, b, c, n) => Expr::Between(Box::new(bind(ctx, a, cols)?), Box::new(bind(ctx, b, cols)?), Box::new(bind(ctx, c, cols)?), *n),
+        Expr::Between(a, b, c, n) => {
+            let (ba, bb, bc) = (bind(ctx, a, cols)?, bind(ctx, b, cols)?, bind(ctx, c, cols)?);
+            match ordered_type(&ba, &bb, cols).or_else(|| ordered_type(&ba, &bc, cols)) {
+                Some(ty) => Expr::Between(Box::new(typed_key_expr(ba, ty)), Box::new(typed_key_expr(bb, ty)), Box::new(typed_key_expr(bc, ty)), *n),
+                None => Expr::Between(Box::new(ba), Box::new(bb), Box::new(bc), *n),
+            }
+        }
         Expr::Call(name, args, p) => {
             if ctx.esql {
                 return bind_call(ctx, name, args, *p, cols);
             }
+            let name = &func::sql_alias(name).to_string();
             if !func::known(name) {
                 return Err(verification_err(ctx.full, *p, format!("Unknown function [{}]", name.to_lowercase())));
             }
             if name == "CASE" {
                 record_case_sources(ctx, args, *p, cols);
             }
-            Expr::Call(name.clone(), args.iter().map(|x| bind(ctx, x, cols)).collect::<Result<_>>()?, *p)
+            let bargs: Vec<Expr> = args.iter().map(|x| bind(ctx, x, cols)).collect::<Result<_>>()?;
+            // SQL's own signatures where they differ from ES|QL's
+            // (`DateFormat`, `DateParse`, `DateDiff` of ES SQL): the value
+            // first, MySQL-style format patterns, unit-boundary differences.
+            match (name.as_str(), bargs.as_slice()) {
+                ("DATE_FORMAT", [value, pattern]) => {
+                    let pattern = match pattern {
+                        Expr::Lit(Val::Str(f)) => Expr::Lit(Val::Str(func::mysql_to_java_pattern(f))),
+                        other => Expr::Call(func::MYSQL_PATTERN_FN.into(), vec![other.clone()], *p),
+                    };
+                    return Ok(Expr::Call(name.clone(), vec![pattern, value.clone()], *p));
+                }
+                ("DATE_PARSE", [value, pattern]) => return Ok(Expr::Call(name.clone(), vec![pattern.clone(), value.clone()], *p)),
+                // ES SQL's own semantics where they differ from ES|QL's:
+                // ISNULL(a, b) is COALESCE; GREATEST / LEAST skip nulls;
+                // LOCATE takes the pattern first; REPLACE is literal; CONCAT
+                // reads NULL as ''; LENGTH excludes trailing blanks.
+                ("ISNULL", [a, b]) => return Ok(Expr::Call("COALESCE".into(), vec![a.clone(), b.clone()], *p)),
+                ("GREATEST", _) => return Ok(Expr::Call(func::SQL_GREATEST.into(), bargs, *p)),
+                ("LEAST", _) => return Ok(Expr::Call(func::SQL_LEAST.into(), bargs, *p)),
+                ("LOCATE", [pattern, source, rest @ ..]) => {
+                    let mut args = vec![source.clone(), pattern.clone()];
+                    args.extend(rest.iter().cloned());
+                    return Ok(Expr::Call(name.clone(), args, *p));
+                }
+                ("REPLACE", _) => return Ok(Expr::Call(func::SQL_REPLACE.into(), bargs, *p)),
+                ("CONCAT", _) => return Ok(Expr::Call(func::SQL_CONCAT.into(), bargs, *p)),
+                ("LENGTH", _) => return Ok(Expr::Call(func::SQL_LENGTH.into(), bargs, *p)),
+                // DATETIME_FORMAT / DATETIME_PARSE: Java patterns, value first.
+                ("DATETIME_FORMAT", [value, pattern]) => return Ok(Expr::Call("DATE_FORMAT".into(), vec![pattern.clone(), value.clone()], *p)),
+                ("DATETIME_PARSE", [value, pattern]) => return Ok(Expr::Call("DATE_PARSE".into(), vec![pattern.clone(), value.clone()], *p)),
+                ("DATE_DIFF", [_, _, _]) => return Ok(Expr::Call(func::SQL_DATE_DIFF.into(), bargs, *p)),
+                _ => {}
+            }
+            Expr::Call(name.clone(), bargs, *p)
         }
         other => other.clone(),
     })
@@ -541,6 +756,11 @@ pub fn call_src(src: &str, pos: usize) -> String {
 /// A function's resolution: unknown functions, arity, string-literal
 /// implicit casts and argument types, like ES's analyzer and verifier.
 fn bind_call(ctx: &Ctx, name: &str, args: &[Expr], p: usize, cols: &[Column]) -> Result<Expr> {
+    // Engine-internal functions (a compiled plan's, never user-written).
+    if name.starts_with('\u{0}') {
+        let bargs: Vec<Expr> = args.iter().map(|x| bind(ctx, x, cols)).collect::<Result<_>>()?;
+        return Ok(Expr::Call(name.to_string(), bargs, p));
+    }
     let lower = name.to_ascii_lowercase();
     // `TBUCKET(span)` buckets `@timestamp`.
     if name == "TBUCKET" && !args.is_empty() && args.len() != 2 {
@@ -597,12 +817,37 @@ fn bind_call(ctx: &Ctx, name: &str, args: &[Expr], p: usize, cols: &[Column]) ->
     if matches!(name, "ST_INTERSECTS" | "ST_DISJOINT" | "ST_WITHIN" | "ST_CONTAINS") && bargs.len() == 2 && bargs.iter().any(|a| type_of(a, cols).is_some_and(|t| t == "geo_point" || t == "geo_shape")) {
         bargs.push(Expr::Lit(Val::Str(func::GEO_RELATION.into())));
     }
+    // Geographic envelopes wrap at the dateline (ES `StEnvelope` /
+    // `StXMin`.. with `SpatialEnvelopeVisitor` `WRAP`); Cartesian ones never.
+    if matches!(name, "ST_ENVELOPE" | "ST_XMIN" | "ST_XMAX" | "ST_YMIN" | "ST_YMAX") && bargs.len() == 1 && type_of(&bargs[0], cols).is_some_and(|t| t == "geo_point" || t == "geo_shape") {
+        bargs.push(Expr::Lit(Val::Str(super::func2::GEO_ENVELOPE.into())));
+    }
+    // Cartesian points measure in their own units (ES `StDistance`).
+    if name == "ST_DISTANCE" && bargs.len() == 2 && bargs.iter().any(|a| type_of(a, cols).is_some_and(|t| t == "cartesian_point")) {
+        bargs.push(Expr::Lit(Val::Str(func::CARTESIAN_DISTANCE.into())));
+    }
     if name == "TO_LONG" && bargs.len() == 1 {
         if let Some(cell) = grid_to_long(&bargs[0], cols, p) {
             return Ok(Expr::Cast(Box::new(cell), "long".into()));
         }
     }
     Ok(Expr::Call(name.to_string(), bargs, p))
+}
+
+/// The typed order (`version` / `ip`) an ordering comparison of bound
+/// operands `a` and `b` uses, when either is of such a type.
+fn ordered_type(a: &Expr, b: &Expr, cols: &[Column]) -> Option<&'static str> {
+    [a, b].iter().find_map(|e| match type_of(e, cols).as_deref() {
+        Some("version") => Some("version"),
+        Some("ip") => Some("ip"),
+        _ => None,
+    })
+}
+
+/// `e` wrapped in its [`func::typed_key`] encoding for type `ty`.
+fn typed_key_expr(e: Expr, ty: &str) -> Expr {
+    let p = expr_pos(&e).unwrap_or(0);
+    Expr::Call(func::TYPED_KEY_FN.into(), vec![e, Expr::Lit(Val::Str(ty.into()))], p)
 }
 
 /// A bound `geohash` / `geotile` / `geohex` value read as its long (ES
@@ -623,6 +868,7 @@ fn cast_string_literal(s: &str, target: &str) -> std::result::Result<Expr, Strin
     let num = |s: &str| s.trim().parse::<f64>().ok().filter(|d| d.is_finite() || s.trim().eq_ignore_ascii_case("nan") || s.trim().to_ascii_lowercase().contains("inf"));
     Ok(match target {
         "double" => Expr::Lit(Val::Double(num(s).ok_or_else(|| format!("Cannot parse number [{s}]"))?)),
+        "unsigned_long" if s.trim().parse::<i64>().is_err() && s.trim().parse::<u64>().is_ok() => Expr::Lit(func::unsigned(s.trim().parse::<u64>().unwrap_or_default())),
         "long" | "unsigned_long" => {
             let v = match s.trim().parse::<i64>() {
                 Ok(i) => i,
@@ -1000,7 +1246,20 @@ fn like_match(s:&str,pat:&str,rlike:bool,f:&FnCtx)->Result<bool> {
         }
     }
     let _translation=crate::memory::breakers().reserve_request((pat.len() as u64).saturating_mul(16).saturating_add(256),ESQL_LABEL)?;
-    let re=if rlike {format!("^(?:{pat})$")} else {
+    // RLIKE is a Lucene `RegExp` over the whole value (ES `RLikePattern`),
+    // as its pushed-down `regexp` query: `@`, `#`, `&`, `~`, quoted
+    // literals, and `.` matching any character.
+    let re=if rlike {
+        match crate::query::regexp::lucene_term_pattern(pat) {
+            Ok(t) if rustic_core::automaton::regexp::intersection_operands(&t).is_none()=>format!("(?s)^(?:{t})$"),
+            Ok(t)=>{
+                use rustic_core::automaton::TermMatcher;
+                let dotall:String=t.split('\u{0}').map(|op| if op.is_empty() { String::new() } else { format!("{}(?s:{})", &op[..1], &op[1..]) }).collect::<Vec<_>>().join("\u{0}");
+                return Ok(rustic_core::automaton::regexp::RegexpMatcher::new(&dotall,Default::default()).map(|m|m.matches(s.as_bytes())).unwrap_or(false));
+            }
+            Err(_)=>return Ok(false),
+        }
+    } else {
         let mut re=String::from("^");let mut chars=pat.chars();
         while let Some(ch)=chars.next() {
             match ch {
@@ -1093,7 +1352,16 @@ fn expression_call_bytes(name:&str,args:&[Val])->u64 {
     base.saturating_add(extra)
 }
 
+thread_local! {
+    /// Row evaluations since the last cancellation check (see [`eval_budget`]).
+    static EVALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 fn eval_budget(e: &Expr, row: &[Val], f: &FnCtx, memory:&mut crate::memory::Reservation) -> Result<Val> {
+    // Every 4096 evaluations: a cancelled task stops inside a long command.
+    if EVALS.with(|c| { let n = c.get().wrapping_add(1); c.set(n); n % 4096 == 0 }) {
+        crate::search::check_cancelled()?;
+    }
     Ok(match e {
         Expr::Lit(v) => { memory.grow((v.heap_bytes() as u64).saturating_mul(2).saturating_add(64),ESQL_LABEL)?;v.clone() },
         Expr::Idx(i) => {let value=row.get(*i);memory.grow(value.map_or(0,|v|v.heap_bytes() as u64).saturating_mul(2).saturating_add(64),ESQL_LABEL)?;value.cloned().unwrap_or(Val::Null)},
@@ -1960,6 +2228,9 @@ fn apply_with_tail(ctx: &mut Ctx, cmd: &Cmd, t: Table, tail: &[Cmd]) -> Result<T
 }
 
 fn apply(ctx: &mut Ctx, cmd: &Cmd, t: Table) -> Result<Table> {
+    // A cancelled query task (an async query's DELETE, `_tasks/_cancel`)
+    // stops between commands, as ES's drivers stop between pages.
+    crate::search::check_cancelled()?;
     let out = apply_cmd(ctx, cmd, t)?;
     account_table(ctx, &out)?;
     Ok(out)
@@ -2110,8 +2381,10 @@ fn apply_cmd(ctx: &mut Ctx, cmd: &Cmd, mut t: Table) -> Result<Table> {
         Cmd::Fork(branches) => {
             let mut outs = Vec::new();
             for (k, b) in branches.iter().enumerate() {
+                // ES 9.4+ (GA FORK): a branch has no implicit limit; its own
+                // LIMIT governs, and the response limit applies once, to the
+                // final output (`run_cmds`).
                 let mut bt = exec_pipeline(ctx, b, Some(t.clone()))?;
-                bt.rows.truncate(ctx.default_limit);
                 let n = bt.rows.len();
                 bt.put_col("_fork", "keyword".into(), vec![Val::Str(format!("fork{}", k + 1)); n]);
                 outs.push(bt);
@@ -2233,13 +2506,17 @@ fn sort_table(ctx: &Ctx, t: &mut Table, keys: &[SortKey]) -> Result<()> {
         }
     }
     let versions: Vec<bool> = bound.iter().map(|b| type_of(b, &t.cols).as_deref() == Some("version")).collect();
+    // Addresses sort by their 16 bytes (ES), not their text.
+    let ips: Vec<bool> = bound.iter().map(|b| type_of(b, &t.cols).as_deref() == Some("ip")).collect();
     let mut keyed: Vec<(Vec<Val>, Vec<Val>)> = Vec::with_capacity(t.rows.len());
     // The sort keys sit beside the rows until the sort ends.
     let pages = crate::memory::RequestMemory::new();
     for r in std::mem::take(&mut t.rows) {
         let mut kv = Vec::with_capacity(bound.len());
         for (bi, (b, k)) in bound.iter().zip(keys).enumerate() {
-            kv.push(sort_key_value(eval(b, &r, &ctx.fctx)?, versions[bi], k.desc));
+            let v = eval(b, &r, &ctx.fctx)?;
+            let v = if ips[bi] { func::typed_key(&v, "ip") } else { v };
+            kv.push(sort_key_value(v, versions[bi], k.desc));
         }
         pages.add(row_bytes(&kv), ESQL_LABEL)?;
         keyed.push((kv, r));
@@ -2318,7 +2595,7 @@ struct AggCall {
 }
 
 /// The warning of a long `SUM` that overflowed (the aggregate reads as null).
-fn sum_overflow_warning(f: &FnCtx, pos: usize) {
+pub(super) fn sum_overflow_warning(f: &FnCtx, pos: usize) {
     let loc = warning_location(&f.query, pos);
     let src = call_src(&f.query, pos);
     f.warnings.borrow_mut().register(&loc, &format!("evaluation of [{src}] failed, treating result as null"), "java.lang.ArithmeticException: long overflow");
@@ -2453,6 +2730,11 @@ fn check_agg(ctx: &Ctx, name: &str, uargs: &[Expr], bargs: &mut [Expr], cols: &[
         return Err(super::parsing_err(ctx.full, p, format!("error building [{}]: {m}", typed_name(ctx.full, p, name))));
     }
     check_args(ctx, d, name, uargs, bargs, cols, p)?;
+    // Structured histogram values are not read by this engine: an
+    // aggregation over them is refused, never answered from no values.
+    if let Some(ty) = bargs.first().and_then(|a| type_of(a, cols)).filter(|t| matches!(t.as_str(), "tdigest" | "exponential_histogram")) {
+        return Err(verification_err(ctx.full, p, format!("aggregations over [{ty}] fields are not supported: [{}]", call_src(ctx.full, p))));
+    }
     let srcs = call_arg_sources(ctx.full, p);
     let src = call_src(ctx.full, p);
     let arg_src = |i: usize| -> String { srcs.get(i).map(|(_, t)| t.clone()).unwrap_or_default() };
@@ -2517,6 +2799,8 @@ fn agg_type(call: &AggCall, cols: &[Column]) -> Option<String> {
         "ST_CENTROID_AGG" => if at.as_deref().is_some_and(|t| t.starts_with("cartesian")) { "cartesian_point".into() } else { "geo_point".into() },
         "ST_EXTENT_AGG" => if at.as_deref().is_some_and(|t| t.starts_with("cartesian")) { "cartesian_shape".into() } else { "geo_shape".into() },
         "MIN" | "MAX" if at.as_deref() == Some("aggregate_metric_double") => "double".into(),
+        // TOP(field, limit, order, output): the output column's values.
+        "TOP" if call.args.len() >= 4 => return type_of(&call.args[3], cols).map(|t| if t == "text" { "keyword".into() } else { t }),
         _ => return at.map(|t| if t == "text" { "keyword".into() } else { t }),
     })
 }
@@ -2557,6 +2841,9 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
         let sum = fold(|a| a.sum, |x, y| x + y);
         let count: Option<i64> = amds.iter().filter_map(|a| a.count).reduce(|x, y| x + y);
         return Ok(match call.name.as_str() {
+            // Presence of a (non-null) metric value.
+            "PRESENT" => Val::Bool(!amds.is_empty()),
+            "ABSENT" => Val::Bool(amds.is_empty()),
             "MIN" => fold(|a| a.min, f64::min).map(Val::Double).unwrap_or(Val::Null),
             "MAX" => fold(|a| a.max, f64::max).map(Val::Double).unwrap_or(Val::Null),
             "SUM" => sum.map(Val::Double).unwrap_or(Val::Null),
@@ -2589,6 +2876,51 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
             _ => Val::Null,
         });
     }
+    // A dense vector is one value (ES `DenseVectorCount`), not one per
+    // coordinate.
+    if call.name == "COUNT" && type_of(first, cols).as_deref() == Some("dense_vector") {
+        let mut n = 0i64;
+        for r in &rows {
+            if !eval(first, r, f)?.is_null() {
+                n += 1;
+            }
+        }
+        return Ok(Val::Long(n));
+    }
+    // TOP(field, limit, order, output): the output values of the rows
+    // with the top ordering values (ES `TopXxxYyyAggregator`).
+    if call.name == "TOP" && call.args.len() >= 4 {
+        let n = constant(1)?.as_i64().unwrap_or(1).max(0) as usize;
+        let desc = constant(2)?.as_str().map(|o| o.eq_ignore_ascii_case("desc")).unwrap_or(false);
+        let ty = type_of(first, cols);
+        let mut pairs: Vec<(Val, Val)> = Vec::new();
+        for r in &rows {
+            let out = eval(&call.args[3], r, f)?;
+            match eval(first, r, f)? {
+                Val::Null => {}
+                Val::Multi(m) => pairs.extend(m.into_iter().filter(|x| !x.is_null()).map(|k| (k, out.clone()))),
+                k => pairs.push((k, out)),
+            }
+        }
+        let key = |v: &Val| match ty.as_deref() {
+            Some(t @ ("version" | "ip")) => func::typed_key(v, t),
+            _ => v.clone(),
+        };
+        pairs.sort_by(|a, b| cmp_vals(&key(&a.0), &key(&b.0)));
+        if desc {
+            pairs.reverse();
+        }
+        pairs.truncate(n);
+        let mut out: Vec<Val> = Vec::new();
+        for (_, o) in pairs {
+            match o {
+                Val::Null => {}
+                Val::Multi(m) => out.extend(m),
+                o => out.push(o),
+            }
+        }
+        return Ok(Val::from_list(out));
+    }
     let mut vals: Vec<Val> = Vec::new();
     if call.name != "WEIGHTED_AVG" {
         for r in &rows {
@@ -2600,6 +2932,11 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
         }
     }
     let nums = |vals: &[Val]| -> Vec<f64> { vals.iter().filter_map(Val::as_f64).collect() };
+    let typed_order: Option<&str> = match type_of(first, cols).as_deref() {
+        Some("version") => Some("version"),
+        Some("ip") => Some("ip"),
+        _ => None,
+    };
     Ok(match call.name.as_str() {
         "COUNT" => Val::Long(vals.len() as i64),
         "PRESENT" => Val::Bool(!vals.is_empty()),
@@ -2648,6 +2985,14 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
                 Val::Double(super::partial::Kahan::sum(n.iter().copied()) / n.len() as f64)
             }
         }
+        // `version` / `ip`: by their typed order (ES `MinIpAggregator`
+        // compares the 16-byte addresses), not their text.
+        "MIN" | "MAX" if typed_order.is_some() => {
+            let ty = typed_order.unwrap_or_default();
+            let it = vals.into_iter();
+            let cmp = |a: &Val, b: &Val| cmp_vals(&func::typed_key(a, ty), &func::typed_key(b, ty));
+            (if call.name == "MIN" { it.min_by(cmp) } else { it.max_by(cmp) }).unwrap_or(Val::Null)
+        }
         "MIN" => vals.into_iter().min_by(cmp_vals).unwrap_or(Val::Null),
         "MAX" => vals.into_iter().max_by(cmp_vals).unwrap_or(Val::Null),
         "MEDIAN" => func::percentile(nums(&vals), 50.0).map(Val::Double).unwrap_or(Val::Null),
@@ -2674,7 +3019,10 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
         "TOP" => {
             let n = constant(1)?.as_i64().unwrap_or(1).max(0) as usize;
             let desc = constant(2)?.as_str().map(|o| o.eq_ignore_ascii_case("desc")).unwrap_or(false);
-            vals.sort_by(cmp_vals);
+            match typed_order {
+                Some(ty) => vals.sort_by(|a, b| cmp_vals(&func::typed_key(a, ty), &func::typed_key(b, ty))),
+                None => vals.sort_by(cmp_vals),
+            }
             if desc {
                 vals.reverse();
             }
@@ -2688,13 +3036,21 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
         }
         "FIRST" | "LAST" => {
             let mut best: Option<(Val, Val)> = None;
+            // A value whose ordering is null: kept when no ordered value
+            // exists (ES picks a value of the group, never drops it).
+            let mut unordered: Option<Val> = None;
             for r in &rows {
                 let v = eval(first, r, f)?;
+                // SQL `FIRST(field)` / `LAST(field)`: ordered by the field itself.
                 let k = match call.args.get(1) {
                     Some(e) => eval(e, r, f)?,
-                    None => Val::Null,
+                    None => v.clone(),
                 };
-                if v.is_null() || k.is_null() {
+                if v.is_null() {
+                    continue;
+                }
+                if k.is_null() {
+                    unordered.get_or_insert(v);
                     continue;
                 }
                 let better = match &best {
@@ -2708,9 +3064,29 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
                     best = Some((v, k));
                 }
             }
-            best.map(|(v, _)| v).unwrap_or(Val::Null)
+            best.map(|(v, _)| v).or(unordered).unwrap_or(Val::Null)
         }
         "WEIGHTED_AVG" => {
+            // ES `WeightedAvg.surrogate`: a constant weight makes it
+            // SUM(field) / COUNT(field), over every value of multivalued
+            // fields (the weight cancels out).
+            if let Some(Expr::Lit(w)) = call.args.get(1) {
+                if w.is_null() {
+                    return Ok(Val::Null);
+                }
+                if w.as_f64().is_some_and(|w| w != 0.0) {
+                    let (mut s, mut n) = (0.0, 0u64);
+                    for r in &rows {
+                        for x in eval(first, r, f)?.values() {
+                            if let Some(x) = x.as_f64() {
+                                s += x;
+                                n += 1;
+                            }
+                        }
+                    }
+                    return Ok(if n == 0 { Val::Null } else { Val::Double(s / n as f64) });
+                }
+            }
             let (mut sw, mut s) = (0.0, 0.0);
             for r in &rows {
                 let v = eval(first, r, f)?;
@@ -2723,6 +3099,70 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
                 }
             }
             if sw == 0.0 { Val::Null } else { Val::Double(s / sw) }
+        }
+        // Shapes (and points in a shape column): every geometry counts,
+        // as ES's shape aggregators fold each doc's shape doc value — the
+        // centroid weighted by the highest dimension present (points by
+        // count, lines by length, polygons by area), the extent of every
+        // part (geo: dateline-aware, on the Lucene grid).
+        "ST_CENTROID_AGG" | "ST_EXTENT_AGG" if matches!(call.args.first().and_then(|a| type_of(a, cols)).as_deref(), Some("geo_shape" | "cartesian_shape")) => {
+            use rustic_core::fieldtypes::shape::{CentroidCalc, ShapeCentroid, ShapeDim, ShapeExtent};
+            let geo = call.args.first().and_then(|a| type_of(a, cols)).as_deref() == Some("geo_shape");
+            let shapes: Vec<rustic_core::fieldtypes::shape::Geometry> = vals.iter().filter_map(|v| v.as_str()).filter_map(super::spatial::geometry).collect();
+            if shapes.is_empty() {
+                return Ok(Val::Null);
+            }
+            if call.name == "ST_CENTROID_AGG" {
+                // `ShapeCentroidState.add`: weighted sums of the highest dimension.
+                let (mut sx, mut sy, mut sw, mut dim) = (0.0f64, 0.0f64, 0.0f64, ShapeDim::Point);
+                let mut any = false;
+                for g in &shapes {
+                    let (x, y, d, w) = if geo {
+                        match ShapeCentroid::of_geometry(g) {
+                            Some(c) => (c.lon_deg(), c.lat_deg(), c.dim, c.weight),
+                            None => continue,
+                        }
+                    } else {
+                        let mut c = CentroidCalc::default();
+                        c.add(g);
+                        (c.x(), c.y(), c.dim(), c.sum_weight())
+                    };
+                    if !x.is_finite() || !y.is_finite() || !(w > 0.0) {
+                        continue;
+                    }
+                    if !any || d > dim {
+                        (sx, sy, sw, dim) = (x * w, y * w, w, d);
+                        any = true;
+                    } else if d == dim {
+                        sx += x * w;
+                        sy += y * w;
+                        sw += w;
+                    }
+                }
+                if sw > 0.0 { Val::Str(super::spatial::point_wkt(sx / sw, sy / sw)) } else { Val::Null }
+            } else if geo {
+                let mut ext: Option<ShapeExtent> = None;
+                for g in &shapes {
+                    if let Some(e) = ShapeExtent::of_geometry(&rustic_core::fieldtypes::shape::normalize_geo(g)) {
+                        ext = Some(match ext {
+                            Some(mut x) => {
+                                x.merge(&e);
+                                x
+                            }
+                            None => e,
+                        });
+                    }
+                }
+                match ext {
+                    Some(e) => fast::shape_extent_wkt(&e),
+                    None => Val::Null,
+                }
+            } else {
+                match shapes.iter().filter_map(|g| g.bbox()).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))) {
+                    Some((min_x, min_y, max_x, max_y)) => Val::Str(super::spatial::to_wkt(&rustic_core::fieldtypes::shape::Geometry::Envelope { min_x, max_x, max_y, min_y })),
+                    None => Val::Null,
+                }
+            }
         }
         "ST_CENTROID_AGG" | "ST_EXTENT_AGG" => {
             let geo = call.args.first().and_then(|a| type_of(a, cols)).as_deref() == Some("geo_point");
@@ -2747,6 +3187,51 @@ fn compute_agg(ctx: &Ctx, call: &AggCall, rows: &[&Vec<Val>], cols: &[Column]) -
         }
         other => return Err(EsError::new(400, "verification_exception", format!("Found 1 problem\nUnknown aggregate function [{}]", other.to_lowercase()))),
     })
+}
+
+/// One row's values of a grouping key: a multi-valued key puts the row in
+/// one group per distinct value (repeated values count it once, as ES's
+/// block hash does), in first-occurrence order.
+pub(super) fn distinct_group_values(v: Val) -> Vec<Val> {
+    match v {
+        Val::Multi(m) => {
+            let mut seen: HashSet<String> = HashSet::with_capacity(m.len());
+            m.into_iter().filter(|x| seen.insert(x.key())).collect()
+        }
+        v => vec![v],
+    }
+}
+
+/// How many combinations [`for_each_combo`] enumerates (saturating).
+pub(super) fn combo_count(opts: &[Vec<Val>]) -> u64 {
+    opts.iter().fold(1u64, |n, o| n.saturating_mul(o.len() as u64))
+}
+
+/// Calls `f` with every combination of one value per key (the later keys
+/// varying fastest), one at a time: the combinations are never all held.
+pub(super) fn for_each_combo<E>(opts: &[Vec<Val>], mut f: impl FnMut(&[Val]) -> std::result::Result<(), E>) -> std::result::Result<(), E> {
+    if opts.iter().any(Vec::is_empty) {
+        return Ok(());
+    }
+    let mut at = vec![0usize; opts.len()];
+    let mut cur: Vec<Val> = opts.iter().map(|o| o[0].clone()).collect();
+    loop {
+        f(&cur)?;
+        let mut k = opts.len();
+        loop {
+            if k == 0 {
+                return Ok(());
+            }
+            k -= 1;
+            at[k] += 1;
+            if at[k] < opts[k].len() {
+                cur[k] = opts[k][at[k]].clone();
+                break;
+            }
+            at[k] = 0;
+            cur[k] = opts[k][0].clone();
+        }
+    }
 }
 
 fn stats(ctx: &Ctx, t: Table, aggs: &[Field], by: &[Field], inline: bool, pos: usize) -> Result<Table> {
@@ -2807,40 +3292,27 @@ fn stats(ctx: &Ctx, t: Table, aggs: &[Field], by: &[Field], inline: bool, pos: u
         }
     } else {
         for (ri, r) in t.rows.iter().enumerate() {
-            let mut combos: Vec<Vec<Val>> = vec![vec![]];
-            for g in &group_exprs {
-                let v = eval(g, r, &ctx.fctx)?;
-                let opts: Vec<Val> = match v {
-                    Val::Multi(m) => m,
-                    v => vec![v],
-                };
-                let mut next = Vec::new();
-                for c in &combos {
-                    for o in &opts {
-                        let mut c2 = c.clone();
-                        c2.push(o.clone());
-                        next.push(c2);
-                    }
-                }
-                combos = next;
-            }
-            for c in combos {
+            let opts: Vec<Vec<Val>> = group_exprs.iter().map(|g| eval(g, r, &ctx.fctx).map(distinct_group_values)).collect::<Result<_>>()?;
+            // The row joins one group per combination: its memberships are
+            // admitted before any combination is enumerated.
+            grouping.add(combo_count(&opts).saturating_mul(8), ESQL_LABEL)?;
+            for_each_combo(&opts, |c| -> Result<()> {
                 let k: Vec<String> = c.iter().map(Val::key).collect();
                 let gi = match index.get(&k) {
                     Some(gi) => *gi,
                     None => {
-                        grouping.add(2 * row_bytes(&c) + k.iter().map(|s| 24 + s.capacity() as u64).sum::<u64>() + 64, ESQL_LABEL)?;
-                        order.push((c.clone(), Vec::new()));
+                        grouping.add(2 * row_bytes(c) + k.iter().map(|s| 24 + s.capacity() as u64).sum::<u64>() + 64, ESQL_LABEL)?;
+                        order.push((c.to_vec(), Vec::new()));
                         index.insert(k, order.len() - 1);
                         order.len() - 1
                     }
                 };
-                grouping.add(8, ESQL_LABEL)?;
                 order[gi].1.push(ri);
                 if row_group[ri].is_none() {
                     row_group[ri] = Some(gi);
                 }
-            }
+                Ok(())
+            })?;
         }
     }
     let _ = pos;
@@ -2887,11 +3359,23 @@ fn stats(ctx: &Ctx, t: Table, aggs: &[Field], by: &[Field], inline: bool, pos: u
         let vals: Vec<Val> = row_group.iter().map(|g| g.map(|g| out_rows[g][k].clone()).unwrap_or(Val::Null)).collect();
         res.put_col(&c.name, c.ty.clone(), vals);
     }
-    for g in &group_cols {
-        if let Some(i) = res.idx(&g.name) {
-            let vals: Vec<Val> = res.rows.iter().map(|r| r[i].clone()).collect();
-            let ty = res.cols[i].ty.clone();
-            res.put_col(&g.name, ty, vals);
+    // Each grouping column holds the row's group key: a grouping
+    // expression (`BY b = BUCKET(x, 10)`, a new or reused name) is
+    // materialized with its own type and shadows a column of that name. A
+    // plain reference to a column of the same name keeps that column's
+    // values (multivalues included), moved to the end.
+    for (gi, (g, field)) in group_cols.iter().zip(by).enumerate() {
+        let same_column = matches!(&field.expr, Expr::Col(n, _) if *n == g.name);
+        match res.idx(&g.name) {
+            Some(i) if same_column => {
+                let vals: Vec<Val> = res.rows.iter().map(|r| r[i].clone()).collect();
+                let ty = res.cols[i].ty.clone();
+                res.put_col(&g.name, ty, vals);
+            }
+            _ => {
+                let vals: Vec<Val> = row_group.iter().map(|rg| rg.and_then(|rg| order[rg].0.get(gi).cloned()).unwrap_or(Val::Null)).collect();
+                res.put_col(&g.name, g.ty.clone(), vals);
+            }
         }
     }
     Ok(res)
@@ -2948,7 +3432,8 @@ fn from_union(ctx: &mut Ctx, indices: &[String], metadata: &[String], pos: usize
             let resolves = ctx.node.is_some_and(|node| {
                 let mut o = ResolveOpts::from_params(&HashMap::new());
                 o.allow_no_indices = true;
-                node.resolve(p, o).map(|t| !t.is_empty()).unwrap_or(false)
+                // (indices the caller may not see do not count)
+                authorized_expr(ctx.authorize.as_ref(), p, &o, false).ok().and_then(|r| r.ok()).is_some_and(|p| node.resolve(&p, o).map(|t| !t.is_empty()).unwrap_or(false))
             });
             if resolves || matched.is_empty() {
                 others.push(p.clone());
@@ -3152,12 +3637,19 @@ fn dissect(ctx: &Ctx, t: &mut Table, field: &Expr, pattern: &str, sep: &str, pos
     let mut cols: Vec<Vec<Val>> = vec![Vec::with_capacity(t.rows.len()); names.len()];
     for r in &t.rows {
         let v = eval(&b, r, &ctx.fctx)?;
-        let res = match v {
-            Val::Str(s) => dissect_one(&s, &prefix, &keys, sep),
-            _ => None,
-        };
-        for (i, n) in names.iter().enumerate() {
-            cols[i].push(res.as_ref().and_then(|m| m.get(n).cloned()).map(Val::Str).unwrap_or(Val::Null));
+        // Every input value is parsed; each key collects its values.
+        let mut vals: Vec<Vec<Val>> = vec![Vec::new(); names.len()];
+        for s in text_values(&v) {
+            if let Some(m) = dissect_one(&s, &prefix, &keys, sep) {
+                for (i, n) in names.iter().enumerate() {
+                    if let Some(x) = m.get(n) {
+                        vals[i].push(Val::Str(x.clone()));
+                    }
+                }
+            }
+        }
+        for (i, v) in vals.into_iter().enumerate() {
+            cols[i].push(Val::from_list(v));
         }
     }
     for (n, vals) in names.iter().zip(cols) {
@@ -3203,6 +3695,7 @@ fn dissect_one(s: &str, prefix: &str, keys: &[DissectKey], sep: &str) -> Option<
     Some(out)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn grok_base(name: &str) -> Option<&'static str> {
     Some(match name {
         "USERNAME" | "USER" => r"[a-zA-Z0-9._-]+",
@@ -3254,10 +3747,12 @@ fn grok_base(name: &str) -> Option<&'static str> {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn grok_push(out:&mut String,text:&str,memory:&mut crate::memory::Reservation)->Result<()> {
     memory.grow((text.len() as u64).saturating_mul(2).saturating_add(64),ESQL_LABEL)?;
     out.push_str(text);Ok(())
 }
+#[cfg_attr(not(test), allow(dead_code))]
 fn grok_compile(ctx: &Ctx, pattern: &str, pos: usize, caps: &mut Vec<(String, String)>, depth: usize,memory:&mut crate::memory::Reservation) -> Result<String> {
     if depth > 20 {
         return Err(verification_err(ctx.full, pos, "grok pattern recursion too deep"));
@@ -3289,58 +3784,59 @@ fn grok_compile(ctx: &Ctx, pattern: &str, pos: usize, caps: &mut Vec<(String, St
     Ok(out)
 }
 
+/// The values of an input column a GROK / DISSECT parses: each string of
+/// a (multi)value (ES processes every input value).
+fn text_values(v: &Val) -> Vec<String> {
+    match v {
+        Val::Str(s) => vec![s.clone()],
+        Val::Multi(m) => m.iter().filter_map(|x| match x { Val::Str(s) => Some(s.clone()), _ => None }).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn grok(ctx: &Ctx, t: &mut Table, field: &Expr, pattern: &str, pos: usize) -> Result<()> {
     let mut memory=crate::memory::breakers().reserve_request(0,ESQL_LABEL)?;
-    let mut caps = Vec::new();
-    let re_src = grok_compile(ctx, pattern, pos, &mut caps, 0,&mut memory)?;
-    let re = super::regex_memory::Program::compile_detailed(&re_src)?.map_err(|e| verification_err(ctx.full, pos, format!("Invalid GROK pattern [{pattern}]: {e}")))?;
+    // ES|QL GROK uses Elasticsearch's full ECS grok pattern bank, nested
+    // captures included (ES `Grok` / `GrokBuiltinPatterns.ecsV1Patterns`).
+    memory.grow((pattern.len() as u64).saturating_mul(64).saturating_add(64 << 10),ESQL_LABEL)?;
+    let g = crate::ingest::grok::Grok::compile_es(pattern, crate::ingest::grok::bank_es(true))
+        .map_err(|e| verification_err(ctx.full, pos, format!("Invalid GROK pattern [{pattern}]: {}", e.reason)))?;
+    let names = g.esql_fields();
     let b = bind(ctx, field, &t.cols)?;
-    let mut names: Vec<(String, String)> = Vec::new();
-    for (n, ty) in &caps {
-        if !names.iter().any(|(x, _)| x == n) {
-            memory.grow((n.len() as u64).saturating_add(ty.len() as u64).saturating_mul(2).saturating_add(256),ESQL_LABEL)?;
-            names.push((n.clone(), ty.clone()));
-        }
-    }
     memory.grow((names.len() as u64).saturating_mul(t.rows.len() as u64).saturating_mul(128).saturating_add((names.len() as u64).saturating_mul(128)),ESQL_LABEL)?;
     let mut cols: Vec<Vec<Val>> = vec![Vec::with_capacity(t.rows.len()); names.len()];
     for r in &t.rows {
-        let mut input_memory=crate::memory::breakers().reserve_request((caps.len() as u64).saturating_mul(128),ESQL_LABEL)?;
+        let mut input_memory=crate::memory::breakers().reserve_request((names.len() as u64).saturating_mul(128),ESQL_LABEL)?;
         let v = eval_reserved(&b, r, &ctx.fctx,&mut input_memory)?;
-        let m = match &v {
-            Val::Str(s) => Some(re.captures(s)?),
-            _ => None,
-        };
-        for (i, (n, ty)) in names.iter().enumerate() {
-            let mut vals = Vec::new();
-            if let Some(m) = &m {
-                for (k, (cn, _)) in caps.iter().enumerate() {
-                    if cn == n {
-                        if let Some(s) = m.named(match &v{Val::Str(s)=>s,_=>""},&format!("g{k}")) {
-                            memory.grow((s.len() as u64).saturating_mul(2).saturating_add(128),ESQL_LABEL)?;
-                            vals.push(match ty.as_str() {
-                                "int" => s.parse::<i64>().map(Val::Int).unwrap_or(Val::Null),
-                                "long" => s.parse::<i64>().map(Val::Long).unwrap_or(Val::Null),
-                                "float" | "double" => s.parse::<f64>().map(Val::Double).unwrap_or(Val::Null),
-                                "boolean" => Val::Bool(s.eq_ignore_ascii_case("true")),
-                                _ => Val::Str(s.to_string()),
-                            });
-                        }
-                    }
+        let mut vals: Vec<Vec<Val>> = vec![Vec::new(); names.len()];
+        for s in text_values(&v) {
+            // A typed capture that does not parse is no value.
+            let Ok(Some(m)) = g.captures_checked(&s) else { continue };
+            for (i, (n, _)) in names.iter().enumerate() {
+                let found: Vec<&serde_json::Value> = match m.get(n) {
+                    Some(serde_json::Value::Array(a)) => a.iter().collect(),
+                    Some(x) => vec![x],
+                    None => Vec::new(),
+                };
+                for x in found {
+                    memory.grow((x.to_string().len() as u64).saturating_mul(2).saturating_add(128),ESQL_LABEL)?;
+                    vals[i].push(match (names[i].1, x) {
+                        ("integer", serde_json::Value::Number(n)) => n.as_i64().map(Val::Int).unwrap_or(Val::Null),
+                        ("long", serde_json::Value::Number(n)) => n.as_i64().map(Val::Long).unwrap_or(Val::Null),
+                        ("double", serde_json::Value::Number(n)) => n.as_f64().map(Val::Double).unwrap_or(Val::Null),
+                        (_, serde_json::Value::Bool(b)) => Val::Bool(*b),
+                        (_, serde_json::Value::String(s)) => Val::Str(s.clone()),
+                        _ => Val::Null,
+                    });
                 }
             }
-            cols[i].push(Val::from_list(vals));
+        }
+        for (i, v) in vals.into_iter().enumerate() {
+            cols[i].push(Val::from_list(v));
         }
     }
     for ((n, ty), vals) in names.iter().zip(cols) {
-        let t2 = match ty.as_str() {
-            "int" => "integer",
-            "long" => "long",
-            "float" | "double" => "double",
-            "boolean" => "boolean",
-            _ => "keyword",
-        };
-        t.put_col(n, t2.into(), vals);
+        t.put_col(n, (*ty).into(), vals);
     }
     account_table(ctx,t)?;
     Ok(())
@@ -3407,11 +3903,14 @@ struct ColSrc {
     ordered: Vec<String>,
     /// `pattern_text`'s `template_id` sub-field: computed from the message.
     template_id: bool,
+    /// The mapping's `null_value`: an explicit `null` in `_source` reads as
+    /// it (what the field indexed).
+    null_value: Option<Value>,
 }
 
 impl ColSrc {
     fn plain(path: &str, ty: &str) -> ColSrc {
-        ColSrc { path: path.to_string(), ty: ty.to_string(), declared: ty.to_string(), date_fmt: None, ignore_above: None, normalizer: None, constants: HashMap::new(), scaling_factor: 1.0, doc_values: true, types: Vec::new(), per_index: HashMap::new(), dimension: false, ordered: Vec::new(), template_id: false }
+        ColSrc { path: path.to_string(), ty: ty.to_string(), declared: ty.to_string(), date_fmt: None, ignore_above: None, normalizer: None, constants: HashMap::new(), scaling_factor: 1.0, doc_values: true, types: Vec::new(), per_index: HashMap::new(), dimension: false, ordered: Vec::new(), template_id: false, null_value: None }
     }
 
     fn of(path: String, ty: &str, f: &crate::mapping::ResolvedField) -> ColSrc {
@@ -3430,6 +3929,7 @@ impl ColSrc {
             dimension: f.time_series_dimension,
             ordered: Vec::new(),
             template_id: false,
+            null_value: f.null_value.clone(),
         }
     }
 
@@ -3458,6 +3958,7 @@ impl ColSrc {
             dimension: self.dimension,
             ordered: self.ordered.clone(),
             template_id: self.template_id,
+            null_value: self.null_value.clone(),
         }
     }
 }
@@ -3467,35 +3968,60 @@ fn round_stored(d: f64, c: &ColSrc) -> f64 {
     match c.declared.as_str() {
         "float" => d as f32 as f64,
         "half_float" => crate::values::to_half_float(d),
-        "scaled_float" if c.scaling_factor > 0.0 => (d * c.scaling_factor).round() / c.scaling_factor,
+        // The mapper's saturated Java `Math.round` encoding.
+        "scaled_float" if c.scaling_factor > 0.0 => rustic_core::fieldtypes::numeric::scaled_round_trip(d, c.scaling_factor),
         _ => d,
     }
+}
+
+/// `f` (truncated) within `[lo, hi]`.
+fn in_range(f: f64, lo: f64, hi: f64) -> bool {
+    f.is_finite() && f.trunc() >= lo && f.trunc() <= hi
 }
 
 fn conv(v: &Value, c: &ColSrc) -> Option<Val> {
     Some(match c.ty.as_str() {
         "unsigned_long" => match v {
-            Value::Number(n) => match n.as_i64() {
-                Some(i) => Val::Long(i),
-                // Beyond i64: kept as an (exactly printed) double.
-                None => Val::Double(n.as_f64()?),
+            // Exact over the whole u64 range (`ULong` beyond i64).
+            Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => Val::Long(i),
+                (None, Some(u)) => Val::ULong(u),
+                _ => func::unsigned_from_f64(n.as_f64()?)?,
             },
-            Value::String(s) => match s.trim().parse::<i64>() {
-                Ok(i) => Val::Long(i),
-                Err(_) => Val::Double(s.trim().parse::<f64>().ok()?),
-            },
+            Value::String(s) => {
+                let t = s.trim();
+                match (t.parse::<i64>(), t.parse::<u64>()) {
+                    (Ok(i), _) => Val::Long(i),
+                    (_, Ok(u)) => Val::ULong(u),
+                    _ => func::unsigned_from_f64(t.parse::<f64>().ok()?)?,
+                }
+            }
             _ => return None,
         },
+        // Integers read exactly (as indexing parses them); only a value
+        // with a fraction goes through a double, truncated. A value out of
+        // the mapped type's range was not indexed (ignore_malformed): none.
         "long" | "counter_long" => match v {
-            Value::Number(n) => Val::Long(n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))?),
-            Value::String(s) => Val::Long(s.trim().parse::<f64>().ok()? as i64),
+            Value::Number(n) => Val::Long(n.as_i64().or_else(|| n.as_f64().filter(|f| in_range(*f, i64::MIN as f64, i64::MAX as f64)).map(|f| f as i64))?),
+            Value::String(s) => Val::Long(s.trim().parse::<i64>().ok().or_else(|| s.trim().parse::<f64>().ok().filter(|f| in_range(*f, i64::MIN as f64, i64::MAX as f64)).map(|f| f as i64))?),
             _ => return None,
         },
-        "integer" | "counter_integer" => match v {
-            Value::Number(n) => Val::Int(n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))?),
-            Value::String(s) => Val::Int(s.trim().parse::<f64>().ok()? as i64),
-            _ => return None,
-        },
+        "integer" | "counter_integer" => {
+            let (lo, hi) = match c.declared.as_str() {
+                "byte" => (i8::MIN as i64, i8::MAX as i64),
+                "short" => (i16::MIN as i64, i16::MAX as i64),
+                _ => (i32::MIN as i64, i32::MAX as i64),
+            };
+            let n = match v {
+                Value::Number(n) => n.as_i64().or_else(|| n.as_f64().filter(|f| f.is_finite()).map(|f| f.trunc() as i64)),
+                Value::String(s) => s.trim().parse::<i64>().ok().or_else(|| s.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| f.trunc() as i64)),
+                _ => None,
+            }?;
+            if n < lo || n > hi {
+                return None;
+            }
+            Val::Int(n)
+        }
         "double" | "counter_double" => match v {
             Value::Number(n) => Val::Double(round_stored(n.as_f64()?, c)),
             Value::String(s) => Val::Double(round_stored(s.trim().parse().ok()?, c)),
@@ -3531,7 +4057,25 @@ fn conv(v: &Value, c: &ColSrc) -> Option<Val> {
             Value::String(s) if s == "false" || s.is_empty() => Val::Bool(false),
             _ => return None,
         },
-        "date" | "date_nanos" => match v {
+        // A millisecond `date` field under a `date`/`date_nanos` union
+        // column: the field's own (millisecond) parse, widened.
+        "date_nanos" if c.declared == "date" => {
+            let ms = match v {
+                Value::String(s) => match &c.date_fmt {
+                    Some(f) => f.parse(s).ok()?,
+                    None => func::parse_date_str(s)?,
+                },
+                Value::Number(n) => match &c.date_fmt {
+                    Some(f) if f.accepts_numbers() => f.parse_number(n.as_f64()?).ok()?,
+                    _ => n.as_f64()? as i64,
+                },
+                _ => return None,
+            };
+            Val::Nanos(rustic_core::fieldtypes::numeric::nanos_from_millis(ms, 0).ok()?)
+        }
+        // Nanosecond resolution, as the field indexes it.
+        "date_nanos" => Val::Nanos(func::source_nanos(v, c.date_fmt.as_ref())?),
+        "date" => match v {
             Value::String(s) => match &c.date_fmt {
                 Some(f) => Val::Date(f.parse(s).ok()?),
                 None => Val::Date(func::parse_date_str(s)?),
@@ -3564,6 +4108,25 @@ fn conv(v: &Value, c: &ColSrc) -> Option<Val> {
     })
 }
 
+/// Whether `a` reads its documents exactly as `b` does (path and every
+/// mapping property extraction applies).
+fn same_reader(a: &ColSrc, b: &ColSrc) -> bool {
+    let normalizer = match (&a.normalizer, &b.normalizer) {
+        (None, None) => true,
+        (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+        _ => false,
+    };
+    a.path == b.path
+        && a.ty == b.ty
+        && a.declared == b.declared
+        && a.date_fmt == b.date_fmt
+        && a.ignore_above == b.ignore_above
+        && a.scaling_factor == b.scaling_factor
+        && a.doc_values == b.doc_values
+        && a.template_id == b.template_id
+        && normalizer
+}
+
 fn extract(src: &Value, c: &ColSrc, index: &str) -> Val {
     if let Some(cv) = c.constants.get(index) {
         return conv(cv, c.per_index.get(index).unwrap_or(c)).unwrap_or(Val::Null);
@@ -3592,6 +4155,15 @@ fn extract_ordered(src: &Value, c: &ColSrc, in_order: bool) -> Val {
     // the top level or inside an array of points, as the geo_point mapper
     // parses it (`[{"lat": .., "lon": ..}, [x, y]]` is two points).
     let vals = if c.ty == "geo_point" || c.ty == "cartesian_point" { point_source_values(src, &c.path) } else { crate::highlight::source_values(src, &c.path) };
+    // An explicit `null` indexed the mapping's `null_value`: read it.
+    if let Some(nv) = &c.null_value {
+        let nulls = null_source_values(src, &c.path);
+        if nulls > 0 {
+            let mut vals = vals;
+            vals.extend(std::iter::repeat_n(nv, nulls));
+            return extract_values(vals, c, in_order);
+        }
+    }
     extract_values(vals, c, in_order)
 }
 
@@ -3626,6 +4198,30 @@ fn extract_values(vals: Vec<&Value>, c: &ColSrc, in_order: bool) -> Val {
         }
     }
     Val::from_list(out)
+}
+
+/// How many explicit `null`s the `_source` holds for `path` (the value, or
+/// members of its arrays), as `source_values` walks dotted keys.
+fn null_source_values(src: &Value, path: &str) -> usize {
+    fn leaf(v: &Value) -> usize {
+        match v {
+            Value::Null => 1,
+            Value::Array(a) => a.iter().map(leaf).sum(),
+            _ => 0,
+        }
+    }
+    fn walk(v: &Value, parts: &[&str]) -> usize {
+        if parts.is_empty() {
+            return leaf(v);
+        }
+        match v {
+            Value::Object(m) => (1..=parts.len()).rev().filter_map(|i| m.get(&parts[..i].join(".")).map(|c| walk(c, &parts[i..]))).sum(),
+            Value::Array(a) => a.iter().map(|x| walk(x, parts)).sum(),
+            _ => 0,
+        }
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    walk(src, &parts)
 }
 
 /// The `_source` values of a point field at `path`: like
@@ -3703,8 +4299,21 @@ fn resolve_schema(ctx: &Ctx, indices: &[String], pos: usize) -> Result<IndexSche
     let expr = indices.join(",");
     let mut opts = ResolveOpts::from_params(&HashMap::new());
     opts.allow_no_indices = true;
-    // FROM accepts cross-cluster expressions: plan the remote parts.
-    let targets = match crate::ccr::remote::resolve_local_part(node, &expr, opts).map(|(targets, _)| targets) {
+    // Only the names the caller may read (ES resolves FROM under the
+    // caller's privileges): none is an unknown index.
+    let authorized = match authorized_expr(ctx.authorize.as_ref(), &expr, &opts, true)? {
+        Ok(authorized) => authorized,
+        Err(unknown) => return Err(verification_err(ctx.full, pos, format!("Unknown index [{unknown}]"))),
+    };
+    // FROM accepts cross-cluster expressions: the remote parts of connected
+    // clusters are read there (`ShardSource::remote_targets`: their
+    // schemas, then fetches routed to each remote cluster).
+    let resolved = crate::ccr::remote::resolve_parts(node, &authorized, opts);
+    let (remote_parts, skipped): (Vec<(String, Vec<String>)>, Vec<crate::ccr::remote::SkippedRemote>) = match &resolved {
+        Ok((_, Some(plan))) => (plan.remote.clone(), plan.skipped.clone()),
+        _ => (Vec::new(), Vec::new()),
+    };
+    let targets = match resolved.map(|(targets, _)| targets) {
         Ok(t) => t,
         // A list with a missing concrete index is the plain index_not_found 404; a single pattern is a verification error.
         Err(e) if e.kind == "index_not_found_exception" && indices.len() == 1 => {
@@ -3712,6 +4321,45 @@ fn resolve_schema(ctx: &Ctx, indices: &[String], pos: usize) -> Result<IndexSche
         }
         Err(e) => return Err(e),
     };
+    let mut remote_targets: Vec<crate::search::Target> = Vec::new();
+    if !remote_parts.is_empty() || !skipped.is_empty() {
+        let source = ctx.shards.as_ref();
+        if source.is_none() && !remote_parts.is_empty() {
+            let named: Vec<String> = remote_parts.iter().flat_map(|(a, i)| i.iter().map(move |i| format!("{a}:{i}"))).collect();
+            return Err(EsError::illegal_argument(format!("Cross-cluster calls are not supported in this context but remote indices were requested: [{}]", named.join(", "))));
+        }
+        // `_clusters`: this cluster's part, then each remote's.
+        let local_expr: Vec<&str> = expr.split(',').map(str::trim).filter(|p| !p.is_empty() && !crate::ccr::remote::is_remote_part(p)).collect();
+        let mut clusters = ctx.clusters.borrow_mut();
+        let mut record = |alias: &str, indices: String, shards: u64, failure: Option<(String, String)>| {
+            if let Some(c) = clusters.iter_mut().find(|c| c.alias == alias) {
+                c.shards += shards;
+                return;
+            }
+            let status = if failure.is_some() { "skipped" } else { "successful" };
+            clusters.push(EsqlCluster { alias: alias.to_string(), indices, status, shards, failure });
+        };
+        if !local_expr.is_empty() {
+            record("", local_expr.join(","), targets.iter().map(|t| t.svc.number_of_shards() as u64).sum(), None);
+        }
+        // Unavailable `skip_unavailable` remotes the plan already skipped.
+        for sk in &skipped {
+            record(&sk.alias, sk.indices.clone(), 0, Some((sk.error_type.clone(), sk.reason.clone())));
+        }
+        for (alias, indices) in &remote_parts {
+            let Some(source) = source else { break };
+            let shells = source.remote_targets(alias, indices)?;
+            // An unavailable `skip_unavailable` remote contributes no target.
+            let failure = (shells.is_empty() && crate::ccr::remote::connected(node, alias) == 0).then(|| {
+                let e = crate::ccr::remote::connection_error(node, alias);
+                (e.kind, e.reason)
+            });
+            record(alias, indices.join(","), shells.iter().map(|t| t.svc.number_of_shards() as u64).sum(), failure);
+            remote_targets.extend(shells);
+        }
+    }
+    let mut targets = targets;
+    targets.extend(remote_targets);
     if targets.is_empty() {
         return Err(verification_err(ctx.full, pos, format!("Unknown index [{expr}]")));
     }
@@ -3722,11 +4370,30 @@ fn resolve_schema(ctx: &Ctx, indices: &[String], pos: usize) -> Result<IndexSche
         }
         None => (targets, None),
     };
-    // Document- and field-level security: every read honours the target's access.
-    let targets = match &ctx.restrict {
+    // Document- and field-level security: every read honours the target's
+    // access (a remote cluster's target: that cluster's, where it is read).
+    let (remote_shells, targets): (Vec<crate::search::Target>, Vec<crate::search::Target>) = targets.into_iter().partition(|t| t.remote_index.is_some());
+    let mut targets = match &ctx.restrict {
         Some(r) => r(targets)?,
         None => targets,
     };
+    let load = ctx.settings.unmapped == super::settings::Unmapped::Load;
+    // The columns are a function of the targets' mappings (and index
+    // modes): reused while every target keeps the same field lookup,
+    // which a mapping change replaces. Field-level security narrows a
+    // target's fields per caller: never cached.
+    // (SQL request runtime fields add per-request columns: not cached.)
+    let sql_runtime_columns = !ctx.esql && sql_runtime().is_some();
+    // A remote cluster's shell targets carry that cluster's mapping per
+    // request: never cached.
+    let key = (!sql_runtime_columns && remote_shells.is_empty() && targets.iter().all(|t| t.field_access().is_none())).then(|| SchemaKey {
+        targets: targets.iter().map(|t| (t.svc.uuid.clone(), t.svc.lookup(), t.svc.setting("index.mode"))).collect(),
+        load,
+    });
+    targets.extend(remote_shells);
+    if let Some(cols) = key.as_ref().and_then(schema_cache_get) {
+        return Ok(IndexSchema { cols, targets, slots, projection: None });
+    }
     let mut map: BTreeMap<String, ColSrc> = BTreeMap::new();
     // Names that are objects (or flattened sub-paths) in some index.
     let mut objects: HashSet<String> = HashSet::new();
@@ -3815,7 +4482,6 @@ fn resolve_schema(ctx: &Ctx, indices: &[String], pos: usize) -> Result<IndexSche
             }
         }
     }
-    let load = ctx.settings.unmapped == super::settings::Unmapped::Load;
     let all_idx: Vec<String> = {
         let mut v: Vec<String> = targets.iter().map(|t| t.svc.name.clone()).collect();
         v.sort();
@@ -3851,13 +4517,85 @@ fn resolve_schema(ctx: &Ctx, indices: &[String], pos: usize) -> Result<IndexSche
         if labels == ["date_nanos", "datetime"] {
             c.ty = "date_nanos".into();
             keep_per_index = true;
+            // The millisecond indices' values widen to nanoseconds
+            // (`conv` of a `date_nanos` column declared `date`), so both
+            // legs group, compare and render as one type.
+            for pc in c.per_index.values_mut() {
+                if pc.ty == "date" {
+                    pc.ty = "date_nanos".into();
+                }
+            }
         }
-        // Single-mapping columns read through the merged source.
-        if c.types.len() < 2 && c.ty != "unsupported" && !keep_per_index {
+        // Single-mapping columns read through the merged source, unless an
+        // index reads the column differently (an alias to another path, its
+        // own date format, normalizer, scaling factor, ignore_above or
+        // doc-values reading): equal type labels are not equal mappings, so
+        // each index's documents keep their own reader.
+        if c.types.len() < 2 && c.ty != "unsupported" && !keep_per_index && c.per_index.values().all(|pc| same_reader(pc, c)) {
             c.per_index.clear();
         }
     }
-    Ok(IndexSchema { cols: map.into_iter().collect(), targets, slots, projection: None })
+    // SQL request runtime fields: columns of their own type (a same-name
+    // mapped field is overridden), read from what the search computes.
+    if !ctx.esql {
+        if let Some(rt) = sql_runtime() {
+            for (name, def) in rt.as_object().into_iter().flatten() {
+                let ty = runtime_column_type(def["type"].as_str().unwrap_or("keyword"));
+                let mut c = ColSrc::plain(name, ty);
+                c.doc_values = false;
+                if ty == "date" {
+                    c.date_fmt = crate::date::DateFormatter::new("strict_date_optional_time||epoch_millis").ok();
+                }
+                map.insert(name.clone(), c);
+            }
+        }
+    }
+    let cols: Vec<(String, ColSrc)> = map.into_iter().collect();
+    if let Some(key) = key {
+        schema_cache_put(key, &cols);
+    }
+    Ok(IndexSchema { cols, targets, slots, projection: None })
+}
+
+/// What [`resolve_schema`]'s columns depend on: each target (in order) by
+/// index uuid, its field lookup (the very `Arc`: a mapping change installs
+/// a new one) and `index.mode`, and `unmapped_fields=load`.
+struct SchemaKey {
+    targets: Vec<(String, std::sync::Arc<crate::mapping::FieldLookup>, Option<String>)>,
+    load: bool,
+}
+
+impl SchemaKey {
+    fn same(&self, other: &SchemaKey) -> bool {
+        self.load == other.load
+            && self.targets.len() == other.targets.len()
+            && self.targets.iter().zip(&other.targets).all(|(a, b)| a.0 == b.0 && std::sync::Arc::ptr_eq(&a.1, &b.1) && a.2 == b.2)
+    }
+}
+
+/// Recently resolved schemas (most recent last). The entries hold their
+/// lookups, so a replaced lookup's address is never reused by another
+/// while it can still be compared.
+static SCHEMA_CACHE: std::sync::LazyLock<parking_lot::Mutex<Vec<(SchemaKey, std::sync::Arc<Vec<(String, ColSrc)>>)>>> = std::sync::LazyLock::new(Default::default);
+const SCHEMA_CACHE_ENTRIES: usize = 32;
+
+fn schema_cache_get(key: &SchemaKey) -> Option<Vec<(String, ColSrc)>> {
+    let mut cache = SCHEMA_CACHE.lock();
+    let i = cache.iter().position(|(k, _)| k.same(key))?;
+    let entry = cache.remove(i);
+    let cols = entry.1.clone();
+    cache.push(entry);
+    drop(cache);
+    Some((*cols).clone())
+}
+
+fn schema_cache_put(key: SchemaKey, cols: &[(String, ColSrc)]) {
+    let mut cache = SCHEMA_CACHE.lock();
+    cache.retain(|(k, _)| !k.same(&key));
+    if cache.len() >= SCHEMA_CACHE_ENTRIES {
+        cache.remove(0);
+    }
+    cache.push((key, std::sync::Arc::new(cols.to_vec())));
 }
 
 /// Index columns a query can read, or `None` when any column may reach the
@@ -3975,12 +4713,147 @@ fn probe_fulltext(e: &Expr, types: &HashMap<String, String>, probes: &mut Vec<Va
 
 /// The search `FROM` runs (without `size`): the pushed-down query and sort,
 /// reading the `_source` paths of the needed columns.
+thread_local! {
+    /// The SQL request's `runtime_mappings` while it runs ([`with_sql_runtime`]).
+    static SQL_RUNTIME: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with SQL request-level `runtime_mappings` in force: they add (or
+/// override, by name) columns of every index the query reads, computed by
+/// the search for each document (ES SQL `runtime_mappings`).
+pub fn with_sql_runtime<T>(rt: Option<&Value>, f: impl FnOnce() -> T) -> T {
+    let rt = rt.filter(|v| v.as_object().is_some_and(|o| !o.is_empty())).cloned();
+    let prev = SQL_RUNTIME.with(|c| c.replace(rt));
+    struct Restore(Option<Option<Value>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                SQL_RUNTIME.with(|c| *c.borrow_mut() = p);
+            }
+        }
+    }
+    let _restore = Restore(Some(prev));
+    f()
+}
+
+/// The SQL runtime mappings in force (`None`: none).
+pub fn sql_runtime() -> Option<Value> {
+    SQL_RUNTIME.with(|c| c.borrow().clone())
+}
+
+/// Names of the SQL runtime fields in force.
+fn sql_runtime_names() -> Vec<String> {
+    sql_runtime().and_then(|v| v.as_object().map(|o| o.keys().cloned().collect())).unwrap_or_default()
+}
+
+/// The ES|QL column type of a runtime field type.
+fn runtime_column_type(ty: &str) -> &'static str {
+    match ty {
+        "long" => "long",
+        "double" => "double",
+        "date" => "date",
+        "boolean" => "boolean",
+        "ip" => "ip",
+        "geo_point" => "geo_point",
+        _ => "keyword",
+    }
+}
+
+/// Field types whose doc values `docvalue_fields` returns as the values a
+/// source would hold.
+fn doc_value_readable(ty: &str) -> bool {
+    matches!(
+        ty,
+        "date" | "date_nanos" | "keyword" | "ip" | "boolean" | "long" | "integer" | "short" | "byte" | "double" | "float" | "half_float" | "scaled_float" | "unsigned_long"
+    )
+}
+
+/// Columns whose values a target's mapping-level `_source` filter
+/// (`includes` / `excludes`) keeps out of the stored source although they
+/// are indexed with doc values, as `(column, path)`: ES reads such columns
+/// from doc values (its block loaders do not depend on `_source`), so they
+/// are read with `docvalue_fields` and the columnar shortcuts, which read
+/// the stored source, are not used. Fields under field-level security keep
+/// the source read.
+fn source_pruned_columns(schema: &IndexSchema) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for t in &schema.targets {
+        if t.field_access().is_some() {
+            continue;
+        }
+        let Some(filter) = t.svc.mapping_source() else { continue };
+        let list = |k: &str| -> Vec<String> { filter[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default() };
+        let (includes, excludes) = (list("includes"), list("excludes"));
+        if includes.is_empty() && excludes.is_empty() {
+            continue;
+        }
+        let lookup = t.svc.lookup();
+        for (name, c) in &schema.cols {
+            let c = c.per_index.get(&t.svc.name).unwrap_or(c);
+            if out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let mut probe = serde_json::Map::new();
+            put_dotted(&mut probe, &c.path, json!(0));
+            let kept = crate::search::filter_source(&Value::Object(probe), &includes, &excludes);
+            if !crate::highlight::source_values(&kept, &c.path).is_empty() {
+                continue;
+            }
+            let Some(f) = lookup.get(&c.path) else { continue };
+            if f.doc_values && doc_value_readable(f.declared.name()) {
+                out.push((name.clone(), c.path.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Insert `v` at dotted `path` (nested objects).
+fn put_dotted(doc: &mut serde_json::Map<String, Value>, path: &str, v: Value) {
+    let mut parts = path.split('.').peekable();
+    let mut cur = doc;
+    while let Some(k) = parts.next() {
+        if parts.peek().is_none() {
+            cur.insert(k.to_string(), v);
+            return;
+        }
+        let e = cur.entry(k.to_string()).or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !e.is_object() {
+            *e = Value::Object(serde_json::Map::new());
+        }
+        cur = e.as_object_mut().expect("object");
+    }
+}
+
+/// A hit's `_source` with the doc-value-read columns (`pruned`) put back
+/// from its `fields`.
+fn with_doc_values(h: &Value, pruned: &[(String, String)]) -> Value {
+    let mut src = match h.get("_source") {
+        Some(Value::Object(o)) => o.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (_, path) in pruned {
+        let Some(vals) = h["fields"][path.as_str()].as_array().filter(|a| !a.is_empty()) else { continue };
+        let v = if vals.len() == 1 { vals[0].clone() } else { Value::Array(vals.clone()) };
+        put_dotted(&mut src, path, v);
+    }
+    Value::Object(src)
+}
+
+/// The `format` of a pushed-down date bound: epoch millis for a number;
+/// none for ISO text (the field's own parse, which keeps nanoseconds).
+fn date_literal_format(v: &Value) -> Option<&'static str> {
+    if v.is_string() { None } else { Some("epoch_millis") }
+}
+
 fn search_body(schema: &IndexSchema, metadata: &[String], needed: &Option<HashSet<String>>, query: &Value, sort: Vec<Value>) -> Value {
     let source = match needed {
-        Some(n) if n.is_empty() && !metadata.iter().any(|m| m == "_source") => json!(false),
+        Some(n) if n.is_empty() && !metadata.iter().any(|m| m == "_source" || m == "_tsid") => json!(false),
         // Columns read their source path (aliases and multi-fields read another field).
         Some(n) if !metadata.iter().any(|m| m == "_source") => {
-            let mut paths: Vec<String> = schema.cols.iter().filter(|(name, _)| n.contains(name)).flat_map(|(_, c)| std::iter::once(c.path.clone()).chain(c.per_index.values().map(|p| p.path.clone()))).collect();
+            // `_tsid` metadata is computed from every dimension.
+            let tsid = metadata.iter().any(|m| m == "_tsid");
+            let mut paths: Vec<String> = schema.cols.iter().filter(|(name, c)| n.contains(name) || (tsid && c.dimension)).flat_map(|(_, c)| std::iter::once(c.path.clone()).chain(c.per_index.values().map(|p| p.path.clone()))).collect();
             paths.sort();
             paths.dedup();
             json!(paths)
@@ -3997,7 +4870,51 @@ fn search_body(schema: &IndexSchema, metadata: &[String], needed: &Option<HashSe
     if metadata.iter().any(|m| m == "_version") {
         body["version"] = json!(true);
     }
+    let pruned = source_pruned_columns(schema);
+    if !pruned.is_empty() {
+        let mut paths: Vec<&str> = pruned.iter().filter(|(n, _)| needed.as_ref().is_none_or(|set| set.contains(n))).map(|(_, p)| p.as_str()).collect();
+        paths.sort();
+        paths.dedup();
+        if !paths.is_empty() {
+            body["docvalue_fields"] = json!(paths);
+        }
+    }
+    // SQL runtime fields: computed by the search, returned under `fields`.
+    if let Some(rt) = sql_runtime() {
+        let names: Vec<String> = rt.as_object().map(|o| o.keys().filter(|n| needed.as_ref().is_none_or(|set| set.contains(*n))).cloned().collect()).unwrap_or_default();
+        body["runtime_mappings"] = rt;
+        if !names.is_empty() {
+            body["fields"] = json!(names);
+        }
+    }
     body
+}
+
+/// A hit's `_source` with each SQL runtime field (`names`) replaced by the
+/// value the search computed for it (none: the field is absent).
+fn with_runtime_fields(src: &Value, h: &Value, names: &[String]) -> Value {
+    let mut out = match src {
+        Value::Object(o) => o.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for n in names {
+        // A same-name mapped value is overridden, never kept.
+        let mut parts: Vec<&str> = n.split('.').collect();
+        let last = parts.pop().unwrap_or_default();
+        let mut cur = Some(&mut out);
+        for p in parts {
+            cur = cur.and_then(|m| m.get_mut(p)).and_then(Value::as_object_mut);
+        }
+        if let Some(m) = cur {
+            m.remove(last);
+        }
+        out.remove(n.as_str());
+        if let Some(vals) = h["fields"][n.as_str()].as_array().filter(|a| !a.is_empty()) {
+            let v = if vals.len() == 1 { vals[0].clone() } else { Value::Array(vals.clone()) };
+            put_dotted(&mut out, n, v);
+        }
+    }
+    Value::Object(out)
 }
 
 /// The index and metadata columns `FROM` loads.
@@ -4079,7 +4996,7 @@ fn agg_plan(ctx: &Ctx, schema: &IndexSchema, indices: &[String], cmd: &Cmd) -> O
 /// the plan's columns (`srcs`, in `plan.types` order), grouped.
 fn shard_partial(node: &Node, t: &crate::search::Target, query: &Value, body: &Value, plan: &super::partial::AggPlan, srcs: &[&ColSrc]) -> Result<super::remote::ShardResult> {
     let targets = std::slice::from_ref(t);
-    let count = crate::search::count(targets, Some(query), None)?;
+    let count = crate::esql::remote::checked_count(targets, Some(query), None)?;
     // Only `COUNT(*)`s without groups: the match count is the whole state
     // (no document is read).
     if plan.by.is_empty() && plan.aggs.iter().all(|a| a.kind == super::partial::AggKind::Count && a.col.is_none()) {
@@ -4303,6 +5220,14 @@ fn distributed_stats(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], q
     Ok(Some(out))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook run right after a load's row search (review finding 543:
+    /// a refresh landing there must not change what the rows' full-text
+    /// predicates say).
+    static AFTER_ROW_SEARCH: std::cell::RefCell<Option<Box<dyn Fn()>>> = std::cell::RefCell::new(None);
+}
+
 fn load(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], query: Value, sort: Vec<Value>, size: Option<usize>, probes: &[Value]) -> Result<Table> {
     let node = ctx.node.ok_or_else(|| EsError::internal("no node"))?;
     let mut cols = source_cols(schema, metadata);
@@ -4310,7 +5235,7 @@ fn load(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], query: Value, 
     // source in batches so each compressed store chunk is decoded once, and
     // avoid building/serializing/parsing a full search-hit JSON response.
     // Keep sorted/limited searches and remote slots on their existing planner.
-    if !ctx.esql && !ctx.ts && metadata.is_empty() && probes.is_empty()
+    if !ctx.esql && !ctx.ts && metadata.is_empty() && probes.is_empty() && sql_runtime().is_none()
         && schema.slots.is_none() && sort.is_empty() && size.is_none()
     {
         if let Some(needed) = needed_columns(ctx.full, schema) {
@@ -4368,7 +5293,7 @@ fn load(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], query: Value, 
         hits = merged.hits;
         probe_sets = merged.probes;
     } else {
-        let count = crate::search::count(&schema.targets, Some(&query), None)? as usize;
+        let count = crate::esql::remote::checked_count(&schema.targets, Some(&query), None)? as usize;
         let total = match size {
             Some(n) => n.min(count),
             None => count,
@@ -4377,9 +5302,15 @@ fn load(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], query: Value, 
             needed = if ctx.ts { None } else { needed_columns(ctx.full, schema) };
             let mut body = search_body(schema, metadata, &needed, &query, sort);
             body["size"] = json!(total);
-            hits = super::remote::search_hits(node, &schema.targets, &body)?;
-            // Documents matching each full-text probe, as (index, id).
-            probe_sets = probes.iter().map(|pq| super::remote::probe_set(node, &schema.targets, pq, &query).map(|ids| ids.into_iter().collect())).collect::<Result<_>>()?;
+            // Each hit carries its full-text probe matches (`__probes`),
+            // evaluated in the same search as the row itself.
+            super::remote::with_probes(&mut body, probes);
+            let mut found = super::remote::search_hits(node, &schema.targets, &body)?;
+            super::remote::annotate_probes(&mut found, probes.len());
+            #[cfg(test)]
+            AFTER_ROW_SEARCH.with(|h| if let Some(h) = h.borrow().as_ref() { h() });
+            hits = found;
+            probe_sets = Vec::new();
         } else {
             needed = None;
             hits = Vec::new();
@@ -4393,17 +5324,24 @@ fn load(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], query: Value, 
     let mut retained=0u64;
     {
         ctx.documents_found += hits.len() as u64;
+        let pruned = source_pruned_columns(schema);
+        let runtime_names = sql_runtime_names();
         for h in hits {
             let scratch=crate::memory::json_bytes(&h).saturating_mul(256).saturating_add((cols.len() as u64).saturating_mul(128)).saturating_add(schema.cols.iter().flat_map(|(_,column)|column.constants.values()).map(crate::memory::json_bytes).fold(0u64,u64::saturating_add).saturating_mul(256));
             loading.grow(scratch,ESQL_LABEL)?;
             let src = &h["_source"];
+            // Columns the source filter pruned: from their doc values (the
+            // `_source` metadata column stays the stored, filtered source).
+            let filled = (!pruned.is_empty()).then(|| with_doc_values(&h, &pruned));
+            let filled = if runtime_names.is_empty() { filled } else { Some(with_runtime_fields(filled.as_ref().unwrap_or(src), &h, &runtime_names)) };
+            let col_src = filled.as_ref().unwrap_or(src);
             let mut row: Vec<Val> = Vec::with_capacity(cols.len());
             for (n, c) in &schema.cols {
                 if needed.as_ref().is_some_and(|set| !set.contains(n)) {
                     row.push(Val::Null);
                     continue;
                 }
-                let v = extract(src, c, h["_index"].as_str().unwrap_or(""));
+                let v = extract(col_src, c, h["_index"].as_str().unwrap_or(""));
                 if !v.is_null() {
                     ctx.values_loaded += 1;
                 }
@@ -4430,14 +5368,15 @@ fn load(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], query: Value, 
                         if modes.get(ix).map(String::as_str) != Some("time_series") {
                             Val::Null
                         } else {
+                            // Each dimension length-prefixed (name and
+                            // value), so no value can mimic a separator: two
+                            // distinct dimension tuples never encode alike.
                             let mut key = String::new();
                             for (n, c) in &tsid_dims {
                                 let v = extract(src, c, ix);
                                 if !v.is_null() {
-                                    key.push_str(n);
-                                    key.push('=');
-                                    key.push_str(&v.to_text());
-                                    key.push('\u{1}');
+                                    let text = v.to_text();
+                                    key.push_str(&format!("{}:{n}{}:{text}", n.len(), text.len()));
                                 }
                             }
                             Val::Str(super::types::tsid_encode(&key))
@@ -4446,9 +5385,16 @@ fn load(ctx: &mut Ctx, schema: &IndexSchema, metadata: &[String], query: Value, 
                     other => h[other].as_str().map(|s| Val::Str(s.to_string())).unwrap_or(Val::Null),
                 });
             }
-            if !probe_sets.is_empty() {
-                let key = (h["_index"].as_str().unwrap_or("").to_string(), h["_id"].as_str().unwrap_or("").to_string());
-                row.extend(probe_sets.iter().map(|set| Val::Bool(set.contains(&key))));
+            if !probes.is_empty() {
+                match h["__probes"].as_array() {
+                    Some(flags) => row.extend((0..probes.len()).map(|k| Val::Bool(flags.get(k).and_then(Value::as_bool).unwrap_or(false)))),
+                    // A node of an earlier version sends the matching
+                    // documents per probe instead.
+                    None => {
+                        let key = (h["_index"].as_str().unwrap_or("").to_string(), h["_id"].as_str().unwrap_or("").to_string());
+                        row.extend((0..probes.len()).map(|k| Val::Bool(probe_sets.get(k).is_some_and(|set| set.contains(&key)))));
+                    }
+                }
             }
             if ctx.ts {
                 let mut m = serde_json::Map::new();
@@ -4493,6 +5439,9 @@ fn lit_json(v: &Val, ty: &str) -> Option<Value> {
     match (v, ty) {
         (Val::Null | Val::Multi(_) | Val::Dur(_) | Val::Period(..), _) => None,
         (Val::Date(d), t) if t.starts_with("date") => Some(json!(d)),
+        (Val::Nanos(n), "date_nanos") => Some(json!(super::fmt_date_nanos_utc(*n))),
+        (Val::Str(s), "date_nanos") => func::parse_nanos_str(s).map(|n| json!(super::fmt_date_nanos_utc(n))),
+        (Val::ULong(u), "unsigned_long" | "double") => Some(json!(u)),
         (Val::Str(s), t) if t.starts_with("date") => func::parse_date_str(s).map(|d| json!(d)),
         (_, t) if t.starts_with("date") => None,
         (Val::Int(_) | Val::Long(_) | Val::Double(_), "long" | "integer" | "double" | "unsigned_long") => Some(v.to_json()),
@@ -4510,8 +5459,172 @@ fn field_of<'e>(e: &'e Expr, types: &HashMap<String, String>) -> Option<(&'e str
     }
 }
 
+thread_local! {
+    /// Set while an ES SQL statement runs or translates (see [`sql_predicates`]).
+    static SQL_PREDICATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the previous predicate mode when dropped.
+pub struct SqlPredicateGuard(bool);
+
+impl Drop for SqlPredicateGuard {
+    fn drop(&mut self) {
+        SQL_PREDICATES.with(|c| c.set(self.0));
+    }
+}
+
+/// Push predicates down as ES SQL does until the guard drops. ES SQL
+/// translates a field predicate to Query DSL two-valued: `NOT p` (after
+/// negating a comparison, `IS NULL` or `NOT`) is `bool.must_not` of `p`, and
+/// `<>`, `NOT IN`, `NOT LIKE` and `NOT BETWEEN` are `must_not` of their
+/// positive query, so documents where the field is null or missing match.
+/// ES|QL keeps three-valued logic (its single-value queries), as does a
+/// predicate ES SQL runs as a script (null is not a match).
+pub fn sql_predicates() -> SqlPredicateGuard {
+    SqlPredicateGuard(SQL_PREDICATES.with(|c| c.replace(true)))
+}
+
+fn es_sql_pushdown() -> bool {
+    SQL_PREDICATES.with(|c| c.get())
+}
+
+/// `NOT e` as ES SQL translates it: comparisons, `IS [NOT] NULL`, `[NOT] IN`
+/// and `NOT` negate (`NOT a > 1` is `a <= 1`); anything else is `must_not`.
+fn sql_not_dsl(e: &Expr, types: &HashMap<String, String>) -> Option<Value> {
+    let flip = |op: &BinOp| match op {
+        BinOp::Eq => Some(BinOp::Neq),
+        BinOp::Neq => Some(BinOp::Eq),
+        BinOp::Lt => Some(BinOp::Ge),
+        BinOp::Le => Some(BinOp::Gt),
+        BinOp::Gt => Some(BinOp::Le),
+        BinOp::Ge => Some(BinOp::Lt),
+        _ => None,
+    };
+    match e {
+        Expr::Not(a) => to_dsl(a, types, true).map(|(q, _)| q),
+        Expr::IsNull(a, not) => to_dsl(&Expr::IsNull(a.clone(), !*not), types, true).map(|(q, _)| q),
+        Expr::In(a, list, neg) => to_dsl(&Expr::In(a.clone(), list.clone(), !*neg), types, true).map(|(q, _)| q),
+        Expr::Bin(op, a, b) if flip(op).is_some() => to_dsl(&Expr::Bin(flip(op)?, a.clone(), b.clone()), types, true).map(|(q, _)| q),
+        _ => to_dsl(e, types, true).map(|(q, _)| json!({"bool": {"must_not": [q]}})),
+    }
+}
+
+/// `must_not` of `q` (ES SQL), or `q`'s FALSE rows on an existing `f` (ES|QL).
+fn negated(f: &str, q: Value) -> Value {
+    if es_sql_pushdown() {
+        json!({"bool": {"must_not": [q]}})
+    } else {
+        exists_and(f, q)
+    }
+}
+
+/// ES SQL fails `WHERE NOT b` on a bare boolean field: ES 9.5.5 answers
+/// HTTP 500 `sql_illegal_argument_exception` "Don't know how to translate
+/// FieldAttribute ..", as this does.
+pub fn check_sql_condition(e: &Expr, types: &HashMap<String, String>) -> Result<()> {
+    if es_sql_pushdown() {
+        if let Expr::Not(a) = e {
+            if let Some((f, ty)) = field_of(a, types) {
+                if matches!(a.as_ref(), Expr::Col(..)) && ty == "boolean" {
+                    return Err(EsError::new(500, "sql_illegal_argument_exception", format!("Don't know how to translate FieldAttribute {f}")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The query of the rows where `e` is FALSE: neither TRUE nor NULL (SQL and
+/// ES|QL three-valued logic; a `NOT e` is TRUE on exactly these rows).
+/// `None`: not translatable (the predicate then stays a row filter).
+fn false_dsl(e: &Expr, types: &HashMap<String, String>) -> Option<Value> {
+    let none = || json!({"match_none": {}});
+    if spatial_dsl(e, types).is_some() {
+        // Spatial relations stay two-valued, as before.
+        let (q, _) = to_dsl(e, types, true)?;
+        return Some(json!({"bool": {"must_not": [q]}}));
+    }
+    match e {
+        Expr::Lit(Val::Bool(true)) | Expr::Lit(Val::Null) => Some(none()),
+        Expr::Lit(Val::Bool(false)) => Some(json!({"match_all": {}})),
+        // FALSE AND x is FALSE whatever x is; FALSE OR x only when x is FALSE.
+        Expr::Bin(BinOp::And, a, b) => Some(json!({"bool": {"should": [false_dsl(a, types)?, false_dsl(b, types)?], "minimum_should_match": 1}})),
+        Expr::Bin(BinOp::Or, a, b) => Some(json!({"bool": {"filter": [false_dsl(a, types)?, false_dsl(b, types)?]}})),
+        Expr::Not(a) => to_dsl(a, types, true).map(|(q, _)| q),
+        // IS [NOT] NULL is never NULL.
+        Expr::IsNull(a, not) => to_dsl(&Expr::IsNull(a.clone(), !*not), types, true).map(|(q, _)| q),
+        Expr::In(a, list, neg) => {
+            let (f, _) = field_of(a, types)?;
+            let listed = to_dsl(&Expr::In(a.clone(), list.clone(), false), types, true)?.0;
+            if *neg {
+                // `x NOT IN l` is FALSE exactly where x is listed.
+                Some(listed)
+            } else if list.iter().any(|x| matches!(x, Expr::Lit(Val::Null))) {
+                // `x IN (.., NULL)` is TRUE or NULL, never FALSE.
+                Some(none())
+            } else {
+                Some(sv(f, exists_and(f, sv_inner(listed))))
+            }
+        }
+        // A comparison with NULL is NULL.
+        Expr::Bin(op, a, b) if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) && (matches!(a.as_ref(), Expr::Lit(Val::Null)) || matches!(b.as_ref(), Expr::Lit(Val::Null))) => Some(none()),
+        // These are NULL exactly where their field is missing: FALSE where it
+        // exists and they are not TRUE.
+        Expr::Bin(op, a, b) if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
+            let (f, _) = field_of(a, types).or_else(|| field_of(b, types))?;
+            let (q, _) = to_dsl(e, types, true)?;
+            Some(sv(f, exists_and(f, sv_inner(q))))
+        }
+        Expr::Like(a, ..) | Expr::Between(a, ..) => {
+            let (f, _) = field_of(a, types)?;
+            let (q, _) = to_dsl(e, types, true)?;
+            Some(sv(f, exists_and(f, sv_inner(q))))
+        }
+        // Full-text and other function predicates keep their two-valued
+        // negation.
+        Expr::Call(..) => {
+            let (q, _) = to_dsl(e, types, true)?;
+            Some(json!({"bool": {"must_not": [q]}}))
+        }
+        _ => None,
+    }
+}
+
 fn exists_and(f: &str, q: Value) -> Value {
     json!({"bool": {"filter": [{"exists": {"field": f}}], "must_not": [q]}})
+}
+
+/// ES `SingleValueQuery`: a scalar predicate pushed to the index holds only
+/// on documents where `f` has exactly one value: a multivalued field makes
+/// the comparison NULL (the row evaluator's semantics), so it matches
+/// neither the predicate nor its negation.
+fn sv(f: &str, q: Value) -> Value {
+    // ES SQL pushes plain Lucene queries (see [`sql_predicates`]): a
+    // must_not there matches null and missing values, which the
+    // single-value wrapper would not.
+    if es_sql_pushdown() {
+        return q;
+    }
+    json!({"esql_single_value": {"field": f, "query": q, crate::query::single_value::TOKEN_KEY: crate::query::single_value::internal_token()}})
+}
+
+/// `q` without its [`sv`] wrappers (SQL's `_sql/translate` output: SQL has
+/// no multivalued fields, and the DSL it shows is ES's plain queries).
+pub fn strip_single_value(q: Value) -> Value {
+    match q {
+        Value::Object(o) if o.len() == 1 && o.contains_key("esql_single_value") => strip_single_value(sv_inner(Value::Object(o))),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, strip_single_value(v))).collect()),
+        Value::Array(a) => Value::Array(a.into_iter().map(strip_single_value).collect()),
+        other => other,
+    }
+}
+
+/// The predicate inside [`sv`].
+fn sv_inner(q: Value) -> Value {
+    match q {
+        Value::Object(mut o) if o.len() == 1 && o.contains_key("esql_single_value") => o.remove("esql_single_value").and_then(|mut b| b.get_mut("query").map(Value::take)).unwrap_or(Value::Null),
+        other => other,
+    }
 }
 
 /// A constant spatial argument as WKT: a string literal, or `TO_GEOSHAPE` /
@@ -4693,9 +5806,16 @@ pub fn to_dsl(e: &Expr, types: &HashMap<String, String>, params_ok: bool) -> Opt
             let (qb, sb) = to_dsl(b, types, true)?;
             Some((json!({"bool": {"should": [qa, qb], "minimum_should_match": 1}}), sa || sb))
         }
-        Expr::Not(a) => {
-            let (q, _) = to_dsl(a, types, true)?;
-            Some((json!({"bool": {"must_not": [q]}}), false))
+        // NOT keeps three-valued logic: it is TRUE exactly where its operand
+        // is FALSE, never where the operand is NULL (a missing field, a NULL
+        // list member), so it selects the operand's FALSE rows.
+        // (ES SQL: two-valued, see [`sql_predicates`].)
+        Expr::Not(a) if es_sql_pushdown() => Some((sql_not_dsl(a, types)?, false)),
+        Expr::Not(a) => Some((false_dsl(a, types)?, false)),
+        // A boolean field is TRUE where it holds `true` (ES SQL `WHERE b`).
+        Expr::Col(..) if es_sql_pushdown() => {
+            let (f, ty) = field_of(e, types)?;
+            (ty == "boolean").then(|| (json!({"term": { f: true }}), false))
         }
         Expr::Bin(op, a, b) if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
             let (f, ty, lit, op) = match (field_of(a, types), field_of(b, types), a.as_ref(), b.as_ref()) {
@@ -4719,23 +5839,37 @@ pub fn to_dsl(e: &Expr, types: &HashMap<String, String>, params_ok: bool) -> Opt
             }
             let v = lit_json(lit, &ty)?;
             let date = ty.starts_with("date");
+            // Millisecond literals push down as epoch millis; nanosecond
+            // ones as their ISO text (nine fractional digits).
+            let fmt = date_literal_format(&v);
             let range = |k: &str| {
                 let mut r = json!({ k: v.clone() });
-                if date {
-                    r["format"] = json!("epoch_millis");
+                if let (true, Some(fmt)) = (date, fmt) {
+                    r["format"] = json!(fmt);
                 }
                 json!({"range": { f: r }})
             };
-            let eq = if date { json!({"range": { f: {"gte": v.clone(), "lte": v.clone(), "format": "epoch_millis"}}}) } else { json!({"term": { f: v.clone() }}) };
+            let eq = if date {
+                let mut r = json!({"gte": v.clone(), "lte": v.clone()});
+                if let Some(fmt) = fmt {
+                    r["format"] = json!(fmt);
+                }
+                json!({"range": { f: r }})
+            } else {
+                json!({"term": { f: v.clone() }})
+            };
             Some((
-                match op {
-                    BinOp::Eq => eq,
-                    BinOp::Neq => exists_and(f, eq),
-                    BinOp::Lt => range("lt"),
-                    BinOp::Le => range("lte"),
-                    BinOp::Gt => range("gt"),
-                    _ => range("gte"),
-                },
+                sv(
+                    f,
+                    match op {
+                        BinOp::Eq => eq,
+                        BinOp::Neq => negated(f, eq),
+                        BinOp::Lt => range("lt"),
+                        BinOp::Le => range("lte"),
+                        BinOp::Gt => range("gt"),
+                        _ => range("gte"),
+                    },
+                ),
                 false,
             ))
         }
@@ -4757,8 +5891,14 @@ pub fn to_dsl(e: &Expr, types: &HashMap<String, String>, params_ok: bool) -> Opt
             if ty.starts_with("date") {
                 return None;
             }
+            // `x NOT IN (.., NULL)` is never TRUE: FALSE where x is listed,
+            // NULL otherwise.
+            // (ES SQL drops the NULL members and negates with must_not.)
+            if *neg && !es_sql_pushdown() && list.iter().any(|x| matches!(x, Expr::Lit(Val::Null))) {
+                return Some((json!({"match_none": {}}), false));
+            }
             let q = json!({"terms": { f: vals }});
-            Some((if *neg { exists_and(f, q) } else { q }, false))
+            Some((sv(f, if *neg { negated(f, q) } else { q }), false))
         }
         Expr::Like(a, pats, neg, rlike) => {
             let (f, ty) = field_of(a, types)?;
@@ -4770,17 +5910,19 @@ pub fn to_dsl(e: &Expr, types: &HashMap<String, String>, params_ok: bool) -> Opt
                 .map(|p| if *rlike { json!({"regexp": { f: {"value": p}}}) } else { json!({"wildcard": { f: {"value": p}}}) })
                 .collect();
             let q = if qs.len() == 1 { qs[0].clone() } else { json!({"bool": {"should": qs, "minimum_should_match": 1}}) };
-            Some((if *neg { exists_and(f, q) } else { q }, false))
+            Some((sv(f, if *neg { negated(f, q) } else { q }), false))
         }
         Expr::Between(a, lo, hi, neg) => {
             let (f, ty) = field_of(a, types)?;
             let (Expr::Lit(l), Expr::Lit(h)) = (lo.as_ref(), hi.as_ref()) else { return None };
-            let mut r = json!({"gte": lit_json(l, &ty)?, "lte": lit_json(h, &ty)?});
-            if ty.starts_with("date") {
-                r["format"] = json!("epoch_millis");
+            let (lo_v, hi_v) = (lit_json(l, &ty)?, lit_json(h, &ty)?);
+            let fmt = if lo_v.is_string() || hi_v.is_string() { None } else { Some("epoch_millis") };
+            let mut r = json!({"gte": lo_v, "lte": hi_v});
+            if let (true, Some(fmt)) = (ty.starts_with("date"), fmt) {
+                r["format"] = json!(fmt);
             }
             let q = json!({"range": { f: r }});
-            Some((if *neg { exists_and(f, q) } else { q }, false))
+            Some((sv(f, if *neg { negated(f, q) } else { q }), false))
         }
         Expr::Call(name, args, _) => {
             let opts = |k: usize| -> serde_json::Map<String, Value> {
@@ -4825,12 +5967,20 @@ pub fn to_dsl(e: &Expr, types: &HashMap<String, String>, params_ok: bool) -> Opt
                     o.insert("fields".into(), Value::Array(fields));
                     Some((json!({"multi_match": o}), true))
                 }
-                "QSTR" | "KQL" => {
+                // ES `Kql`: the KQL query itself (its own parser: field
+                // scope over every following term, quoted values kept as
+                // written, ranges, nested scopes), never query_string.
+                "KQL" => {
                     let q = lit_s(0)?;
                     let mut o = opts(1);
-                    let qs = q.as_str()?.to_string();
-                    let qs = if name == "KQL" { kql_to_qs(&qs) } else { qs };
-                    o.insert("query".into(), json!(qs));
+                    o.retain(|k, _| matches!(k.as_str(), "case_insensitive" | "time_zone" | "default_field"));
+                    o.insert("query".into(), json!(q.as_str()?));
+                    Some((json!({"kql": o}), true))
+                }
+                "QSTR" => {
+                    let q = lit_s(0)?;
+                    let mut o = opts(1);
+                    o.insert("query".into(), json!(q.as_str()?));
                     Some((json!({"query_string": o}), true))
                 }
                 "TERM" => {
@@ -4867,18 +6017,6 @@ pub fn to_dsl(e: &Expr, types: &HashMap<String, String>, params_ok: bool) -> Opt
         }
         _ => None,
     }
-}
-
-fn kql_to_qs(q: &str) -> String {
-    q.split_whitespace()
-        .map(|w| match w {
-            "and" => "AND",
-            "or" => "OR",
-            "not" => "NOT",
-            o => o,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// FROM + leading WHERE/SORT/LIMIT pushdown. Returns the table and how many
@@ -5152,6 +6290,7 @@ fn from_with_pushdown(ctx: &mut Ctx, indices: &[String], metadata: &[String], po
     let mut schema = resolve_schema(ctx, indices, pos)?;
     if ctx.ts {
         ctx.ts_dims = schema.cols.iter().filter(|(_, c)| c.dimension || c.ty == "flattened").map(|(n, _)| n.clone()).collect();
+        ctx.ts_temporality = schema.targets.iter().find_map(|t| t.svc.setting("index.time_series.temporality_field")).filter(|f| schema.cols.iter().any(|(n, c)| n == f && c.dimension));
     }
     {
         let mut scope: Vec<String> = schema.cols.iter().map(|(n, _)| n.clone()).collect();
@@ -5180,7 +6319,10 @@ fn from_with_pushdown(ctx: &mut Ctx, indices: &[String], metadata: &[String], po
         }
         ctx.pristine.insert(n.clone());
     }
-    let mut types: HashMap<String, String> = schema.cols.iter().map(|(n, c)| (n.clone(), c.ty.clone())).collect();
+    // SQL runtime fields are computed by the search per document: their
+    // predicates run on the loaded rows, never pushed down as mapped fields.
+    let runtime_names = if ctx.esql { Vec::new() } else { sql_runtime_names() };
+    let mut types: HashMap<String, String> = schema.cols.iter().filter(|(n, _)| !runtime_names.contains(n)).map(|(n, c)| (n.clone(), c.ty.clone())).collect();
     // Keyword metadata fields filter in Lucene too (`_ignored` matches any of its values).
     for m in metadata {
         if matches!(m.as_str(), "_index" | "_id" | "_ignored") {
@@ -5216,6 +6358,7 @@ fn from_with_pushdown(ctx: &mut Ctx, indices: &[String], metadata: &[String], po
         let mut cs = Vec::new();
         conjuncts(e, &mut cs);
         for c in cs {
+            check_sql_condition(&c, &types)?;
             match to_dsl(&c, &types, true) {
                 Some((q, true)) => must.push(q),
                 Some((q, false)) => filter.push(q),
@@ -5316,7 +6459,7 @@ fn from_with_pushdown(ctx: &mut Ctx, indices: &[String], metadata: &[String], po
         }
         size = hint.map(|h| h.min(ctx.max_limit));
     }
-    if !ctx.esql && metadata.is_empty() && ft_probes.is_empty() && !scoring {
+    if !ctx.esql && metadata.is_empty() && ft_probes.is_empty() && !scoring && runtime_names.is_empty() {
         if residual.is_empty() {
             if let Some(table) = sql_pivot_stream::grouped_count(ctx, &schema, &query, &rest[consumed..])? {
                 return Ok((table, consumed + 1, hoisted));
@@ -5334,20 +6477,24 @@ fn from_with_pushdown(ctx: &mut Ctx, indices: &[String], metadata: &[String], po
             return Ok((table, consumed + covered, hoisted));
         }
     }
+    // Columns a source filter pruned are read through the general path
+    // (doc values merged into each row); the columnar shortcuts read the
+    // stored source.
+    let source_pruned = (ctx.esql && !source_pruned_columns(&schema).is_empty()) || !runtime_names.is_empty();
     // Pipelines the index answers directly (doc values, counts).
-    if ft_probes.is_empty() && !scoring && metadata.is_empty() {
+    if ft_probes.is_empty() && !scoring && metadata.is_empty() && !source_pruned {
         if let Some((t, n)) = fast::try_run(ctx, &schema, indices, &query, &residual, &rest[consumed..])? {
             return Ok((t, consumed + n, hoisted));
         }
     }
-    if metadata.is_empty() && residual.is_empty() && ft_probes.is_empty() && !scoring && !ctx.ts && ctx.esql {
+    if metadata.is_empty() && residual.is_empty() && ft_probes.is_empty() && !scoring && !ctx.ts && ctx.esql && !source_pruned {
         if let Some(table) = distributed_group_limit(ctx, &schema, indices, &query, &rest[consumed..])? {
             return Ok((table, rest.len(), hoisted));
         }
     }
     // A decomposable STATS aggregates per shard (in parallel, on the node
     // holding each shard) and merges partial states instead of loading rows.
-    if residual.is_empty() && ft_probes.is_empty() && !scoring && ctx.shards.is_some() {
+    if residual.is_empty() && ft_probes.is_empty() && !scoring && ctx.shards.is_some() && !source_pruned {
         if let Some(cmd) = rest.get(consumed) {
             // Every shard here: one slot per shard copy target.
             let all_local = || -> Option<Vec<super::remote::Slot>> {
@@ -5638,10 +6785,15 @@ fn lookup_mv_warning(f: &FnCtx, pos: usize) {
 /// reading only the join's `fields` (the command's; `None`: every column).
 fn lookup_schema(ctx: &mut Ctx, index: &str, index_pos: usize, fields: Option<&HashSet<String>>) -> Result<IndexSchema> {
     let node = ctx.node.ok_or_else(|| EsError::internal("no node"))?;
-    // The right side must be exactly one index in `lookup` mode.
+    // The right side must be exactly one index in `lookup` mode, one the
+    // caller may read.
     let mut opts = ResolveOpts::from_params(&HashMap::new());
     opts.allow_no_indices = true;
-    let targets = match node.resolve(index, opts) {
+    let authorized = match authorized_expr(ctx.authorize.as_ref(), index, &opts, true)? {
+        Ok(authorized) => authorized,
+        Err(unknown) => return Err(verification_err(ctx.full, index_pos, format!("Unknown index [{unknown}]"))),
+    };
+    let targets = match node.resolve(&authorized, opts) {
         Ok(t) if !t.is_empty() => t,
         _ => return Err(verification_err(ctx.full, index_pos, format!("Unknown index [{index}]"))),
     };
@@ -6249,8 +7401,13 @@ impl LookupJoinPlan {
         // matched-but-rejected, not unmatched outer-join rows.
         let right_only_null_passes = if !filters.is_empty() && filters.iter().all(|expr| lookup_right_only(expr, lkeep.len())) {
             let mut accepted = Vec::with_capacity(right.rows.len());
+            // One buffer: the left columns' nulls stay, each lookup row's
+            // columns replace the previous one's (a wide source made this a
+            // fresh row of hundreds of nulls per lookup row).
+            let mut combined = vec![Val::Null; lkeep.len()];
+            combined.reserve(rcols.len());
             for row in &right.rows {
-                let mut combined = vec![Val::Null; lkeep.len()];
+                combined.truncate(lkeep.len());
                 combined.extend(rcols.iter().map(|i| row[*i].clone()));
                 accepted.push(join_row_passes(ctx, &filters, &combined)?);
             }
@@ -6354,6 +7511,9 @@ fn lookup_join(ctx: &mut Ctx, left: Table, index: &str, index_pos: usize, on: &[
 /// `ENRICH`: join each row with the policy's enrich index on the match
 /// column; enrich columns are appended (multi-valued over several matches).
 fn enrich(ctx: &mut Ctx, mut t: Table, policy: &str, on: Option<&str>, with: &[(String, String)], pos: usize) -> Result<Table> {
+    if let Some(authorize) = &ctx.authorize {
+        authorize.enrich(policy)?;
+    }
     let node = ctx.node.ok_or_else(|| verification_err(ctx.full, pos, format!("cannot find enrich policy [{policy}]")))?;
     let Some(p) = crate::enrich::store(node).get(policy).filter(|_| crate::enrich::has_enrich_index(node, policy)) else {
         return Err(verification_err(ctx.full, pos, format!("cannot find enrich policy [{policy}]")));
@@ -6390,7 +7550,20 @@ fn enrich(ctx: &mut Ctx, mut t: Table, policy: &str, on: Option<&str>, with: &[(
             }
         }
     }
-    let schema = resolve_schema(ctx, &p.indices, pos).ok();
+    // The executed enrich index's own mapping types the enrich columns
+    // (ES `EnrichPolicyResolver`): the types and match semantics bound to
+    // that generation, never the policy's live source indices. An enrich
+    // index executed before it recorded them reads the source mappings.
+    // Read internally (ES reads the enrich index as the system, whatever
+    // the caller's privileges on the policy's source indices).
+    let authorize = ctx.authorize.take();
+    let mut eopts = ResolveOpts::from_params(&HashMap::new());
+    eopts.expand_hidden = true;
+    let enrich_indices: Vec<String> = node.resolve(&p.alias(), eopts).map(|ts| ts.iter().map(|t| t.svc.name.clone()).collect()).unwrap_or_default();
+    let recorded = !enrich_indices.is_empty()
+        && enrich_indices.iter().all(|n| node.get_index(n).is_some_and(|s| s.meta().mappings.to_json()["_meta"]["enrich_field_types"].as_bool() == Some(true)));
+    let schema = if recorded { resolve_schema(ctx, &enrich_indices, pos).ok() } else { resolve_schema(ctx, &p.indices, pos).ok() };
+    ctx.authorize = authorize;
     let col_src = |name: &str| -> ColSrc {
         schema
             .as_ref()
@@ -6415,7 +7588,23 @@ fn enrich(ctx: &mut Ctx, mut t: Table, policy: &str, on: Option<&str>, with: &[(
     pages.charge((fields.len() * t.rows.len() * std::mem::size_of::<Val>()) as u64, ESQL_LABEL)?;
     let mut out: Vec<Vec<Val>> = vec![Vec::with_capacity(t.rows.len()); fields.len()];
     if p.kind == "match" {
-        let docs = crate::enrich::lookup(node, policy, serde_json::json!({"match_all": {}}), 10_000)?;
+        // Look up the input's own keys (ES `EnrichLookupService`: a terms
+        // lookup per input page), in bounded batches. The whole policy index
+        // was read with one 10,000-hit `match_all` before: keys beyond that
+        // prefix silently enriched nothing (production review #177).
+        let mut keys: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for r in &t.rows {
+            for v in r[mi].values() {
+                if !v.is_null() {
+                    let k = v.to_text();
+                    if seen.insert(k.clone()) {
+                        keys.push(k);
+                    }
+                }
+            }
+        }
+        let docs = enrich_match_docs(node, policy, &p.match_field, &keys)?;
         let mcs = col_src(&p.match_field);
         let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
         // Inputs match like a term query on the match field: by their string form.
@@ -6448,10 +7637,16 @@ fn enrich(ctx: &mut Ctx, mut t: Table, policy: &str, on: Option<&str>, with: &[(
                     Val::Date(d) => json!(d),
                     other => other.to_json(),
                 };
-                // Values that don't parse as the match field's type match nothing (ES warns).
-                crate::enrich::lookup_query(&p.kind, &p.match_field, &jv, "intersects")
-                    .and_then(|q| crate::enrich::lookup(node, policy, q, 128))
-                    .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
+                // Values that don't parse as the match field's type match
+                // nothing (ES warns): the query cannot be built from them,
+                // here or by the enrich shard (a 400). Any other failing
+                // lookup (shard unavailable, remote or search failure) fails
+                // the query, never reads as a nonmatch (production review #178).
+                match crate::enrich::lookup_query(&p.kind, &p.match_field, &jv, "intersects").and_then(|q| crate::enrich::lookup(node, policy, q, 128)) {
+                    Ok(docs) => docs,
+                    Err(e) if e.status == 400 => std::sync::Arc::new(Vec::new()),
+                    Err(e) => return Err(e),
+                }
             };
             for (k, c) in srcs.iter().enumerate() {
                 let v = Val::from_list(docs.iter().flat_map(|d| extract(d, c, "").values().into_iter().cloned().collect::<Vec<_>>()).collect());
@@ -6466,15 +7661,46 @@ fn enrich(ctx: &mut Ctx, mut t: Table, policy: &str, on: Option<&str>, with: &[(
     Ok(t)
 }
 
+/// The match policy's enrich documents for `keys`: terms lookups of at most
+/// [`ENRICH_KEY_BATCH`] keys, each complete (a batch whose answer fills the
+/// lookup size is split and asked again, so no match is cut off).
+fn enrich_match_docs(node: &crate::node::Node, policy: &str, field: &str, keys: &[String]) -> Result<Vec<Value>> {
+    let mut docs: Vec<Value> = Vec::new();
+    let mut pending: Vec<&[String]> = keys.chunks(ENRICH_KEY_BATCH).rev().collect();
+    while let Some(batch) = pending.pop() {
+        if batch.is_empty() {
+            continue;
+        }
+        let found = crate::enrich::lookup(node, policy, json!({"terms": {field: batch}}), ENRICH_LOOKUP_SIZE)?;
+        if found.len() >= ENRICH_LOOKUP_SIZE {
+            if batch.len() == 1 {
+                return Err(EsError::illegal_argument(format!("enrich policy [{policy}] has more than [{ENRICH_LOOKUP_SIZE}] documents matching [{}]", batch[0])));
+            }
+            let (a, b) = batch.split_at(batch.len() / 2);
+            pending.push(b);
+            pending.push(a);
+            continue;
+        }
+        docs.extend(found.iter().cloned());
+    }
+    Ok(docs)
+}
+
+/// Keys per match-enrich lookup.
+const ENRICH_KEY_BATCH: usize = 1024;
+/// Documents one match-enrich lookup may return before it is split.
+const ENRICH_LOOKUP_SIZE: usize = 10_000;
+
 /// Run commands over an existing table (no node access; used by tests/SQL).
 pub fn run_on_table(full: &str, cmds: &[Cmd], t: Table) -> Result<Table> {
-    let mut ctx = Ctx { node: None, full, filter: None, fctx: FnCtx { now: crate::date::now_millis(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit: 1000, max_limit: 10_000, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: false, ts: false, ts_done: false, ts_dims: Vec::new(), col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None };
+    let mut ctx = Ctx { node: None, full, filter: None, fctx: FnCtx { now: crate::date::now_millis(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit: 1000, max_limit: 10_000, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: false, ts: false, ts_done: false, ts_dims: Vec::new(), ts_temporality: None, col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, authorize: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None, clusters: Default::default() };
     exec_pipeline(&mut ctx, cmds, Some(t))
 }
 
 /// New context for embedding (SQL).
 pub fn new_ctx<'a>(node: &'a Node, full: &'a str, filter: Option<&'a Value>, default_limit: usize, max_limit: usize) -> Ctx<'a> {
-    Ctx { node: Some(node), full, filter, fctx: FnCtx { now: crate::date::now_millis(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit, max_limit, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: false, ts: false, ts_done: false, ts_dims: Vec::new(), col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None }
+    // The thread's zone: a SQL request's `time_zone` (see `set_sql_zone`).
+    Ctx { node: Some(node), full, filter, fctx: FnCtx { now: crate::date::now_millis(), tz: super::zone(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit, max_limit, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: false, ts: false, ts_done: false, ts_dims: Vec::new(), ts_temporality: None, col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, authorize: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None, clusters: Default::default() }
 }
 
 /// An unsorted SQL scan pins segment snapshots and retains search cursors plus
@@ -6549,6 +7775,7 @@ impl SqlScan {
                     let mut conjuncts_ = Vec::new();
                     conjuncts(expr, &mut conjuncts_);
                     for e in conjuncts_ {
+                        check_sql_condition(&e, &types)?;
                         if let Some((q, _)) = to_dsl(&e, &types, true) { conditions.push(q); }
                         else { local.push(Cmd::Where(e, *pos)); }
                     }
@@ -6734,21 +7961,37 @@ pub(crate) fn sql_float_columns(ctx: &Ctx, index: &str) -> Result<HashSet<String
 
 /// Columns (name, ES|QL type) of the indices matching `indices`.
 pub fn index_columns(node: &Node, indices: &[String]) -> Result<Vec<Column>> {
-    let ctx = new_ctx(node, "", None, 1000, 10_000);
+    index_columns_as(node, indices, None)
+}
+
+/// [`index_columns`] of the indices the caller may see (`authorize`; their
+/// mappings only, so no read privilege is needed).
+pub fn index_columns_as(node: &Node, indices: &[String], authorize: Option<&AuthorizeIndices>) -> Result<Vec<Column>> {
+    let mut ctx = new_ctx(node, "", None, 1000, 10_000);
+    ctx.authorize = authorize.map(|a| std::sync::Arc::new(MetadataOnly(a.clone())) as AuthorizeIndices);
     let schema = resolve_schema(&ctx, indices, 0)?;
     Ok(schema.cols.iter().map(|(n, c)| Column { name: n.clone(), ty: c.col_type() }).collect())
+}
+
+/// The time series dimension fields (PromQL labels) of the indices matching
+/// `indices`, in schema order (the caller's visible mappings only).
+pub fn index_dimensions_as(node: &Node, indices: &[String], authorize: Option<&AuthorizeIndices>) -> Result<Vec<String>> {
+    let mut ctx = new_ctx(node, "", None, 1000, 10_000);
+    ctx.authorize = authorize.map(|a| std::sync::Arc::new(MetadataOnly(a.clone())) as AuthorizeIndices);
+    let schema = resolve_schema(&ctx, indices, 0)?;
+    Ok(schema.cols.iter().filter(|(_, c)| c.dimension).map(|(n, _)| n.clone()).collect())
 }
 
 /// A node-less ES|QL context for `query` (tests: warnings stay readable).
 #[cfg(test)]
 pub fn new_ctx_local(query: &str) -> Ctx<'_> {
-    Ctx { node: None, full: query, filter: None, fctx: FnCtx { query: query.to_string(), now: crate::date::now_millis(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit: 1000, max_limit: 10_000, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: true, ts: false, ts_done: false, ts_dims: Vec::new(), col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None }
+    Ctx { node: None, full: query, filter: None, fctx: FnCtx { query: query.to_string(), now: crate::date::now_millis(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit: 1000, max_limit: 10_000, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: true, ts: false, ts_done: false, ts_dims: Vec::new(), ts_temporality: None, col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, authorize: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None, clusters: Default::default() }
 }
 
 /// Run a node-less query (`ROW ...`, `SHOW INFO`).
 pub fn run_local(query: &str, params: &Params) -> Result<Table> {
     let cmds = parse_query(query, params)?;
-    let mut ctx = Ctx { node: None, full: query, filter: None, fctx: FnCtx { now: crate::date::now_millis(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit: 1000, max_limit: 10_000, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: true, ts: false, ts_done: false, ts_dims: Vec::new(), col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None };
+    let mut ctx = Ctx { node: None, full: query, filter: None, fctx: FnCtx { now: crate::date::now_millis(), ..Default::default() }, documents_found: 0, values_loaded: 0, default_limit: 1000, max_limit: 10_000, unsupported: HashMap::new(), pristine: HashSet::new(), fulltext_barrier: None, lexical_barrier: None, settings: Default::default(), rows_emitted: 0, esql: true, ts: false, ts_done: false, ts_dims: Vec::new(), ts_temporality: None, col_meta: Default::default(), view_stack: Vec::new(), used_views: false, extra_load: Vec::new(), restrict: None, authorize: None, shards: None, mem: Default::default(), table_bytes: Default::default(), drop_null_columns: false, all_columns: None, clusters: Default::default() };
     run_cmds(&mut ctx, &cmds)
 }
 
@@ -6870,5 +8113,459 @@ mod join_memory_tests {
             assert_eq!(join_row_scratch(&left,Some(&wide),2).err().unwrap().status,429);
             assert_eq!(breakers.request.reserved(),0);
         });
+    }
+}
+
+#[cfg(test)]
+mod source_and_enrich_binding_tests {
+    use super::*;
+
+    fn esql(node: &Node, q: &str) -> Table {
+        match run(node, q, EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }) {
+            Ok(r) => r.table,
+            Err(e) => panic!("{q}: {e:?}"),
+        }
+    }
+
+    fn col<'t>(t: &'t Table, name: &str) -> Vec<&'t Val> {
+        let i = t.cols.iter().position(|c| c.name == name).unwrap_or_else(|| panic!("{name}: {:?}", t.cols));
+        t.rows.iter().map(|r| &r[i]).collect()
+    }
+
+    fn put_docs(node: &Node, index: &str, docs: &[Value]) {
+        let svc = node.get_index(index).unwrap();
+        let reqs = docs.iter().map(|d| crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    /// Review finding 184: a mapped doc-values field excluded from an
+    /// otherwise stored `_source` still reads its indexed value in ES|QL
+    /// (projection, STATS, SORT), while `_source` metadata stays pruned;
+    /// the unfiltered index is the control.
+    #[test]
+    fn source_pruned_columns_read_their_doc_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let props = json!({"k": {"type": "keyword"}, "v": {"type": "long"}, "d": {"type": "double"}});
+        node.create_index("pruned", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"_source": {"excludes": ["v", "d"]}, "properties": props}})).unwrap();
+        node.create_index("plain", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": props}})).unwrap();
+        let docs = [json!({"k": "a", "v": 5, "d": 1.5}), json!({"k": "b", "v": 7, "d": 2.5})];
+        put_docs(&node, "pruned", &docs);
+        put_docs(&node, "plain", &docs);
+        for ix in ["plain", "pruned"] {
+            let t = esql(&node, &format!("FROM {ix} METADATA _source | SORT k | KEEP k, v, d, _source"));
+            assert_eq!(col(&t, "v"), vec![&Val::Long(5), &Val::Long(7)], "{ix}");
+            assert_eq!(col(&t, "d"), vec![&Val::Double(1.5), &Val::Double(2.5)], "{ix}");
+            let src = col(&t, "_source");
+            assert_eq!(src[0].to_text().contains("\"v\""), ix == "plain", "{ix}: {:?}", src[0]);
+            let t = esql(&node, &format!("FROM {ix} | KEEP v | SORT v"));
+            assert_eq!(col(&t, "v"), vec![&Val::Long(5), &Val::Long(7)], "{ix}");
+            let t = esql(&node, &format!("FROM {ix} | STATS s = SUM(v)"));
+            assert_eq!(col(&t, "s"), vec![&Val::Long(12)], "{ix}");
+        }
+    }
+
+    /// Review finding 185: an executed enrich policy keeps the output types
+    /// of the generation that was executed: replacing its source index with
+    /// one mapping the enrich field as keyword (or deleting it) leaves the
+    /// ENRICH output long until the policy is executed again.
+    #[test]
+    fn enrich_output_types_are_bound_to_the_executed_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("src", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"k": {"type": "keyword"}, "n": {"type": "long"}}}})).unwrap();
+        put_docs(&node, "src", &[json!({"k": "a", "n": 7})]);
+        crate::enrich::put_policy(&node, "pol", &json!({"match": {"indices": "src", "match_field": "k", "enrich_fields": ["n"]}}), None).unwrap();
+        let task = node.tasks.register("cluster:admin/xpack/enrich/execute", None, false, false, serde_json::Map::new());
+        crate::enrich::execute_policy(&node, "pol", &task, None).unwrap();
+        let q = "ROW k = \"a\" | ENRICH pol ON k WITH n";
+        let check = |label: &str| {
+            let t = esql(&node, q);
+            let i = t.cols.iter().position(|c| c.name == "n").unwrap();
+            assert_eq!(t.cols[i].ty, "long", "{label}");
+            assert_eq!(t.rows[0][i], Val::Long(7), "{label}");
+        };
+        check("executed");
+        node.delete_index("src").unwrap();
+        check("source deleted");
+        node.create_index("src", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"k": {"type": "keyword"}, "n": {"type": "keyword"}}}})).unwrap();
+        check("source replaced with a keyword mapping");
+    }
+}
+
+#[cfg(test)]
+mod fork_inline_weighted_tests {
+    use super::*;
+
+    fn esql(node: &Node, q: &str) -> Table {
+        match run(node, q, EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }) {
+            Ok(r) => r.table,
+            Err(e) => panic!("{q}: {e:?}"),
+        }
+    }
+
+    fn col(t: &Table, name: &str) -> Vec<Val> {
+        let i = t.cols.iter().position(|c| c.name == name).unwrap_or_else(|| panic!("{name}: {:?}", t.cols));
+        t.rows.iter().map(|r| r[i].clone()).collect()
+    }
+
+    fn index(node: &Node, name: &str, props: Value, docs: &[Value]) {
+        node.create_index(name, &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": props}})).unwrap();
+        let svc = node.get_index(name).unwrap();
+        let reqs = docs.iter().map(|d| crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    /// Review finding 268: FORK branches carry no implicit 1000-row limit
+    /// (ES 9.4+): an explicit branch LIMIT governs, and an aggregation after
+    /// FORK sees every branch row.
+    #[test]
+    fn fork_branches_keep_their_explicit_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let docs: Vec<Value> = (0..2000).map(|i| json!({"n": i})).collect();
+        index(&node, "events", json!({"n": {"type": "long"}}), &docs);
+        let t = esql(&node, "FROM events | FORK (LIMIT 2000) (WHERE false) | STATS n = COUNT(*)");
+        assert_eq!(col(&t, "n"), vec![Val::Long(2000)]);
+        let t = esql(&node, "FROM events | FORK (LIMIT 10000) (LIMIT 5) | STATS n = COUNT(*)");
+        assert_eq!(col(&t, "n"), vec![Val::Long(2005)]);
+        let t = esql(&node, "FROM events | FORK (LIMIT 1500) (WHERE n < 10) | STATS c = COUNT(*) BY _fork | SORT _fork");
+        assert_eq!(col(&t, "c"), vec![Val::Long(1500), Val::Long(10)]);
+    }
+
+    /// Review finding 269: INLINE STATS emits each row's computed group key
+    /// under the grouping name (a reused name is overwritten; a new name is
+    /// added and usable downstream); a plain column reference keeps it.
+    #[test]
+    fn inline_stats_emits_computed_grouping_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        index(&node, "sales", json!({"amount": {"type": "integer"}}), &[json!({"amount": 11}), json!({"amount": 19}), json!({"amount": 25})]);
+        let f = |v: &Val| v.as_f64().unwrap_or(f64::NAN);
+        let t = esql(&node, "FROM sales | INLINE STATS n = COUNT(*) BY amount = BUCKET(amount, 10) | SORT amount, n");
+        assert_eq!(col(&t, "amount").iter().map(f).collect::<Vec<_>>(), vec![10.0, 10.0, 20.0]);
+        assert_eq!(col(&t, "n"), vec![Val::Long(2), Val::Long(2), Val::Long(1)]);
+        let t = esql(&node, "FROM sales | INLINE STATS n = COUNT(*) BY b = BUCKET(amount, 10) | WHERE b == 10 | KEEP amount, b, n | SORT amount");
+        assert_eq!(col(&t, "amount"), vec![Val::Int(11), Val::Int(19)]);
+        assert_eq!(col(&t, "b").iter().map(f).collect::<Vec<_>>(), vec![10.0, 10.0]);
+        assert_eq!(col(&t, "n"), vec![Val::Long(2), Val::Long(2)]);
+        // Control: a plain grouping column keeps its own values.
+        let t = esql(&node, "FROM sales | INLINE STATS n = COUNT(*) BY amount | SORT amount");
+        assert_eq!(col(&t, "amount"), vec![Val::Int(11), Val::Int(19), Val::Int(25)]);
+        assert_eq!(col(&t, "n"), vec![Val::Long(1), Val::Long(1), Val::Long(1)]);
+    }
+
+    /// Review finding 270: a constant-weight WEIGHTED_AVG is SUM / COUNT over
+    /// every value (ES's surrogate), multivalued documents included, so it
+    /// equals AVG; documents without the field are ignored.
+    #[test]
+    fn constant_weight_weighted_avg_counts_multivalues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        index(&node, "vals", json!({"v": {"type": "long"}, "g": {"type": "keyword"}}), &[
+            json!({"g": "mixed", "v": [10, 20]}), json!({"g": "mixed", "v": 30}),
+            json!({"g": "multi", "v": [10, 20]}), json!({"g": "multi", "v": [40, 50]}),
+            json!({"g": "multi"}),
+        ]);
+        let t = esql(&node, "FROM vals | STATS w = WEIGHTED_AVG(v, 1), w2 = WEIGHTED_AVG(v, 2.5), a = AVG(v) BY g | SORT g");
+        assert_eq!(col(&t, "g"), vec![Val::Str("mixed".into()), Val::Str("multi".into())]);
+        assert_eq!(col(&t, "w"), vec![Val::Double(20.0), Val::Double(30.0)]);
+        assert_eq!(col(&t, "w2"), col(&t, "w"));
+        assert_eq!(col(&t, "a"), col(&t, "w"));
+    }
+}
+
+#[cfg(test)]
+mod pushdown_semantics_tests {
+    use super::*;
+
+    fn esql(node: &Node, q: &str) -> Table {
+        match run(node, q, EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }) {
+            Ok(r) => r.table,
+            Err(e) => panic!("{q}: {e:?}"),
+        }
+    }
+
+    fn count(node: &Node, q: &str) -> i64 {
+        let t = esql(node, q);
+        t.rows.first().and_then(|r| r.first()).and_then(Val::as_i64).unwrap_or(-1)
+    }
+
+    fn put_docs(node: &Node, index: &str, docs: &[Value]) {
+        let svc = node.get_index(index).unwrap();
+        let reqs = docs.iter().map(|d| crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    /// Review finding 271: a pushed scalar predicate holds only on a
+    /// single-valued field, as the row evaluator (and ES's
+    /// SingleValueQuery) decides: `v == 1` on `v: [1, 2]` is NULL, so
+    /// neither it nor its negation counts the document. Pushed and
+    /// EVAL-forced predicates agree for singleton, duplicate-only and
+    /// distinct arrays, on longs and keywords, before and after a refresh.
+    #[test]
+    fn pushed_predicates_skip_multivalued_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("events", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"v": {"type": "long"}, "k": {"type": "keyword"}}}})).unwrap();
+        put_docs(&node, "events", &[json!({"v": 1, "k": "a"}), json!({"v": [1, 2], "k": ["a", "b"]}), json!({"v": [1], "k": ["a"]}), json!({"v": 3, "k": ["a", "a"]})]);
+        let pairs = [
+            ("v == 1", 2),
+            ("v != 1", 1),
+            ("v > 0", 3),
+            ("v IN (1, 2)", 2),
+            ("NOT v == 1", 1),
+            ("k == \"a\"", 3),
+            ("k LIKE \"a*\"", 3),
+            ("k IN (\"a\", \"b\")", 3),
+        ];
+        for (cond, want) in pairs {
+            let pushed = count(&node, &format!("FROM events | WHERE {cond} | STATS n = COUNT(*)"));
+            // The same predicate evaluated per row (not pushed: through EVAL).
+            let forced = count(&node, &format!("FROM events | EVAL c = {cond} | WHERE c | STATS n = COUNT(*)"));
+            assert_eq!((pushed, forced), (want, want), "{cond}");
+        }
+    }
+
+    /// Review finding 272: indices whose same-typed column is mapped
+    /// differently (an alias to another field, its own date format) keep
+    /// each index's reader: the union equals each index read alone.
+    #[test]
+    fn same_typed_columns_keep_each_index_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("gen_a", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {
+            "old_user": {"type": "keyword"}, "user": {"type": "alias", "path": "old_user"}, "d": {"type": "date", "format": "yyyy/MM/dd"}}}})).unwrap();
+        node.create_index("gen_b", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {
+            "new_user": {"type": "keyword"}, "user": {"type": "alias", "path": "new_user"}, "d": {"type": "date", "format": "dd.MM.yyyy"}}}})).unwrap();
+        put_docs(&node, "gen_a", &[json!({"old_user": "alice", "d": "2026/01/02"})]);
+        put_docs(&node, "gen_b", &[json!({"new_user": "bob", "d": "03.04.2026"})]);
+        let read = |ix: &str| -> Vec<String> {
+            let t = esql(&node, &format!("FROM {ix} | KEEP user, d | SORT user"));
+            t.rows.iter().map(|r| format!("{}|{}", r[0].to_text(), r[1].to_text())).collect()
+        };
+        let a = read("gen_a");
+        let b = read("gen_b");
+        assert_eq!(a, vec!["alice|2026-01-02T00:00:00.000Z"]);
+        assert_eq!(b, vec!["bob|2026-04-03T00:00:00.000Z"]);
+        assert_eq!(read("gen_a,gen_b"), [a, b].concat(), "the union reads each index's own alias target and format");
+        let t = esql(&node, "FROM gen_a,gen_b | STATS n = COUNT(*) BY user | SORT user");
+        assert_eq!(t.rows.len(), 2, "{:?}", t.rows);
+    }
+
+    /// Review finding 273: ES|QL KQL runs the KQL query: a field prefix
+    /// scopes every following term (`message: null pointer` requires both
+    /// in `message`), quoted values keep their literal words (`and` is not
+    /// rewritten to `AND`), and ranges work; each equals its explicit DSL.
+    #[test]
+    fn kql_runs_kql_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("logs", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {
+            "message": {"type": "text"}, "other": {"type": "text"}, "tag": {"type": "keyword"}, "n": {"type": "long"}}}})).unwrap();
+        put_docs(&node, "logs", &[
+            json!({"message": "null pointer exception", "tag": "rock and roll", "n": 1}),
+            json!({"message": "null value", "other": "pointer", "tag": "rock AND roll", "n": 5}),
+            json!({"message": "pointer only", "tag": "jazz", "n": 9}),
+        ]);
+        assert_eq!(count(&node, "FROM logs | WHERE KQL(\"tag: \\\"rock and roll\\\"\") | STATS n = COUNT(*)"), 1);
+        assert_eq!(count(&node, "FROM logs | WHERE KQL(\"n >= 5\") | STATS n = COUNT(*)"), 2);
+        assert_eq!(count(&node, "FROM logs | WHERE KQL(\"message: null and not tag: jazz\") | STATS n = COUNT(*)"), 2);
+    }
+}
+
+#[cfg(test)]
+mod aggregate_value_tests {
+    use super::*;
+
+    fn esql(node: &Node, q: &str) -> Result<Table> {
+        run(node, q, EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }).map(|r| r.table)
+    }
+
+    fn put_docs(node: &Node, index: &str, docs: &[Value]) {
+        let svc = node.get_index(index).unwrap();
+        let reqs = docs.iter().map(|d| crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    /// Review finding 373: SQL `FIRST(field)` / `LAST(field)` order by the
+    /// field itself; an ES|QL group whose ordering values are all null keeps
+    /// a value instead of losing the group's values.
+    #[test]
+    fn first_and_last_keep_their_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("fl", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"g": {"type": "keyword"}, "v": {"type": "long"}, "o": {"type": "long"}}}})).unwrap();
+        put_docs(&node, "fl", &[json!({"g": "a", "v": 5}), json!({"g": "a", "v": 2}), json!({"g": "a", "v": 9}), json!({"g": "b", "v": 7, "o": 1})]);
+        let t = crate::sql::execute(&node, "SELECT g, FIRST(v) AS f, LAST(v) AS l FROM fl GROUP BY g ORDER BY g", None, None).unwrap();
+        assert_eq!(t.rows[0][1..], [Val::Long(2), Val::Long(9)], "{:?}", t.rows);
+        assert_eq!(t.rows[1][1..], [Val::Long(7), Val::Long(7)], "{:?}", t.rows);
+        let t = esql(&node, "FROM fl | STATS f = FIRST(v, o) BY g | SORT g").unwrap();
+        assert!(!t.rows[0][0].is_null(), "group a (all-null ordering) keeps a value: {:?}", t.rows);
+        assert_eq!(t.rows[1][0], Val::Long(7));
+    }
+
+    /// Review finding 375: dense vectors are vectors in ES|QL: arithmetic
+    /// is coordinate-wise (vector with vector, vector with scalar) and
+    /// COUNT counts one value per vector, not per coordinate.
+    #[test]
+    fn dense_vectors_are_whole_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("vec", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"_source": {"mode": "stored"}, "properties": {"v": {"type": "dense_vector", "dims": 3, "index": false}}}})).unwrap();
+        put_docs(&node, "vec", &[json!({"v": [1.0, 2.0, 3.0]}), json!({"v": [4.0, 5.0, 6.0]})]);
+        let t = esql(&node, "FROM vec | STATS c = COUNT(v)").unwrap();
+        assert_eq!(t.rows[0][0], Val::Long(2), "one per vector");
+        let t = esql(&node, "ROW a = TO_DENSE_VECTOR([1.0, 2.0, 3.0]), b = TO_DENSE_VECTOR([0.5, 0.5, 0.5]) | EVAL s = a + b, d = a - b, m = a * 2").unwrap();
+        let col = |n: &str| t.rows[0][t.cols.iter().position(|c| c.name == n).unwrap()].clone();
+        assert_eq!(col("s"), Val::Multi(vec![Val::Double(1.5), Val::Double(2.5), Val::Double(3.5)]));
+        assert_eq!(col("d"), Val::Multi(vec![Val::Double(0.5), Val::Double(1.5), Val::Double(2.5)]));
+        assert_eq!(col("m"), Val::Multi(vec![Val::Double(2.0), Val::Double(4.0), Val::Double(6.0)]));
+        assert_eq!(t.cols.iter().find(|c| c.name == "s").unwrap().ty, "dense_vector");
+    }
+
+    /// Review finding 376: aggregations over `tdigest` and
+    /// `exponential_histogram` fields, whose values this engine does not
+    /// read, are refused instead of answering from no values.
+    #[test]
+    fn histogram_field_aggregations_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("h", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"td": {"type": "tdigest"}, "eh": {"type": "exponential_histogram"}}}})).unwrap();
+        for q in ["FROM h | STATS c = COUNT(td)", "FROM h | STATS s = SUM(eh)", "FROM h | STATS p = PERCENTILE(td, 50)"] {
+            let e = esql(&node, q).unwrap_err();
+            assert!(e.reason.contains("are not supported"), "{q}: {}", e.reason);
+        }
+    }
+}
+
+#[cfg(test)]
+mod review_b7_esql_tests {
+    use super::*;
+
+    fn esql(node: &Node, q: &str, filter: Option<&Value>) -> Result<Table> {
+        run(node, q, EsqlOptions { default_limit: 1000, max_limit: 10_000, filter, ..Default::default() }).map(|r| r.table)
+    }
+
+    fn write(svc: &crate::index::IndexService, id: &str, routing: Option<&str>, doc: Value) {
+        for r in svc.write(vec![crate::index::WriteReq::Index { id: Some(id.into()), source: doc.to_string(), routing: routing.map(str::to_string), cond: Default::default() }], true) {
+            r.unwrap();
+        }
+    }
+
+    /// Review finding 542 (and the mechanism closing 543): full-text probe
+    /// matches come with each hit of the row search itself, so two
+    /// documents sharing an `_id` on different shards (custom routing) keep
+    /// their own MATCH results; only fox passes.
+    #[test]
+    fn fulltext_probes_are_per_document_not_per_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("i", &json!({"settings": {"number_of_shards": 8, "number_of_replicas": 0}, "mappings": {"properties": {"message": {"type": "text"}, "tag": {"type": "keyword"}}}})).unwrap();
+        let svc = node.get_index("i").unwrap();
+        write(&svc, "1", Some("a"), json!({"message": "fox", "tag": ""}));
+        let mut placed = false;
+        for r in ["b", "c", "d", "e", "f", "g", "h", "i", "j", "k"] {
+            write(&svc, "1", Some(r), json!({"message": "cat", "tag": ""}));
+            svc.refresh().unwrap();
+            if svc.doc_count().0 == 2 {
+                placed = true;
+                break;
+            }
+        }
+        assert!(placed, "no routing put the second copy on another shard");
+        let t = esql(&node, "FROM i | WHERE MATCH(message, \"fox\") OR LENGTH(tag) > 3 | KEEP message", None).unwrap();
+        assert_eq!(t.rows, vec![vec![Val::Str("fox".into())]]);
+    }
+
+    /// Review finding 544: an internal search losing a shard (a request
+    /// filter on a field one index lacks) fails the query without
+    /// `allow_partial_results`, and marks it partial with it; never a
+    /// complete-looking result.
+    #[test]
+    fn shard_failures_fail_or_mark_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("a", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"message": {"type": "text"}, "location": {"type": "geo_point"}}}})).unwrap();
+        node.create_index("b", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"message": {"type": "text"}}}})).unwrap();
+        write(&node.get_index("a").unwrap(), "1", None, json!({"message": "fox", "location": [0, 0]}));
+        write(&node.get_index("b").unwrap(), "2", None, json!({"message": "fox"}));
+        for ix in ["a", "b"] {
+            node.get_index(ix).unwrap().refresh().unwrap();
+        }
+        let filter = json!({"geo_distance": {"distance": "10km", "location": [0, 0]}});
+        let q = "FROM a,b | WHERE MATCH(message, \"fox\") | KEEP message";
+        {
+            let _strict = super::super::partial_scope(false);
+            assert!(esql(&node, q, Some(&filter)).is_err(), "a lost shard was not reported");
+        }
+        let lenient = super::super::partial_scope(true);
+        let t = esql(&node, q, Some(&filter)).unwrap();
+        assert_eq!(t.rows, vec![vec![Val::Str("fox".into())]]);
+        assert!(super::super::partial_seen(), "the partial result was not marked");
+        drop(lenient);
+        // Without failures nothing is partial.
+        let _clean = super::super::partial_scope(true);
+        esql(&node, q, None).unwrap();
+        assert!(!super::super::partial_seen());
+    }
+
+    /// A cancelled query task (an async query's DELETE) stops: ES|QL fails
+    /// with ES's `task_cancelled_exception` instead of running on.
+    #[test]
+    fn a_cancelled_task_stops_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        node.create_index("c", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"n": {"type": "long"}}}})).unwrap();
+        write(&node.get_index("c").unwrap(), "1", None, json!({"n": 1}));
+        node.get_index("c").unwrap().refresh().unwrap();
+        let token = rustic_core::cancel::Token::new();
+        assert!(rustic_core::cancel::with_search(Some(token.clone()), || esql(&node, "FROM c | EVAL x = n + 1 | KEEP x", None)).is_ok());
+        token.cancel("by user request");
+        let e = rustic_core::cancel::with_search(Some(token), || esql(&node, "FROM c | EVAL x = n + 1 | KEEP x", None)).err().expect("cancelled");
+        assert_eq!(e.kind, "task_cancelled_exception", "{e}");
+        assert!(e.reason.contains("by user request"), "{e}");
+    }
+
+    /// Review finding 543, deterministic: the document is updated (cat ->
+    /// fox) and refreshed right after the row search. The row read cat, so
+    /// its MATCH(message, "fox") is false and it is filtered out: rows and
+    /// predicates come from the same revision (the probes ride on the row
+    /// search). Before, a separate probe search saw fox and kept the cat row.
+    #[test]
+    fn fulltext_probes_see_the_rows_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = std::sync::Arc::new(Node::open(tmp.path()).unwrap());
+        node.create_index("rev", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"message": {"type": "text"}, "tag": {"type": "keyword"}}}})).unwrap();
+        let svc = node.get_index("rev").unwrap();
+        write(&svc, "1", None, json!({"message": "cat", "tag": ""}));
+        svc.refresh().unwrap();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (n2, f2) = (node.clone(), fired.clone());
+        AFTER_ROW_SEARCH.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+            if !f2.get() {
+                f2.set(true);
+                let svc = n2.get_index("rev").unwrap();
+                write(&svc, "1", None, json!({"message": "fox", "tag": ""}));
+                svc.refresh().unwrap();
+            }
+        })));
+        let t = esql(&node, "FROM rev | WHERE MATCH(message, \"fox\") OR LENGTH(tag) > 3 | KEEP message", None);
+        AFTER_ROW_SEARCH.with(|h| *h.borrow_mut() = None);
+        let t = t.unwrap();
+        assert!(fired.get(), "the hook did not run (the query took another path)");
+        assert!(t.rows.is_empty(), "a row passed on another revision's text: {:?}", t.rows);
     }
 }

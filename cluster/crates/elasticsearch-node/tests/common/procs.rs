@@ -34,11 +34,18 @@ pub struct Procs {
     /// `cluster.name` of every node (unique per cluster).
     pub cluster: String,
     extra: Vec<(String, String)>,
+    /// Environment every node process of this cluster gets.
+    env: Vec<(String, String)>,
+    /// Each node's own settings from the start (kept on restarts, below
+    /// what a [`Procs::spawn`] passes).
+    node_extra: Vec<Vec<(String, String)>>,
     children: Vec<Option<Child>>,
     binaries: Vec<PathBuf>,
     /// This build's `elasticsearch-node`: the one binary known to write
     /// `node.portsfile`.
     current: PathBuf,
+    /// Basic credentials every helper request sends (a secured cluster).
+    pub auth: Option<(String, String)>,
 }
 
 /// How a spawned node's startup ended.
@@ -146,10 +153,18 @@ impl Procs {
         for w in ["low", "high", "flood_stage"] {
             e(&format!("cluster.routing.allocation.disk.watermark.{w}"), "1b");
         }
-        for (k, v) in self.extra.iter().map(|(k, v)| (k.as_str(), v.as_str())).chain(node_extra.iter().copied()) {
+        // Cluster settings, then the node's own from the start, then this
+        // spawn's: each key once, the last one given wins.
+        let mut merged: Vec<(String, String)> = Vec::new();
+        let kept = self.node_extra.get(i).cloned().unwrap_or_default();
+        for (k, v) in self.extra.iter().chain(kept.iter()).map(|(k, v)| (k.clone(), v.clone())).chain(node_extra.iter().map(|(k, v)| (k.to_string(), v.to_string()))) {
+            merged.retain(|(m, _)| *m != k);
+            merged.push((k, v));
+        }
+        for (k, v) in &merged {
             e(k, v);
         }
-        let child = Command::new(&self.binaries[i]).args(&args).envs(env.iter().copied()).stdin(Stdio::null()).stdout(out.try_clone().unwrap()).stderr(out).spawn().expect("spawn elasticsearch-node");
+        let child = Command::new(&self.binaries[i]).args(&args).envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))).envs(env.iter().copied()).stdin(Stdio::null()).stdout(out.try_clone().unwrap()).stderr(out).spawn().expect("spawn elasticsearch-node");
         self.children[i] = Some(child);
 
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -268,6 +283,9 @@ impl Procs {
 
     pub async fn call(&self, node: usize, method: Method, path: &str, body: Option<Value>) -> (u16, Value) {
         let mut r = self.c.request(method, format!("http://127.0.0.1:{}{path}", self.p.http[node])).timeout(Duration::from_secs(120));
+        if let Some((u, p)) = &self.auth {
+            r = r.basic_auth(u, Some(p));
+        }
         if let Some(b) = body {
             r = r.json(&b);
         }
@@ -279,8 +297,11 @@ impl Procs {
 
     /// An `application/x-ndjson` POST (`_bulk`, `_msearch`).
     pub async fn ndjson(&self, node: usize, path: &str, body: String) -> (u16, Value) {
-        let r = self.c.post(format!("http://127.0.0.1:{}{path}", self.p.http[node])).timeout(Duration::from_secs(120))
+        let mut r = self.c.post(format!("http://127.0.0.1:{}{path}", self.p.http[node])).timeout(Duration::from_secs(120))
             .header("content-type", "application/x-ndjson").body(body);
+        if let Some((u, p)) = &self.auth {
+            r = r.basic_auth(u, Some(p));
+        }
         let Ok(resp) = r.send().await else { return (0, Value::Null) };
         let status = resp.status().as_u16();
         (status, resp.json().await.unwrap_or(Value::Null))
@@ -375,6 +396,47 @@ pub async fn start_procs(nodes: usize, extra: &[(&str, &str)]) -> Procs {
 /// Start real nodes with explicitly selected executables, one per node.
 /// The caller must record the binaries' revisions/hashes with test evidence.
 pub async fn start_procs_with_binaries(extra: &[(&str, &str)], binaries: &[PathBuf]) -> Procs {
+    start_procs_inner(extra, &[], binaries, &[], None).await
+}
+
+/// Like [`start_procs`] for a secured cluster: every helper request
+/// authenticates as `user` / `password` (e.g. `elastic` with the
+/// `bootstrap.password` in `extra`).
+#[allow(dead_code)]
+pub async fn start_procs_secured(nodes: usize, extra: &[(&str, &str)], user: &str, password: &str) -> Procs {
+    let binaries = vec![PathBuf::from(env!("CARGO_BIN_EXE_elasticsearch-node")); nodes];
+    start_procs_inner(extra, &[], &binaries, &[], Some((user.to_string(), password.to_string()))).await
+}
+
+/// Like [`start_procs`], with node-specific settings (e.g. `node.roles`)
+/// on top of `extra`: node `i` gets `node_extra[i]`, also when it is
+/// restarted ([`Procs::spawn`] adds its own on top).
+#[allow(dead_code)]
+pub async fn start_procs_per_node(extra: &[(&str, &str)], node_extra: &[&[(&str, &str)]]) -> Procs {
+    let binaries = vec![PathBuf::from(env!("CARGO_BIN_EXE_elasticsearch-node")); node_extra.len()];
+    start_procs_inner(extra, &[], &binaries, node_extra, None).await
+}
+
+/// [`start_procs_secured`] whose processes all get `env` (e.g. `ES_PATH_CONF`
+/// of a keystore holding `bootstrap.password`).
+#[allow(dead_code)]
+pub async fn start_procs_secured_env(nodes: usize, extra: &[(&str, &str)], env: &[(&str, &str)], user: &str, password: &str) -> Procs {
+    let binaries = vec![PathBuf::from(env!("CARGO_BIN_EXE_elasticsearch-node")); nodes];
+    start_procs_inner(extra, env, &binaries, &[], Some((user.to_string(), password.to_string()))).await
+}
+
+/// Start `nodes` nodes whose processes all get `env` (also on restarts).
+#[allow(dead_code)]
+pub async fn start_procs_env(nodes: usize, extra: &[(&str, &str)], env: &[(&str, &str)]) -> Procs {
+    let binaries = vec![PathBuf::from(env!("CARGO_BIN_EXE_elasticsearch-node")); nodes];
+    start_procs_inner(extra, env, &binaries, &[], None).await
+}
+
+/// The one way a process cluster starts: cluster-wide settings `extra`,
+/// environment `env` for every node process, one binary per node, and
+/// node `i`'s own settings `node_extra[i]`. Restarts keep `env` and
+/// `node_extra`.
+async fn start_procs_inner(extra: &[(&str, &str)], env: &[(&str, &str)], binaries: &[PathBuf], node_extra: &[&[(&str, &str)]], auth: Option<(String, String)>) -> Procs {
     let binaries: Vec<PathBuf> = binaries.iter().map(|path| {
         let path = std::fs::canonicalize(path).expect("resolve node binary");
         assert!(path.is_file(), "node binary must be a regular file");
@@ -388,9 +450,12 @@ pub async fn start_procs_with_binaries(extra: &[(&str, &str)], binaries: &[PathB
         dir: super::scratch_dir(&cluster),
         cluster,
         extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        node_extra: (0..n).map(|i| node_extra.get(i).map(|e| e.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()).unwrap_or_default()).collect(),
         children: (0..n).map(|_| None).collect(),
         binaries,
         current: std::fs::canonicalize(env!("CARGO_BIN_EXE_elasticsearch-node")).expect("resolve this build's node binary"),
+        auth,
     };
     // One at a time: each node seeds from the ports of those before it.
     for i in 0..n {

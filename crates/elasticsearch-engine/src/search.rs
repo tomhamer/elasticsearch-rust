@@ -60,6 +60,30 @@ pub struct Target {
 thread_local! {
     static READ_SHARD: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static READ_SHARD_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SHARD_TAGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A coordinator's point-in-time sub search over several shards of this
+/// node, ordered by score: each hit also names its shard
+/// ([`SHARD_TAG_KEY`]), so the coordinator breaks score ties across the
+/// subs by shard, as ES does (by shard request index), not by node.
+pub struct ShardTagScope(bool);
+impl ShardTagScope {
+    pub fn enter(on: bool) -> Self { Self(SHARD_TAGS.with(|s| s.replace(on))) }
+}
+impl Drop for ShardTagScope {
+    fn drop(&mut self) { SHARD_TAGS.with(|s| s.set(self.0)); }
+}
+
+/// The hit member naming its shard under [`ShardTagScope`] (for the
+/// coordinator's merge only, never returned to clients).
+pub const SHARD_TAG_KEY: &str = "_rustic_shard";
+
+fn shard_tag(js: &mut String, t: &Target) {
+    if js.ends_with('}') {
+        js.pop();
+        js.push_str(&format!(",\"{SHARD_TAG_KEY}\":{}}}", t.shard.as_ref().map(|x| x.id).unwrap_or(0)));
+    }
 }
 
 /// Request-scoped selection used by the cluster's shard search endpoints.
@@ -162,6 +186,11 @@ impl Target {
         }
     }
 
+    /// The caller's document-level security filter on this index.
+    pub fn dls_filter(&self) -> Option<Value> {
+        self.access.as_ref().and_then(|a| a.dls.clone())
+    }
+
     /// Field-level security of the caller on this index.
     pub fn field_access(&self) -> Option<&crate::security::roles::FieldAccess> {
         self.access.as_ref().and_then(|a| a.fields.as_ref())
@@ -210,6 +239,10 @@ pub struct SortSpec {
     pub format: Option<String>,
     /// `numeric_type` (`date` / `date_nanos`): unit date sort values are compared and rendered in.
     pub numeric_type: Option<String>,
+    /// This criterion's raw sort object when [`SortSpec`] cannot represent it
+    /// (`_geo_distance`, `_script`, a `nested` context). Kept per criterion:
+    /// two `_script` (or `_geo_distance`) criteria of one sort are distinct.
+    pub extra: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -241,6 +274,9 @@ pub struct SearchRequest {
     /// searches: `AbstractAsyncBulkByPaginatedSearchAction` includes vectors
     /// unless told otherwise, `_inference_fields` still left out).
     pub vectors_by_default: bool,
+    /// Internal (cluster resize copy): hits carry the indexing input
+    /// (`_recovery_source`) as `_source` where the mapping filters it.
+    pub recovery_source: bool,
     pub fields: Vec<(String, Option<String>)>,
     pub docvalue_fields: Vec<(String, Option<String>)>,
     pub highlight: Option<Map<String, Value>>,
@@ -362,6 +398,7 @@ impl Default for SearchRequest {
             source: SourceFilter::All,
             exclude_vectors: None,
             vectors_by_default: false,
+            recovery_source: false,
             fields: Vec::new(),
             docvalue_fields: Vec::new(),
             highlight: None,
@@ -455,15 +492,18 @@ fn parse_sort(v: &Value) -> Result<Vec<SortSpec>> {
                     Some("asc") => false,
                     _ => f == "_score",
                 };
-                out.push(SortSpec { field: f, descending: desc, missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None });
+                out.push(SortSpec { field: f, descending: desc, missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None, extra: None });
             }
             Value::Number(_) | Value::Bool(_) => {
                 let f = crate::query::dsl::scalar_string(&it);
-                out.push(SortSpec { field: f, descending: false, missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None });
+                out.push(SortSpec { field: f, descending: false, missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None, extra: None });
             }
             Value::Object(o) => {
                 for (f, spec) in o {
-                    let mut s = SortSpec { field: f.clone(), descending: f == "_score", missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None };
+                    let mut s = SortSpec { field: f.clone(), descending: f == "_score", missing: None, mode: None, unmapped_type: None, format: None, numeric_type: None, extra: None };
+                    if f == "_geo_distance" || f == "_script" || spec.get("nested").is_some() {
+                        s.extra = Some(spec.clone());
+                    }
                     match spec {
                         Value::String(ord) => s.descending = ord == "desc",
                         Value::Object(so) => {
@@ -923,9 +963,20 @@ pub fn parse_request(body: &Value, params: &HashMap<String, String>) -> Result<S
     if let Some(v) = params.get("docvalue_fields") {
         r.docvalue_fields = field_list(&json!(v));
     }
+    // ES `RestSearchAction`: a URL `stored_fields` list replaces the body's,
+    // with the body form's semantics (`_none_`, `_source`, no source unless
+    // asked for).
     if let Some(v) = params.get("stored_fields") {
-        if v == "_none_" {
+        let sf: Vec<String> = v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+        r.stored_fields = sf.iter().filter(|s| !s.starts_with('_') || s.as_str() == "_ignored_source").cloned().collect();
+        r.stored_fields_none = false;
+        if sf.iter().any(|s| s == "_none_") {
             r.stored_fields_none = true;
+            r.source = SourceFilter::None;
+        } else if !sf.iter().any(|s| s == "_source")
+            && !o.contains_key("_source")
+            && !["_source", "_source_includes", "_source_include", "_source_excludes", "_source_exclude"].iter().any(|k| params.contains_key(*k))
+        {
             r.source = SourceFilter::None;
         }
     }
@@ -972,11 +1023,20 @@ fn resolve_geo_sort(spec: &Map<String, Value>, s: &SortSpec, lookup: &FieldLooku
         .iter()
         .find(|(k, _)| !matches!(k.as_str(), "order" | "unit" | "mode" | "distance_type" | "ignore_unmapped" | "validation_method" | "nested" | "missing"))
         .ok_or_else(|| EsError::parsing("[_geo_distance] requires a geo_point field and an origin"))?;
-    let origin = match origin {
-        Value::Array(a) if !values::is_point_array(a) => a.first().cloned().unwrap_or(Value::Null),
-        other => other.clone(),
+    // One origin, or several (`[[lon, lat], "lat,lon", {..}, ..]`): the
+    // mode then picks among every point-to-origin distance.
+    let origins: Vec<Value> = match origin {
+        Value::Array(a) if !values::is_point_array(a) => a.clone(),
+        other => vec![other.clone()],
     };
-    let (lat, lon) = values::parse_geo_point(&origin).ok_or_else(|| EsError::parsing(format!("failed to parse [_geo_distance] origin [{origin}]")))?;
+    let mut points = Vec::with_capacity(origins.len());
+    for origin in &origins {
+        points.push(values::parse_geo_point(origin).ok_or_else(|| EsError::parsing(format!("failed to parse [_geo_distance] origin [{origin}]")))?);
+    }
+    let Some(&(lat, lon)) = points.first() else {
+        return Err(EsError::parsing(format!("failed to parse [_geo_distance] origin [{}]", Value::Array(Vec::new()))));
+    };
+    let more = points[1..].to_vec();
     let unit = spec.get("unit").and_then(Value::as_str).unwrap_or("m");
     let scale = values::unit_meters(unit).ok_or_else(|| EsError::illegal_argument(format!("No distance unit match [{unit}]")))?;
     let plane = spec.get("distance_type").and_then(Value::as_str) == Some("plane");
@@ -995,15 +1055,20 @@ fn resolve_geo_sort(spec: &Map<String, Value>, s: &SortSpec, lookup: &FieldLooku
         Some(o) => return Err(EsError::illegal_argument(format!("Unsupported sort mode [{o}] for geo distance sorting"))),
         None => None,
     };
-    Ok(ResolvedSort { field: SortField::GeoDistance { field, lat, lon, descending: s.descending, mode, plane }, scale, render: "geo", descending: s.descending, missing_first: false })
+    Ok(ResolvedSort { field: SortField::GeoDistance { field, lat, lon, descending: s.descending, mode, plane, more }, scale, render: "geo", descending: s.descending, missing_first: false })
 }
 
 /// Wrap a resolved field sort in a nested sort when the request gives a
 /// `nested` context (or the field lives under a nested path).
 fn wrap_nested_sort(rs: &mut ResolvedSort, nested: Option<&Value>, field_nested_path: Option<String>, qctx: &QueryContext) -> Result<()> {
-    let (path, filter) = match nested {
+    let (path, filter, max_children) = match nested {
         Some(n) => {
             let path = n.get("path").and_then(Value::as_str).ok_or_else(|| EsError::parsing("[nested] sort requires a [path]"))?;
+            // SIDE 014: the per-root bound on the children considered.
+            let max_children = match n.get("max_children") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).ok_or_else(|| EsError::parsing("[nested] [max_children] must be a non-negative integer"))? as usize),
+            };
             let filter = match n.get("filter") {
                 Some(f) => Some(Box::new(parse_query(f, qctx)?)),
                 None => None,
@@ -1011,15 +1076,15 @@ fn wrap_nested_sort(rs: &mut ResolvedSort, nested: Option<&Value>, field_nested_
             if n.get("nested").is_some() {
                 return Err(EsError::illegal_argument("multi-level nested sort contexts are not supported"));
             }
-            (path.to_string(), filter)
+            (path.to_string(), filter, max_children)
         }
         None => match field_nested_path {
-            Some(p) => (p, None),
+            Some(p) => (p, None, None),
             None => return Ok(()),
         },
     };
     let inner = std::mem::replace(&mut rs.field, SortField::Doc);
-    rs.field = SortField::Nested { path, filter, sort: Box::new(inner) };
+    rs.field = SortField::Nested { path, filter, sort: Box::new(inner), max_children };
     Ok(())
 }
 
@@ -1039,7 +1104,7 @@ fn resolve_sort(specs: &[SortSpec], lookup: &FieldLookup, index: &str, uuid: &st
                 missing_first: false,
             }),
             "_geo_distance" => {
-                let spec = extra.get("_geo_distance").and_then(Value::as_object).cloned().unwrap_or_default();
+                let spec = s.extra.as_ref().or_else(|| extra.get("_geo_distance")).and_then(Value::as_object).cloned().unwrap_or_default();
                 out.push(resolve_geo_sort(&spec, s, lookup, index, uuid)?);
                 wrap_nested_sort(out.last_mut().unwrap(), spec.get("nested"), None, qctx)?;
             }
@@ -1048,7 +1113,7 @@ fn resolve_sort(specs: &[SortSpec], lookup: &FieldLookup, index: &str, uuid: &st
                 out.push(ResolvedSort { field: SortField::Doc, scale: 1.0, render: "ts_routing_hash", descending: s.descending, missing_first: false });
             }
             "_script" => {
-                let render = crate::script::search::script_sort_render(extra.get("_script"))?;
+                let render = crate::script::search::script_sort_render(s.extra.as_ref().or_else(|| extra.get("_script")))?;
                 out.push(ResolvedSort { field: SortField::Doc, scale: 1.0, render, descending: s.descending, missing_first: false });
             }
             "_id" => out.push(ResolvedSort {
@@ -1097,7 +1162,7 @@ fn resolve_sort(specs: &[SortSpec], lookup: &FieldLookup, index: &str, uuid: &st
                             }
                             // No doc-values column: sort on the uninverted terms.
                             EsType::Text | EsType::MatchOnlyText => {
-                                crate::fielddata_cache::mark(index, name);
+                                crate::fielddata_cache::mark(uuid, name);
                                 (SortKind::Fielddata, "keyword")
                             }
                             EsType::AggregateMetricDouble => (SortKind::F64, "double"),
@@ -1173,11 +1238,29 @@ fn resolve_sort(specs: &[SortSpec], lookup: &FieldLookup, index: &str, uuid: &st
                     missing_first,
                 });
                 let nested_path = f.and_then(|f| f.nested_path.clone());
-                wrap_nested_sort(out.last_mut().unwrap(), extra.get(name).and_then(|e| e.get("nested")), nested_path, qctx)?;
+                wrap_nested_sort(out.last_mut().unwrap(), s.extra.as_ref().or_else(|| extra.get(name)).and_then(|e| e.get("nested")), nested_path, qctx)?;
             }
         }
     }
     Ok(out)
+}
+
+/// [`after_value`] of resolved criterion `s`: a `numeric_type: long` sort
+/// of a floating-point field compares (and renders) cast longs, so its
+/// cursor is a long ([`crate::script::search::long_cast`]).
+fn after_value_resolved(v: &Value, s: &ResolvedSort, lookup: &FieldLookup, spec: &SortSpec) -> Result<SortValue> {
+    if crate::script::search::long_cast(spec, &s.field, lookup).is_some() {
+        return Ok(match v {
+            Value::Null => SortValue::Missing,
+            Value::Number(n) => SortValue::I64(n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)),
+            other => {
+                let t = crate::query::dsl::scalar_string(other);
+                let t = t.trim();
+                SortValue::I64(t.parse::<i64>().unwrap_or_else(|_| t.parse::<f64>().map(|x| x as i64).unwrap_or(0)))
+            }
+        });
+    }
+    after_value(v, s.render, lookup, spec)
 }
 
 fn after_value(v: &Value, render: &str, lookup: &FieldLookup, spec: &SortSpec) -> Result<SortValue> {
@@ -1215,9 +1298,13 @@ fn after_value(v: &Value, render: &str, lookup: &FieldLookup, spec: &SortSpec) -
                 },
                 None => s.parse().unwrap_or(0),
             };
+            // A date_nanos sort compares nanoseconds: the cursor keeps the
+            // sub-millisecond digits its formatted value shows
+            // (`format_nanos`), not just the millis the formatter parses.
+            let nanos = |m: i64| m.saturating_mul(1_000_000).saturating_add(rustic_core::fieldtypes::numeric::fraction_nanos(s).map_or(0, |n| (n % 1_000_000) as i64));
             match f {
-                Some(f) if f.ty == EsType::DateNanos && spec.format.is_some() => SortValue::I64(m * 1_000_000),
-                Some(f) if f.ty == EsType::DateNanos && s.parse::<i64>().is_err() => SortValue::I64(m * 1_000_000),
+                Some(f) if f.ty == EsType::DateNanos && spec.format.is_some() => SortValue::I64(nanos(m)),
+                Some(f) if f.ty == EsType::DateNanos && s.parse::<i64>().is_err() => SortValue::I64(nanos(m)),
                 _ => SortValue::I64(m),
             }
         }
@@ -1493,43 +1580,45 @@ pub fn filter_source(v: &Value, includes: &[String], excludes: &[String]) -> Val
     fn matches(p: &str, path: &str) -> bool {
         crate::mapping::wildcard_match(p, path)
     }
-    fn walk(v: &Value, path: &str, inc: &[String], exc: &[String]) -> Option<Value> {
+    // `included`: an ancestor matched an include, so everything below is
+    // included unless excluded (ES `XContentMapValues.filter` carries the
+    // match into sub-objects); arrays are filtered element by element at
+    // every depth (finding 431).
+    fn walk(v: &Value, path: &str, included: bool, inc: &[String], exc: &[String]) -> Option<Value> {
         if !path.is_empty() && exc.iter().any(|e| matches(e, path) || path.starts_with(&format!("{e}."))) {
             return None;
         }
+        let here = included || inc.is_empty() || (!path.is_empty() && inc.iter().any(|i| matches(i, path)));
         match v {
             Value::Object(m) => {
                 let mut out = Map::new();
                 for (k, c) in m {
                     let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
-                    if let Some(x) = walk(c, &p, inc, exc) {
+                    if let Some(x) = walk(c, &p, here, inc, exc) {
                         out.insert(k.clone(), x);
                     }
                 }
-                let self_included = !path.is_empty() && (inc.is_empty() || inc.iter().any(|i| matches(i, path) || path.starts_with(&format!("{i}."))));
-                if out.is_empty() && !self_included && !path.is_empty() {
-                    return None;
-                }
-                if out.is_empty() && !m.is_empty() && !self_included {
-                    return if path.is_empty() { Some(Value::Object(out)) } else { None };
-                }
-                Some(Value::Object(out))
-            }
-            Value::Array(a) if a.iter().any(Value::is_object) => {
-                let items: Vec<Value> = a.iter().filter_map(|x| if x.is_object() { walk(x, path, inc, exc) } else if inc.is_empty() || inc.iter().any(|i| matches(i, path) || path.starts_with(&format!("{i}."))) { Some(x.clone()) } else { None }).collect();
-                let items: Vec<Value> = items.into_iter().filter(|x| !(x.is_object() && x.as_object().unwrap().is_empty()) || inc.is_empty()).collect();
-                if items.is_empty() { None } else { Some(Value::Array(items)) }
-            }
-            leaf => {
-                if inc.is_empty() || inc.iter().any(|i| matches(i, path) || path.starts_with(&format!("{i}."))) {
-                    Some(leaf.clone())
+                if path.is_empty() || (here && !path.is_empty()) || !out.is_empty() {
+                    Some(Value::Object(out))
                 } else {
                     None
                 }
             }
+            Value::Array(a) if a.iter().any(|x| x.is_object() || x.is_array()) => {
+                let items: Vec<Value> = a
+                    .iter()
+                    .filter_map(|x| match x {
+                        Value::Object(_) => walk(x, path, included, inc, exc).filter(|r| inc.is_empty() || r.as_object().is_some_and(|o| !o.is_empty())),
+                        Value::Array(_) => walk(x, path, included, inc, exc).filter(|r| r.as_array().is_some_and(|a| !a.is_empty())),
+                        scalar => here.then(|| scalar.clone()),
+                    })
+                    .collect();
+                if items.is_empty() { None } else { Some(Value::Array(items)) }
+            }
+            leaf => here.then(|| leaf.clone()),
         }
     }
-    walk(v, "", includes, excludes).unwrap_or_else(|| json!({}))
+    walk(v, "", false, includes, excludes).unwrap_or_else(|| json!({}))
 }
 
 /// `{"a": {"b": v}}` for the dotted `path` `a.b`.
@@ -1722,6 +1811,30 @@ fn unmapped_level(c: &FieldsCtx, v: &Value, root: &str, prefix: &str, out: &mut 
 }
 
 /// The fields API value of one mapped field from `_source`.
+/// Whether indexing accepts scalar `v` for `f` (booleans and integers, whose
+/// malformed values the fields API must not present; other types: `false`,
+/// every value of an ignored field is reported ignored).
+fn scalar_accepted(f: &crate::mapping::ResolvedField, v: &Value) -> bool {
+    match f.ty {
+        EsType::Boolean => matches!(v, Value::Bool(_)) || matches!(v.as_str(), Some("true" | "false" | "")),
+        EsType::Long | EsType::Integer | EsType::Short | EsType::Byte => {
+            let x: Option<i128> = match v {
+                Value::Number(n) => n.as_i64().map(i128::from).or_else(|| n.as_f64().filter(|x| x.is_finite()).map(|x| x.trunc() as i128)),
+                Value::String(t) => t.trim().parse::<i64>().ok().map(i128::from).or_else(|| t.trim().parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| x.trunc() as i128)),
+                _ => None,
+            };
+            let (lo, hi): (i128, i128) = match f.ty {
+                EsType::Byte => (i8::MIN.into(), i8::MAX.into()),
+                EsType::Short => (i16::MIN.into(), i16::MAX.into()),
+                EsType::Integer => (i32::MIN.into(), i32::MAX.into()),
+                _ => (i64::MIN.into(), i64::MAX.into()),
+            };
+            x.is_some_and(|x| (lo..=hi).contains(&x))
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn fields_api_values(lookup: &FieldLookup, name: &str, path: &str, src: &Value, format: Option<&str>) -> Vec<Value> {
     let Some(f) = lookup.get(name) else { return vec![] };
     // constant_keyword: every document holds the mapped value.
@@ -1747,7 +1860,9 @@ pub(crate) fn fields_api_values(lookup: &FieldLookup, name: &str, path: &str, sr
             _ => vec![],
         };
     }
-    let mut raw = source_values_ordered_with(src, path, f.declared == EsType::UnsignedLong && f.null_value.is_some());
+    // Explicit nulls are kept wherever a `null_value` replaces them (what
+    // indexing stores for them).
+    let mut raw = source_values_ordered_with(src, path, f.null_value.is_some());
     // dense_vector: the whole vector (a hex string is its byte values).
     if f.declared == EsType::DenseVector {
         return match raw.as_slice() {
@@ -1813,6 +1928,16 @@ pub(crate) fn fields_api_values(lookup: &FieldLookup, name: &str, path: &str, sr
             }
         }
         let val = match f.ty {
+            // date_nanos: parsed and rendered at nanosecond resolution (as
+            // its doc values are), never through milliseconds.
+            EsType::DateNanos if f.declared == EsType::DateNanos => {
+                let explicit = f.ext.as_ref().and_then(|e| e.str("format")).map(str::to_string);
+                let spec = match format {
+                    Some(s) if s != "use_field_mapping" => Some(s.to_string()),
+                    _ => explicit,
+                };
+                crate::fieldtypes::index::parse_nanos(f, &v).ok().map(|n| Value::String(crate::fieldtypes::format_nanos(n, spec.as_deref(), f)))
+            }
             EsType::Date | EsType::DateNanos => {
                 let ms = match &v {
                     Value::String(s) => f.date_format.parse(s).ok(),
@@ -1830,11 +1955,22 @@ pub(crate) fn fields_api_values(lookup: &FieldLookup, name: &str, path: &str, sr
                 Value::String(s) => s.trim().parse::<u64>().ok().map(Value::from),
                 _ => None,
             },
-            EsType::Long | EsType::Integer | EsType::Short | EsType::Byte => match &v {
-                Value::Number(n) => Some(n.as_i64().map(Value::from).unwrap_or_else(|| Value::from(n.as_f64().unwrap_or(0.0).trunc() as i64))),
-                Value::String(s) => s.trim().parse::<f64>().ok().map(|x| Value::from(x.trunc() as i64)),
-                _ => None,
-            },
+            // The values indexing accepts, within the type's range (an
+            // out-of-range value was ignored as malformed, not indexed).
+            EsType::Long | EsType::Integer | EsType::Short | EsType::Byte => {
+                let x: Option<i128> = match &v {
+                    Value::Number(n) => n.as_i64().map(i128::from).or_else(|| n.as_f64().filter(|x| x.is_finite()).map(|x| x.trunc() as i128)),
+                    Value::String(t) => t.trim().parse::<i64>().ok().map(i128::from).or_else(|| t.trim().parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| x.trunc() as i128)),
+                    _ => None,
+                };
+                let (lo, hi): (i128, i128) = match f.ty {
+                    EsType::Byte => (i8::MIN.into(), i8::MAX.into()),
+                    EsType::Short => (i16::MIN.into(), i16::MAX.into()),
+                    EsType::Integer => (i32::MIN.into(), i32::MAX.into()),
+                    _ => (i64::MIN.into(), i64::MAX.into()),
+                };
+                x.filter(|x| (lo..=hi).contains(x)).map(|x| Value::from(x as i64))
+            }
             EsType::Double | EsType::Float | EsType::HalfFloat | EsType::ScaledFloat => {
                 let x = v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
                 x.map(|x| match f.ty {
@@ -1844,9 +1980,15 @@ pub(crate) fn fields_api_values(lookup: &FieldLookup, name: &str, path: &str, sr
                     _ => values::java_double(x),
                 })
             }
+            // ES `BooleanFieldMapper`: true / false and the strings "true",
+            // "false" and "" (false); anything else was ignored as malformed.
             EsType::Boolean => match &v {
                 Value::Bool(b) => Some(Value::Bool(*b)),
-                Value::String(s) => Some(Value::Bool(s == "true")),
+                Value::String(s) => match s.as_str() {
+                    "true" => Some(Value::Bool(true)),
+                    "false" | "" => Some(Value::Bool(false)),
+                    _ => None,
+                },
                 _ => None,
             },
             EsType::Keyword | EsType::ConstantKeyword | EsType::Wildcard => {
@@ -2050,7 +2192,7 @@ fn docvalue_values_plain(leaf: &LeafReader<'_>, lookup: &FieldLookup, name: &str
             };
             sorted_i64().into_iter().map(|m| Value::String(fmt.format(m, crate::date::Tz::UTC))).collect()
         }
-        EsType::Boolean => leaf.bool_value(id, doc).map(Value::Bool).into_iter().collect(),
+        EsType::Boolean => leaf.bool_values(id, doc).into_iter().map(Value::Bool).collect(),
         EsType::DenseVector => {
             let Some(v) = leaf.vector(id, doc) else { return vec![] };
             let et = crate::vectors::element_type(f);
@@ -2141,7 +2283,7 @@ fn aggregation_visibility(t: &Target, ctx: &QueryContext, req: &SearchRequest) -
     t.effective_filter().map(|filter| {
         // A role/alias filter may reference a field hidden by FLS.
         let full_lookup = t.svc.lookup();
-        parse_query(&filter, &QueryContext { lookup: &full_lookup, ..ctx.clone() })
+        parse_query(&filter, &QueryContext { lookup: &full_lookup, dls_filter: None, ..ctx.clone() })
             .map_err(|e| wrap_shard_err(&t.svc.name, e))
     }).transpose()
 }
@@ -2258,37 +2400,78 @@ struct InnerHitsDef {
     children: Vec<InnerHitsDef>,
     /// The inner scorer of the last rendered parent (reused for later parents of the same leaf).
     cursor: std::sync::Mutex<Option<rustic_core::query::InnerHitsCursor>>,
-    /// `inner_hits.sort`: `(field, descending)` keys (`_score` / `_doc` too).
-    sort: Vec<(String, bool)>,
+    /// `inner_hits.sort`: each criterion as parsed and as resolved against
+    /// the index (`_score` / `_doc` too), so mode, missing and numeric
+    /// type apply as they do to a search's own sort.
+    sort: Vec<(SortSpec, ResolvedSort)>,
     /// Parent/child inner hits (`has_child` / `has_parent`) instead of nested ones.
     join: Option<crate::fieldtypes::join::InnerSide>,
 }
 
-/// `inner_hits.sort` entries (`"f"`, `{"f": "desc"}`, `{"f": {"order": ..}}`).
-fn inner_sort(v: Option<&Value>) -> Vec<(String, bool)> {
-    let items = match v {
-        Some(Value::Array(a)) => a.clone(),
-        Some(x) => vec![x.clone()],
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for it in items {
-        match it {
-            Value::String(f) => out.push((f.clone(), f == "_score")),
-            Value::Object(m) => {
-                for (f, o) in m {
-                    let ord = o.as_str().or_else(|| o.get("order").and_then(Value::as_str));
-                    let desc = match ord {
-                        Some(x) => x.eq_ignore_ascii_case("desc"),
-                        None => f == "_score",
+/// `inner_hits.sort` (any form a search's `sort` takes), resolved against
+/// the index like a search's own sort.
+fn inner_sort(v: Option<&Value>, qctx: &QueryContext) -> Result<Vec<(SortSpec, ResolvedSort)>> {
+    let Some(v) = v else { return Ok(Vec::new()) };
+    let specs = parse_sort(v)?;
+    let resolved = resolve_sort(&specs, qctx.lookup, qctx.index_name, qctx.index_uuid, &HashMap::new(), qctx)?;
+    Ok(specs.into_iter().zip(resolved).collect())
+}
+
+/// The typed sort keys of inner hit `doc` (of `leaf`, scored `score`): a
+/// field's values picked by the criterion's mode (min ascending, max
+/// descending by default), its `missing` and `numeric_type` applied.
+fn inner_sort_keys(sort: &[(SortSpec, ResolvedSort)], lookup: &FieldLookup, li: usize, leaf: &LeafReader<'_>, doc: DocId, score: f32) -> Result<Vec<SortValue>> {
+    sort.iter()
+        .map(|(spec, rs)| {
+            Ok(match rs.render {
+                "score" => SortValue::F64(score as f64),
+                "doc" => SortValue::I64(((li as i64) << 32) | doc as i64),
+                _ => {
+                    // A nested field's inner hits are its nested docs: their own values.
+                    let sf = match &rs.field {
+                        SortField::Nested { sort, .. } => &**sort,
+                        f => f,
                     };
-                    out.push((f.clone(), desc));
+                    match sf {
+                        SortField::Field { field, kind, missing, mode, descending } => {
+                            crate::script::search::field_sort_value(leaf, doc, *field, *kind, *descending, *mode, missing, crate::script::search::long_cast(spec, sf, lookup))?
+                        }
+                        // The inner hit's own points' distance to every origin.
+                        SortField::GeoDistance { .. } => rustic_core::query::Searcher::geo_distance_value(leaf, doc, sf),
+                        _ => SortValue::Missing,
+                    }
                 }
-            }
-            _ => {}
+            })
+        })
+        .collect()
+}
+
+/// Order of two inner hits' [`inner_sort_keys`].
+fn cmp_inner_keys(sort: &[(SortSpec, ResolvedSort)], a: &[SortValue], b: &[SortValue]) -> Ordering {
+    for (i, (_, rs)) in sort.iter().enumerate() {
+        let (Some(x), Some(y)) = (a.get(i), b.get(i)) else { break };
+        let o = cmp_sort(x, y, rs.descending, rs.missing_first);
+        if o != Ordering::Equal {
+            return o;
         }
     }
-    out
+    Ordering::Equal
+}
+
+/// An inner hit's `sort` values, rendered as a search renders its own.
+fn inner_sort_json(sort: &[(SortSpec, ResolvedSort)], lookup: &FieldLookup, keys: &[SortValue], doc: DocId, score: f32) -> Vec<Value> {
+    sort.iter()
+        .zip(keys)
+        .map(|((spec, rs), v)| match rs.render {
+            "score" => serde_json::from_str(&crate::retriever::score_json(score)).unwrap_or(Value::Null),
+            "doc" => json!(doc),
+            "geo" => match v {
+                SortValue::F64(m) if m.is_finite() => values::java_double(m / rs.scale),
+                _ => json!("Infinity"),
+            },
+            render => render_sort_value(v, render, lookup, Some(spec), score, rs.scale > 1.5),
+        })
+        .collect()
 }
 
 /// Collect the `nested`, `has_child` and `has_parent` queries of the
@@ -2390,7 +2573,7 @@ fn inner_hit_defs(query: Option<&Value>, qctx: &QueryContext, leaves: &[LeafRead
             highlight: ih.get("highlight").and_then(Value::as_object).cloned(),
             children,
             cursor: Default::default(),
-            sort: inner_sort(ih.get("sort")),
+            sort: inner_sort(ih.get("sort"), qctx)?,
             join,
         });
     }
@@ -2486,42 +2669,17 @@ fn render_inner_hits(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: Doc
             def.query.nested_inner_hits_with(&mut cur, leaf, &def.ctx, doc)
         };
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc.cmp(&b.doc)));
-        let by_field = def.sort.iter().any(|(f, _)| f != "_score");
+        let by_field = def.sort.iter().any(|(spec, _)| spec.field != "_score");
+        // Typed keys (once per hit), then the hits in their order.
+        let mut keys: Vec<Vec<SortValue>> = Vec::new();
         if !def.sort.is_empty() {
-            let failure=std::cell::RefCell::new(None);
-            let key = |d: DocId, f: &str| match docvalue_values(leaf, &run.lookup, f, d, None) {
-                Ok(values)=>values.into_iter().next().unwrap_or(Value::Null),
-                Err(error)=>{failure.borrow_mut().get_or_insert(error);Value::Null}
-            };
-            hits.sort_by(|a, b| {
-                for (f, desc) in &def.sort {
-                    let o = match f.as_str() {
-                        "_score" => a.score.total_cmp(&b.score),
-                        "_doc" => a.doc.cmp(&b.doc),
-                        _ => {
-                            let (x, y) = (key(a.doc, f), key(b.doc, f));
-                            match (&x, &y) {
-                                (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                                // Missing values sort last either way.
-                                (Value::Null, _) => return std::cmp::Ordering::Greater,
-                                (_, Value::Null) => return std::cmp::Ordering::Less,
-                                (Value::Number(p), Value::Number(q)) => p.as_f64().unwrap_or(0.0).total_cmp(&q.as_f64().unwrap_or(0.0)),
-                                _ => x.as_str().unwrap_or_default().cmp(y.as_str().unwrap_or_default()),
-                            }
-                        }
-                    };
-                    let o = if *desc { o.reverse() } else { o };
-                    if o != std::cmp::Ordering::Equal {
-                        return o;
-                    }
-                }
-                a.doc.cmp(&b.doc)
-            });
-            if let Some(error)=failure.into_inner(){return Err(error);}
+            let mut keyed = hits.into_iter().map(|h| Ok((inner_sort_keys(&def.sort, &run.lookup, 0, leaf, h.doc, h.score)?, h))).collect::<Result<Vec<_>>>()?;
+            keyed.sort_by(|a, b| cmp_inner_keys(&def.sort, &a.0, &b.0).then(a.1.doc.cmp(&b.1.doc)));
+            (keys, hits) = keyed.into_iter().unzip();
         }
         let max = if by_field { None } else { hits.first().map(|h| h.score) };
         let mut page = Vec::new();
-        for h in hits.iter().skip(def.from).take(def.size) {
+        for (hi, h) in hits.iter().enumerate().skip(def.from).take(def.size) {
             let (meta, child_src) = nested_meta(leaf, h.doc, src.as_ref());
             let mut m = Map::new();
             m.insert("_index".into(), json!(t.svc.name));
@@ -2537,15 +2695,7 @@ fn render_inner_hits(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: Doc
             // ES scores are Java floats.
             m.insert("_score".into(), if by_field { Value::Null } else { serde_json::from_str(&crate::retriever::score_json(h.score)).unwrap_or(Value::Null) });
             if by_field {
-                let sv: Vec<Value> = def
-                    .sort
-                    .iter()
-                    .map(|(f, _)| Ok(match f.as_str() {
-                        "_score" => serde_json::from_str(&crate::retriever::score_json(h.score)).unwrap_or(Value::Null),
-                        "_doc" => json!(h.doc),
-                        _ => docvalue_values(leaf, &run.lookup, f, h.doc, None)?.into_iter().next().unwrap_or(Value::Null),
-                    }))
-                    .collect::<Result<_>>()?;
+                let sv = inner_sort_json(&def.sort, &run.lookup, keys.get(hi).map(Vec::as_slice).unwrap_or(&[]), h.doc, h.score);
                 m.insert("sort".into(), Value::Array(sv));
             }
             let mut fields = Map::new();
@@ -2625,47 +2775,18 @@ fn render_inner_hits(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: Doc
 fn join_inner_hits(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: DocId, def: &InnerHitsDef, side: &crate::fieldtypes::join::InnerSide, total_as_int: bool) -> Result<Value> {
     let mut hits = crate::fieldtypes::join::inner_hits_of(side, &run.leaves, leaf, doc, run.visibility_query.as_ref())?;
     hits.sort_by(|a, b| b.2.total_cmp(&a.2).then((a.0, a.1).cmp(&(b.0, b.1))));
-    let by_field = def.sort.iter().any(|(f, _)| f != "_score");
-    let failure=std::cell::RefCell::new(None);
-    let key = |li: usize, d: DocId, f: &str| -> Value {
-        match f {
-            "_doc" => json!(d),
-            _ => match docvalue_values(&run.leaves[li], &run.lookup, f, d, None) {
-                Ok(values)=>values.into_iter().next().unwrap_or(Value::Null),
-                Err(error)=>{failure.borrow_mut().get_or_insert(error);Value::Null},
-            },
-        }
-    };
+    let by_field = def.sort.iter().any(|(spec, _)| spec.field != "_score");
+    // Typed keys (once per hit), then the hits in their order.
+    let mut keys: Vec<Vec<SortValue>> = Vec::new();
     if !def.sort.is_empty() {
-        hits.sort_by(|a, b| {
-            for (f, desc) in &def.sort {
-                let o = match f.as_str() {
-                    "_score" => a.2.total_cmp(&b.2),
-                    "_doc" => (a.0, a.1).cmp(&(b.0, b.1)),
-                    _ => {
-                        let (x, y) = (key(a.0, a.1, f), key(b.0, b.1, f));
-                        match (&x, &y) {
-                            (Value::Null, Value::Null) => Ordering::Equal,
-                            // Missing values sort last either way.
-                            (Value::Null, _) => return Ordering::Greater,
-                            (_, Value::Null) => return Ordering::Less,
-                            (Value::Number(p), Value::Number(q)) => p.as_f64().unwrap_or(0.0).total_cmp(&q.as_f64().unwrap_or(0.0)),
-                            _ => x.as_str().unwrap_or_default().cmp(y.as_str().unwrap_or_default()),
-                        }
-                    }
-                };
-                let o = if *desc { o.reverse() } else { o };
-                if o != Ordering::Equal {
-                    return o;
-                }
-            }
-            (a.0, a.1).cmp(&(b.0, b.1))
-        });
+        let mut keyed = hits.into_iter().map(|h| Ok((inner_sort_keys(&def.sort, &run.lookup, h.0, &run.leaves[h.0], h.1, h.2)?, h))).collect::<Result<Vec<_>>>()?;
+        keyed.sort_by(|a, b| cmp_inner_keys(&def.sort, &a.0, &b.0).then((a.1 .0, a.1 .1).cmp(&(b.1 .0, b.1 .1))));
+        (keys, hits) = keyed.into_iter().unzip();
     }
     let score = |s: f32| serde_json::from_str(&crate::retriever::score_json(s)).unwrap_or(Value::Null);
     let max = if by_field { None } else { hits.first().map(|h| h.2) };
     let mut page = Vec::new();
-    for &(li, d, s) in hits.iter().skip(def.from).take(def.size) {
+    for (hi, &(li, d, s)) in hits.iter().enumerate().skip(def.from).take(def.size) {
         let other = &run.leaves[li];
         let stored: Document = other.get_doc(d)?.unwrap_or_default();
         let mut m = Map::new();
@@ -2701,12 +2822,11 @@ fn join_inner_hits(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: DocId
             m.insert("fields".into(), Value::Object(fields));
         }
         if by_field {
-            m.insert("sort".into(), Value::Array(def.sort.iter().map(|(f, _)| if f == "_score" { score(s) } else { key(li, d, f) }).collect()));
+            m.insert("sort".into(), Value::Array(inner_sort_json(&def.sort, &run.lookup, keys.get(hi).map(Vec::as_slice).unwrap_or(&[]), d, s)));
         }
         page.push(Value::Object(m));
     }
     let total = if total_as_int { json!(hits.len()) } else { json!({ "value": hits.len(), "relation": "eq" }) };
-    if let Some(error)=failure.into_inner(){return Err(error);}
     Ok(json!({ "hits": {
         "total": total,
         "max_score": max.map(score).unwrap_or(Value::Null),
@@ -2801,8 +2921,10 @@ fn build_query_with(req: &SearchRequest, t: &Target, ctx: &QueryContext, knn_fix
 fn build_query_inner(req: &SearchRequest, t: &Target, ctx: &QueryContext, knn_fixed: Option<(u64, &[phases::ShardKnnHit])>) -> Result<(Query, Query)> {
     // Alias and role (DLS) filters are parsed against the full mapping, not the FLS-restricted one.
     let full_lookup = t.field_access().map(|_| t.svc.lookup());
-    let dls_owned = full_lookup.as_ref().map(|l| QueryContext { lookup: l, ..ctx.clone() });
-    let dls_ctx: &QueryContext = dls_owned.as_ref().unwrap_or(ctx);
+    // The role/alias filter itself sees every document (ES computes the DLS
+    // bitset on the unwrapped reader).
+    let dls_owned = QueryContext { lookup: full_lookup.as_deref().unwrap_or(ctx.lookup), dls_filter: None, ..ctx.clone() };
+    let dls_ctx: &QueryContext = &dls_owned;
     if let Some(plan) = &req.rank_plan {
         // Compound retriever: rank docs for the hits, rank docs + the
         // zero-scored union of the children for aggregations / total.
@@ -2815,7 +2937,9 @@ fn build_query_inner(req: &SearchRequest, t: &Target, ctx: &QueryContext, knn_fi
             // The total comes from the union ([`crate::retriever::fix_total`]), not the hits.
             && req.track_total_hits.is_some())
             .then(|| req.from.saturating_add(req.size).saturating_mul(2));
-        let (mut all, mut top) = crate::retriever::plan_queries(plan, &t.svc.name, union, page);
+        // A shard-level target looks up only the rank docs routed to it.
+        let shard = t.shard.as_ref().map(|s| (s.id, &*t.svc));
+        let (mut all, mut top) = crate::retriever::plan_queries(plan, &t.svc.name, union, page, shard);
         // `DefaultSearchContext.buildFilteredQuery`: on an index with nested
         // documents (`semantic_text` chunks included) a query that might match
         // them is restricted to root documents (a filter clause).
@@ -2928,7 +3052,7 @@ fn check_security_restrictions(targets: &[Target], req: &SearchRequest) -> Resul
     }
     if targets.iter().any(|t| t.field_access().is_some()) {
         let parts = [&req.query, &req.post_filter, &req.aggs, &req.rescore, &req.script_fields, &req.runtime_mappings, &req.retriever, &req.rank, &req.sub_searches, &req.collapse_spec];
-        let in_sort = req.sort_extra.values().any(json_uses_scripts);
+        let in_sort = req.sort_extra.values().chain(req.sort.iter().filter_map(|s| s.extra.as_ref())).any(json_uses_scripts);
         if in_sort || req.knn.iter().any(json_uses_scripts) || parts.iter().any(|p| p.as_ref().is_some_and(json_uses_scripts)) {
             return Err(forbidden("scripts"));
         }
@@ -3508,6 +3632,7 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
             allow_unmapped_fields: t.svc.setting("index.query.parse.allow_unmapped_fields").map(|v| v != "false").unwrap_or(true),
             knn_prefilter: t.effective_filter(),
             knn_prefilter_lookup: Some(t.svc.lookup()),
+            dls_filter: t.dls_filter(),
             allow_expensive_queries: req.allow_expensive_queries && t.svc.setting("index.search.allow_expensive_queries").map(|v| v != "false").unwrap_or(true),
             mappings: Some(&**t.svc),
         };
@@ -3632,12 +3757,11 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
                     vals.push(SortValue::F64(v.as_f64().or_else(|| v.as_str().and_then(|x| x.parse().ok())).unwrap_or(f64::INFINITY) * s.scale));
                     continue;
                 }
-                vals.push(after_value(v, s.render, &lookup, &req.sort[i]).map_err(|e| wrap_shard_err(&t.svc.name, e))?);
+                vals.push(after_value_resolved(v, s, &lookup, &req.sort[i]).map_err(|e| wrap_shard_err(&t.svc.name, e))?);
             }
             so.search_after = Some(TopHit::new(leaf, doc, score, vals));
         }
-        let sort_names: Vec<(String, bool)> = req.sort.iter().map(|s| (s.field.clone(), s.descending)).collect();
-        let script_keys = crate::script::search::sort_keys(&sort_names, &so.sort, &req.sort_extra, &t.svc.name, &lookup).map_err(|e| wrap_shard_err(&t.svc.name, e))?;
+        let script_keys = crate::script::search::sort_keys(&req.sort, &so.sort, &t.svc.name, &lookup).map_err(|e| wrap_shard_err(&t.svc.name, e))?;
         if so.sort.is_empty() && so.search_after.is_some() {
             // The core ignores `search_after` for plain score collection: use an explicit score sort.
             so.sort = vec![SortField::Score { descending: true }];
@@ -3661,6 +3785,10 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
         // or as a kNN execution error): its cancellation is the answer.
         check_cancelled()?;
         if let Some(error) = &top.execution_error {
+            // ES `FieldValueFactorFunction`'s `ElasticsearchException`.
+            if error.starts_with("Missing value for field [") {
+                return Err(EsError::search_phase(&t.svc.name, EsError::new(500, "exception", error.clone())));
+            }
             return Err(EsError::search_phase(&t.svc.name, EsError::illegal_argument(error.clone())));
         }
         if let Some((doc, score)) = top.invalid_score {
@@ -3712,13 +3840,19 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
     let reranked: Vec<(usize, TopHit)>;
     // Merge hits across indices.
     let mut merged: Vec<(usize, &TopHit)> = runs.iter().enumerate().flat_map(|(ti, r)| r.top.hits.iter().map(move |h| (ti, h))).collect();
-    let sort0 = runs.first().map(|r| &r.sort);
+    // The requested sort, from any target that resolved it (a target whose
+    // query failed carries none).
+    let sort0 = runs.iter().map(|r| &r.sort).find(|s| !s.is_empty());
     merged.sort_by(|(ta, a), (tb, b)| {
         match sort0 {
             Some(s) if !s.is_empty() => {
                 for (i, sp) in s.iter().enumerate() {
                     let o = match sp.render {
-                        "score" => b.score.total_cmp(&a.score),
+                        // `_score` in its requested direction.
+                        "score" => {
+                            let o = b.score.total_cmp(&a.score);
+                            if sp.descending { o } else { o.reverse() }
+                        }
                         "doc" => {
                             let o = ta.cmp(tb).then(a.leaf.cmp(&b.leaf)).then(a.doc.cmp(&b.doc));
                             if sp.descending { o.reverse() } else { o }
@@ -3736,9 +3870,18 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
     });
     if let (Some(plan), true) = (&req.rank_plan, req.sort.is_empty()) {
         // Compound retrievers: hits in fused rank order.
+        let routed = plan.has_routing();
         let rank = |ti: usize, h: &TopHit| {
-            let id = runs[ti].leaves[h.leaf].keyword_value(ID_FIELD, h.doc).unwrap_or_default();
-            plan.rank_of(&targets[ti].svc.name, &id)
+            let leaf = &runs[ti].leaves[h.leaf];
+            let id = leaf.keyword_value(ID_FIELD, h.doc).unwrap_or_default();
+            // A routed rank doc is ranked by its own routing (another doc
+            // may share its `_id` on another shard).
+            let routing = if routed {
+                leaf.get_doc(h.doc).ok().flatten().and_then(|d| d.get(ROUTING_FIELD).and_then(|v| v.as_text()).map(str::to_string))
+            } else {
+                None
+            };
+            plan.rank_of(&targets[ti].svc.name, &id, routing.as_deref())
         };
         let mut keyed: Vec<(usize, (usize, &TopHit))> = merged.into_iter().map(|(ti, h)| (rank(ti, h), (ti, h))).collect();
         keyed.sort_by(|a, b| b.1 .1.score.total_cmp(&a.1 .1.score).then(a.0.cmp(&b.0)));
@@ -3876,6 +4019,7 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
             }
         }
         let slots: Vec<parking_lot::Mutex<Option<Document>>> = (0..page.len()).map(|p| parking_lot::Mutex::new(pre.get_mut(p).and_then(Option::take))).collect();
+        let shard_tags = SHARD_TAGS.with(|s| s.get());
         let request_ctx = crate::memory::RequestContext::capture();
         let coordinator = crate::coord::current();
         let inference = crate::inference::current();
@@ -3908,10 +4052,14 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
                 js.pop();
                 js.push_str(&format!(",\"_rustic_doc\":[{ti},{},{}]}}", h.leaf, h.doc));
             }
+            if shard_tags {
+                shard_tag(&mut js, &targets[ti]);
+            }
             mem.add(js.capacity() as u64, "<fetch_source>").map_err(|e| phase_trip(targets, "fetch", e))?;
             hits_json.push(js);
         }
     }
+    let shard_tags = SHARD_TAGS.with(|s| s.get());
     for (p, (ti, h)) in page.iter().enumerate().filter(|_| !parallel_fetch) {
         // Per hit (not per doc): the fetch phase stops once cancelled.
         check_cancelled().map_err(|e| phase_trip(targets, "fetch", e))?;
@@ -3944,6 +4092,9 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
         if (req.doc_refs || req.fetch_refs) && js.ends_with('}') {
             js.pop();
             js.push_str(&format!(",\"_rustic_doc\":[{ti},{},{}]}}", h.leaf, h.doc));
+        }
+        if shard_tags {
+            shard_tag(&mut js, t);
         }
         mem.add(js.capacity() as u64, "<fetch_source>").map_err(|e| phase_trip(targets, "fetch", e))?;
         hits_json.push(js);
@@ -4019,7 +4170,7 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
             let range_auto = if plain { aggs::range_auto_date_fields(spec) } else { None };
             let mut elided: Vec<bool> = Vec::new();
             for (ti, run) in runs.iter().enumerate() {
-                let ctx = SearchContext::for_query(&run.query, &run.leaves, Bm25Params::default());
+                let ctx = agg_context(run, &targets[ti]);
                 ctx.execution_result()?;
                 let elide_nested = nested_path.is_some_and(|p| {
                     run.visibility_query.is_none() && run.lookup.doc_count_id.is_none() && run.query.is_match_all()
@@ -4059,7 +4210,7 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
                     // index's child docs): the deletions themselves must be none.
                     let undeleted = if elide_nested { leaf.deletions_only().is_none() } else { leaf.deleted_bits().is_none() };
                     if elide_run && leaf.num_docs() > 0 && undeleted && matches!(leaf, LeafReader::Segment(_)) {
-                        segs.push(AggSeg { leaf: *leaf, lookup: &run.lookup, index: &targets[ti].svc.name, max_regex_length: targets[ti].svc.setting_usize("index.max_regex_length", 1000), docs: Vec::new(), scores: Vec::new() });
+                        segs.push(AggSeg { shard: ti, leaf: *leaf, lookup: &run.lookup, index: &targets[ti].svc.name, index_uuid: &targets[ti].svc.uuid, max_regex_length: targets[ti].svc.setting_usize("index.max_regex_length", 1000), docs: Vec::new(), scores: Vec::new() });
                         seg_owner.push(ti);
                         elided.push(true);
                         continue;
@@ -4071,7 +4222,7 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
                             break 'collect;
                         }
                     };
-                    segs.push(AggSeg { leaf: *leaf, lookup: &run.lookup, index: &targets[ti].svc.name, max_regex_length: targets[ti].svc.setting_usize("index.max_regex_length", 1000), docs, scores });
+                    segs.push(AggSeg { shard: ti, leaf: *leaf, lookup: &run.lookup, index: &targets[ti].svc.name, index_uuid: &targets[ti].svc.uuid, max_regex_length: targets[ti].svc.setting_usize("index.max_regex_length", 1000), docs, scores });
                     seg_owner.push(ti);
                     elided.push(false);
                 }
@@ -4120,7 +4271,8 @@ fn execute_inner(targets: &[Target], req: &SearchRequest, opts: &ExecOpts) -> Re
                 fetch_aggregation_sources(&targets[ti], &runs[ti], &segs[si].leaf, docs, paths, emit)
             };
             let mapping_context: Vec<_> = targets.iter().zip(&runs).map(|(t,r)|(t.svc.name.as_str(),r.lookup.as_ref())).collect();
-            let env = AggEnv { mapping_context: &mapping_context, now, max_buckets: opts.max_buckets, fetch_hit: &fetch, fetch_source: Some(&source), all_docs: &all, background_filtered: runs.iter().any(|r| r.visibility_query.is_some()), top_metrics_max_size: targets.first().map(|t| t.svc.setting_usize("index.top_metrics_max_size", 10)).unwrap_or(10), max_result_window: targets.first().map(|t| t.svc.setting_usize("index.max_result_window", 10_000)).unwrap_or(10_000), profile: req.profile };
+            let index_aliases: Vec<(&str, Vec<String>)> = targets.iter().map(|t| (t.svc.name.as_str(), t.svc.aliases().keys().cloned().collect())).collect();
+            let env = AggEnv { mapping_context: &mapping_context, now, max_buckets: opts.max_buckets, fetch_hit: &fetch, fetch_source: Some(&source), all_docs: &all, background_filtered: runs.iter().any(|r| r.visibility_query.is_some()), top_metrics_max_size: targets.first().map(|t| t.svc.setting_usize("index.top_metrics_max_size", 10)).unwrap_or(10), max_result_window: targets.first().map(|t| t.svc.setting_usize("index.max_result_window", 10_000)).unwrap_or(10_000), profile: req.profile, index_aliases: &index_aliases, terms_lookup: None };
             let ranges = seg_owner.iter().map(|&ti| runs[ti].query.required_i64_range()).collect();
             let f64_ranges = seg_owner.iter().zip(&elided).map(|(&ti, &e)| if e { runs[ti].query.sole_f64_range() } else { None }).collect();
             let aggregated=aggs::with_query_f64_ranges(f64_ranges, || aggs::with_query_ranges(ranges, || aggs::with_elided_root(elided, || aggs::run_aggregations(spec,&segs,&env))));
@@ -4600,6 +4752,13 @@ pub(crate) fn tree_centroid_sums(g: &rustic_core::geo::GeoIndex, hits: Option<ru
 /// scoring the scorer once per doc. ES collects such a shard through its
 /// match-all weight's bulk scorer (`DefaultBulkScorer` over all docs) or,
 /// for a top-level count-only histogram, not per doc at all.
+// Test hook (#363): the bulk aggregation fill's admission and allocation,
+// in order, with their byte counts (8 a doc).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BULK_TRACE: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn agg_leaf_docs(query: &Query, leaf: &LeafReader<'_>, ctx: &SearchContext, min_score: Option<f32>, mem: &crate::memory::RequestMemory) -> std::result::Result<(Vec<DocId>, Vec<f32>), EsError> {
     let mut docs = Vec::new();
     let mut scores = Vec::new();
@@ -4610,7 +4769,13 @@ fn agg_leaf_docs(query: &Query, leaf: &LeafReader<'_>, ctx: &SearchContext, min_
     if deadline.expired() {
         return Ok((docs, scores));
     }
-    let Some(mut s) = query.scorer(leaf, ctx) else { return Ok((docs, scores)) };
+    // A scorer that refused its workspace records the refusal on the
+    // context and builds no scorer: that is a failed collection, never an
+    // empty one (as the hit search checks its context).
+    let Some(mut s) = query.scorer(leaf, ctx) else {
+        ctx.execution_result()?;
+        return Ok((docs, scores));
+    };
     let n = leaf.num_docs();
     if min_score.is_none() && n > 0 && query.is_match_all() && leaf.deleted_bits().is_none() {
         let first = s.advance();
@@ -4630,29 +4795,49 @@ fn agg_leaf_docs(query: &Query, leaf: &LeafReader<'_>, ctx: &SearchContext, min_
             return Ok((docs, scores));
         }
         // Not the expected first doc: collect generically from a fresh scorer.
-        let Some(fresh) = query.scorer(leaf, ctx) else { return Ok((docs, scores)) };
+        let Some(fresh) = query.scorer(leaf, ctx) else {
+            ctx.execution_result()?;
+            return Ok((docs, scores));
+        };
         s = fresh;
     }
     // A constant-score set held whole (a geo / points query's bitset or
     // doc list): its live docs appended in bulk, all with its one score,
     // instead of advancing and scoring per doc. Same docs and scores.
     let deleted = leaf.deleted_bits();
-    if let Some(score) = s.collect_all(deleted.as_ref().map(|b| b.words()), &mut docs) {
+    // The bulk fill is admitted before it allocates: at most the set's size
+    // (bounded by the leaf) at 8 bytes a doc (id and score), charged a page
+    // at a time; what the fill did not use is given back after.
+    let admitted = (s.size_hint() as usize).min(n as usize);
+    let page = (crate::memory::PAGE / 8) as usize;
+    mem.charge(8 * admitted as u64, "<agg [_docs]>")?;
+    #[cfg(test)]
+    BULK_TRACE.with(|t| t.borrow_mut().push(("charged", 8 * admitted)));
+    let bulk = s.collect_all(deleted.as_ref().map(|b| b.words()), &mut docs);
+    #[cfg(test)]
+    BULK_TRACE.with(|t| t.borrow_mut().push(("filled", 8 * docs.len())));
+    if let Some(score) = bulk {
         if min_score.is_some_and(|m| !(score >= m)) {
             docs.clear();
+            mem.release(8 * admitted as u64);
             return Ok((docs, scores));
         }
-        // Charged as the per-doc loop charges (8 bytes a doc).
-        let page = (crate::memory::PAGE / 8) as usize;
-        let mut at = 0usize;
+        // An under-estimated set: the rest charged as the per-doc loop does.
+        let mut at = admitted;
         while at < docs.len() {
             let k = page.min(docs.len() - at);
             mem.add(8 * k as u64, "<agg [_docs]>")?;
             at += k;
         }
+        if admitted > docs.len() {
+            mem.release(8 * (admitted - docs.len()) as u64);
+        }
         scores = vec![score; docs.len()];
+        ctx.execution_result()?;
         return Ok((docs, scores));
     }
+    // Not a bulk set: the per-doc loop charges as it goes.
+    mem.release(8 * admitted as u64);
     let live = leaf.live_docs();
     // The `timeout` and cancellation polls share one check every 1024 docs.
     let cancel = rustic_core::cancel::current();
@@ -4682,6 +4867,8 @@ fn agg_leaf_docs(query: &Query, leaf: &LeafReader<'_>, ctx: &SearchContext, min_
             }
         }
     }
+    // A scorer that refused workspace part way recorded it on the context.
+    ctx.execution_result()?;
     Ok((docs, scores))
 }
 
@@ -4768,6 +4955,14 @@ fn aggs_fields_uniform(spec: Option<&Value>, targets: &[Target]) -> bool {
 /// `_shards.failures` and returns the others' results); when all do, the
 /// search fails with 429.
 #[allow(clippy::too_many_arguments)]
+/// The scoring context aggregations collect under: the index's (and its
+/// fields') configured similarities, as the hit search scores, so
+/// `min_score`, `top_hits` and samplers see the same scores as the hits.
+fn agg_context(run: &IndexRun<'_>, t: &Target) -> SearchContext {
+    let (similarity, fields) = crate::similarity::options_for(&t.svc, &run.lookup);
+    SearchContext::with_similarity(&run.query, &run.leaves, similarity, fields)
+}
+
 fn shard_reduce_aggs(targets: &[Target], runs: &[IndexRun], req: &SearchRequest, spec: &Value, now: i64, max_buckets: usize, shard_failures: &mut Vec<(String, EsError)>) -> Result<Option<Value>> {
     let first = targets.first().map(|t| t.svc.name.clone()).unwrap_or_default();
     let wrap = |e: EsError| if crate::memory::is_breaking(&e) && e.kind != "search_phase_execution_exception" { EsError::search_phase(&first, e) } else if e.kind == "parsing_exception" || e.kind == "x_content_parse_exception" || e.kind == "action_request_validation_exception" || e.kind == "search_phase_execution_exception" || e.status != 400 { e } else { EsError::search_phase(&first, e) };
@@ -4782,7 +4977,7 @@ fn shard_reduce_aggs(targets: &[Target], runs: &[IndexRun], req: &SearchRequest,
     let one = |ti: usize| -> ShardOut {
         let run = &runs[ti];
         let t = &targets[ti];
-        let ctx = SearchContext::for_query(&run.query, &run.leaves, Bm25Params::default());
+        let ctx = agg_context(run, t);
         if let Err(e) = ctx.execution_result() { return ShardOut::Raw(e.into()); }
         // This shard's doc sets, charged while it aggregates (freed, and
         // released, once its partial is built).
@@ -4793,7 +4988,7 @@ fn shard_reduce_aggs(targets: &[Target], runs: &[IndexRun], req: &SearchRequest,
                 Ok(found) => found,
                 Err(e) => return ShardOut::Tripped(e),
             };
-            segs.push(AggSeg { leaf: *leaf, lookup: &run.lookup, index: &t.svc.name, max_regex_length: t.svc.setting_usize("index.max_regex_length", 1000), docs, scores });
+            segs.push(AggSeg { shard: 0, leaf: *leaf, lookup: &run.lookup, index: &t.svc.name, index_uuid: &t.svc.uuid, max_regex_length: t.svc.setting_usize("index.max_regex_length", 1000), docs, scores });
         }
         let fetch = |si: usize, doc: DocId, score: f32, spec: &Value| -> Result<Value> {
             let sub = agg_hit_request(spec)?;
@@ -4809,7 +5004,8 @@ fn shard_reduce_aggs(targets: &[Target], runs: &[IndexRun], req: &SearchRequest,
             fetch_aggregation_sources(t, run, &segs[si].leaf, docs, paths, emit)
         };
         let mapping_context = [(t.svc.name.as_str(), run.lookup.as_ref())];
-        let env = AggEnv { mapping_context: &mapping_context, now, max_buckets, fetch_hit: &fetch, fetch_source: Some(&source), all_docs: &all, background_filtered: run.visibility_query.is_some(), top_metrics_max_size: t.svc.setting_usize("index.top_metrics_max_size", 10), max_result_window: t.svc.setting_usize("index.max_result_window", 10_000), profile: req.profile };
+        let index_aliases = [(t.svc.name.as_str(), t.svc.aliases().keys().cloned().collect::<Vec<String>>())];
+        let env = AggEnv { mapping_context: &mapping_context, now, max_buckets, fetch_hit: &fetch, fetch_source: Some(&source), all_docs: &all, background_filtered: run.visibility_query.is_some(), top_metrics_max_size: t.svc.setting_usize("index.top_metrics_max_size", 10), max_result_window: t.svc.setting_usize("index.max_result_window", 10_000), profile: req.profile, index_aliases: &index_aliases, terms_lookup: None };
         let ranges = vec![run.query.required_i64_range(); segs.len()];
         let partial=aggs::with_query_ranges(ranges, || crate::hooks::agg_partial::shard_partial(spec,&segs,&env,&request,true));
         if let Err(e) = run.visibility_result() { return ShardOut::Raw(e); }
@@ -5109,9 +5305,45 @@ fn push_hit_sort(s: &mut String, run: &IndexRun, h: &TopHit, req: &SearchRequest
             .collect();
         s.push_str(",\"sort\":");
         s.push_str(&serde_json::to_string(&vals)?);
+        // A coordinator merges shard hits on their sort values. Where the
+        // rendered value does not order like the value the shard sorted on
+        // (a date in a requested `format`, an ip, a version, a tsid), the
+        // hit also carries the typed values ([`RAW_SORT_KEY`]); the
+        // coordinator orders on them and drops them (ES merges typed sort
+        // values and formats them for the client only).
+        // Only a search's own hits (an aggregation's `top_hits` hit has no
+        // sort values of its own).
+        if aggregation_shard_response() && !h.sort.is_empty() {
+            let raw_kind = |i: usize, render: &str| match render {
+                "date" => req.sort.get(i).is_some_and(|s| s.format.is_some()),
+                "ip" | "version" | "tsid" | "ts_routing_hash" => true,
+                _ => false,
+            };
+            if run.sort.iter().enumerate().any(|(i, sp)| raw_kind(i, sp.render)) {
+                let raw: Vec<Value> = run.sort.iter().enumerate().zip(vals).map(|((i, sp), rendered)| {
+                    if !raw_kind(i, sp.render) {
+                        return rendered;
+                    }
+                    match (h.sort.get(i).unwrap_or(&SortValue::Missing), sp.render) {
+                        // Millis / nanos, a missing one as the long end it sorts as.
+                        (v, "date") => render_sort_value(v, "long", &run.lookup, req.sort.get(i), h.score, false),
+                        (SortValue::Str(x), _) => Value::String(x.clone()),
+                        _ => Value::Null,
+                    }
+                }).collect();
+                s.push_str(",\"");
+                s.push_str(RAW_SORT_KEY);
+                s.push_str("\":");
+                s.push_str(&serde_json::to_string(&raw)?);
+            }
+        }
     }
     Ok(())
 }
+
+/// The hit member carrying typed sort values for a coordinator's merge
+/// (written right after `sort`, never returned to clients).
+pub const RAW_SORT_KEY: &str = "_sort_raw";
 
 /// A query phase hit of [`SearchRequest::light_refs`]: `_index`, `_score`
 /// and `sort` as [`fetch_hit`] renders them, nothing read from the
@@ -5173,6 +5405,17 @@ fn fetch_hit_read(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: DocId,
         &loaded
     } else {
         raw_src
+    };
+    // An internal resize copy (production review #485): the indexing input
+    // (`_recovery_source`, with the indexed vectors), not the stored
+    // `_source` its mapping filters, so the copy indexes every field.
+    let recovered;
+    let raw_src: &str = match run.lookup.recovery_source_id.filter(|_| req.recovery_source).and_then(|f| stored.get(f)).and_then(|v| v.as_text()) {
+        Some(original) => {
+            recovered = crate::vector_source::with_rebuilt_vectors(original, &run.lookup, &|f| leaf.vector(f, doc)).unwrap_or_else(|| original.to_string());
+            &recovered
+        }
+        None => raw_src,
     };
     // The whole loaded source (the folded `_ignored_source` rebuilds from it).
     let full_src: &str = raw_src;
@@ -5236,6 +5479,15 @@ fn fetch_hit_read(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: DocId,
         };
         if let Some(f) = &folded {
             entries = f.iter().map(String::as_str).collect();
+        }
+        // Field-level security: the encoded entries carry original field
+        // names and values, so each is filtered like `_source`.
+        let permitted = t.field_access().map(|fa| {
+            let format = crate::synthetic::IgnoredSourceFormat::of(run.lookup.registry.created_version, run.lookup.registry.ts_doc_values_format);
+            crate::synthetic::filter_ignored_source(&entries, format, fa)
+        });
+        if let Some(p) = &permitted {
+            entries = p.iter().map(String::as_str).collect();
         }
         if run.lookup.registry.ts_doc_values_format && run.lookup.registry.created_version.on_or_after(crate::version::IndexVersion::IGNORED_SOURCE_AS_DOC_VALUES_NO_FF) {
             // ES returns binary doc values in encoded-byte order, whereas
@@ -5427,7 +5679,10 @@ fn fetch_hit_read(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: DocId,
         let mut igv = Map::new();
         for n in &ignored {
             if req.fields.iter().any(|(pat, _)| crate::mapping::wildcard_match(pat, n)) {
-                let vals: Vec<Value> = source_values_ordered(p, n).into_iter().cloned().collect();
+                // Only the values indexing rejected (a mixed array's valid
+                // values are in `fields`).
+                let mapped = run.lookup.get(n);
+                let vals: Vec<Value> = source_values_ordered(p, n).into_iter().filter(|v| mapped.is_none_or(|f| !scalar_accepted(f, v))).cloned().collect();
                 if !vals.is_empty() {
                     igv.insert(n.to_string(), Value::Array(vals));
                 }
@@ -5487,9 +5742,13 @@ fn fetch_hit_read(t: &Target, run: &IndexRun, leaf: &LeafReader<'_>, doc: DocId,
 
 /// `_count`.
 pub fn count(targets: &[Target], query: Option<&Value>, terms_lookup: Option<TermsLookupFn>) -> Result<u64> {
+    Ok(count_output(targets, query, terms_lookup)?.total)
+}
+
+/// The search [`count`] runs, whole (its `_shards` say whether any failed).
+pub fn count_output(targets: &[Target], query: Option<&Value>, terms_lookup: Option<TermsLookupFn>) -> Result<SearchOutput> {
     let req = SearchRequest { query: query.cloned(), size: 0, track_total_hits: Some(TrackTotalHits::True), ..Default::default() };
-    let out = execute(targets, &req, &ExecOpts { terms_lookup, cursors: None, max_buckets: 65_536, scroll_id: None, pit_id: None })?;
-    Ok(out.total)
+    execute(targets, &req, &ExecOpts { terms_lookup, cursors: None, max_buckets: 65_536, scroll_id: None, pit_id: None })
 }
 
 /// One page of [`for_each_match`]: ascending docs of one leaf of one shard.
@@ -5576,6 +5835,7 @@ fn with_target_in_env<R>(t: &Target, query: &Value, now: i64, f: &mut dyn FnMut(
         allow_unmapped_fields: t.svc.setting("index.query.parse.allow_unmapped_fields").map(|v| v != "false").unwrap_or(true),
         knn_prefilter: t.effective_filter(),
         knn_prefilter_lookup: Some(t.svc.lookup()),
+        dls_filter: t.dls_filter(),
         allow_expensive_queries: t.svc.setting("index.search.allow_expensive_queries").map(|v| v != "false").unwrap_or(true),
         mappings: Some(&**t.svc),
     };
@@ -6199,6 +6459,7 @@ fn with_query_context<R>(t: &Target, f: impl FnOnce(&QueryContext) -> R) -> R {
         allow_unmapped_fields: true,
         knn_prefilter: None,
         knn_prefilter_lookup: None,
+        dls_filter: None,
         allow_expensive_queries: true,
         mappings: Some(&**t.svc),
     };
@@ -6226,6 +6487,7 @@ pub fn can_match(t: &Target, query: &Value) -> Result<bool> {
         allow_unmapped_fields: true,
         knn_prefilter: None,
         knn_prefilter_lookup: None,
+        dls_filter: None,
         allow_expensive_queries: true,
         mappings: Some(&**t.svc),
     };
@@ -6238,20 +6500,32 @@ pub fn can_match(t: &Target, query: &Value) -> Result<bool> {
     Ok(!range_disjoint(t, query))
 }
 
-/// Document-level security for single-document reads: is document `id` of
-/// `svc` visible to a caller restricted by `access`? Refreshes first so a
-/// realtime-visible document is judged by the same query as a search.
-/// `refresh = false` is for callers already inside a search (they hold the shard read
-/// lock, so a refresh would deadlock): an unrefreshed document is then treated as hidden.
-pub fn doc_visible(svc: &Arc<IndexService>, id: &str, access: &Arc<crate::security::roles::IndexAccess>, refresh: bool) -> Result<bool> {
+/// Document-level security of one fetched document: is exactly `fetched`
+/// (document `id` on the shard `id` / `routing` selects, at the fetched
+/// `_seq_no`) visible to a caller restricted by `access`? Bound to the
+/// shard and the fetched version, a same-id copy on another shard or a
+/// newer (or older) version of the id cannot authorize the returned one.
+/// `refresh` first makes a realtime-fetched version searchable; callers
+/// already inside a search (holding the shard read lock, where a refresh
+/// would deadlock) pass `false`, and a fetched version the searcher does
+/// not hold yet is then treated as hidden. On an index without
+/// sequence numbers only the shard binds (callers re-fetch to detect a
+/// concurrent change).
+pub fn fetched_doc_visible(svc: &Arc<IndexService>, id: &str, routing: Option<&str>, fetched: &crate::shard::GetResult, access: &Arc<crate::security::roles::IndexAccess>, refresh: bool) -> Result<bool> {
     if access.dls.is_none() {
         return Ok(true);
     }
     if refresh {
         svc.refresh()?;
     }
-    let t = Target { access: Some(access.clone()), ..Target::new(svc.clone()) };
-    Ok(count(std::slice::from_ref(&t), Some(&json!({"ids": {"values": [id]}})), None)? > 0)
+    let n = svc.route(id, routing)?;
+    let Some(shard) = svc.shard(n) else { return Err(EsError::shard_not_found(&svc.name, &svc.uuid, n)) };
+    let t = Target { access: Some(access.clone()), shard: Some(shard), ..Target::new(svc.clone()) };
+    let mut filter = vec![json!({"ids": {"values": [id]}})];
+    if !svc.seq_no_disabled() {
+        filter.push(json!({"term": {"_seq_no": fetched.seq_no}}));
+    }
+    Ok(count(std::slice::from_ref(&t), Some(&json!({"bool": {"filter": filter}})), None)? > 0)
 }
 
 impl std::fmt::Debug for Target {
@@ -6262,6 +6536,25 @@ impl std::fmt::Debug for Target {
 
 #[cfg(test)]
 mod fetch_document_tests {
+    /// Finding 431: includes reach values inside nested arrays and the
+    /// descendants of a wildcard-matched object; exclusions still apply.
+    #[test]
+    fn source_filter_carries_includes_into_arrays_and_matches() {
+        let s = |v: serde_json::Value, inc: &[&str], exc: &[&str]| {
+            let f = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let out = super::filter_source(&v, &f(inc), &f(exc));
+            let lossless = crate::source_json::Source::parse(&v.to_string()).unwrap().filter(&f(inc), &f(exc)).text();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&lossless).unwrap(), out, "lossless differs");
+            out
+        };
+        assert_eq!(s(serde_json::json!({"a": [[{"b": 1, "c": 2}]]}), &["a.b"], &[]), serde_json::json!({"a": [[{"b": 1}]]}));
+        assert_eq!(s(serde_json::json!({"a": {"b": {"c": 1}}}), &["*.b"], &[]), serde_json::json!({"a": {"b": {"c": 1}}}));
+        assert_eq!(s(serde_json::json!({"a": {"b": {"c": 1, "d": 2}}}), &["*.b"], &["a.b.d"]), serde_json::json!({"a": {"b": {"c": 1}}}));
+        assert_eq!(s(serde_json::json!({"a": [[1, 2], {"b": 3}]}), &["a"], &[]), serde_json::json!({"a": [[1, 2], {"b": 3}]}));
+        assert_eq!(s(serde_json::json!({"a": [{"x": 1}], "b": 2}), &["b"], &[]), serde_json::json!({"b": 2}));
+        assert_eq!(s(serde_json::json!({"a": {"b": 1}, "c": 2}), &[], &["a"]), serde_json::json!({"c": 2}));
+    }
+
     use super::*;
 
     #[test]
@@ -6955,5 +7248,422 @@ mod agg_leaf_docs_tests {
         let fill = time(&|| leaves.iter().map(|l| agg_leaf_docs(&Query::MatchAll, l, &ctx, None, &crate::memory::RequestMemory::new()).unwrap().0.len()).sum());
         let loop_ = time(&|| leaves.iter().map(|l| per_doc(&Query::MatchAll, l, &ctx).0.len()).sum());
         eprintln!("agg doc collection over {n} docs: fill {fill:?}, per-doc {loop_:?}");
+    }
+}
+
+/// Closure tests of the production-review sort findings (234–238, 240):
+/// whole searches over a real node.
+#[cfg(test)]
+mod sort_review_tests {
+    use crate::index::WriteReq;
+    use crate::node::Node;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    fn node() -> (tempfile::TempDir, Arc<Node>) {
+        let t = tempfile::tempdir().unwrap();
+        let n = Node::open(t.path()).unwrap();
+        (t, n)
+    }
+
+    /// Create `name` with `body` and index `docs` (`(id, routing, source)`), refreshed.
+    fn index(node: &Node, name: &str, body: Value, docs: &[(&str, Option<&str>, Value)]) {
+        let svc = node.create_index(name, &body).unwrap();
+        let reqs = docs.iter().map(|(id, routing, d)| WriteReq::Index { id: Some(id.to_string()), source: d.to_string(), routing: routing.map(str::to_string), cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    fn search(node: &Node, index: &str, body: Value) -> Value {
+        crate::ml::search(node, index, &body).unwrap()
+    }
+
+    fn ids(v: &Value) -> Vec<String> {
+        v["hits"]["hits"].as_array().unwrap_or_else(|| panic!("{v}")).iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect()
+    }
+
+    fn sort_of(v: &Value, i: usize) -> Value {
+        v["hits"]["hits"][i]["sort"].clone()
+    }
+
+    /// `numeric_type: long` on a double under a nested path: the children's
+    /// values are cast before the mode picks, so casts tie and cursors move.
+    #[test]
+    fn nested_numeric_type_long_casts_children() {
+        let (_t, n) = node();
+        index(&n, "nl", json!({"mappings": {"properties": {"offers": {"type": "nested", "properties": {"price": {"type": "double"}}}}}}), &[
+            ("a", None, json!({"offers": [{"price": 1.9}, {"price": 7.5}]})),
+            ("b", None, json!({"offers": [{"price": 1.2}]})),
+            ("c", None, json!({"offers": [{"price": 2.5}]})),
+        ]);
+        let sort = json!([{"offers.price": {"order": "asc", "numeric_type": "long", "nested": {"path": "offers"}}}]);
+        let v = search(&n, "nl", json!({"sort": sort}));
+        assert_eq!(ids(&v), ["a", "b", "c"], "1.9 and 1.2 both cast to 1 (doc order breaks the tie): {v}");
+        assert_eq!(sort_of(&v, 0), json!([1]));
+        assert_eq!(sort_of(&v, 2), json!([2]));
+        let v = search(&n, "nl", json!({"sort": sort, "search_after": [1]}));
+        assert_eq!(ids(&v), ["c"], "{v}");
+    }
+
+    /// `_geo_distance` in an inner-hits sort: each inner hit's own points.
+    #[test]
+    fn inner_hits_sort_by_geo_distance() {
+        let (_t, n) = node();
+        index(&n, "ig", json!({"mappings": {"properties": {"stops": {"type": "nested", "properties": {"loc": {"type": "geo_point"}, "name": {"type": "keyword"}}}}}}), &[
+            ("r", None, json!({"stops": [{"loc": {"lat": 0.0, "lon": 5.0}, "name": "far"}, {"loc": {"lat": 0.0, "lon": 1.0}, "name": "near"}, {"loc": {"lat": 0.0, "lon": 3.0}, "name": "mid"}]})),
+        ]);
+        let v = search(&n, "ig", json!({"query": {"nested": {"path": "stops", "query": {"match_all": {}}, "inner_hits": {"size": 3,
+            "sort": [{"_geo_distance": {"stops.loc": {"lat": 0.0, "lon": 0.0}, "order": "asc", "unit": "km"}}]}}}}));
+        let inner = v["hits"]["hits"][0]["inner_hits"]["stops"]["hits"]["hits"].as_array().unwrap_or_else(|| panic!("{v}")).clone();
+        let names: Vec<&str> = inner.iter().map(|h| h["_source"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["near", "mid", "far"], "{v}");
+        let d0 = inner[0]["sort"][0].as_f64().unwrap_or_else(|| panic!("{v}"));
+        assert!((d0 - 111.19).abs() < 1.0, "{d0}");
+    }
+
+    /// Every id of a sort, one page of `size` at a time (`search_after`).
+    fn paged(node: &Node, index: &str, mut body: Value, size: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        body["size"] = json!(size);
+        for _ in 0..20 {
+            let v = search(node, index, body.clone());
+            let hits = v["hits"]["hits"].as_array().cloned().unwrap_or_default();
+            if hits.is_empty() {
+                return out;
+            }
+            out.extend(ids(&v));
+            body["search_after"] = hits.last().unwrap()["sort"].clone();
+        }
+        panic!("pagination did not end: {out:?}");
+    }
+
+    /// Finding 234: every `_geo_distance` origin counts; the mode picks among
+    /// all point-to-origin distances.
+    #[test]
+    fn geo_distance_sort_uses_every_origin() {
+        let (_t, node) = node();
+        for (name, shards) in [("geo1", 1), ("geo2", 2)] {
+            index(
+                &node,
+                name,
+                json!({"settings": {"number_of_shards": shards}, "mappings": {"properties": {"loc": {"type": "geo_point"}}}}),
+                &[
+                    // ~1.1 km from A (0,0).
+                    ("x", None, json!({"loc": {"lat": 0.0, "lon": 0.01}})),
+                    // Exactly at B (0,50).
+                    ("y", None, json!({"loc": {"lat": 0.0, "lon": 50.0}})),
+                    // Multi-valued: one point 1° from B.
+                    ("z", None, json!({"loc": [{"lat": 0.0, "lon": 20.0}, {"lat": 0.0, "lon": 49.0}]})),
+                ],
+            );
+            for origins in [json!(["0,0", "0,50"]), json!(["0,50", "0,0"])] {
+                let body = json!({"sort": [{"_geo_distance": {"loc": origins, "order": "asc"}}]});
+                let v = search(&node, name, body.clone());
+                assert_eq!(ids(&v), ["y", "x", "z"], "{name} {origins}: {v}");
+                assert!(sort_of(&v, 0)[0].as_f64().unwrap() < 1.0, "{v}");
+                assert_eq!(paged(&node, name, body, 1), ["y", "x", "z"], "{name} {origins}");
+                // Max: the farthest distance to any origin.
+                let v = search(&node, name, json!({"sort": [{"_geo_distance": {"loc": origins, "order": "desc", "mode": "max"}}]}));
+                assert_eq!(ids(&v), ["y", "x", "z"], "{name} {origins}: {v}");
+                let v = search(&node, name, json!({"sort": [{"_geo_distance": {"loc": origins, "order": "asc", "mode": "max"}}]}));
+                assert_eq!(ids(&v), ["z", "x", "y"], "{name} {origins}: {v}");
+            }
+        }
+    }
+
+    /// Finding 235: `numeric_type: long` casts the keys before collection:
+    /// cast values tie (a secondary key decides) and a cursor at the cast
+    /// value pages past its document.
+    #[test]
+    fn numeric_type_long_casts_before_collecting() {
+        let (_t, node) = node();
+        index(
+            &node,
+            "nt",
+            json!({"mappings": {"properties": {"v": {"type": "double"}, "s": {"type": "scaled_float", "scaling_factor": 10}, "t": {"type": "keyword"}}}}),
+            &[
+                ("a", None, json!({"v": 1.2, "s": 2.2, "t": "b"})),
+                ("b", None, json!({"v": 1.9, "s": 2.7, "t": "a"})),
+                ("c", None, json!({"v": -0.5, "s": 0.5, "t": "c"})),
+                ("d", None, json!({"t": "d"})),
+            ],
+        );
+        for f in ["v", "s"] {
+            let body = json!({"sort": [{f: {"order": "asc", "numeric_type": "long"}}, {"t": "asc"}]});
+            let v = search(&node, "nt", body.clone());
+            assert_eq!(ids(&v), ["c", "b", "a", "d"], "{f}: {v}");
+            assert_eq!(sort_of(&v, 0), json!([0, "c"]), "{f}");
+            assert_eq!(sort_of(&v, 1)[0], json!(if f == "v" { 1 } else { 2 }), "{f}");
+            assert_eq!(paged(&node, "nt", body, 1), ["c", "b", "a", "d"], "{f}");
+        }
+        // A singleton: the cursor it returns ends the pagination.
+        index(&node, "one", json!({"mappings": {"properties": {"v": {"type": "double"}}}}), &[("only", None, json!({"v": 1.9}))]);
+        let body = json!({"sort": [{"v": {"order": "asc", "numeric_type": "long"}}]});
+        let v = search(&node, "one", body.clone());
+        assert_eq!(sort_of(&v, 0), json!([1]));
+        assert_eq!(paged(&node, "one", body, 1), ["only"]);
+    }
+
+    /// Finding 236: a formatted date_nanos cursor keeps its nanoseconds.
+    #[test]
+    fn formatted_date_nanos_cursor_keeps_nanoseconds() {
+        let (_t, node) = node();
+        index(
+            &node,
+            "ns",
+            json!({"mappings": {"properties": {"ts": {"type": "date_nanos"}}}}),
+            &[
+                ("e1", None, json!({"ts": "2020-01-01T00:00:00.123456789Z"})),
+                ("e2", None, json!({"ts": "2020-01-01T00:00:00.123456999Z"})),
+                ("e3", None, json!({"ts": "2020-01-01T00:00:00.124Z"})),
+            ],
+        );
+        let body = json!({"sort": [{"ts": {"order": "asc", "format": "strict_date_optional_time_nanos"}}]});
+        let v = search(&node, "ns", json!({"size": 1, "sort": body["sort"].clone()}));
+        assert_eq!(sort_of(&v, 0), json!(["2020-01-01T00:00:00.123456789Z"]));
+        assert_eq!(paged(&node, "ns", body, 1), ["e1", "e2", "e3"]);
+        let desc = json!({"sort": [{"ts": {"order": "desc", "format": "strict_date_optional_time_nanos"}}]});
+        assert_eq!(paged(&node, "ns", desc, 1), ["e3", "e2", "e1"]);
+    }
+
+    /// Finding 237: two `_script` (or `_geo_distance`) criteria keep their
+    /// own definitions.
+    #[test]
+    fn repeated_script_and_geo_criteria_keep_their_definitions() {
+        let (_t, node) = node();
+        index(
+            &node,
+            "pc",
+            json!({"mappings": {"properties": {"priority": {"type": "long"}, "cost": {"type": "long"}, "loc": {"type": "geo_point"}}}}),
+            &[
+                ("d1", None, json!({"priority": 1, "cost": 30, "loc": {"lat": 0.0, "lon": 1.0}})),
+                ("d2", None, json!({"priority": 2, "cost": 20, "loc": {"lat": 0.0, "lon": 40.0}})),
+                ("d3", None, json!({"priority": 3, "cost": 10, "loc": {"lat": 0.0, "lon": 45.0}})),
+            ],
+        );
+        let script = |src: &str| json!({"_script": {"type": "number", "script": {"source": src}, "order": "asc"}});
+        let body = json!({"sort": [script("doc['priority'].value"), script("doc['cost'].value")]});
+        let v = search(&node, "pc", body.clone());
+        assert_eq!(ids(&v), ["d1", "d2", "d3"], "{v}");
+        let first: Vec<f64> = sort_of(&v, 0).as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        assert_eq!(first, [1.0, 30.0]);
+        assert_eq!(paged(&node, "pc", body, 1), ["d1", "d2", "d3"]);
+        // A from (0,0), B from (0,50): ascending A ranks d1 first, B would rank d3.
+        let body = json!({"sort": [{"_geo_distance": {"loc": "0,0", "order": "asc"}}, {"_geo_distance": {"loc": "0,50", "order": "asc"}}]});
+        let v = search(&node, "pc", body.clone());
+        assert_eq!(ids(&v), ["d1", "d2", "d3"], "{v}");
+        assert!(sort_of(&v, 0)[0].as_f64().unwrap() < sort_of(&v, 0)[1].as_f64().unwrap(), "{v}");
+        assert_eq!(paged(&node, "pc", body, 1), ["d1", "d2", "d3"]);
+    }
+
+    /// Finding 238: the script / runtime collector applies `mode` and
+    /// `missing`, and a mapped field routed through it sorts as the core does.
+    #[test]
+    fn runtime_and_script_sorts_apply_mode_and_missing() {
+        let (_t, node) = node();
+        index(
+            &node,
+            "rt",
+            json!({"mappings": {"properties": {"vals": {"type": "long"}, "m": {"type": "long"}}}}),
+            &[
+                ("r1", None, json!({"vals": [1, 100], "m": [1, 2, 100]})),
+                ("r2", None, json!({"vals": [20], "m": [3]})),
+                ("r3", None, json!({"m": [0, 50]})),
+            ],
+        );
+        let rt = json!({"x": {"type": "long", "script": {"source": "for (def v : doc['vals']) { emit(v); }"}}});
+        let v = search(&node, "rt", json!({"runtime_mappings": rt, "sort": [{"x": {"order": "asc", "mode": "max"}}]}));
+        assert_eq!(ids(&v), ["r2", "r1", "r3"], "{v}");
+        assert_eq!(sort_of(&v, 0), json!([20]));
+        let v = search(&node, "rt", json!({"runtime_mappings": rt, "sort": [{"x": {"order": "asc", "mode": "median"}}]}));
+        assert_eq!(ids(&v), ["r2", "r1", "r3"], "{v}");
+        let v = search(&node, "rt", json!({"runtime_mappings": rt, "sort": [{"x": {"order": "asc", "missing": "_first"}}]}));
+        assert_eq!(ids(&v), ["r3", "r1", "r2"], "{v}");
+        let v = search(&node, "rt", json!({"runtime_mappings": rt, "sort": [{"x": {"order": "desc", "missing": "_first"}}]}));
+        assert_eq!(ids(&v), ["r3", "r1", "r2"], "{v}");
+        // A mapped median sort: identical with or without a constant script tie-breaker.
+        let plain = search(&node, "rt", json!({"sort": [{"m": {"order": "asc", "mode": "median"}}]}));
+        let with_script = search(&node, "rt", json!({"sort": [{"m": {"order": "asc", "mode": "median"}}, {"_script": {"type": "number", "script": {"source": "1"}, "order": "asc"}}]}));
+        assert_eq!(ids(&plain), ["r1", "r2", "r3"], "{plain}");
+        assert_eq!(ids(&with_script), ids(&plain), "{with_script}");
+        for i in 0..3 {
+            assert_eq!(sort_of(&with_script, i)[0], sort_of(&plain, i)[0]);
+        }
+        let first = json!({"sort": [{"m": {"order": "asc", "missing": "_first"}}, {"_script": {"type": "number", "script": {"source": "1"}, "order": "asc"}}]});
+        assert_eq!(paged(&node, "rt", first, 1), ["r3", "r1", "r2"]);
+    }
+
+    /// Finding 240: nested and parent/child inner hits sort like a search:
+    /// by the mode-picked value, missing first when asked, exact longs.
+    #[test]
+    fn inner_hits_sort_with_mode_missing_and_exact_longs() {
+        let (_t, node) = node();
+        index(
+            &node,
+            "ih",
+            json!({"mappings": {"properties": {"offers": {"type": "nested", "properties": {"price": {"type": "long"}}}}}}),
+            &[
+                ("p", None, json!({"offers": [{"price": [10, 100]}, {"price": [20]}, {"other": 1}]})),
+                ("big", None, json!({"offers": [{"price": 9007199254740992i64}, {"price": 9007199254740993i64}]})),
+            ],
+        );
+        let top = |id: &str, sort: Value| -> (i64, Value) {
+            let v = search(&node, "ih", json!({"query": {"bool": {"filter": [{"ids": {"values": [id]}}], "must": [{"nested": {"path": "offers", "query": {"match_all": {}}, "inner_hits": {"size": 1, "sort": sort}}}]}}}));
+            let h = &v["hits"]["hits"][0]["inner_hits"]["offers"]["hits"]["hits"][0];
+            (h["_nested"]["offset"].as_i64().unwrap_or_else(|| panic!("{v}")), h["sort"].clone())
+        };
+        assert_eq!(top("p", json!([{"offers.price": "desc"}])), (0, json!([100])));
+        assert_eq!(top("p", json!([{"offers.price": {"order": "desc", "mode": "max"}}])).0, 0);
+        assert_eq!(top("p", json!([{"offers.price": {"order": "asc", "mode": "max"}}])), (1, json!([20])));
+        assert_eq!(top("p", json!([{"offers.price": {"order": "asc", "missing": "_first"}}])).0, 2);
+        assert_eq!(top("big", json!([{"offers.price": "desc"}])), (1, json!([9007199254740993i64])));
+        // Parent/child.
+        index(
+            &node,
+            "pj",
+            json!({"mappings": {"properties": {"rel": {"type": "join", "relations": {"question": "answer"}}, "n": {"type": "long"}}}}),
+            &[
+                ("q", None, json!({"rel": "question"})),
+                ("c1", Some("q"), json!({"rel": {"name": "answer", "parent": "q"}, "n": [10, 100]})),
+                ("c2", Some("q"), json!({"rel": {"name": "answer", "parent": "q"}, "n": [20]})),
+                ("c3", Some("q"), json!({"rel": {"name": "answer", "parent": "q"}})),
+            ],
+        );
+        let child = |sort: Value| -> Vec<String> {
+            let v = search(&node, "pj", json!({"query": {"has_child": {"type": "answer", "query": {"match_all": {}}, "inner_hits": {"size": 3, "sort": sort}}}}));
+            v["hits"]["hits"][0]["inner_hits"]["answer"]["hits"]["hits"].as_array().unwrap_or_else(|| panic!("{v}")).iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(child(json!([{"n": "desc"}])), ["c1", "c2", "c3"]);
+        assert_eq!(child(json!([{"n": {"order": "asc", "mode": "max"}}])), ["c2", "c1", "c3"]);
+        assert_eq!(child(json!([{"n": {"order": "asc", "missing": "_first"}}])), ["c3", "c1", "c2"]);
+    }
+}
+
+#[cfg(test)]
+mod fields_fidelity_tests {
+    use serde_json::{json, Value};
+
+    fn search(node: &crate::node::Node, index: &str, body: Value) -> Value {
+        let req = crate::search::parse_request(&body, &std::collections::HashMap::new()).unwrap();
+        let opts = crate::search::ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None };
+        let out = crate::search::execute(&[crate::search::Target::new(node.get_index(index).unwrap())], &req, &opts).unwrap();
+        serde_json::from_str(&out.json).unwrap()
+    }
+
+    fn put(node: &crate::node::Node, index: &str, docs: &[(&str, Value)]) {
+        let svc = node.get_index(index).unwrap();
+        let reqs = docs.iter().map(|(id, d)| crate::index::WriteReq::Index { id: Some(id.to_string()), source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    /// Review finding 401: the fields API keeps date_nanos nanoseconds (as
+    /// docvalue_fields do), including the requested nanosecond format.
+    #[test]
+    fn fields_api_keeps_date_nanos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        node.create_index("dn", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"t": {"type": "date_nanos"}}}})).unwrap();
+        put(&node, "dn", &[("1", json!({"t": "2023-01-01T00:00:00.000000001Z"})), ("2", json!({"t": "2023-01-01T00:00:00.000000002Z"}))]);
+        let v = search(&node, "dn", json!({"query": {"match_all": {}}, "fields": [{"field": "t", "format": "strict_date_optional_time_nanos"}], "docvalue_fields": [{"field": "t", "format": "strict_date_optional_time_nanos"}], "sort": ["_doc"]}));
+        let hits = v["hits"]["hits"].as_array().unwrap();
+        let f: Vec<String> = hits.iter().map(|h| h["fields"]["t"][0].as_str().unwrap().to_string()).collect();
+        assert_eq!(f, vec!["2023-01-01T00:00:00.000000001Z", "2023-01-01T00:00:00.000000002Z"], "{v}");
+        let v = search(&node, "dn", json!({"query": {"match_all": {}}, "fields": ["t"], "sort": ["_doc"]}));
+        assert_eq!(v["hits"]["hits"][1]["fields"]["t"][0], "2023-01-01T00:00:00.000000002Z", "{v}");
+    }
+
+    /// Review finding 407: the fields API returns only values indexing
+    /// accepted: a malformed boolean or an out-of-range integer ignored by
+    /// `ignore_malformed` is in `ignored_field_values` (the rejected values
+    /// only), not in `fields`; explicit nulls read the `null_value`.
+    #[test]
+    fn fields_api_skips_ignored_malformed_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        node.create_index("im", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {
+            "ok": {"type": "boolean", "ignore_malformed": true}, "b": {"type": "byte", "ignore_malformed": true}, "k": {"type": "keyword", "null_value": "NA"}}}})).unwrap();
+        put(&node, "im", &[("1", json!({"ok": ["unknown", true], "b": [300, 7], "k": null}))]);
+        let v = search(&node, "im", json!({"query": {"match_all": {}}, "fields": ["ok", "b", "k"]}));
+        let h = &v["hits"]["hits"][0];
+        assert_eq!(h["fields"]["ok"], json!([true]), "{v}");
+        assert_eq!(h["fields"]["b"], json!([7]), "{v}");
+        assert_eq!(h["fields"]["k"], json!(["NA"]), "{v}");
+        assert_eq!(h["ignored_field_values"]["ok"], json!(["unknown"]), "{v}");
+        assert_eq!(h["ignored_field_values"]["b"], json!([300]), "{v}");
+    }
+
+    /// Review finding 421: a boolean array keeps every value in doc values:
+    /// docvalue_fields and a terms aggregation agree with term filters, in
+    /// the memtable and after flush and merge.
+    #[test]
+    fn boolean_arrays_keep_every_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        node.create_index("bo", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"f": {"type": "boolean"}}}})).unwrap();
+        let check = |stage: &str| {
+            let v = search(&node, "bo", json!({"query": {"match_all": {}}, "docvalue_fields": ["f"], "sort": ["_doc"], "size": 10,
+                "aggs": {"t": {"terms": {"field": "f"}}}}));
+            let mut dv: Vec<(String, Value)> = v["hits"]["hits"].as_array().unwrap().iter().map(|h| (h["_id"].as_str().unwrap().to_string(), h["fields"]["f"].clone())).collect();
+            dv.sort_by(|a, b| a.0.cmp(&b.0));
+            let want = vec![("1", json!([false, true])), ("2", json!([true])), ("3", json!([false, true, true])), ("4", Value::Null), ("5", json!([false]))];
+            assert_eq!(dv, want.into_iter().map(|(a, b)| (a.to_string(), b)).collect::<Vec<_>>(), "{stage}: {v}");
+            let mut buckets: Vec<(String, u64)> = v["aggregations"]["t"]["buckets"].as_array().unwrap().iter().map(|b| (b["key_as_string"].as_str().unwrap_or_default().to_string(), b["doc_count"].as_u64().unwrap())).collect();
+            buckets.sort();
+            assert_eq!(buckets, vec![("false".to_string(), 3), ("true".to_string(), 3)], "{stage}: {v}");
+            let n = |b: bool| search(&node, "bo", json!({"query": {"term": {"f": b}}}))["hits"]["hits"].as_array().unwrap().len();
+            assert_eq!((n(false), n(true)), (3, 3), "{stage}");
+        };
+        put(&node, "bo", &[("1", json!({"f": [true, false]})), ("2", json!({"f": true}))]);
+        put(&node, "bo", &[("3", json!({"f": [false, true, true]})), ("4", json!({"x": 1}))]);
+        put(&node, "bo", &[("5", json!({"f": false}))]);
+        check("refreshed");
+        let svc = node.get_index("bo").unwrap();
+        svc.flush().unwrap();
+        check("flushed");
+        svc.force_merge(1, false).unwrap();
+        check("merged");
+    }
+}
+
+#[cfg(test)]
+mod url_stored_fields_tests {
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    /// #426: URL `stored_fields` (the Rust client's form) selects stored
+    /// fields exactly as the body form does.
+    #[test]
+    fn url_stored_fields_match_the_body_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("sf", &json!({"mappings": {"_source": {"enabled": false},
+            "properties": {"k": {"type": "keyword", "store": true}, "n": {"type": "long", "store": true}}}})).unwrap();
+        let w = vec![crate::index::WriteReq::Index { id: Some("1".into()), source: json!({"k": "a", "n": 7}).to_string(), routing: None, cond: Default::default() }];
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let run = |body: Value, params: &[(&str, &str)]| -> Value {
+            let params: HashMap<String, String> = params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let targets = node.resolve("sf", Default::default()).unwrap();
+            let req = crate::search::parse_request(&body, &params).unwrap();
+            let out = crate::search::execute(&targets, &req, &crate::search::ExecOpts { terms_lookup: None, cursors: None, max_buckets: 65_536, scroll_id: None, pit_id: None }).unwrap();
+            serde_json::from_str(&out.json).unwrap()
+        };
+        let body = run(json!({"stored_fields": ["k", "n"]}), &[]);
+        let url = run(json!({}), &[("stored_fields", "k,n")]);
+        assert_eq!(body["hits"]["hits"][0]["fields"], json!({"k": ["a"], "n": [7]}), "{body}");
+        assert_eq!(url["hits"]["hits"][0]["fields"], body["hits"]["hits"][0]["fields"], "{url}");
+        assert!(url["hits"]["hits"][0].get("_source").is_none(), "{url}");
+        // The URL list replaces the body's.
+        let both = run(json!({"stored_fields": ["n"]}), &[("stored_fields", "k")]);
+        assert_eq!(both["hits"]["hits"][0]["fields"], json!({"k": ["a"]}), "{both}");
+        let none = run(json!({}), &[("stored_fields", "_none_")]);
+        assert!(none["hits"]["hits"][0].get("_id").is_none(), "{none}");
     }
 }

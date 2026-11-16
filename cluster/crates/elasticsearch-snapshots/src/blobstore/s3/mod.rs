@@ -4,7 +4,17 @@
 //! path-style addressing, custom endpoints, session tokens, SSE-S3, storage
 //! classes, canned ACLs, conditional create (`If-None-Match: *`), multipart
 //! uploads for blobs larger than `buffer_size`, and batch deletes.
+//!
+//! Every request is bounded (ES `s3.client.*` settings): connecting is
+//! limited by [`CONNECT_TIMEOUT`]; every wait for progress (the connection
+//! taking more of the request body, the response headers, the next chunk of
+//! the response body) by `read_timeout` (default 50s), like a socket read
+//! timeout; and the whole call, retries included, by `api_call_timeout`
+//! when set. Transport errors, timeouts, truncated bodies,
+//! 5xx and 429 responses are retried up to `max_retries` times with
+//! exponential backoff and full jitter (the AWS SDK's standard strategy).
 
+pub mod credentials;
 pub mod sigv4;
 mod xml;
 
@@ -16,12 +26,21 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use sigv4::{Credentials, EMPTY_SHA256, SignableRequest, sha256_hex, uri_encode_path};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Minimum S3 multipart part size.
 pub const MIN_PART_SIZE: u64 = 5 << 20;
 /// ES default `buffer_size`: 100mb (or 5% of heap, whichever is smaller).
 pub const DEFAULT_BUFFER_SIZE: u64 = 100 << 20;
+/// ES `s3.client.*.read_timeout` default.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(50);
+/// TCP/TLS connection establishment limit.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// ES `s3.client.*.connection_max_idle_time` default.
+pub const DEFAULT_MAX_IDLE_TIME: Duration = Duration::from_secs(60);
+/// Backoff cap (AWS SDK standard retry strategy).
+pub const MAX_BACKOFF: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -34,13 +53,28 @@ pub struct S3Config {
     /// `https` (default) or `http`, used when `endpoint` has no scheme.
     pub protocol: String,
     pub path_style_access: bool,
-    /// `None` → environment variables at request time.
+    /// `None` → the AWS default provider chain (environment, web identity,
+    /// container, instance profile), see [`credentials`].
     pub credentials: Option<Credentials>,
+    /// Where the provider chain looks; `None`: the standard AWS environment
+    /// variables and endpoints ([`credentials::ChainConfig::from_env`]).
+    pub credential_chain: Option<credentials::ChainConfig>,
     pub server_side_encryption: bool,
     pub storage_class: Option<String>,
     pub canned_acl: Option<String>,
     pub buffer_size: u64,
     pub max_retries: u32,
+    /// Limit on any wait for progress: the connection taking more of the
+    /// request body, the response headers, the next response body chunk
+    /// (ES `read_timeout`).
+    pub read_timeout: Duration,
+    /// Limit on one whole call including its retries (ES
+    /// `api_call_timeout`); `None`: bounded by the per-attempt limits only.
+    pub api_call_timeout: Option<Duration>,
+    /// Base of the exponential backoff between retries.
+    pub retry_base_delay: Duration,
+    /// Idle pooled connections are closed after this long.
+    pub max_idle_time: Duration,
 }
 
 impl S3Config {
@@ -53,15 +87,21 @@ impl S3Config {
             protocol: "https".into(),
             path_style_access: false,
             credentials: None,
+            credential_chain: None,
             server_side_encryption: false,
             storage_class: None,
             canned_acl: None,
             buffer_size: DEFAULT_BUFFER_SIZE,
             max_retries: 3,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            api_call_timeout: None,
+            retry_base_delay: Duration::from_millis(100),
+            max_idle_time: DEFAULT_MAX_IDLE_TIME,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct S3BlobStore {
     cfg: S3Config,
     client: reqwest::Client,
@@ -69,6 +109,86 @@ pub struct S3BlobStore {
     origin: String,
     host: String,
     prefix: String,
+    chain: Arc<credentials::CredentialChain>,
+}
+
+/// When a request last made progress (its body consumed by the connection).
+struct Progress {
+    origin: Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self { origin: Instant::now(), last_ms: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    fn touch(&self) {
+        self.last_ms.store(self.origin.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> Duration {
+        let last = Duration::from_millis(self.last_ms.load(std::sync::atomic::Ordering::Relaxed));
+        self.origin.elapsed().saturating_sub(last)
+    }
+}
+
+/// A request body handed to the connection in small pieces, recording
+/// progress: the connection pulls the next piece only once it has room, so
+/// a peer that stops reading stops the progress.
+struct ProgressBody {
+    data: Bytes,
+    off: usize,
+    progress: Arc<Progress>,
+}
+
+impl http_body::Body for ProgressBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, Self::Error>>> {
+        const PIECE: usize = 64 << 10;
+        let this = &mut *self;
+        this.progress.touch();
+        if this.off >= this.data.len() {
+            return std::task::Poll::Ready(None);
+        }
+        let end = (this.off + PIECE).min(this.data.len());
+        let piece = this.data.slice(this.off..end);
+        this.off = end;
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(piece))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.off >= self.data.len()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact((self.data.len() - self.off) as u64)
+    }
+}
+
+/// Why an attempt produced no response.
+enum Failure {
+    /// Transport error, timeout or truncated body: worth another attempt.
+    Retryable(String),
+    /// E.g. the caller's admission refused the body.
+    Fatal(SnapshotError),
+}
+
+/// `e` with its sources (reqwest's top-level message alone hides the cause).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        cur = s.source();
+    }
+    out
 }
 
 struct Resp {
@@ -94,10 +214,16 @@ impl S3BlobStore {
         let base = cfg.base_path.trim_matches('/');
         let prefix = if base.is_empty() { String::new() } else { format!("{base}/") };
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(CONNECT_TIMEOUT.min(cfg.read_timeout.max(Duration::from_millis(1))))
+            // No reqwest `read_timeout`: it is armed on connection reads
+            // even while a large body is still being written. The limits
+            // are applied per attempt instead (`attempt`).
+            .pool_idle_timeout(cfg.max_idle_time)
             .build()
             .map_err(|e| SnapshotError::io("building s3 client", e))?;
-        Ok(Self { cfg, client, origin, host, prefix })
+        let chain_cfg = cfg.credential_chain.clone().unwrap_or_else(|| credentials::ChainConfig::from_env(&cfg.region));
+        let chain = Arc::new(credentials::CredentialChain::new(chain_cfg)?);
+        Ok(Self { cfg, client, origin, host, prefix, chain })
     }
 
     pub fn config(&self) -> &S3Config {
@@ -120,14 +246,13 @@ impl S3BlobStore {
         if self.cfg.path_style_access { format!("/{}", sigv4::uri_encode(&self.cfg.bucket)) } else { "/".into() }
     }
 
-    fn credentials(&self) -> Result<Credentials> {
-        self.cfg.credentials.clone().or_else(Credentials::from_env).ok_or_else(|| {
-            SnapshotError::new(
-                "sdk_client_exception",
-                500,
-                "Unable to load AWS credentials: set access_key/secret_key or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY",
-            )
-        })
+    /// Keystore credentials, else the provider chain's current ones
+    /// (refreshed before they expire).
+    async fn credentials(&self) -> Result<Credentials> {
+        match &self.cfg.credentials {
+            Some(c) => Ok(c.clone()),
+            None => self.chain.credentials().await,
+        }
     }
 
     async fn request(
@@ -142,14 +267,18 @@ impl S3BlobStore {
     }
 
     async fn request_with_admission(&self, method: &str, path: &str, query: &[(String,String)], headers: &[(String,String)], body: Bytes, admission: Option<super::ReadAdmission>) -> Result<Resp> {
-        let creds = self.credentials()?;
         let payload_hash = if body.is_empty() { EMPTY_SHA256.to_string() } else { sha256_hex(&body) };
         let qs = sigv4::canonical_query(query);
         let url = if qs.is_empty() { format!("{}{}", self.origin, path) } else { format!("{}{}?{}", self.origin, path, qs) };
         let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| SnapshotError::illegal_argument(e.to_string()))?;
-        let mut attempt = 0;
+        let deadline = self.cfg.api_call_timeout.map(|t| Instant::now() + t);
+        let ctx = || format!("s3 {method} [{url}]");
+        let mut attempt = 0u32;
         loop {
             attempt += 1;
+            // Per attempt: temporary credentials may rotate during a long
+            // operation (e.g. between the parts of a multipart upload).
+            let creds = self.credentials().await?;
             let date = sigv4::amz_date(chrono::Utc::now());
             let req = SignableRequest { method, host: &self.host, path, query, headers, payload_sha256: &payload_hash };
             let signed = sigv4::sign(&req, &creds, &self.cfg.region, "s3", &date);
@@ -165,39 +294,108 @@ impl S3BlobStore {
             if body.is_empty() && matches!(method, "PUT" | "POST") {
                 rb = rb.header("content-length", "0");
             }
-            let rb = rb.body(body.clone());
-            let result = rb.send().await;
-            match result {
-                Ok(r) => {
-                    let status = r.status().as_u16();
-                    let rheaders = r.headers().clone();
-                    let collected = match &admission {
-                        Some(admit) => super::admitted::response(r, admit.clone()).await,
-                        None => r.bytes().await.map_err(|e| SnapshotError::io(format!("s3 {method} [{url}]"),e)),
-                    };
-                    let rbody = match collected {
-                        Ok(b) => b,
-                        Err(e) if e.kind == "circuit_breaking_exception" => return Err(e),
-                        Err(e) if attempt <= self.cfg.max_retries => {
-                            tracing::debug!("s3 {method} {url} body read failed, retrying: {e}");
-                            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                            continue;
-                        }
-                        Err(e) => return Err(SnapshotError::io(format!("s3 {method} [{url}]"), e)),
-                    };
-                    if (status >= 500 || status == 429) && attempt <= self.cfg.max_retries {
-                        tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                        continue;
+            let attempt_fut = self.attempt(rb, &body, admission.as_ref());
+            let outcome = match deadline {
+                Some(d) => match tokio::time::timeout_at(d.into(), attempt_fut).await {
+                    Ok(o) => o,
+                    Err(_) => {
+                        return Err(SnapshotError::io(ctx(), format!("api call timed out after [{}ms] ({attempt} attempts)", self.cfg.api_call_timeout.unwrap_or_default().as_millis())));
                     }
-                    return Ok(Resp { status, headers: rheaders, body: rbody });
+                },
+                None => attempt_fut.await,
+            };
+            let (err, throttled) = match outcome {
+                Ok(resp) if matches!(resp.status, 400 | 403) && self.cfg.credentials.is_none() && attempt <= self.cfg.max_retries && {
+                    let code = xml::tag(&String::from_utf8_lossy(&resp.body), "Code").unwrap_or_default();
+                    matches!(code.as_str(), "ExpiredToken" | "InvalidToken" | "TokenRefreshRequired" | "InvalidAccessKeyId")
+                } => {
+                    // Rotated or expired temporary credentials: reload them.
+                    self.chain.invalidate().await;
+                    (format!("credentials rejected (status code {})", resp.status), false)
                 }
-                Err(e) if attempt <= self.cfg.max_retries => {
-                    tracing::debug!("s3 {method} {url} failed, retrying: {e}");
-                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                Ok(resp) => {
+                    let throttled = resp.status == 429 || (resp.status == 503 && String::from_utf8_lossy(&resp.body).contains("SlowDown"));
+                    if (resp.status >= 500 || resp.status == 429) && attempt <= self.cfg.max_retries {
+                        (format!("status code {}", resp.status), throttled)
+                    } else {
+                        return Ok(resp);
+                    }
                 }
-                Err(e) => return Err(SnapshotError::io(format!("s3 {method} [{url}]"), e)),
+                Err(Failure::Fatal(e)) => return Err(e),
+                Err(Failure::Retryable(e)) if attempt <= self.cfg.max_retries => (e, false),
+                Err(Failure::Retryable(e)) => return Err(SnapshotError::io(ctx(), format!("{e} (after {attempt} attempts)"))),
+            };
+            let delay = self.backoff(attempt, throttled);
+            if let Some(d) = deadline {
+                if Instant::now() + delay >= d {
+                    return Err(SnapshotError::io(ctx(), format!("api call timed out after [{}ms] ({attempt} attempts, last: {err})", self.cfg.api_call_timeout.unwrap_or_default().as_millis())));
+                }
+            }
+            tracing::debug!("s3 {method} {url} attempt {attempt} failed, retrying in {delay:?}: {err}");
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Exponential backoff with full jitter: uniform in `[0, min(cap, base * 2^(attempt-1))]`.
+    fn backoff(&self, attempt: u32, throttled: bool) -> Duration {
+        use rand::Rng;
+        // Throttling responses (429, 503 SlowDown) back off longer, as the
+        // AWS SDK v2 always does.
+        let base = if throttled { self.cfg.retry_base_delay * 5 } else { self.cfg.retry_base_delay };
+        let ceiling = base.saturating_mul(1u32 << attempt.saturating_sub(1).min(16)).min(MAX_BACKOFF);
+        let ms = ceiling.as_millis() as u64;
+        Duration::from_millis(if ms == 0 { 0 } else { rand::thread_rng().gen_range(0..=ms) })
+    }
+
+    /// One attempt. Bounded like a socket read timeout: the request body
+    /// must keep being consumed and, once sent, the response headers and
+    /// then each body chunk must arrive, each within `read_timeout`.
+    async fn attempt(&self, rb: reqwest::RequestBuilder, body: &Bytes, admission: Option<&super::ReadAdmission>) -> std::result::Result<Resp, Failure> {
+        let read_timeout = self.cfg.read_timeout;
+        let progress = Arc::new(Progress::new());
+        let rb = if body.is_empty() {
+            rb.body(Bytes::new())
+        } else {
+            rb.header("content-length", body.len().to_string())
+                .body(reqwest::Body::wrap(ProgressBody { data: body.clone(), off: 0, progress: progress.clone() }))
+        };
+        let watchdog = async {
+            loop {
+                let idle = progress.idle();
+                if idle >= read_timeout {
+                    return;
+                }
+                tokio::time::sleep(read_timeout - idle).await;
+            }
+        };
+        let sent = tokio::select! {
+            r = rb.send() => r,
+            _ = watchdog => {
+                return Err(Failure::Retryable(format!("Read timed out: no progress sending the request or awaiting the response for [{}ms]", read_timeout.as_millis())));
+            }
+        };
+        let mut r = sent.map_err(|e| Failure::Retryable(error_chain(&e)))?;
+        let status = r.status().as_u16();
+        let headers = r.headers().clone();
+        let mut admitted = admission.map(|a| super::admitted::Buffer::new(a.clone()));
+        let mut plain = BytesMut::with_capacity(if admitted.is_some() { 0 } else { r.content_length().unwrap_or(0).min(64 << 20) as usize });
+        loop {
+            let chunk = match tokio::time::timeout(read_timeout, r.chunk()).await {
+                Err(_) => return Err(Failure::Retryable(format!("Read timed out: response body stalled for [{}ms]", read_timeout.as_millis()))),
+                Ok(Err(e)) => return Err(Failure::Retryable(format!("reading the response body: {}", error_chain(&e)))),
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(c))) => c,
+            };
+            match admitted.as_mut() {
+                Some(b) => b.extend(&chunk).map_err(Failure::Fatal)?,
+                None => plain.extend_from_slice(&chunk),
             }
         }
+        let body = match admitted {
+            Some(b) => b.finish(),
+            None => plain.freeze(),
+        };
+        Ok(Resp { status, headers, body })
     }
 
     fn s3_error(op: &str, key: &str, r: &Resp) -> SnapshotError {
@@ -272,6 +470,9 @@ impl S3BlobStore {
         let upload_id = xml::tag(&String::from_utf8_lossy(&r.body), "UploadId")
             .ok_or_else(|| SnapshotError::io("CreateMultipartUpload", "missing UploadId"))?;
         let part_size = self.cfg.buffer_size.max(MIN_PART_SIZE) as usize;
+        // A caller that stops waiting (cancellation drops this future) must
+        // not leave the upload's parts behind: abort it in the background.
+        let mut guard = AbortUploadOnDrop { store: Some(self.clone()), path: path.clone(), upload_id: upload_id.clone() };
 
         let result: Result<()> = async {
             let mut parts: Vec<(u32, String)> = Vec::new();
@@ -325,11 +526,18 @@ impl S3BlobStore {
             Ok(())
         }
         .await;
+        guard.store = None;
         if result.is_err() {
-            let q = vec![("uploadId".to_string(), upload_id.clone())];
-            let _ = self.request("DELETE", &path, &q, &[], Bytes::new()).await;
+            self.abort_upload(&path, &upload_id).await;
         }
         result
+    }
+
+    async fn abort_upload(&self, path: &str, upload_id: &str) {
+        let q = vec![("uploadId".to_string(), upload_id.to_string())];
+        if let Err(e) = self.request("DELETE", path, &q, &[], Bytes::new()).await {
+            tracing::warn!("failed to abort multipart upload [{upload_id}] of [{path}]: {e}");
+        }
     }
 
     /// ListObjectsV2 over `prefix`; returns (key → size, common prefixes).
@@ -397,6 +605,24 @@ impl S3BlobStore {
             }
         }
         Ok(())
+    }
+}
+
+/// Aborts a multipart upload whose upload future was dropped before it
+/// completed or aborted the upload itself.
+struct AbortUploadOnDrop {
+    store: Option<S3BlobStore>,
+    path: String,
+    upload_id: String,
+}
+
+impl Drop for AbortUploadOnDrop {
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else { return };
+        let (path, upload_id) = (std::mem::take(&mut self.path), std::mem::take(&mut self.upload_id));
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { store.abort_upload(&path, &upload_id).await });
+        }
     }
 }
 

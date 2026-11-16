@@ -466,3 +466,99 @@ async fn asynchronous_force_merge_retains_real_task_result() {
     assert_eq!(es.post0("/merge/_forcemerge?only_expunge_deletes=true&max_num_segments=-1").await.0, 200);
     assert_eq!(es.post0("/merge/_forcemerge?only_expunge_deletes=true&max_num_segments=1").await.0, 400);
 }
+
+/// A replication barrier that holds every batch until opened, or fails it.
+struct Gate {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+    calls: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl elasticsearch_engine::reindex::ReplicationBarrier for Gate {
+    fn await_replicated(&self, svc: &elasticsearch_engine::index::IndexService) -> elasticsearch_engine::error::Result<()> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(elasticsearch_engine::error::EsError::new(500, "retry_on_primary_exception", format!("[{}][0] replication failed", svc.name)));
+        }
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.cv.wait(open).unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// BulkByScroll batches are acknowledged through the node's replication
+/// barrier: a background update-by-query stays pending while its batches
+/// wait for replication and completes once they are acknowledged; a batch
+/// whose replication fails counts as failed, never as updated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn by_query_batches_wait_for_their_replication() {
+    use std::sync::atomic::Ordering;
+    let tmp = tempfile::tempdir().unwrap();
+    let node = Node::open(tmp.path()).unwrap();
+    let gate = std::sync::Arc::new(Gate { open: std::sync::Mutex::new(true), cv: std::sync::Condvar::new(), calls: Default::default(), fail: Default::default() });
+    node.set_replication_barrier(Some(gate.clone() as std::sync::Arc<dyn elasticsearch_engine::reindex::ReplicationBarrier>));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = elasticsearch_http::serve_listener(node, listener).await;
+    });
+    let es = Es { base: format!("http://{addr}"), c: Client::new() };
+    seed(&es, 10).await;
+
+    *gate.open.lock().unwrap() = false;
+    let (st, v) = es.post("/src/_update_by_query?wait_for_completion=false&scroll_size=4&refresh=true", json!({"script": {"source": "ctx._source.n += 100"}})).await;
+    assert_eq!(st, 200, "{v}");
+    let task = v["task"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (st, t) = es.get(&format!("/_tasks/{task}")).await;
+    assert_eq!((st, t["completed"].clone()), (200, json!(false)), "{t}");
+    assert!(gate.calls.load(Ordering::SeqCst) >= 1);
+    *gate.open.lock().unwrap() = true;
+    gate.cv.notify_all();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let done = loop {
+        let (_, t) = es.get(&format!("/_tasks/{task}")).await;
+        if t["completed"] == true {
+            break t;
+        }
+        assert!(std::time::Instant::now() < deadline, "{t}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!((done["response"]["updated"].as_u64(), done["response"]["failures"].clone()), (Some(10), json!([])), "{done}");
+    // Three batches, then the final barrier.
+    assert!(gate.calls.load(Ordering::SeqCst) >= 4, "{}", gate.calls.load(Ordering::SeqCst));
+
+    gate.fail.store(true, Ordering::SeqCst);
+    let (st, v) = es.post("/src/_update_by_query", json!({"script": {"source": "ctx._source.n += 1"}})).await;
+    assert_eq!(st, 500, "{v}");
+    assert_eq!(v["updated"].as_u64(), Some(0), "{v}");
+    assert_eq!(v["failures"][0]["cause"]["type"], "retry_on_primary_exception", "{v}");
+    gate.fail.store(false, Ordering::SeqCst);
+}
+
+/// `conflicts: proceed` with `max_docs`: ES counts successfully processed
+/// documents toward the quota, so five create conflicts do not stop the
+/// reindex before the five eligible documents are copied.
+#[tokio::test]
+async fn conflicts_do_not_use_up_max_docs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let es = start(tmp.path()).await;
+    let mut lines = Vec::new();
+    for i in 0..10 {
+        lines.push(json!({"index": {"_index": "qs", "_id": format!("q{i}")}}));
+        lines.push(json!({"v": i}));
+    }
+    for i in 0..5 {
+        lines.push(json!({"index": {"_index": "qd", "_id": format!("q{i}")}}));
+        lines.push(json!({"v": -1}));
+    }
+    es.bulk(&lines).await;
+    let (st, v) = es.post("/_reindex?refresh=true", json!({"conflicts": "proceed", "max_docs": 5, "source": {"index": "qs"}, "dest": {"index": "qd", "op_type": "create"}})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!((v["created"].as_u64(), v["version_conflicts"].as_u64(), v["total"].as_u64()), (Some(5), Some(5), Some(5)), "{v}");
+    let (_, c) = es.get("/qd/_count").await;
+    assert_eq!(c["count"], 10, "{c}");
+}

@@ -132,12 +132,16 @@ pub enum SortField {
     /// geo-point field `field` (ES `_geo_distance`; haversine `arc`, or
     /// `plane`). `mode` picks among several points (min ascending, max
     /// descending by default); docs without a point sort as `+inf`.
-    GeoDistance { field: u16, lat: f64, lon: f64, descending: bool, mode: Option<SortMode>, plane: bool },
+    /// `more`: further origins (ES accepts several): the mode then picks
+    /// among the distances of every doc point to every origin.
+    GeoDistance { field: u16, lat: f64, lon: f64, descending: bool, mode: Option<SortMode>, plane: bool, more: Vec<(f64, f64)> },
     /// ES `nested` sort: `sort` (a field or geo-distance sort) evaluated
     /// over the live nested docs of `path` in each hit's block (only those
     /// matching `filter`, if given); the children's values are combined by
     /// the inner sort's mode. A hit without such children is missing.
-    Nested { path: String, filter: Option<Box<Query>>, sort: Box<SortField> },
+    /// `max_children`: at most that many eligible children (in doc order,
+    /// after `filter`) of each root give its value (ES `NestedSortBuilder`).
+    Nested { path: String, filter: Option<Box<Query>>, sort: Box<SortField>, max_children: Option<usize> },
 }
 
 impl SortField {
@@ -598,7 +602,8 @@ impl<'a> Searcher<'a> {
     /// Open a nested scalar column and its block/filter metadata once per leaf.
     /// The hot path reduces child values without allocating per-parent vectors.
     fn nested_i64<'r>(leaf: &'r LeafReader<'_>, sort: &SortField, filter: Option<&'r [u64]>) -> Option<Box<dyn Fn(DocId) -> SortValue + 'r>> {
-        let SortField::Nested { path, sort, .. } = sort else { return None };
+        let SortField::Nested { path, sort, max_children, .. } = sort else { return None };
+        let max_children = max_children.unwrap_or(usize::MAX);
         let SortField::Field { field, kind: SortKind::I64, descending, missing, mode } = &**sort else { return None };
         let mode = mode.unwrap_or(if *descending { SortMode::Max } else { SortMode::Min });
         let missing = missing.clone();
@@ -609,9 +614,12 @@ impl<'a> Searcher<'a> {
             let mut count = 0u64;
             let mut value = match mode { SortMode::Min => i64::MAX, SortMode::Max => i64::MIN, _ => 0 };
             let mut median = Vec::new();
+            let mut eligible = 0usize;
             for child in nested.children_iter(parent, ord) {
                 if deleted.as_ref().is_some_and(|bits| bits.get(child))
                     || filter.is_some_and(|bits| !bits.get(child as usize / 64).is_some_and(|w| (w >> (child % 64)) & 1 == 1)) { continue }
+                if eligible == max_children { break }
+                eligible += 1;
                 if let Some(v) = get(child) {
                     count += 1;
                     match mode {
@@ -710,15 +718,30 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Geo distance (meters) from a point over the points of several docs.
-    fn geo_distance_docs(leaf: &LeafReader<'_>, docs: &[DocId], field: u16, (lat, lon): (f64, f64), descending: bool, mode: Option<SortMode>, plane: bool) -> SortValue {
+    /// Geo distance (meters) from the origins over the points of several
+    /// docs: every point's distance to every origin (ES
+    /// `GeoUtils.distanceValues`), picked by `mode`.
+    #[allow(clippy::too_many_arguments)]
+    fn geo_distance_docs(leaf: &LeafReader<'_>, docs: &[DocId], field: u16, origin: (f64, f64), more: &[(f64, f64)], descending: bool, mode: Option<SortMode>, plane: bool) -> SortValue {
         let mode = mode.unwrap_or(if descending { SortMode::Max } else { SortMode::Min });
-        let d: Vec<f64> = docs
+        let points: Vec<(f64, f64)> = docs.iter().flat_map(|&d| leaf.geo_values(field, d)).collect();
+        let d: Vec<f64> = points
             .iter()
-            .flat_map(|&d| leaf.geo_values(field, d))
-            .map(|(a, b)| if plane { crate::geo::plane_meters(lat, lon, a, b) } else { crate::sloppy_math::haversin_meters(lat, lon, a, b) })
+            .flat_map(|&(a, b)| {
+                std::iter::once(origin).chain(more.iter().copied()).map(move |(lat, lon)| if plane { crate::geo::plane_meters(lat, lon, a, b) } else { crate::sloppy_math::haversin_meters(lat, lon, a, b) })
+            })
             .collect();
         SortValue::F64(Self::pick_numeric(d, mode).unwrap_or(f64::INFINITY))
+    }
+
+    /// A `_geo_distance` sort's value of `doc` (every origin, `mode`
+    /// picking among the distances), as the search's own sort computes it;
+    /// `Missing` for another sort field.
+    pub fn geo_distance_value(leaf: &LeafReader<'_>, doc: DocId, s: &SortField) -> SortValue {
+        match s {
+            SortField::GeoDistance { field, lat, lon, descending, mode, plane, more } => Self::geo_distance_docs(leaf, &[doc], *field, (*lat, *lon), more, *descending, *mode, *plane),
+            _ => SortValue::Missing,
+        }
     }
 
     /// The value of a field / geo-distance sort over `docs`.
@@ -730,8 +753,8 @@ impl<'a> Searcher<'a> {
                     (v, _) => v,
                 }
             }
-            SortField::GeoDistance { field, lat, lon, descending, mode, plane } => {
-                Self::geo_distance_docs(leaf, docs, *field, (*lat, *lon), *descending, *mode, *plane)
+            SortField::GeoDistance { field, lat, lon, descending, mode, plane, more } => {
+                Self::geo_distance_docs(leaf, docs, *field, (*lat, *lon), more, *descending, *mode, *plane)
             }
             SortField::Nested { sort, .. } => Self::value_over(ctx,leaf, docs, sort, fd),
             SortField::Score { .. } | SortField::Doc | SortField::DocDesc => SortValue::Missing,
@@ -774,11 +797,14 @@ impl<'a> Searcher<'a> {
                     SortField::Score { .. } => SortValue::F64(score as f64),
                     SortField::Doc | SortField::DocDesc => SortValue::I64(((li as i64) << 32) | doc as i64),
                     SortField::Field { .. } | SortField::GeoDistance { .. } => Self::value_over(ctx,leaf, std::slice::from_ref(&doc), s, fd),
-                    SortField::Nested { path, sort: inner, .. } => {
+                    SortField::Nested { path, sort: inner, max_children, .. } => {
                         if let Some(Some(get)) = nested_numeric.get(i) { return get(doc) }
                         let mut kids = leaf.nested_children(doc, path);
                         if let Some(Some(bits)) = nested_filters.get(i) {
                             kids.retain(|&d| bits.get(d as usize / 64).is_some_and(|w| (w >> (d % 64)) & 1 == 1));
+                        }
+                        if let Some(m) = max_children {
+                            kids.truncate(*m);
                         }
                         if kids.is_empty() {
                             // No matching child: the inner sort's missing value.
@@ -1996,12 +2022,11 @@ impl<'a> Searcher<'a> {
                 h.score *= r.query_weight;
                 h.sort = vec![SortValue::F64(h.score as f64)];
             }
-            if *mode == RescoreMode::Replace {
-                // `ScriptRescorer.combine`: every hit is re-sorted.
-                hits.sort_by(|a, b| Self::cmp_hits(a, b, true, &[]));
-            } else {
-                hits[..window].sort_by(|a, b| Self::cmp_hits(a, b, true, &[]));
-            }
+            // Every retained hit is re-sorted before the next rescorer takes
+            // its window (`QueryRescorer.combine` / `ScriptRescorer.combine`
+            // sort the whole `TopDocs` once hits lie beyond the window): a
+            // window hit the step lowered falls below a higher tail hit.
+            hits.sort_by(|a, b| Self::cmp_hits(a, b, true, &[]));
             rescored.push(step_map);
             ctx.inherit_errors(&rctx);
             rescore_ctxs.push(rctx);
@@ -2056,7 +2081,7 @@ impl<'a> Searcher<'a> {
             terminated_early,
             timed_out: shared.timed_out.load(AtomicOrdering::Relaxed) || ctx.vector_timed_out.load(AtomicOrdering::Relaxed),
             invalid_score: ctx.invalid_score.lock().take(),
-            execution_error: ctx.execution_error.lock().clone(),
+            execution_error: ctx.execution_error.lock().clone().or_else(|| ctx.function_error.lock().clone()),
         }
     }
 
@@ -2915,7 +2940,7 @@ mod tests {
         let f = fixture();
         let s = f.searcher();
         let base = Query::RangeI64 { field: 1, lower: Bound::Included(10), upper: Bound::Unbounded }; // score 1
-        let fvf = ScoreFunction::FieldValueFactor { field: 1, factor: 1.0, modifier: FieldValueModifier::None, missing: None };
+        let fvf = ScoreFunction::FieldValueFactor { field: 1, name: "n".into(), factor: 1.0, modifier: FieldValueModifier::None, missing: None };
         let check = |q: Query, expect: &dyn Fn(f64) -> f64| {
             let td = s.search(&q, &all(1000));
             assert_eq!(td.hits.len(), 289, "{q:?}"); // 290 docs with n >= 10, minus deleted 250
@@ -2945,9 +2970,9 @@ mod tests {
         check(fs(two(), ScoreMode::Sum, BoostMode::Avg), &|n| (1.0 + n + 2.0) / 2.0);
         check(fs(two(), ScoreMode::Sum, BoostMode::Min), &|_| 1.0);
         check(fs(two(), ScoreMode::Sum, BoostMode::Max), &|n| n + 2.0);
-        let log = ScoreFunction::FieldValueFactor { field: 1, factor: 2.0, modifier: FieldValueModifier::Log1p, missing: None };
+        let log = ScoreFunction::FieldValueFactor { field: 1, name: "n".into(), factor: 2.0, modifier: FieldValueModifier::Log1p, missing: None };
         check(fs(vec![log], ScoreMode::Multiply, BoostMode::Replace), &|n| (2.0 * n + 1.0).log10());
-        let gauss = ScoreFunction::Decay { field: 1, origin: 150.0, scale: 20.0, offset: 5.0, decay: 0.5, kind: DecayKind::Gauss };
+        let gauss = ScoreFunction::Decay { field: 1, origin: 150.0, scale: 20.0, offset: 5.0, decay: 0.5, kind: DecayKind::Gauss, mode: Default::default() };
         check(fs(vec![gauss], ScoreMode::Multiply, BoostMode::Replace), &|n| {
             let d = ((n - 150.0).abs() - 5.0).max(0.0);
             let sigma2 = -400.0 / (2.0 * 0.5f64.ln());
@@ -3139,6 +3164,49 @@ mod tests {
         let e = td.hits[0].explanation.as_ref().unwrap();
         assert_eq!(e.details.len(), 2);
         assert!((e.value - td.hits[0].score).abs() < 1e-5);
+    }
+
+    /// Review finding 99: each rescorer re-sorts every retained hit before
+    /// the next one takes its window (ES `QueryRescorer.combine`). A=2, B=1;
+    /// step one (window 1) lowers A below B, so step two's window is B.
+    #[test]
+    fn chained_rescorers_take_windows_from_the_resorted_hits() {
+        let f = fixture();
+        let s = f.searcher();
+        let one = |n: i64| Query::RangeI64 { field: 1, lower: Bound::Included(n), upper: Bound::Included(n) };
+        let cs = |q: Query, score: f32| Query::ConstScore { query: Box::new(q), score, point_set: false };
+        // A = n 10 (score 2), B = n 11 (score 1).
+        let base = Query::bool_query().should(cs(one(10), 2.0)).should(cs(one(11), 1.0)).build();
+        let step = |weight: f32, q: Query| Rescore { window_size: 1, query: q, query_weight: 1.0, rescore_query_weight: weight };
+        let run = |first: RescoreMode, second: RescoreMode, explain: bool| {
+            let opts = SearchOptions {
+                top_k: 2,
+                explain,
+                rescore: Some(step(0.1, Query::MatchAll)),
+                rescore_mode: first,
+                rescore_chain: vec![(step(1.0, cs(Query::MatchAll, 10.0)), second)],
+                ..Default::default()
+            };
+            let td = s.search(&base, &opts);
+            td.hits.iter().map(|h| (f.docs[Fixture::global(h)].1, h.score, h.explanation.as_ref().map(|e| e.value))).collect::<Vec<_>>()
+        };
+        let close = |got: &[(i64, f32, Option<f32>)], want: &[(i64, f32)]| {
+            assert_eq!(got.len(), want.len(), "{got:?}");
+            for ((n, sc, ex), (wn, ws)) in got.iter().zip(want) {
+                assert_eq!(n, wn, "{got:?}");
+                assert!((sc - ws).abs() < 1e-5, "{got:?} vs {want:?}");
+                if let Some(e) = ex {
+                    assert!((e - ws).abs() < 1e-5, "explanation {got:?} vs {want:?}");
+                }
+            }
+        };
+        // multiply then total: A 2*0.1 = 0.2 < B 1, so B gets +10.
+        close(&run(RescoreMode::Multiply, RescoreMode::Total, false), &[(11, 11.0), (10, 0.2)]);
+        close(&run(RescoreMode::Multiply, RescoreMode::Total, true), &[(11, 11.0), (10, 0.2)]);
+        // min then avg: A min(2, 0.1) = 0.1 < B 1, B = (1 + 10) / 2.
+        close(&run(RescoreMode::Min, RescoreMode::Avg, true), &[(11, 5.5), (10, 0.1)]);
+        // No hit crosses the window boundary: A stays first and gets both.
+        close(&run(RescoreMode::Total, RescoreMode::Total, true), &[(10, 12.1), (11, 1.0)]);
     }
 
     #[test]
@@ -3855,7 +3923,8 @@ mod tests {
                 if i % 101 != 0 {
                     d.add_i64(1, (seg as i64 * 40_000 + i as i64) / 3);
                 }
-                d.add_f64(2, ((i * 2654435761u32) % 10_000) as f64 / 7.0);
+                // Widened: `i * 2654435761` overflows `u32` (debug builds panic).
+                d.add_f64(2, ((i as u64 * 2_654_435_761) % 10_000) as f64 / 7.0);
                 w.add_document(&d, &schema);
             }
             let s = w.write_to(&dir).unwrap();

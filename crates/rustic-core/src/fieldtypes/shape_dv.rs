@@ -120,36 +120,42 @@ pub fn write_extent(e: &ShapeExtent, out: &mut Vec<u8>) {
     }
 }
 
-/// ES `Extent.readFromCompressed`.
+/// ES `Extent.readFromCompressed`. The deltas and negated edges are
+/// computed in `i64`: `-negRight` of a doc reaching longitude -180 is 2^31
+/// (ES writes `Integer.MIN_VALUE` negated as that vint), which `i32` cannot
+/// negate. Each value is narrowed back checked: a value outside `i32` is a
+/// corrupt doc value (`None`), never a wrapped coordinate.
 fn read_extent(b: &[u8], pos: &mut usize) -> Option<ShapeExtent> {
     let top = i32::from_be_bytes(b.get(*pos..*pos + 4)?.try_into().ok()?);
     *pos += 4;
-    let bottom = (top as i64 - read_vint(b, pos).ok()? as i64) as i32;
+    let narrow = |v: i64| i32::try_from(v).ok();
+    let bottom = narrow(top as i64 - read_vint(b, pos).ok()? as i64)?;
     let ty = *b.get(*pos)?;
     *pos += 1;
     let mut e = ShapeExtent { top, bottom, ..ShapeExtent::default() };
-    let mut rd = || read_vint(b, pos).ok();
+    // A vint as ES reads it: an unsigned 32-bit magnitude.
+    let mut rd = || read_vint(b, pos).ok().map(|v| v as u32 as i64);
     match ty {
         0 => {}
         1 => {
-            e.pos_left = rd()? as u32 as i32;
-            e.pos_right = (rd()? as i64 + e.pos_left as i64) as i32;
+            e.pos_left = narrow(rd()?)?;
+            e.pos_right = narrow(rd()? + e.pos_left as i64)?;
         }
         2 => {
-            e.neg_right = -(rd()? as u32 as i32);
-            e.neg_left = (e.neg_right as i64 - rd()? as i64) as i32;
+            e.neg_right = narrow(-rd()?)?;
+            e.neg_left = narrow(e.neg_right as i64 - rd()?)?;
         }
         3 => {
-            e.pos_right = rd()? as u32 as i32;
-            e.neg_left = -(rd()? as u32 as i32);
+            e.pos_right = narrow(rd()?)?;
+            e.neg_left = narrow(-rd()?)?;
             e.pos_left = 0;
             e.neg_right = 0;
         }
         4 => {
-            e.pos_left = rd()? as u32 as i32;
-            e.pos_right = (rd()? as i64 + e.pos_left as i64) as i32;
-            e.neg_right = -(rd()? as u32 as i32);
-            e.neg_left = (e.neg_right as i64 - rd()? as i64) as i32;
+            e.pos_left = narrow(rd()?)?;
+            e.pos_right = narrow(rd()? + e.pos_left as i64)?;
+            e.neg_right = narrow(-rd()?)?;
+            e.neg_left = narrow(e.neg_right as i64 - rd()?)?;
         }
         _ => return None,
     }
@@ -629,7 +635,7 @@ impl<'a> ShapeValue<'a> {
 fn visit_node(b: &[u8], pos: &mut usize, v: &mut dyn TreeVisitor, split_x: bool, this_max_x: i32, this_max_y: i32, is_root: bool) -> Option<bool> {
     let metadata = *b.get(*pos)?;
     *pos += 1;
-    let mut rd = |base: i32| -> Option<i32> { read_vint(b, pos).ok().map(|d| (base as i64 - d as i64) as i32) };
+    let mut rd = |base: i32| -> Option<i32> { read_vint(b, pos).ok().and_then(|d| i32::try_from(base as i64 - d as i64).ok()) };
     let (this_min_x, this_min_y);
     if metadata & POINT != 0 {
         let x = rd(this_max_x)?;
@@ -678,8 +684,8 @@ fn visit_node(b: &[u8], pos: &mut usize, v: &mut dyn TreeVisitor, split_x: bool,
 }
 
 fn push_left(b: &[u8], pos: &mut usize, v: &mut dyn TreeVisitor, this_max_x: i32, this_max_y: i32, split_x: bool) -> Option<bool> {
-    let next_max_x = (this_max_x as i64 - read_vint(b, pos).ok()? as i64) as i32;
-    let next_max_y = (this_max_y as i64 - read_vint(b, pos).ok()? as i64) as i32;
+    let next_max_x = i32::try_from(this_max_x as i64 - read_vint(b, pos).ok()? as i64).ok()?;
+    let next_max_y = i32::try_from(this_max_y as i64 - read_vint(b, pos).ok()? as i64).ok()?;
     let size = read_vint(b, pos).ok()? as usize;
     if v.push_max(next_max_x, next_max_y) {
         visit_node(b, pos, v, !split_x, next_max_x, next_max_y, false)
@@ -692,8 +698,8 @@ fn push_left(b: &[u8], pos: &mut usize, v: &mut dyn TreeVisitor, this_max_x: i32
 #[allow(clippy::too_many_arguments)]
 fn push_right(b: &[u8], pos: &mut usize, v: &mut dyn TreeVisitor, this_max_x: i32, this_max_y: i32, this_min_x: i32, this_min_y: i32, split_x: bool, right_size: usize) -> Option<bool> {
     if (!split_x && v.push_y(this_min_y)) || (split_x && v.push_x(this_min_x)) {
-        let next_max_x = (this_max_x as i64 - read_vint(b, pos).ok()? as i64) as i32;
-        let next_max_y = (this_max_y as i64 - read_vint(b, pos).ok()? as i64) as i32;
+        let next_max_x = i32::try_from(this_max_x as i64 - read_vint(b, pos).ok()? as i64).ok()?;
+        let next_max_y = i32::try_from(this_max_y as i64 - read_vint(b, pos).ok()? as i64).ok()?;
         let size = read_vint(b, pos).ok()? as usize;
         if v.push_max(next_max_x, next_max_y) {
             return visit_node(b, pos, v, !split_x, next_max_x, next_max_y, false);

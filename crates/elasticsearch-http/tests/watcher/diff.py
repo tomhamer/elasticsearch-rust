@@ -178,8 +178,8 @@ STEPS = [
     ("PUT", "/_watcher/watch/w3", W({"transform": {"script": "return foo.bar"}}), "errtype"),
     ("POST", "/_watcher/watch/_execute", {"watch": W({"input": {"search": {"request": {"indices": ["nonexist"], "body": {}}}}, "actions": {"l": {"logging": {"text": "x"}}}})}),
     ("GET", "/_xpack/usage?filter_path=watcher.watch,watcher.count,watcher.available,watcher.enabled", None),
-    ("POST", "/.watcher-history-17*/_refresh", None, "nobody"),
-    ("POST", "/.watcher-history-17*/_search?size=100&sort=@timestamp:asc&filter_path=hits.hits._source", {"query": {"terms": {"watch_id": ["w1", "s1", "t1", "_inlined_"]}}}),
+    ("POST", "/.watcher-history-18*/_refresh", None, "nobody"),
+    ("POST", "/.watcher-history-18*/_search?size=100&sort=@timestamp:asc&filter_path=hits.hits._source", {"query": {"terms": {"watch_id": ["w1", "s1", "t1", "_inlined_"]}}}),
     ("DELETE", "/_watcher/watch/w2", None, "nover"),
     ("DELETE", "/_watcher/watch/w2", None, "nover"),
 ]

@@ -261,6 +261,8 @@ pub struct CancelToken {
 struct CancelInner {
     cancelled: AtomicBool,
     reason: Mutex<Option<String>>,
+    /// Wakes [`CancelToken::cancelled`] waiters.
+    notify: tokio::sync::Notify,
 }
 
 impl CancelToken {
@@ -271,6 +273,39 @@ impl CancelToken {
     pub fn cancel(&self, reason: impl Into<String>) {
         *self.inner.reason.lock() = Some(reason.into());
         self.inner.cancelled.store(true, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Resolves once the token is cancelled.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            // Registered before the flag is checked, so a concurrent
+            // `cancel` cannot slip between the check and the wait.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Run `fut` until it completes or the token is cancelled, whichever
+    /// comes first. A cancelled token drops `fut` (aborting whatever I/O it
+    /// was blocked on, such as a stalled blob-store request) and returns
+    /// `task_cancelled_exception`.
+    pub async fn run<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        self.check()?;
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => Err(self.error()),
+            r = fut => r,
+        }
+    }
+
+    fn error(&self) -> SnapshotError {
+        SnapshotError::cancelled(self.reason().unwrap_or_else(|| "cancelled".into()))
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -283,7 +318,7 @@ impl CancelToken {
 
     pub fn check(&self) -> Result<()> {
         if self.is_cancelled() {
-            Err(SnapshotError::cancelled(self.reason().unwrap_or_else(|| "cancelled".into())))
+            Err(self.error())
         } else {
             Ok(())
         }
@@ -386,6 +421,25 @@ pub fn stringify_settings(settings: &serde_json::Map<String, serde_json::Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancel_token_aborts_a_pending_future() {
+        let t = CancelToken::new();
+        assert_eq!(t.run(async { Ok(7) }).await.unwrap(), 7);
+        let t2 = t.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            t2.cancel("Snapshot was aborted by deletion");
+        });
+        let started = Instant::now();
+        let e = t.run(futures::future::pending::<Result<()>>()).await.unwrap_err();
+        assert_eq!((e.kind, e.reason.as_str()), ("task_cancelled_exception", "Snapshot was aborted by deletion"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        canceller.await.unwrap();
+        // Already cancelled: refused before the future is polled.
+        assert!(t.run(async { Ok(()) }).await.is_err());
+        tokio::time::timeout(Duration::from_secs(1), t.cancelled()).await.unwrap();
+    }
 
     #[test]
     fn crc32_is_ieee_and_streams() {

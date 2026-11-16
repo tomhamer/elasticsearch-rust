@@ -385,6 +385,9 @@ pub struct AllocSettings {
     pub include: NodeFilters,
     pub exclude: NodeFilters,
     pub disk_threshold_enabled: bool,
+    /// `cluster.routing.allocation.same_shard.host`: no two copies of a
+    /// shard on nodes sharing a host address or host name.
+    pub same_shard_host: bool,
     pub low: Watermark,
     pub high: Watermark,
     pub flood: Watermark,
@@ -471,6 +474,7 @@ impl AllocSettings {
             include: filters("include"),
             exclude: filters("exclude"),
             disk_threshold_enabled: view.parse("cluster.routing.allocation.disk.threshold_enabled", parse_bool, true),
+            same_shard_host: view.parse("cluster.routing.allocation.same_shard.host", parse_bool, false),
             low: watermark(view, LOW_KEY, "85%", "200gb"),
             high: watermark(view, HIGH_KEY, "90%", "150gb"),
             flood: watermark(view, FLOOD_KEY, "95%", "100gb"),

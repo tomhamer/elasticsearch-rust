@@ -102,10 +102,14 @@ impl<'a> LeafSort<'a> {
     /// must run (memtable leaves, sum/avg/median over multi-valued columns,
     /// boolean columns, a `missing` value of another type).
     pub(crate) fn new(leaf: &LeafReader<'a>, sf: &SortField) -> Option<Self> {
-        if let SortField::GeoDistance { field, lat, lon, descending, mode, plane } = sf {
+        if let SortField::GeoDistance { field, lat, lon, descending, mode, plane, more } = sf {
             let LeafReader::Segment(seg) = *leaf else {
                 return None;
             };
+            // Several origins: the generic collector pools every distance.
+            if !more.is_empty() {
+                return None;
+            }
             let mode = mode.unwrap_or(if *descending { SortMode::Max } else { SortMode::Min });
             if !matches!(mode, SortMode::Min | SortMode::Max) {
                 return None;
@@ -189,6 +193,10 @@ impl<'a> LeafSort<'a> {
                     Src::Kw(c, blocks, seg, field)
                 } else if let Some(c) = seg.multi_keyword_reader(field) {
                     Src::MKw(c)
+                } else if seg.keyword_from_postings(field) {
+                    // A derived column not built (its memory refused): the
+                    // field is present, so the normal collector sorts it.
+                    return None;
                 } else {
                     Src::Absent
                 }

@@ -91,6 +91,13 @@ impl ShapeBuf {
         Some(ShapeValue::new(&self.dv[c as usize][o as usize..(o + n) as usize]))
     }
 
+    /// The doc's encoded value bytes, if any (as [`ShapeBuf::push`] took them).
+    pub fn raw_value(&self, doc: DocId) -> Option<&[u8]> {
+        let i = self.values.binary_search_by_key(&doc, |e| e.0).ok()?;
+        let (_, c, o, n) = self.values[i];
+        Some(&self.dv[c as usize][o as usize..(o + n) as usize])
+    }
+
     /// The tree parts over the first `num_docs` docs.
     pub fn encode_tree(&self, num_docs: u32) -> Vec<Vec<u8>> {
         let mut entries: Vec<Entry> = Vec::with_capacity(self.docs.iter().map(|e| e.3 as usize).sum());

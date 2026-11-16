@@ -41,10 +41,146 @@ impl super::Tokenizer for StandardTokenizer {
         let mut tokens = Vec::new();
         let mut position: u32 = 0;
         for (start, seg) in uax29_words(text) {
-            tokens.push(Token { text: seg.to_string(), position, offset_from: start as u32, offset_to: (start + seg.len()) as u32 });
+            tokens.push(Token { text: seg.to_string(), position, offset_from: start as u32, offset_to: (start + seg.len()) as u32, keyword: false });
             position += 1;
         }
         tokens
+    }
+}
+
+/// Lucene `ThaiTokenizer` (the `thai` analyzer and ES `thai` tokenizer):
+/// word segments as a word break iterator finds them; runs of Thai are
+/// split into dictionary words (SIDE 004). The dictionary is ICU's Thai
+/// word list (`icu4c/source/data/brkitr/dictionaries/thaidict.txt`, ICU
+/// 76.1, Unicode License); a run is divided to cover the most characters
+/// with dictionary words, then with the fewest words, and characters no
+/// word covers stay together (combining marks with the word before them).
+#[derive(Clone, Debug, Default)]
+pub struct ThaiTokenizer;
+
+fn thai_dict() -> &'static (std::collections::HashSet<String>, usize) {
+    static D: std::sync::OnceLock<(std::collections::HashSet<String>, usize)> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let raw = zstd::decode_all(&include_bytes!("data/thaidict.txt.zst")[..]).expect("thai dictionary");
+        let text = String::from_utf8(raw).expect("utf-8 dictionary");
+        let words: std::collections::HashSet<String> = text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let max = words.iter().map(|w| w.chars().count()).max().unwrap_or(1);
+        (words, max)
+    })
+}
+
+fn is_thai(c: char) -> bool {
+    matches!(c as u32, 0x0E00..=0x0E7F)
+}
+
+/// Thai combining marks (they never start a word).
+fn is_thai_mark(c: char) -> bool {
+    matches!(c as u32, 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E)
+}
+
+/// Dictionary segmentation of a run of Thai: `(char start, char end)`.
+fn thai_segments(chars: &[char]) -> Vec<(usize, usize)> {
+    let (dict, max) = thai_dict();
+    let n = chars.len();
+    // best[i]: (uncovered chars, words) for chars[..i], with the split.
+    let mut best: Vec<Option<(usize, usize, usize, bool)>> = vec![None; n + 1];
+    best[0] = Some((0, 0, 0, true));
+    let mut buf = String::new();
+    for i in 0..n {
+        let Some((unk, words, _, _)) = best[i] else { continue };
+        let mut relax = |j: usize, cand: (usize, usize, usize, bool), best: &mut Vec<Option<(usize, usize, usize, bool)>>| {
+            if best[j].map(|b| (cand.0, cand.1) < (b.0, b.1)).unwrap_or(true) {
+                best[j] = Some(cand);
+            }
+        };
+        buf.clear();
+        for j in i..n.min(i + *max) {
+            buf.push(chars[j]);
+            if dict.contains(&buf) {
+                relax(j + 1, (unk, words + 1, i, true), &mut best);
+            }
+        }
+        relax(i + 1, (unk + 1, words + 1, i, false), &mut best);
+    }
+    let mut cuts = Vec::new();
+    let mut j = n;
+    while j > 0 {
+        let (_, _, i, known) = best[j].expect("reachable");
+        cuts.push((i, j, known));
+        j = i;
+    }
+    cuts.reverse();
+    // Uncovered characters stay together; a combining mark joins the
+    // segment before it.
+    let mut out: Vec<(usize, usize, bool)> = Vec::new();
+    for (i, j, known) in cuts {
+        if let Some(last) = out.last_mut() {
+            if (!known && !last.2 && last.1 == i) || (is_thai_mark(chars[i]) && last.1 == i) {
+                last.1 = j;
+                last.2 = last.2 && known;
+                continue;
+            }
+        }
+        out.push((i, j, known));
+    }
+    out.into_iter().map(|(i, j, _)| (i, j)).collect()
+}
+
+impl super::Tokenizer for ThaiTokenizer {
+    fn clone_box(&self) -> Box<dyn super::Tokenizer> {
+        Box::new(self.clone())
+    }
+
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        let mut position: u32 = 0;
+        for (start, seg) in uax29_words(text) {
+            if !seg.chars().next().is_some_and(is_thai) {
+                tokens.push(Token { text: seg.to_string(), position, offset_from: start as u32, offset_to: (start + seg.len()) as u32, keyword: false });
+                position += 1;
+                continue;
+            }
+            let chars: Vec<char> = seg.chars().collect();
+            let mut byte_at = Vec::with_capacity(chars.len() + 1);
+            let mut b = start;
+            for c in &chars {
+                byte_at.push(b);
+                b += c.len_utf8();
+            }
+            byte_at.push(b);
+            for (i, j) in thai_segments(&chars) {
+                let word: String = chars[i..j].iter().collect();
+                // Only segments starting with a letter or digit are words.
+                if !chars[i].is_alphanumeric() {
+                    continue;
+                }
+                tokens.push(Token { text: word, position, offset_from: byte_at[i] as u32, offset_to: byte_at[j] as u32, keyword: false });
+                position += 1;
+            }
+        }
+        tokens
+    }
+}
+
+#[cfg(test)]
+mod thai_tests {
+    use super::*;
+    use crate::analysis::Tokenizer;
+
+    fn words(s: &str) -> Vec<String> {
+        ThaiTokenizer.tokenize(s).into_iter().map(|t| t.text).collect()
+    }
+
+    /// SIDE 004: Lucene `TestThaiAnalyzer` segmentations.
+    #[test]
+    fn thai_runs_split_into_words() {
+        assert_eq!(words("ภาษาไทย"), ["ภาษา", "ไทย"]);
+        assert_eq!(words("การที่ได้ต้องแสดงว่างานดี"), ["การ", "ที่", "ได้", "ต้อง", "แสดง", "ว่า", "งาน", "ดี"]);
+        assert_eq!(words("บริษัทชื่อ XY&Z - คุยกับ xyz@demo.com"), ["บริษัท", "ชื่อ", "XY", "Z", "คุย", "กับ", "xyz", "demo.com"]);
+        assert_eq!(words(""), Vec::<String>::new());
+        let t = ThaiTokenizer.tokenize("ภาษาไทย abc");
+        assert_eq!((t[0].offset_from, t[0].offset_to, t[1].offset_from, t[2].text.as_str()), (0, 12, 12, "abc"));
+        assert_eq!(t.iter().map(|t| t.position).collect::<Vec<_>>(), [0, 1, 2]);
     }
 }
 
@@ -291,8 +427,7 @@ impl super::Tokenizer for WhitespaceTokenizer {
                     text: text[start..end].to_string(),
                     position,
                     offset_from: start as u32,
-                    offset_to: end as u32,
-                });
+                    offset_to: end as u32, keyword: false });
                 position += 1;
                 i = end;
             }
@@ -333,8 +468,7 @@ impl super::Tokenizer for LetterTokenizer {
                     text: text[start..end].to_string(),
                     position,
                     offset_from: start as u32,
-                    offset_to: end as u32,
-                });
+                    offset_to: end as u32, keyword: false });
                 position += 1;
                 i = end;
             } else {
@@ -363,8 +497,7 @@ impl super::Tokenizer for KeywordTokenizer {
                 text: text.to_string(),
                 position: 0,
                 offset_from: 0,
-                offset_to: text.len() as u32,
-            }]
+                offset_to: text.len() as u32, keyword: false }]
         }
     }
 }
@@ -386,31 +519,40 @@ impl super::Tokenizer for NGramTokenizer {
     }
 
     fn tokenize(&self, text: &str) -> Vec<Token> {
+        self.tokenize_bounded(text, usize::MAX).expect("unbounded")
+    }
+
+    fn tokenize_bounded(&self, text: &str, budget: usize) -> Option<Vec<Token>> {
         let mut tokens = Vec::new();
         let mut position: u32 = 0;
-        for word in text.split_whitespace() {
-            let word_start = text
-                .find(word)
-                .expect("word comes from text");
-            let chars: Vec<char> = word.chars().collect();
-            let n = chars.len();
+        for (word_start, word) in whitespace_words(text) {
+            // Byte offset of each char boundary within the word.
+            let bounds: Vec<usize> = word.char_indices().map(|(i, _)| i).chain(std::iter::once(word.len())).collect();
+            let n = bounds.len() - 1;
             for len in self.min..=self.max.min(n) {
                 for start in 0..=n - len {
-                    let gram: String = chars[start..start + len].iter().collect();
-                    let byte_start: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
-                    let byte_end: usize = chars[..start + len].iter().map(|c| c.len_utf8()).sum();
+                    if tokens.len() == budget {
+                        return None;
+                    }
+                    let (from, to) = (bounds[start], bounds[start + len]);
                     tokens.push(Token {
-                        text: gram,
+                        text: word[from..to].to_string(),
                         position,
-                        offset_from: (word_start + byte_start) as u32,
-                        offset_to: (word_start + byte_end) as u32,
-                    });
+                        offset_from: (word_start + from) as u32,
+                        offset_to: (word_start + to) as u32, keyword: false });
                     position += 1;
                 }
             }
         }
-        tokens
+        Some(tokens)
     }
+}
+
+/// Whitespace-separated words of `text` with their byte offsets.
+fn whitespace_words(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.split(char::is_whitespace)
+        .filter(|w| !w.is_empty())
+        .map(move |w| (w.as_ptr() as usize - text.as_ptr() as usize, w))
 }
 
 /// Emits prefix n-grams of length `min`..=`max` (in characters) for each
@@ -430,27 +572,28 @@ impl super::Tokenizer for EdgeNGramTokenizer {
     }
 
     fn tokenize(&self, text: &str) -> Vec<Token> {
+        self.tokenize_bounded(text, usize::MAX).expect("unbounded")
+    }
+
+    fn tokenize_bounded(&self, text: &str, budget: usize) -> Option<Vec<Token>> {
         let mut tokens = Vec::new();
         let mut position: u32 = 0;
-        for word in text.split_whitespace() {
-            let word_start = text
-                .find(word)
-                .expect("word comes from text");
-            let chars: Vec<char> = word.chars().collect();
-            let n = chars.len();
+        for (word_start, word) in whitespace_words(text) {
+            let bounds: Vec<usize> = word.char_indices().map(|(i, _)| i).chain(std::iter::once(word.len())).collect();
+            let n = bounds.len() - 1;
             for len in self.min..=self.max.min(n) {
-                let gram: String = chars[..len].iter().collect();
-                let byte_end: usize = chars[..len].iter().map(|c| c.len_utf8()).sum();
+                if tokens.len() == budget {
+                    return None;
+                }
                 tokens.push(Token {
-                    text: gram,
+                    text: word[..bounds[len]].to_string(),
                     position,
                     offset_from: word_start as u32,
-                    offset_to: (word_start + byte_end) as u32,
-                });
+                    offset_to: (word_start + bounds[len]) as u32, keyword: false });
                 position += 1;
             }
         }
-        tokens
+        Some(tokens)
     }
 }
 
@@ -473,20 +616,27 @@ fn scan_while(text: &str, start: usize, pred: impl Fn(char) -> bool) -> usize {
 /// Whether `text[start..]` begins with a URL of the form `scheme://...`;
 /// returns the end offset of the URL. Terminates at whitespace, `<`, `>`,
 /// `"`, and drops trailing sentence punctuation (`.,;:!?)`).
-fn scan_url(text: &str, start: usize) -> Option<usize> {
+///
+/// On failure, `Err(dead)`: no start in `start..dead` can begin a URL
+/// either (they share this scheme run's end), so the caller skips them
+/// instead of rescanning the run from every offset.
+fn scan_url(text: &str, start: usize) -> Result<usize, usize> {
     let scheme_end = scan_while(text, start, |c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
-    if scheme_end == start || !text[start..scheme_end].chars().next().unwrap().is_ascii_alphabetic() {
-        return None;
+    if scheme_end == start {
+        return Err(start);
     }
     if !text[scheme_end..].starts_with("://") {
-        return None;
+        return Err(scheme_end);
+    }
+    if !text[start..scheme_end].chars().next().unwrap().is_ascii_alphabetic() {
+        return Err(start);
     }
     let body_start = scheme_end + 3;
     let mut end = scan_while(text, body_start, |c| {
         !c.is_whitespace() && !matches!(c, '<' | '>' | '"' | '\'' | '`' | '{' | '}' | '|' | '\\' | '^')
     });
     if end == body_start {
-        return None;
+        return Err(scheme_end);
     }
     // Trailing punctuation is not part of the URL.
     while end > body_start {
@@ -497,7 +647,7 @@ fn scan_url(text: &str, start: usize) -> Option<usize> {
             break;
         }
     }
-    Some(end)
+    Ok(end)
 }
 
 fn is_email_local_char(c: char) -> bool {
@@ -511,11 +661,25 @@ fn is_host_char(c: char) -> bool {
 /// Whether `text[start..]` begins with an email address `local@domain.tld`;
 /// returns its end offset. The domain must contain at least one dot and
 /// end in an alphabetic label of length >= 2.
-fn scan_email(text: &str, start: usize) -> Option<usize> {
+///
+/// On failure, `Err(dead)`: every start in `start..dead` lies in the same
+/// local-part run, reaches the same `@` (or none) and the same host, so
+/// fails too; the caller skips them (finding 305: rescanning a long
+/// rejected run from each offset was quadratic).
+fn scan_email(text: &str, start: usize) -> Result<usize, usize> {
     let local_end = scan_while(text, start, is_email_local_char);
-    if local_end == start || !text[local_end..].starts_with('@') {
+    match check_email_host(text, local_end) {
+        Some(end) if local_end > start => Ok(end),
+        _ => Err(local_end),
+    }
+}
+
+/// The end of a valid `@host.tld` at `at`, if there is one.
+fn check_email_host(text: &str, at: usize) -> Option<usize> {
+    if !text[at..].starts_with('@') {
         return None;
     }
+    let local_end = at;
     let host_start = local_end + 1;
     let mut host_end = scan_while(text, host_start, is_host_char);
     while host_end > host_start && text[..host_end].ends_with('.') {
@@ -557,20 +721,29 @@ impl super::Tokenizer for UaxUrlEmailTokenizer {
                 text: text[start..end].to_string(),
                 position,
                 offset_from: start as u32,
-                offset_to: end as u32,
-            });
+                offset_to: end as u32, keyword: false });
             position += 1;
         };
+        // Offsets before which a URL / email cannot start (see `scan_url`).
+        let (mut no_url, mut no_email) = (0usize, 0usize);
         while i < text.len() {
             let c = text[i..].chars().next().unwrap();
             if is_ideograph(c) {
                 push(&mut tokens, i, i + c.len_utf8());
                 i += c.len_utf8();
             } else if is_word_char(c) || is_email_local_char(c) && c != '.' {
-                if let Some(end) = scan_url(text, i) {
+                let url = if i < no_url { Err(no_url) } else { scan_url(text, i) };
+                if let Err(dead) = url {
+                    no_url = no_url.max(dead);
+                }
+                let email = if url.is_ok() || i < no_email { None } else { Some(scan_email(text, i)) };
+                if let Some(Err(dead)) = email {
+                    no_email = no_email.max(dead);
+                }
+                if let Ok(end) = url {
                     push(&mut tokens, i, end);
                     i = end;
-                } else if let Some(end) = scan_email(text, i) {
+                } else if let Some(Ok(end)) = email {
                     push(&mut tokens, i, end);
                     i = end;
                 } else if is_word_char(c) {
@@ -667,8 +840,7 @@ impl super::Tokenizer for PathHierarchyTokenizer {
                     text: emit(&text[..end]),
                     position: 0,
                     offset_from: 0,
-                    offset_to: end as u32,
-                });
+                    offset_to: end as u32, keyword: false });
             }
         } else {
             // Suffix starts: 0, and after each delimiter that is not the last char.
@@ -690,8 +862,7 @@ impl super::Tokenizer for PathHierarchyTokenizer {
                     text: emit(&text[start..]),
                     position: 0,
                     offset_from: start as u32,
-                    offset_to: text.len() as u32,
-                });
+                    offset_to: text.len() as u32, keyword: false });
             }
         }
         tokens
@@ -802,8 +973,7 @@ impl super::Tokenizer for CharGroupTokenizer {
                 text: text[i..end].to_string(),
                 position,
                 offset_from: i as u32,
-                offset_to: end as u32,
-            });
+                offset_to: end as u32, keyword: false });
             position += 1;
             i = end;
         }
@@ -923,15 +1093,21 @@ impl super::Tokenizer for ClassicTokenizer {
         let mut tokens = Vec::new();
         let mut position: u32 = 0;
         let mut i = 0usize;
+        // Offset before which no email can start (see `scan_email`).
+        let mut no_email = 0usize;
         while i < text.len() {
             let c = text[i..].chars().next().unwrap();
             if !c.is_alphanumeric() {
                 i += c.len_utf8();
                 continue;
             }
+            let email = if i < no_email { Err(no_email) } else { scan_email(text, i) };
+            if let Err(dead) = email {
+                no_email = no_email.max(dead);
+            }
             let end = if is_ideograph(c) {
                 i + c.len_utf8()
-            } else if let Some(e) = scan_email(text, i) {
+            } else if let Ok(e) = email {
                 e
             } else if let Some(e) = Self::scan_acronym(text, i) {
                 e
@@ -948,8 +1124,7 @@ impl super::Tokenizer for ClassicTokenizer {
                 text: text[i..end].to_string(),
                 position,
                 offset_from: i as u32,
-                offset_to: end as u32,
-            });
+                offset_to: end as u32, keyword: false });
             position += 1;
             i = end;
         }
@@ -1343,6 +1518,36 @@ mod tests {
         assert_eq!(texts(&t.tokenize("a@b c@d.1 @x")), vec!["a", "b", "c", "d", "1", "x"]);
     }
 
+    /// Finding 305: a long rejected email-local / scheme run is scanned
+    /// once, not once per offset, and the tokens are unchanged.
+    #[test]
+    fn uax_rejected_runs_are_scanned_once() {
+        let t = UaxUrlEmailTokenizer;
+        assert_eq!(
+            texts(&t.tokenize("a_b_c mail me_x@ex.org or a+b+c ftp://h.org/x_y x__@ex")),
+            vec!["a", "b", "c", "mail", "me_x@ex.org", "or", "a", "b", "c", "ftp://h.org/x_y", "x", "ex"]
+        );
+        for run in ["_", "a_", "a+", "-"] {
+            let small = run.repeat(20_000);
+            let large = run.repeat(400_000);
+            let t0 = std::time::Instant::now();
+            let n_small = t.tokenize(&small).len();
+            let small_time = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let n_large = t.tokenize(&large).len();
+            let large_time = t1.elapsed();
+            assert_eq!(n_large, n_small * 20, "{run}");
+            // 20x the input: linear is ~20x; the old rescans were ~400x
+            // (minutes at this size). Generous bound against noise.
+            assert!(large_time < std::time::Duration::from_secs(5), "{run}: {large_time:?} (small {small_time:?})");
+        }
+        let c = ClassicTokenizer;
+        let large = "a_".repeat(400_000);
+        let t0 = std::time::Instant::now();
+        assert_eq!(c.tokenize(&large).len(), 400_000);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
+    }
+
     #[test]
     fn uax_falls_back_to_standard() {
         let t = UaxUrlEmailTokenizer;
@@ -1484,7 +1689,7 @@ impl super::Tokenizer for PreTokenizedTokenizer {
         text.split(PRETOKENIZED_REC_SEP)
             .filter_map(|rec| {
                 let (pos, tok) = rec.split_once(PRETOKENIZED_POS_SEP)?;
-                Some(Token { text: tok.to_string(), position: pos.parse().ok()?, offset_from: 0, offset_to: 0 })
+                Some(Token { text: tok.to_string(), position: pos.parse().ok()?, offset_from: 0, offset_to: 0, keyword: false })
             })
             .collect()
     }

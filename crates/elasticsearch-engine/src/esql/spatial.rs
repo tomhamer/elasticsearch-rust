@@ -118,6 +118,11 @@ pub fn prims(s: &str) -> Option<shape::Prims> {
     shape::parse_wkt(s.trim(), &OPTS).ok().map(|g| shape::Prims::of(&g))
 }
 
+/// Any geometry of a WKT value.
+pub fn geometry(s: &str) -> Option<Geometry> {
+    shape::parse_wkt(s.trim(), &OPTS).ok()
+}
+
 /// `(x, y)` of a `POINT` WKT.
 pub fn point_xy(s: &str) -> Option<(f64, f64)> {
     match shape::parse_wkt(s.trim(), &OPTS).ok()? {
@@ -373,5 +378,143 @@ mod tests {
         );
         assert_eq!(parse_wkt("POINT(1e10 2.123456789)", "cartesian_point").unwrap(), "POINT (1.0E10 2.123456789)");
         assert_eq!(parse_wkt("bad", "geo_point"), None);
+    }
+}
+
+#[cfg(test)]
+mod typed_semantics_tests {
+    use crate::esql::Val;
+    use crate::node::Node;
+    use serde_json::{json, Value};
+
+    fn run(node: &Node, q: &str) -> crate::esql::exec::EsqlResult {
+        match crate::esql::run(node, q, crate::esql::EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }) {
+            Ok(r) => r,
+            Err(e) => panic!("{q}: {e:?}"),
+        }
+    }
+
+    fn col(r: &crate::esql::exec::EsqlResult, name: &str) -> Vec<Val> {
+        let i = r.table.cols.iter().position(|c| c.name == name).unwrap_or_else(|| panic!("{name}: {:?}", r.table.cols));
+        r.table.rows.iter().map(|row| row[i].clone()).collect()
+    }
+
+    fn put_docs(node: &Node, index: &str, docs: &[Value]) {
+        let svc = node.get_index(index).unwrap();
+        let reqs = docs.iter().map(|d| crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    fn bbox(v: &Val) -> (f64, f64, f64, f64) {
+        super::geometry(v.as_str().unwrap_or_else(|| panic!("not a geometry: {v:?}"))).and_then(|g| g.bbox()).unwrap()
+    }
+
+    fn xy(v: &Val) -> (f64, f64) {
+        super::point_xy(v.as_str().unwrap_or_else(|| panic!("not a point: {v:?}"))).unwrap()
+    }
+
+    fn close(a: (f64, f64), b: (f64, f64), tol: f64) -> bool {
+        (a.0 - b.0).abs() <= tol && (a.1 - b.1).abs() <= tol
+    }
+
+    /// Review finding 267: grouped ST_EXTENT_AGG / ST_CENTROID_AGG over
+    /// shapes (the table path) count every geometry — polygons, lines and
+    /// points in a shape column — with the highest dimension weighting the
+    /// centroid, for geo and cartesian shapes; each group matches the same
+    /// aggregation run ungrouped over that group.
+    #[test]
+    fn grouped_shape_aggregates_keep_non_point_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let _ = crate::license::service(&node).start_trial(&node, "trial", true);
+        node.create_index("shapes", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {"properties": {"region": {"type": "keyword"}, "shape": {"type": "geo_shape"}, "cs": {"type": "shape"}}}})).unwrap();
+        put_docs(&node, "shapes", &[
+            json!({"region": "a", "shape": "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))", "cs": "POLYGON ((0 0, 4 0, 4 2, 0 2, 0 0))"}),
+            json!({"region": "a", "shape": "POINT (20 30)", "cs": "POINT (100 100)"}),
+            json!({"region": "b", "shape": "LINESTRING (0 0, 4 0)", "cs": "LINESTRING (0 0, 0 6)"}),
+        ]);
+        let grouped = run(&node, "FROM shapes | STATS e = ST_EXTENT_AGG(shape), c = ST_CENTROID_AGG(shape), ce = ST_EXTENT_AGG(cs), cc = ST_CENTROID_AGG(cs) BY region | SORT region");
+        let (e, c, ce, cc) = (col(&grouped, "e"), col(&grouped, "c"), col(&grouped, "ce"), col(&grouped, "cc"));
+        assert_eq!(e.len(), 2, "{:?}", grouped.table.rows);
+        // Region a: the polygon's area centroid (the point does not weigh in), the extent of both.
+        assert!(close(xy(&c[0]), (5.0, 5.0), 1e-5), "{:?}", c[0]);
+        let b = bbox(&e[0]);
+        assert!(close((b.0, b.1), (0.0, 0.0), 1e-5) && close((b.2, b.3), (20.0, 30.0), 1e-5), "{b:?}");
+        assert!(close(xy(&cc[0]), (2.0, 1.0), 1e-9), "{:?}", cc[0]);
+        assert_eq!(bbox(&ce[0]), (0.0, 0.0, 100.0, 100.0));
+        // Region b: a line.
+        assert!(close(xy(&c[1]), (2.0, 0.0), 1e-5), "{:?}", c[1]);
+        assert!(close(xy(&cc[1]), (0.0, 3.0), 1e-9), "{:?}", cc[1]);
+        for (k, region) in ["a", "b"].iter().enumerate() {
+            let one = run(&node, &format!("FROM shapes | WHERE region == \"{region}\" | STATS e = ST_EXTENT_AGG(shape), c = ST_CENTROID_AGG(shape)"));
+            assert!(close(xy(&col(&one, "c")[0]), xy(&c[k]), 1e-5), "{region}: {:?} vs {:?}", col(&one, "c"), c[k]);
+            let (u, g) = (bbox(&col(&one, "e")[0]), bbox(&e[k]));
+            assert!(close((u.0, u.1), (g.0, g.1), 1e-5) && close((u.2, u.3), (g.2, g.3), 1e-5), "{region}: {u:?} vs {g:?}");
+        }
+    }
+
+    /// Review finding 277: version and IP ordering comparisons, MIN/MAX,
+    /// TOP and SORT use the types' order (version precedence; the 16-byte
+    /// address), not their rendered text.
+    #[test]
+    fn version_and_ip_compare_by_their_type_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let r = run(&node, "ROW v = TO_VERSION(\"10.0.0\"), a = TO_IP(\"10.0.0.10\") | EVAL vlt = v < TO_VERSION(\"2.0.0\"), vgt = v > TO_VERSION(\"2.0.0\"), alt = a < TO_IP(\"10.0.0.2\"), age = a >= TO_IP(\"10.0.0.2\")");
+        assert_eq!((col(&r, "vlt"), col(&r, "vgt")), (vec![Val::Bool(false)], vec![Val::Bool(true)]));
+        assert_eq!((col(&r, "alt"), col(&r, "age")), (vec![Val::Bool(false)], vec![Val::Bool(true)]));
+        let r = run(&node, "ROW v = [\"10.0.0\", \"2.0.0\", \"2.0.0-beta\"] | MV_EXPAND v | EVAL v = TO_VERSION(v) | STATS mn = MIN(v), mx = MAX(v)");
+        assert_eq!(col(&r, "mn")[0].to_text(), "2.0.0-beta");
+        assert_eq!(col(&r, "mx")[0].to_text(), "10.0.0");
+        let r = run(&node, "ROW a = [\"10.0.0.10\", \"10.0.0.2\", \"::1\"] | MV_EXPAND a | EVAL a = TO_IP(a) | STATS mn = MIN(a), mx = MAX(a)");
+        assert_eq!((col(&r, "mn")[0].to_text(), col(&r, "mx")[0].to_text()), ("::1".to_string(), "10.0.0.10".to_string()));
+        let r = run(&node, "ROW a = [\"10.0.0.10\", \"10.0.0.2\"] | MV_EXPAND a | EVAL a = TO_IP(a) | SORT a");
+        assert_eq!(col(&r, "a").iter().map(Val::to_text).collect::<Vec<_>>(), vec!["10.0.0.2", "10.0.0.10"]);
+    }
+
+    /// Review finding 278: SUM_OVER_TIME of a long gauge is an exact,
+    /// checked sum: an overflowing series is null with ES's long-overflow
+    /// warning (never a wrapped negative), and the exact boundary sums.
+    #[test]
+    fn integer_sum_over_time_overflow_is_null_with_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let now = crate::date::now_millis();
+        let base = now - now.rem_euclid(3_600_000) - 3_600_000;
+        node.create_index("m", &json!({
+            "settings": {"index.mode": "time_series", "index.routing_path": ["host"], "index.number_of_replicas": 0,
+                "index.time_series.start_time": crate::ilm::iso_date(base - 3_600_000), "index.time_series.end_time": crate::ilm::iso_date(now + 3_600_000)},
+            "mappings": {"properties": {"@timestamp": {"type": "date"}, "host": {"type": "keyword", "time_series_dimension": true},
+                "bytes": {"type": "long", "time_series_metric": "gauge"}}}}))
+            .unwrap();
+        let big = 1i64 << 62;
+        put_docs(&node, "m", &[
+            json!({"@timestamp": crate::ilm::iso_date(base + 1_000), "host": "a", "bytes": big}),
+            json!({"@timestamp": crate::ilm::iso_date(base + 2_000), "host": "a", "bytes": big}),
+            json!({"@timestamp": crate::ilm::iso_date(base + 1_000), "host": "b", "bytes": big}),
+            json!({"@timestamp": crate::ilm::iso_date(base + 2_000), "host": "b", "bytes": big - 1}),
+        ]);
+        let r = run(&node, "TS m | STATS total = SUM(SUM_OVER_TIME(bytes)) BY host | SORT host");
+        assert_eq!(col(&r, "total"), vec![Val::Null, Val::Long(i64::MAX)], "{:?}", r.table.rows);
+        assert!(r.warnings.iter().any(|w| w.contains("long overflow")), "{:?}", r.warnings);
+    }
+
+    /// Review finding 280: ST_DISTANCE of cartesian points is the
+    /// Pythagorean distance in coordinate units; geo points keep meters.
+    #[test]
+    fn cartesian_distance_is_euclidean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let r = run(&node, "ROW a = TO_CARTESIANPOINT(\"POINT(0 0)\"), b = TO_CARTESIANPOINT(\"POINT(3 4)\"), g = TO_GEOPOINT(\"POINT(0 0)\"), h = TO_GEOPOINT(\"POINT(3 4)\") | EVAL d = ST_DISTANCE(a, b), gd = ST_DISTANCE(g, h)");
+        assert_eq!(col(&r, "d"), vec![Val::Double(5.0)]);
+        assert!(col(&r, "gd")[0].as_f64().unwrap() > 500_000.0, "{:?}", col(&r, "gd"));
+        node.create_index("pts", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"p": {"type": "point"}}}})).unwrap();
+        put_docs(&node, "pts", &[json!({"p": "POINT (3 4)"}), json!({"p": "POINT (6 8)"})]);
+        let r = run(&node, "FROM pts | EVAL d = ST_DISTANCE(p, TO_CARTESIANPOINT(\"POINT(0 0)\")) | WHERE d < 7 | SORT d | KEEP d");
+        assert_eq!(col(&r, "d"), vec![Val::Double(5.0)]);
     }
 }

@@ -164,7 +164,11 @@ fn put_pipeline(node: &Node, req: &Req, id: &str) -> R {
         None => None,
     };
     let _enrich = elasticsearch_engine::enrich::NodeScope::enter(node);
+    let download = elasticsearch_engine::ingest::geoip_download::wants_download(&body);
     node.ingest().put(id, body, if_version)?;
+    if download {
+        elasticsearch_engine::ingest::geoip_download::trigger(&node.data);
+    }
     Ok(Resp::ack())
 }
 
@@ -184,7 +188,9 @@ fn simulate_ingest(node: &Node, req: &Req, index: Option<&str>) -> R {
 
 /// What to write after ingest.
 pub(crate) enum Prepared {
-    Write { index: String, id: Option<String>, routing: Option<String>, source: String, dynamic_templates: Option<std::collections::HashMap<String, String>> },
+    /// `cond`: the write's version and concurrency conditions after the
+    /// pipelines (`None`: as requested).
+    Write { index: String, id: Option<String>, routing: Option<String>, source: String, dynamic_templates: Option<std::collections::HashMap<String, String>>, cond: Option<elasticsearch_engine::ingest::WriteMeta> },
     Dropped { index: String, id: Option<String> },
 }
 
@@ -198,15 +204,16 @@ pub(crate) fn prepare_ext(
     routing: Option<String>,
     source: String,
     pipeline: Option<&str>,
+    cond: elasticsearch_engine::ingest::WriteMeta,
 ) -> Result<Prepared, Box<(elasticsearch_engine::ingest::IngestFailure, String)>> {
-    let out = match node.run_ingest_ext(IngestRequest { index, id: id.as_deref(), routing: routing.as_deref(), source: &source, pipeline }) {
+    let out = match node.run_ingest_ext(IngestRequest { index, id: id.as_deref(), routing: routing.as_deref(), source: &source, pipeline, cond }) {
         Ok(o) => o,
         Err(f) => return Err(Box::new((f, source))),
     };
     Ok(match out {
-        IngestOutcome::Unchanged => Prepared::Write { index: index.to_string(), id, routing, source, dynamic_templates: None },
+        IngestOutcome::Unchanged => Prepared::Write { index: index.to_string(), id, routing, source, dynamic_templates: None, cond: None },
         IngestOutcome::Dropped { index } => Prepared::Dropped { index, id },
-        IngestOutcome::Changed { index, id, routing, source, dynamic_templates } => Prepared::Write { index, id, routing, source, dynamic_templates },
+        IngestOutcome::Changed { index, id, routing, source, dynamic_templates, cond } => Prepared::Write { index, id, routing, source, dynamic_templates, cond: Some(cond) },
     })
 }
 

@@ -596,7 +596,12 @@ fn get_cluster_settings(node: &Node, req: &Req) -> R {
             let node_settings = node.node_settings.read();
             let filter = elasticsearch_engine::settings_filter::SettingsFilter::for_settings(node_settings.iter());
             for (k, v) in node_settings.iter().filter(|(k, _)| !filter.hides(k)) {
-                d.insert(k.clone(), json!(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())));
+                // List settings stay lists (`cluster.remote.<alias>.seeds`).
+                let rendered = match v {
+                    Value::Array(a) => Value::Array(a.iter().map(|x| json!(x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))).collect()),
+                    other => json!(other.as_str().map(str::to_string).unwrap_or_else(|| other.to_string())),
+                };
+                d.insert(k.clone(), rendered);
             }
         }
         d.retain(|k, _| !cs.0.contains_key(k) && !cs.1.contains_key(k));
@@ -654,12 +659,17 @@ fn put_cluster_settings(node: &Node, req: &Req) -> R {
         effective.extend(cs.0.iter().map(|(k,v)|(k.clone(),v.clone())));
         effective.extend(cs.1.iter().map(|(k,v)|(k.clone(),v.clone())));
         elasticsearch_engine::script::rate_limit::validate_settings(&effective)?;
+        // `RemoteClusterSettings`: every alias's settings against its mode.
+        elasticsearch_engine::ccr::remote::validate_remote_settings(&cs.0, &cs.1, &node.node_settings.read())?;
         *committed = cs;
     }
     node.persist_state()?;
     // Applied once committed.
     elasticsearch_engine::memory::configure(node);
     elasticsearch_engine::script::rate_limit::configure(node)?;
+    // More ML memory (`xpack.ml.max_machine_memory_percent`) assigns the
+    // lazily opened jobs that fit now.
+    elasticsearch_engine::ml::anomaly::assign_pending_jobs(node);
     Ok(Resp::ok(out))
 }
 

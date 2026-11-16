@@ -31,11 +31,11 @@ fn run(f: &Fixture, aggs: Value) -> Result<Value> {
     let leaves = f.index.leaves();
     let segs: Vec<AggSeg> = leaves
         .iter()
-        .map(|l| AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: (0..l.num_docs()).map(|d| d as f32).collect() })
+        .map(|l| AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: (0..l.num_docs()).map(|d| d as f32).collect() })
         .collect();
     let fetch = |s: usize, d: DocId, sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({"_index": "idx", "_id": format!("{s}-{d}"), "_score": sc})) };
     let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
     run_aggregations(&aggs, &segs, &env)
 }
 
@@ -267,7 +267,10 @@ fn top_hits_and_pipelines() {
     assert_eq!(b[0]["cum"], json!({"value": 30.0}));
     assert_eq!(b[2]["cum"], json!({"value": 100.0}));
     assert!(b[0].get("der").is_none());
-    assert_eq!(b[1]["der"], json!({"value": -30.0}));
+    // Day 2 is empty: under `skip` a gap (ES `BucketHelpers`: NaN), so the
+    // derivatives around it are null, not -30 and +70.
+    assert_eq!(b[1]["der"], json!({"value": null}));
+    assert_eq!(b[2]["der"], json!({"value": null}));
     assert_eq!(b[0]["ratio"], json!({"value": 15.0}));
     assert_eq!(r["avg_day"], json!({"value": 100.0 / 3.0}));
     assert_eq!(r["max_day"], json!({"value": 70.0, "keys": ["2020-01-03T00:00:00.000Z"]}));
@@ -297,10 +300,10 @@ fn errors_and_limits() {
     assert_eq!(run(&f, json!({"x": {"moving_avg": {"buckets_path": "a"}}})).unwrap_err().status, 400);
     assert!(run(&f, json!({"x": {"terms": {"field": "tag"}, "avg": {"field": "qty"}}})).unwrap_err().reason.contains("Found two aggregation type definitions"));
     let leaves = f.index.leaves();
-    let segs: Vec<AggSeg> = leaves.iter().map(|l| AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: vec![] }).collect();
+    let segs: Vec<AggSeg> = leaves.iter().map(|l| AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: (0..l.num_docs()).collect(), scores: vec![] }).collect();
     let fetch = |_: usize, _: DocId, _: f32, _: &Value| -> Result<Value> { Ok(Value::Null) };
     let all = |_: usize| -> Vec<DocId> { vec![] };
-    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 2, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 2, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
     let e = run_aggregations(&json!({"t": {"terms": {"field": "tag"}}}), &segs, &env).unwrap_err();
     assert_eq!(e.kind, "too_many_buckets_exception");
 }
@@ -525,13 +528,13 @@ fn filter_aggregations_use_each_index_regex_limit() {
     let lookup = &f.lookup;
     let execute = |indices: &[(&str, usize)], pattern: &str| {
         let segs: Vec<AggSeg> = indices.iter().flat_map(|(index, limit)| leaves.iter().map(move |leaf| AggSeg {
-            leaf: *leaf, lookup, index: *index, max_regex_length: *limit,
+            shard: 0, leaf: *leaf, lookup, index: *index, index_uuid: *index, max_regex_length: *limit,
             docs: (0..leaf.num_docs()).collect(), scores: vec![],
         })).collect();
         let fetch = |_: usize, _: DocId, _: f32, _: &Value| -> Result<Value> { Ok(Value::Null) };
         let all = |i: usize| -> Vec<DocId> { (0..segs[i].leaf.num_docs()).collect() };
         let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all,
-            background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+            background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
         run_aggregations(&json!({"outer": {"filter": {"match_all": {}}, "aggs": {
             "inner": {"filters": {"filters": {"regex": {"regexp": {"tag": pattern}}}}}
         }}}), &segs, &env)
@@ -765,10 +768,10 @@ fn date_histogram_whole_segment_points_counts_match_per_doc() {
         }
         // Not the whole segment (a filtered doc set): the per-doc paths, same answer.
         let leaves = f.index.leaves();
-        let segs: Vec<AggSeg> = leaves.iter().map(|l| AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: (1..l.num_docs()).collect(), scores: vec![] }).collect();
+        let segs: Vec<AggSeg> = leaves.iter().map(|l| AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: (1..l.num_docs()).collect(), scores: vec![] }).collect();
         let fetch = |_: usize, _: DocId, _: f32, _: &Value| -> Result<Value> { Ok(json!({})) };
         let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
         let before = POINTS_COUNTED_SEGMENTS.with(|c| c.get());
         let partial = run_aggregations(&json!({"h": {"date_histogram": {"field": "ts", "calendar_interval": "month"}}}), &segs, &env).unwrap();
         // Only a doc set holding every doc with a value (here: the skipped
@@ -882,10 +885,10 @@ fn auto_date_histogram_in_query_range_counts_match_per_doc() {
     assert_eq!(leaves.len(), 1);
     let fetch = |s: usize, d: DocId, sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({"_index": "idx", "_id": format!("{s}-{d}"), "_score": sc})) };
     let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
     for (lo, hi) in [(1_550_100_000_000i64, 1_550_400_000_000i64), (1_550_000_000_000, 1_550_086_399_999), (1_400_000_000_000, 1_400_000_000_001)] {
         let matching: Vec<DocId> = (0..docs.len()).filter(|&i| ms_of(i).is_some_and(|ms| lo <= ms && ms <= hi)).map(|i| i as DocId).collect();
-        let segs = vec![AggSeg { leaf: leaves[0], lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: matching.clone(), scores: vec![1.0; matching.len()] }];
+        let segs = vec![AggSeg { shard: 0, leaf: leaves[0], lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: matching.clone(), scores: vec![1.0; matching.len()] }];
         for conf in [
             json!({"field": "ts", "buckets": 24}),
             json!({"field": "ts", "buckets": 24, "time_zone": "America/New_York"}),
@@ -927,12 +930,12 @@ fn auto_date_histogram_of_uncollected_range_matches_collected() {
         assert_eq!(leaves.len(), 1);
         let fetch = |s: usize, d: DocId, sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({"_index": "idx", "_id": format!("{s}-{d}"), "_score": sc})) };
         let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
         let values = |i: usize| -> Vec<i64> { match &docs[i]["ts"] { Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(), v => v.as_i64().into_iter().collect() } };
         for (lo, hi) in [(1_550_100_000_000i64, 1_550_400_000_000i64), (1_550_000_000_000, 1_550_086_399_999), (1_400_000_000_000, 1_400_000_000_001)] {
             let matching: Vec<DocId> = (0..docs.len()).filter(|&i| values(i).iter().any(|&ms| lo <= ms && ms <= hi)).map(|i| i as DocId).collect();
-            let collected = vec![AggSeg { leaf: leaves[0], lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: matching.clone(), scores: vec![1.0; matching.len()] }];
-            let uncollected = vec![AggSeg { leaf: leaves[0], lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: Vec::new(), scores: Vec::new() }];
+            let collected = vec![AggSeg { shard: 0, leaf: leaves[0], lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: matching.clone(), scores: vec![1.0; matching.len()] }];
+            let uncollected = vec![AggSeg { shard: 0, leaf: leaves[0], lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: Vec::new(), scores: Vec::new() }];
             for conf in [
                 json!({"field": "ts", "buckets": 24}),
                 json!({"field": "ts", "buckets": 24, "time_zone": "America/New_York"}),
@@ -991,12 +994,12 @@ fn run_roots_as(f: &Fixture, aggs: Value, elided: bool) -> Result<Value> {
         .map(|l| {
             let docs: Vec<DocId> = if elided { Vec::new() } else { (0..l.num_docs()).filter(|&d| l.is_root(d)).collect() };
             let scores = vec![1.0; docs.len()];
-            AggSeg { leaf: *l, lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs, scores }
+            AggSeg { shard: 0, leaf: *l, lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs, scores }
         })
         .collect();
     let fetch = |_: usize, _: DocId, _: f32, _: &Value| -> Result<Value> { Ok(json!({})) };
     let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
     if elided {
         return with_elided_root(vec![true; segs.len()], || run_aggregations(&aggs, &segs, &env));
     }
@@ -1144,12 +1147,12 @@ fn histogram_of_uncollected_double_range_matches_collected() {
         assert_eq!(leaves.len(), 1);
         let fetch = |s: usize, d: DocId, sc: f32, _spec: &Value| -> Result<Value> { Ok(json!({"_index": "idx", "_id": format!("{s}-{d}"), "_score": sc})) };
         let all = |s: usize| -> Vec<DocId> { (0..leaves[s].num_docs()).collect() };
-        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+        let env = AggEnv { mapping_context: &[], now: 0, max_buckets: 65536, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: false, top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &[], terms_lookup: None };
         let col_value = |d: DocId| leaves[0].f64_values(field, d).first().copied();
         for (lo, hi) in [(0.0f64, 50.0f64.next_down()), (f64::NEG_INFINITY, f64::INFINITY), (10.5, 10.5), (1e9, 2e9)] {
             let matching: Vec<DocId> = (0..leaves[0].num_docs()).filter(|&d| col_value(d).is_some_and(|x| lo <= x && x <= hi)).collect();
-            let collected = vec![AggSeg { leaf: leaves[0], lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: matching.clone(), scores: vec![1.0; matching.len()] }];
-            let uncollected = vec![AggSeg { leaf: leaves[0], lookup: &f.lookup, index: "idx", max_regex_length: 1000, docs: Vec::new(), scores: Vec::new() }];
+            let collected = vec![AggSeg { shard: 0, leaf: leaves[0], lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: matching.clone(), scores: vec![1.0; matching.len()] }];
+            let uncollected = vec![AggSeg { shard: 0, leaf: leaves[0], lookup: &f.lookup, index: "idx", index_uuid: "idx", max_regex_length: 1000, docs: Vec::new(), scores: Vec::new() }];
             for spec in [
                 json!({"h": {"histogram": {"field": "d", "interval": 1}}}),
                 json!({"h": {"histogram": {"field": "d", "interval": 1}, "aggs": {"st": {"stats": {"field": "amt"}}}}}),
@@ -1456,4 +1459,642 @@ fn simple_metrics_fold_equals_listed_values() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #115 / #121 / #122: working state admitted before it is allocated.
+
+fn breakers_at(b: &'static crate::memory::Breakers, limit: &str) {
+    b.apply_settings(&|key| match key {
+        "indices.breaker.request.limit" => Some(limit.into()),
+        "indices.breaker.total.limit" => Some("-1".into()),
+        _ => None,
+    });
+}
+
+/// Run `aggs` under a request breaker of `limit`; every reservation is
+/// given back whether it succeeds or trips.
+fn run_limited(f: &Fixture, b: &'static crate::memory::Breakers, limit: &str, aggs: Value) -> Result<Value> {
+    breakers_at(b, limit);
+    let scope = crate::memory::RequestScope::new("agg-admission", b);
+    let r = crate::memory::scoped(Some(scope), || run(f, aggs));
+    assert_eq!(b.request.reserved(), 0, "reservations released");
+    r
+}
+
+/// Run `aggs` as a search task that is cancelled at its first in-loop poll.
+fn run_cancelled_in_loop(f: &Fixture, aggs: Value) -> EsError {
+    super::cancel_hook::cancel_at_poll(Some(1));
+    let r = rustic_core::cancel::with_search(Some(rustic_core::cancel::Token::new()), || run(f, aggs));
+    let polls = super::cancel_hook::polls();
+    super::cancel_hook::cancel_at_poll(None);
+    assert!(polls >= 1, "the collection loop polled");
+    r.unwrap_err()
+}
+
+fn topn_peak_reset() {
+    super::cancel_hook::TOPN_PEAK.with(|p| p.set(0));
+}
+
+fn topn_peak() -> usize {
+    super::cancel_hook::TOPN_PEAK.with(std::cell::Cell::get)
+}
+
+#[test]
+fn matrix_stats_dedupes_fields_and_admits_its_matrix() {
+    let b = crate::memory::Breakers::leak_for_tests(1 << 31);
+    let f = fixture(
+        json!({"properties": {"a": {"type": "double"}, "b": {"type": "double"}, "c": {"type": "double"}}}),
+        &[json!({"a": 1.0, "b": 2.0}), json!({"a": 2.0, "b": 4.0}), json!({"a": 3.0, "b": 6.0}), json!({"a": 4.0, "b": 9.0})],
+    );
+    // Reference: a small covariance computed by hand.
+    let r = run_limited(&f, b, "64mb", json!({"m": {"matrix_stats": {"fields": ["a", "b"]}}})).unwrap();
+    assert_eq!(r["m"]["doc_count"], 4);
+    let fields = r["m"]["fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 2);
+    let a = fields.iter().find(|e| e["name"] == "a").unwrap();
+    assert!((a["mean"].as_f64().unwrap() - 2.5).abs() < 1e-12);
+    assert!((a["variance"].as_f64().unwrap() - 5.0 / 3.0).abs() < 1e-12);
+    assert!((a["covariance"]["b"].as_f64().unwrap() - 11.5 / 3.0).abs() < 1e-12, "{a}");
+    // ES keys the fields by name: repeats are one field, same result.
+    let rep = run_limited(&f, b, "64mb", json!({"m": {"matrix_stats": {"fields": ["a", "b", "a", "b", "a"]}}})).unwrap();
+    assert_eq!(rep, r);
+    // No document has every field: an empty result.
+    let none = run_limited(&f, b, "64mb", json!({"m": {"matrix_stats": {"fields": ["a", "c"]}}})).unwrap();
+    assert_eq!(none["m"], json!({"doc_count": 0, "fields": []}));
+    // A field repeated 5,000 times is one field even under a 1mb breaker.
+    let many: Vec<&str> = vec!["a"; 5000];
+    let r = run_limited(&f, b, "1mb", json!({"m": {"matrix_stats": {"fields": many}}})).unwrap();
+    assert_eq!(r["m"]["fields"].as_array().unwrap().len(), 1);
+    assert_eq!(r["m"]["doc_count"], 4);
+
+    // 300 distinct fields (a ~15mb matrix and rendering): refused before
+    // allocation under 1mb, even with no matching rows; fine under 64mb.
+    let mut props = Map::new();
+    for i in 0..300 {
+        props.insert(format!("f{i}"), json!({"type": "double"}));
+    }
+    let wide = fixture(json!({"properties": props}), &[json!({"f0": 1.0})]);
+    let names: Vec<String> = (0..300).map(|i| format!("f{i}")).collect();
+    let e = run_limited(&wide, b, "1mb", json!({"m": {"matrix_stats": {"fields": names}}})).unwrap_err();
+    assert!(crate::memory::is_breaking(&e), "{e:?}");
+    assert_eq!(e.status, 429);
+    let r = run_limited(&wide, b, "64mb", json!({"m": {"matrix_stats": {"fields": names}}})).unwrap();
+    assert_eq!(r["m"]["doc_count"], 0);
+    assert!(super::analytics::matrix_stats_bytes(&names) > 1 << 20);
+}
+
+/// One document whose four keyword fields hold ten values each: a
+/// 10,000-combination product.
+fn product_fixture() -> Fixture {
+    let vals: Vec<String> = (0..10).map(|i| format!("v{i}")).collect();
+    fixture(
+        json!({"properties": {"k0": {"type": "keyword"}, "k1": {"type": "keyword"}, "k2": {"type": "keyword"}, "k3": {"type": "keyword"}}}),
+        &[json!({"k0": vals, "k1": vals, "k2": vals, "k3": vals})],
+    )
+}
+
+fn composite_spec(size: usize, after: Option<Value>) -> Value {
+    let mut c = json!({"size": size, "sources": [
+        {"k0": {"terms": {"field": "k0"}}}, {"k1": {"terms": {"field": "k1"}}},
+        {"k2": {"terms": {"field": "k2"}}}, {"k3": {"terms": {"field": "k3"}}}
+    ]});
+    if let Some(a) = after {
+        c["after"] = a;
+    }
+    json!({"c": {"composite": c}})
+}
+
+#[test]
+fn multi_terms_and_composite_products_are_admitted_as_enumerated() {
+    let b = crate::memory::Breakers::leak_for_tests(1 << 31);
+    // Reference: a 2 x 2 product, every combination once.
+    let small = fixture(json!({"properties": {"k0": {"type": "keyword"}, "k1": {"type": "keyword"}}}), &[json!({"k0": ["a", "b"], "k1": ["x", "y"]})]);
+    let r = run_limited(&small, b, "64mb", json!({"m": {"multi_terms": {"terms": [{"field": "k0"}, {"field": "k1"}]}}})).unwrap();
+    let keys: Vec<Value> = r["m"]["buckets"].as_array().unwrap().iter().map(|x| x["key"].clone()).collect();
+    assert_eq!(keys, vec![json!(["a", "x"]), json!(["a", "y"]), json!(["b", "x"]), json!(["b", "y"])]);
+    assert!(r["m"]["buckets"].as_array().unwrap().iter().all(|x| x["doc_count"] == 1));
+
+    let f = product_fixture();
+    let mt = json!({"m": {"multi_terms": {"terms": [{"field": "k0"}, {"field": "k1"}, {"field": "k2"}, {"field": "k3"}], "size": 1}}});
+    // A tiny breaker refuses the product part way (size:1 does not help).
+    let e = run_limited(&f, b, "256kb", mt.clone()).unwrap_err();
+    assert!(crate::memory::is_breaking(&e), "{e:?}");
+    let e = run_limited(&f, b, "256kb", composite_spec(1, None)).unwrap_err();
+    assert!(crate::memory::is_breaking(&e), "{e:?}");
+    // Enough memory: the same results as before.
+    let r = run_limited(&f, b, "64mb", mt.clone()).unwrap();
+    assert_eq!(r["m"]["buckets"][0]["doc_count"], 1);
+    assert_eq!(r["m"]["buckets"][0]["key"], json!(["v0", "v0", "v0", "v0"]));
+    let r = run_limited(&f, b, "64mb", composite_spec(2, None)).unwrap();
+    let keys: Vec<Value> = r["c"]["buckets"].as_array().unwrap().iter().map(|x| x["key"].clone()).collect();
+    assert_eq!(keys, vec![json!({"k0": "v0", "k1": "v0", "k2": "v0", "k3": "v0"}), json!({"k0": "v0", "k1": "v0", "k2": "v0", "k3": "v1"})]);
+    let r = run_limited(&f, b, "64mb", composite_spec(2, Some(r["c"]["after_key"].clone()))).unwrap();
+    let keys: Vec<Value> = r["c"]["buckets"].as_array().unwrap().iter().map(|x| x["key"].clone()).collect();
+    assert_eq!(keys, vec![json!({"k0": "v0", "k1": "v0", "k2": "v0", "k3": "v2"}), json!({"k0": "v0", "k1": "v0", "k2": "v0", "k3": "v3"})]);
+    // Keys at or before `after` are skipped before they are kept: the
+    // last page fits the tiny breaker.
+    let r = run_limited(&f, b, "256kb", composite_spec(1, Some(json!({"k0": "v9", "k1": "v9", "k2": "v9", "k3": "v8"})))).unwrap();
+    assert_eq!(r["c"]["buckets"], json!([{"key": {"k0": "v9", "k1": "v9", "k2": "v9", "k3": "v9"}, "doc_count": 1}]));
+    // Cancellation is seen inside one document's product.
+    for spec in [mt, composite_spec(1, None)] {
+        let e = run_cancelled_in_loop(&f, spec);
+        assert_eq!(e.kind, "task_cancelled_exception", "{e:?}");
+    }
+}
+
+#[test]
+fn top_hits_and_top_metrics_hold_only_their_window() {
+    let b = crate::memory::Breakers::leak_for_tests(1 << 31);
+    let pad = "x".repeat(4000);
+    let docs: Vec<Value> = (0..300).map(|i| json!({"k": format!("{:04}-{pad}", (i * 37) % 300), "n": i % 7, "i": i})).collect();
+    let f = fixture(json!({"properties": {"k": {"type": "keyword"}, "n": {"type": "long"}, "i": {"type": "long"}}}), &docs);
+    // 32 repeated keyword criteria (each a 4kb owned key).
+    let mut sort = vec![json!({"n": "asc"})];
+    sort.extend(std::iter::repeat_n(json!({"k": "desc"}), 32));
+    let th = |from: usize, size: usize| json!({"t": {"top_hits": {"from": from, "size": size, "sort": sort.clone()}}});
+    // Reference: the full sort of every match.
+    let mut want: Vec<(i64, String)> = (0..300).map(|i| ((i % 7) as i64, format!("{:04}-{pad}", (i * 37) % 300))).collect();
+    want.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    topn_peak_reset();
+    let r = run_limited(&f, b, "8mb", th(3, 5)).unwrap();
+    assert!(topn_peak() > 0 && topn_peak() <= 16, "held {} of 300", topn_peak());
+    assert_eq!(r["t"]["hits"]["total"]["value"], 300);
+    let hits = r["t"]["hits"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 5);
+    for (h, (n, k)) in hits.iter().zip(&want[3..8]) {
+        let s = h["sort"].as_array().unwrap();
+        assert_eq!(s.len(), 33);
+        assert_eq!(s[0], *n);
+        assert!(s[1..].iter().all(|x| x == k));
+    }
+    // A 100-hit window of such keys (~13mb held) trips the breaker.
+    let e = run_limited(&f, b, "8mb", th(0, 100)).unwrap_err();
+    assert!(crate::memory::is_breaking(&e), "{e:?}");
+    // Score order: max_score and ties as before.
+    let r = run_limited(&f, b, "64mb", json!({"t": {"top_hits": {"size": 3}}})).unwrap();
+    assert_eq!(r["t"]["hits"]["max_score"].as_f64(), Some(150.0));
+    let ids: Vec<&str> = r["t"]["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["0-150", "0-149", "0-148"]);
+    // top_metrics: the best `size` with ties in arrival order (the stable
+    // sort it replaces), holding at most twice its size.
+    topn_peak_reset();
+    let r = run_limited(&f, b, "8mb", json!({"tm": {"top_metrics": {"metrics": {"field": "i"}, "sort": {"n": "asc"}, "size": 3}}})).unwrap();
+    assert!(topn_peak() > 0 && topn_peak() <= 6, "held {}", topn_peak());
+    let got: Vec<&Value> = r["tm"]["top"].as_array().unwrap().iter().map(|t| &t["metrics"]["i"]).collect();
+    assert_eq!(got, [&json!(0), &json!(7), &json!(14)]);
+    let r = run_limited(&f, b, "8mb", json!({"tm": {"top_metrics": {"metrics": {"field": "i"}, "sort": {"n": "desc"}, "size": 3}}})).unwrap();
+    let got: Vec<&Value> = r["tm"]["top"].as_array().unwrap().iter().map(|t| &t["metrics"]["i"]).collect();
+    assert_eq!(got, [&json!(6), &json!(13), &json!(20)]);
+    assert_eq!(r["tm"]["top"][0]["sort"], json!([6]));
+    // Cancellation is polled while collecting.
+    let many: Vec<Value> = (0..1100).map(|i| json!({"n": i})).collect();
+    let g = fixture(json!({"properties": {"n": {"type": "long"}}}), &many);
+    for spec in [
+        json!({"t": {"top_hits": {"size": 1, "sort": [{"n": "desc"}]}}}),
+        json!({"tm": {"top_metrics": {"metrics": {"field": "n"}, "sort": {"n": "desc"}}}}),
+        json!({"m": {"matrix_stats": {"fields": ["n"]}}}),
+    ] {
+        let e = run_cancelled_in_loop(&g, spec);
+        assert_eq!(e.kind, "task_cancelled_exception", "{e:?}");
+    }
+}
+
+/// One sealed segment of `docs`, the mapping grown by them (`_doc_count`).
+fn sealed_dynamic_fixture(mapping: Value, docs: &[Value]) -> Fixture {
+    let reg = AnalysisRegistry::default();
+    let mut m = Mappings::parse(&mapping, &reg).unwrap();
+    m.assign_core_ids();
+    let mut lookup = FieldLookup::build(&m, &reg);
+    for (i, d) in docs.iter().enumerate() {
+        if let (_, Some((nm, nl))) = parse_with_dynamic(d, &i.to_string(), &m, &lookup, 1000).unwrap() {
+            m = nm;
+            lookup = nl;
+        }
+    }
+    let mut index = Index::new("idx", lookup.core_schema(), IndexSettings::default());
+    for (i, d) in docs.iter().enumerate() {
+        let (pd, upd) = parse_with_dynamic(d, &i.to_string(), &m, &lookup, 1000).unwrap();
+        assert!(upd.is_none());
+        index.add_document(&pd.doc).unwrap();
+    }
+    index.refresh().unwrap();
+    Fixture { index, lookup }
+}
+
+/// #175: `_doc_count` weights count in terms buckets whether or not a
+/// metric sub-aggregation selects the one-pass collector.
+#[test]
+fn weighted_terms_count_the_same_with_and_without_metrics() {
+    let f = sealed_dynamic_fixture(
+        json!({"properties": {"k": {"type": "keyword"}, "v": {"type": "long"}}}),
+        &[json!({"k": "A", "v": 1, "_doc_count": 100}), json!({"k": "B", "v": 1}), json!({"k": "B", "v": 1})],
+    );
+    let plain = run(&f, json!({"t": {"terms": {"field": "k", "size": 1}}})).unwrap();
+    assert_eq!(plain["t"]["buckets"], json!([{"key": "A", "doc_count": 100}]), "{plain}");
+    let with_sum = run(&f, json!({"t": {"terms": {"field": "k", "size": 1}, "aggs": {"s": {"sum": {"field": "v"}}}}})).unwrap();
+    assert_eq!(with_sum["t"]["buckets"][0]["key"], "A", "{with_sum}");
+    assert_eq!(with_sum["t"]["buckets"][0]["doc_count"], 100);
+    assert_eq!(with_sum["t"]["buckets"][0]["s"]["value"], 1.0);
+    assert_eq!(with_sum["t"]["sum_other_doc_count"], plain["t"]["sum_other_doc_count"]);
+    let thr = run(&f, json!({"t": {"terms": {"field": "k", "min_doc_count": 3}, "aggs": {"s": {"sum": {"field": "v"}}}}})).unwrap();
+    let keys: Vec<&str> = thr["t"]["buckets"].as_array().unwrap().iter().map(|b| b["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, ["A"], "{thr}");
+}
+
+/// #176: a unit-normalised `rate` under a date histogram (or a composite's
+/// one date source) on a runtime date field, or on `missing` parent values,
+/// divides by its own bucket: the same as over the physical date field.
+#[test]
+fn rate_under_runtime_and_missing_dates_uses_the_bucket() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    let svc = node.create_index("r", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+        "mappings": {"properties": {"ts": {"type": "date"}, "absent_date": {"type": "date"}, "ms": {"type": "long"}, "v": {"type": "long"}}}})).unwrap();
+    let docs = [json!({"ts": 0, "ms": 0, "v": 60}), json!({"ts": 1000, "ms": 1000, "v": 60}), json!({"ts": 61_000, "ms": 61_000, "v": 30})];
+    let reqs: Vec<WriteReq> = docs.iter().enumerate().map(|(i, d)| WriteReq::Index { id: Some(i.to_string()), source: d.to_string(), routing: None, cond: WriteCond::default() }).collect();
+    assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+    svc.refresh().unwrap();
+    let rm = json!({"rt": {"type": "date", "script": {"source": "emit(doc['ms'].value)"}}});
+    let rates = |body: Value, path: &str| -> Vec<f64> {
+        let r = crate::ml::search(&node, "r", &body).unwrap();
+        r["aggregations"]["h"]["buckets"].as_array().unwrap().iter().map(|b| b[path]["value"].as_f64().unwrap()).collect()
+    };
+    let dh = |field: &str| json!({"size": 0, "runtime_mappings": rm, "aggs": {"h": {"date_histogram": {"field": field, "fixed_interval": "1m"}, "aggs": {"r": {"rate": {"field": "v", "unit": "second"}}}}}});
+    let physical = rates(dh("ts"), "r");
+    assert_eq!(physical, vec![2.0, 0.5]);
+    assert_eq!(rates(dh("rt"), "r"), physical, "runtime parent");
+    let cal = |field: &str| json!({"size": 0, "runtime_mappings": rm, "aggs": {"h": {"date_histogram": {"field": field, "calendar_interval": "1m"}, "aggs": {"r": {"rate": {"field": "v", "unit": "second"}}}}}});
+    assert_eq!(rates(cal("rt"), "r"), rates(cal("ts"), "r"), "calendar interval");
+    let comp = |field: &str| json!({"size": 0, "runtime_mappings": rm, "aggs": {"h": {"composite": {"sources": [{"d": {"date_histogram": {"field": field, "fixed_interval": "1m"}}}]},
+        "aggs": {"r": {"rate": {"field": "v", "unit": "second"}}}}}});
+    assert_eq!(rates(comp("rt"), "r"), physical, "composite with a runtime date source");
+    // Docs without the parent field, bucketed by `missing`.
+    let missing = json!({"size": 0, "aggs": {"h": {"date_histogram": {"field": "absent_date", "fixed_interval": "1m", "missing": "1970-01-01T00:00:00Z"},
+        "aggs": {"r": {"rate": {"field": "v", "unit": "second"}}}}}});
+    let r = crate::ml::search(&node, "r", &missing).unwrap();
+    let b = &r["aggregations"]["h"]["buckets"][0];
+    assert_eq!(b["doc_count"], 3, "{r}");
+    assert_eq!(b["r"]["value"].as_f64(), Some(150.0 / 60.0), "{r}");
+}
+
+/// #217: a cluster shard response's auto_date_histogram buckets are one
+/// unit wide, keyed on unit boundaries, with the shard's chosen interval.
+#[test]
+fn auto_date_histogram_shard_response_buckets_are_unit_wide() {
+    let f = fixture(json!({"properties": {"t": {"type": "date"}, "v": {"type": "long"}}}), &[json!({"t": 5000, "v": 2}), json!({"t": 14000, "v": 2}), json!({"t": 15000, "v": 2})]);
+    let spec = json!({"a": {"auto_date_histogram": {"field": "t", "buckets": 2}, "aggs": {"s": {"sum": {"field": "v"}}}}});
+    // Standalone: the shard's own 10s buckets anchored at 5s.
+    let r = run(&f, spec.clone()).unwrap();
+    let keys: Vec<(i64, u64)> = r["a"]["buckets"].as_array().unwrap().iter().map(|b| (b["key"].as_i64().unwrap(), b["doc_count"].as_u64().unwrap())).collect();
+    assert_eq!(keys, vec![(5000, 2), (15000, 1)]);
+    assert_eq!(r["a"]["interval"], "10s");
+    let _shard = crate::search::ReadShardCountScope::enter(Some(1));
+    let r = run(&f, spec).unwrap();
+    let keys: Vec<(i64, u64)> = r["a"]["buckets"].as_array().unwrap().iter().map(|b| (b["key"].as_i64().unwrap(), b["doc_count"].as_u64().unwrap())).collect();
+    assert_eq!(keys, vec![(5000, 1), (14000, 1), (15000, 1)], "{r}");
+    assert_eq!(r["a"]["interval"], "10s");
+}
+
+/// #219: random_sampler finalisation follows ES `finalizeSampling`:
+/// cardinality is never scaled; extended_stats scales count, sum and the
+/// sum of squares together (its variance unchanged, its parts coherent).
+#[test]
+fn random_sampler_scales_only_what_es_scales() {
+    let docs: Vec<Value> = (0..400).map(|i| json!({"tag": "x", "price": (i % 17) as f64})).collect();
+    let f = fixture(json!({"properties": {"tag": {"type": "keyword"}, "price": {"type": "double"}}}), &docs);
+    let r = run(&f, json!({"s": {"random_sampler": {"probability": 0.1, "seed": 7}, "aggs": {
+        "c": {"cardinality": {"field": "tag"}}, "n": {"value_count": {"field": "price"}}, "e": {"extended_stats": {"field": "price"}}}}})).unwrap();
+    let s = &r["s"];
+    assert!(s["doc_count"].as_u64().unwrap() > 0, "{r}");
+    assert_eq!(s["c"]["value"], 1, "one distinct value stays one: {r}");
+    let e = &s["e"];
+    let (n, sum, sq) = (e["count"].as_f64().unwrap(), e["sum"].as_f64().unwrap(), e["sum_of_squares"].as_f64().unwrap());
+    let var = sq / n - (sum / n) * (sum / n);
+    assert!((var - e["variance"].as_f64().unwrap()).abs() < 1e-6, "coherent parts: {e}");
+    assert_eq!(e["count"], s["n"]["value"]);
+}
+
+/// #220: top_hits applies the sort plan it accepts: `mode`, `missing`,
+/// runtime-field and `_script` sorts pick the same documents an ordinary
+/// search sorted the same way returns; `nested` sorts are refused.
+#[test]
+fn top_hits_applies_sort_modes_missing_and_scripts() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    let svc = node.create_index("th", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+        "mappings": {"properties": {"v": {"type": "long"}, "w": {"type": "long"}}}})).unwrap();
+    let docs = [("a", json!({"v": [0, 100], "w": 3})), ("b", json!({"v": [40, 40], "w": 1})), ("c", json!({"w": 2}))];
+    let reqs: Vec<WriteReq> = docs.iter().map(|(id, d)| WriteReq::Index { id: Some(id.to_string()), source: d.to_string(), routing: None, cond: WriteCond::default() }).collect();
+    assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+    svc.refresh().unwrap();
+    let rm = json!({"neg": {"type": "long", "script": {"source": "emit(0 - doc['w'].value)"}}});
+    let check = |sort: Value| {
+        let plain = crate::ml::search(&node, "th", &json!({"size": 3, "runtime_mappings": rm, "sort": sort.clone()})).unwrap();
+        let want: Vec<String> = plain["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect();
+        let r = crate::ml::search(&node, "th", &json!({"size": 0, "runtime_mappings": rm, "aggs": {"t": {"top_hits": {"size": 3, "sort": sort.clone()}}}})).unwrap();
+        let got: Vec<String> = r["aggregations"]["t"]["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(got, want, "{sort}");
+        got
+    };
+    // avg mode: b (40) before a (50), not a by its minimum 0.
+    assert_eq!(check(json!([{"v": {"order": "asc", "mode": "avg"}}]))[0], "b");
+    assert_eq!(check(json!([{"v": {"order": "asc", "missing": "_first"}}]))[0], "c");
+    check(json!([{"v": {"order": "desc", "mode": "median"}}]));
+    check(json!([{"v": {"order": "asc", "missing": 50}}]));
+    // A runtime field and a script sort.
+    assert_eq!(check(json!([{"neg": "asc"}]))[0], "a");
+    assert_eq!(check(json!([{"_script": {"type": "number", "script": {"source": "doc['w'].value * 10"}, "order": "desc"}}]))[0], "a");
+}
+
+/// #220 follow-up: `nested` sort options (path, filter, max_children) in
+/// top_hits pick their values from the matching children, as the
+/// ordinary search's nested sort does.
+#[test]
+fn top_hits_applies_nested_sorts() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    let svc = node.create_index("ns", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+        "mappings": {"properties": {"offers": {"type": "nested", "properties": {"price": {"type": "long"}, "color": {"type": "keyword"}}}}}})).unwrap();
+    let docs = [
+        ("a", json!({"offers": [{"price": 10, "color": "red"}, {"price": 100, "color": "blue"}]})),
+        ("b", json!({"offers": [{"price": 50, "color": "red"}]})),
+        ("c", json!({"offers": [{"price": 70, "color": "blue"}]})),
+    ];
+    let reqs: Vec<WriteReq> = docs.iter().map(|(id, d)| WriteReq::Index { id: Some(id.to_string()), source: d.to_string(), routing: None, cond: WriteCond::default() }).collect();
+    assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+    svc.refresh().unwrap();
+    let ids = |r: &Value, path: &[&str]| -> Vec<String> {
+        let mut v = r;
+        for p in path {
+            v = &v[*p];
+        }
+        v.as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect()
+    };
+    for sort in [
+        json!([{"offers.price": {"order": "asc", "nested": {"path": "offers"}}}]),
+        json!([{"offers.price": {"order": "desc", "mode": "min", "nested": {"path": "offers"}}}]),
+        json!([{"offers.price": {"order": "asc", "nested": {"path": "offers", "filter": {"term": {"offers.color": "blue"}}}}}]),
+    ] {
+        let plain = crate::ml::search(&node, "ns", &json!({"size": 3, "sort": sort.clone()})).unwrap();
+        let r = crate::ml::search(&node, "ns", &json!({"size": 0, "aggs": {"t": {"top_hits": {"size": 3, "sort": sort.clone()}}}})).unwrap();
+        assert_eq!(ids(&r, &["aggregations", "t", "hits", "hits"]), ids(&plain, &["hits", "hits"]), "{sort}");
+    }
+    // Filtered: c (70) then a (100); b has no blue child (missing, last).
+    let r = crate::ml::search(&node, "ns", &json!({"size": 0, "aggs": {"t": {"top_hits": {"size": 3,
+        "sort": [{"offers.price": {"order": "asc", "nested": {"path": "offers", "filter": {"term": {"offers.color": "blue"}}}}}]}}}})).unwrap();
+    assert_eq!(ids(&r, &["aggregations", "t", "hits", "hits"]), ["c", "a", "b"]);
+    // max_children 1: a's value is its first child (10) only.
+    let r = crate::ml::search(&node, "ns", &json!({"size": 0, "aggs": {"t": {"top_hits": {"size": 3,
+        "sort": [{"offers.price": {"order": "desc", "nested": {"path": "offers", "max_children": 1}}}]}}}})).unwrap();
+    assert_eq!(ids(&r, &["aggregations", "t", "hits", "hits"]), ["c", "b", "a"]);
+}
+
+/// #221: counted_terms reads multiplicities from `_source`; with the field
+/// excluded from it the aggregation fails instead of counting nothing.
+#[test]
+fn counted_terms_refuses_a_field_missing_from_source() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    for (name, mappings) in [
+        ("kept", json!({"properties": {"tags": {"type": "counted_keyword"}}})),
+        ("pruned", json!({"_source": {"excludes": ["tags"]}, "properties": {"tags": {"type": "counted_keyword"}}})),
+    ] {
+        let svc = node.create_index(name, &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": mappings})).unwrap();
+        let w = vec![WriteReq::Index { id: Some("1".into()), source: json!({"tags": ["a", "a", "b"]}).to_string(), routing: None, cond: WriteCond::default() }];
+        assert!(svc.write(w, false).iter().all(|r| r.is_ok()));
+        svc.refresh().unwrap();
+    }
+    let body = json!({"size": 0, "aggs": {"c": {"counted_terms": {"field": "tags"}}}});
+    let r = crate::ml::search(&node, "kept", &body).unwrap();
+    assert_eq!(r["aggregations"]["c"]["buckets"], json!([{"key": "a", "doc_count": 2}, {"key": "b", "doc_count": 1}]), "{r}");
+    let e = crate::ml::search(&node, "pruned", &body).unwrap_err();
+    assert!(format!("{e:?}").contains("not kept in [_source]"), "{e:?}");
+}
+
+/// #224: top_metrics honours a metric's `missing` replacement (ES
+/// `TopMetricsAggregator` reads the metric through its value source config);
+/// without one a missing metric renders null, the document still chosen by
+/// its sort value as in ES.
+#[test]
+fn top_metrics_applies_metric_missing_replacements() {
+    let f = fixture(json!({"properties": {"ts": {"type": "long"}, "m": {"type": "long"}, "a": {"type": "long"}, "b": {"type": "long"}}}),
+        &[json!({"ts": 1, "m": 10, "a": 7, "b": 8}), json!({"ts": 2}), json!({"ts": 3, "a": 1}), json!({"ts": 4, "b": 2})]);
+    let r = run(&f, json!({"t": {"top_metrics": {"metrics": {"field": "m"}, "sort": {"ts": "desc"}}}})).unwrap();
+    assert_eq!(r["t"]["top"], json!([{"sort": [4], "metrics": {"m": null}}]), "{r}");
+    let r = run(&f, json!({"t": {"top_metrics": {"metrics": {"field": "m", "missing": 5}, "sort": {"ts": "desc"}}}})).unwrap();
+    assert_eq!(r["t"]["top"], json!([{"sort": [4], "metrics": {"m": 5}}]), "{r}");
+    let r = run(&f, json!({"t": {"top_metrics": {"metrics": [{"field": "a", "missing": 0}, {"field": "b"}], "sort": {"ts": "desc"}, "size": 2}}})).unwrap();
+    assert_eq!(r["t"]["top"], json!([{"sort": [4], "metrics": {"a": 0, "b": 2}}, {"sort": [3], "metrics": {"a": 1, "b": null}}]), "{r}");
+}
+
+/// #226: multi_terms picks each shard's candidates by the requested order
+/// (key order, a sub-aggregation metric), and its default shard size
+/// follows `size`.
+#[test]
+fn multi_terms_shard_candidates_follow_the_requested_order() {
+    let f = fixture(json!({"properties": {"a": {"type": "keyword"}, "b": {"type": "keyword"}, "v": {"type": "long"}}}),
+        &[json!({"a": "a", "b": "x", "v": 1}), json!({"a": "z", "b": "x", "v": 1}), json!({"a": "z", "b": "x", "v": 1}),
+          json!({"a": "p", "b": "x", "v": 1}), json!({"a": "p", "b": "x", "v": 1}), json!({"a": "q", "b": "x", "v": 100})]);
+    let terms = json!([{"field": "a"}, {"field": "b"}]);
+    let r = run(&f, json!({"m": {"multi_terms": {"terms": terms, "order": {"_key": "asc"}, "size": 1, "shard_size": 1}}})).unwrap();
+    assert_eq!(r["m"]["buckets"][0]["key"], json!(["a", "x"]), "{r}");
+    let r = run(&f, json!({"m": {"multi_terms": {"terms": terms, "order": {"mx": "desc"}, "size": 1, "shard_size": 1}, "aggs": {"mx": {"max": {"field": "v"}}}}})).unwrap();
+    assert_eq!(r["m"]["buckets"][0]["key"], json!(["q", "x"]), "{r}");
+    assert_eq!(r["m"]["buckets"][0]["mx"]["value"], 100.0);
+    let many: Vec<Value> = (0..201).map(|i| json!({"a": format!("k{i:03}"), "b": "x"})).collect();
+    let g = fixture(json!({"properties": {"a": {"type": "keyword"}, "b": {"type": "keyword"}}}), &many);
+    let r = run(&g, json!({"m": {"multi_terms": {"terms": terms, "size": 200}}})).unwrap();
+    assert_eq!(r["m"]["buckets"].as_array().unwrap().len(), 200, "size above the old fixed 100 cut");
+    assert_eq!(r["m"]["sum_other_doc_count"], 1);
+}
+
+/// #227: weighted_avg, multi_terms and the other listed aggregations read
+/// runtime fields and value scripts (as avg / terms do), not the raw field.
+#[test]
+fn aggregations_read_runtime_fields_and_value_scripts() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    let svc = node.create_index("rv", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+        "mappings": {"properties": {"v": {"type": "long"}, "w": {"type": "long"}, "k": {"type": "keyword"}, "t": {"type": "date"}}}})).unwrap();
+    let docs = [json!({"v": 10, "w": 1, "k": "a", "t": 0}), json!({"v": 20, "w": 3, "k": "b", "t": 60_000})];
+    let reqs: Vec<WriteReq> = docs.iter().enumerate().map(|(i, d)| WriteReq::Index { id: Some(i.to_string()), source: d.to_string(), routing: None, cond: WriteCond::default() }).collect();
+    assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+    svc.refresh().unwrap();
+    let rm = json!({
+        "rv": {"type": "long", "script": {"source": "emit(doc['v'].value * 2)"}},
+        "v": {"type": "long", "script": {"source": "emit(params._source.v + 1)"}},
+        "rk": {"type": "keyword", "script": {"source": "emit(doc['k'].value + '!')"}}
+    });
+    let agg = |a: Value| -> Value {
+        let r = crate::ml::search(&node, "rv", &json!({"size": 0, "runtime_mappings": rm, "aggs": {"a": a}})).unwrap();
+        r["aggregations"]["a"].clone()
+    };
+    // Runtime-only value: `doc['v']` reads the runtime `v` (11, 21), as ES
+    // resolves a shadowing runtime field: (22*1 + 42*3) / 4 = 37.
+    assert_eq!(agg(json!({"weighted_avg": {"value": {"field": "rv"}, "weight": {"field": "w"}}}))["value"], 37.0);
+    // A runtime override of `v` (11, 21): (11 + 63) / 4 = 18.5.
+    assert_eq!(agg(json!({"weighted_avg": {"value": {"field": "v"}, "weight": {"field": "w"}}}))["value"], 18.5);
+    // field + value script on the weight: weights 2 and 6, values 11, 21.
+    let r = agg(json!({"weighted_avg": {"value": {"field": "v"}, "weight": {"field": "w", "script": "_value * 2"}}}));
+    assert_eq!(r["value"], 18.5, "{r}");
+    // multi_terms on a runtime keyword.
+    let r = agg(json!({"multi_terms": {"terms": [{"field": "rk"}, {"field": "k"}]}}));
+    let keys: Vec<Value> = r["buckets"].as_array().unwrap().iter().map(|b| b["key"].clone()).collect();
+    assert_eq!(keys, vec![json!(["a!", "a"]), json!(["b!", "b"])], "{r}");
+    // string_stats and rare_terms on the runtime keyword; t_test on runtime values.
+    assert_eq!(agg(json!({"string_stats": {"field": "rk"}}))["max_length"], 2);
+    let r = agg(json!({"rare_terms": {"field": "rk"}}));
+    assert_eq!(r["buckets"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(r["buckets"][0]["key"], "a!");
+}
+
+/// #239: geo_line holds only its `size` best points (charged), counts
+/// every point for `complete`, refuses an over-budget line and polls
+/// cancellation; results match the full sort.
+#[test]
+fn geo_line_holds_only_its_size() {
+    let docs: Vec<Value> = (0..3000).map(|i| json!({"p": {"lat": (i % 80) as f64, "lon": (i % 170) as f64}, "t": (i * 7919) % 3001})).collect();
+    let f = fixture(json!({"properties": {"p": {"type": "geo_point"}, "t": {"type": "long"}}}), &docs);
+    let b = crate::memory::Breakers::leak_for_tests(1 << 31);
+    topn_peak_reset();
+    let r = run_limited(&f, b, "256kb", json!({"g": {"geo_line": {"point": {"field": "p"}, "sort": {"field": "t"}, "size": 3, "sort_order": "DESC"}}})).unwrap();
+    assert!(topn_peak() <= 6, "held {}", topn_peak());
+    assert_eq!(r["g"]["properties"]["complete"], false);
+    let mut want: Vec<(i64, f64, f64)> = (0..3000).map(|i| (((i * 7919) % 3001) as i64, (i % 170) as f64, (i % 80) as f64)).collect();
+    want.sort_by(|a, b| b.0.cmp(&a.0));
+    let coords: Vec<(f64, f64)> = r["g"]["geometry"]["coordinates"].as_array().unwrap().iter().map(|c| (c[0].as_f64().unwrap(), c[1].as_f64().unwrap())).collect();
+    assert_eq!(coords, want[..3].iter().map(|w| (w.1, w.2)).collect::<Vec<_>>());
+    let e = run_limited(&f, b, "64kb", json!({"g": {"geo_line": {"point": {"field": "p"}, "sort": {"field": "t"}, "size": 10000}}})).unwrap_err();
+    assert!(crate::memory::is_breaking(&e), "{e:?}");
+    let e = run_cancelled_in_loop(&f, json!({"g": {"geo_line": {"point": {"field": "p"}, "sort": {"field": "t"}}}}));
+    assert_eq!(e.kind, "task_cancelled_exception");
+}
+
+/// #371: a scorer that refuses its workspace fails the aggregation
+/// collection instead of answering it as empty; #363: a bulk constant-score
+/// set is admitted before it is filled.
+#[test]
+fn aggregation_collection_reports_scorer_refusals_and_admits_bulk_sets() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    let svc = node.create_index("ac", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+        "mappings": {"properties": {"n": {"type": "long"}, "m": {"type": "long"}}}})).unwrap();
+    let reqs: Vec<WriteReq> = (0..20_000).map(|i| WriteReq::Index { id: Some(i.to_string()), source: json!({"n": i % 10, "m": 1}).to_string(), routing: None, cond: WriteCond::default() }).collect();
+    assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+    svc.refresh().unwrap();
+    let terms = json!({"size": 0, "track_total_hits": false, "query": {"terms": {"n": [1, 2]}}, "aggs": {"s": {"sum": {"field": "m"}}}});
+    let ok = crate::ml::search(&node, "ac", &terms).unwrap();
+    assert_eq!(ok["aggregations"]["s"]["value"], 4000.0);
+    {
+        let _tiny = rustic_core::admission::private_shared(64);
+        let r = crate::ml::search(&node, "ac", &terms);
+        assert!(r.is_err(), "a refused scorer is not an empty match: {r:?}");
+    }
+    let exists = json!({"size": 0, "track_total_hits": false, "query": {"exists": {"field": "n"}}, "aggs": {"s": {"sum": {"field": "m"}}}});
+    let b = crate::memory::Breakers::leak_for_tests(1 << 31);
+    for (limit, ok) in [("64kb", false), ("64mb", true)] {
+        breakers_at(b, limit);
+        let scope = crate::memory::RequestScope::new("bulk agg docs", b);
+        crate::search::BULK_TRACE.with(|t| t.borrow_mut().clear());
+        let r = crate::memory::scoped(Some(scope), || crate::ml::search(&node, "ac", &exists));
+        // The fill is admitted before it allocates: a refusal allocates
+        // nothing; an admitted fill is charged first, for at least its size.
+        let trace = crate::search::BULK_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()));
+        if ok {
+            assert!(matches!(trace.as_slice(), [("charged", c), ("filled", f), ..] if c >= f && *f == 8 * 20_000), "{trace:?}");
+        } else {
+            assert!(trace.iter().all(|(e, _)| *e != "filled"), "refused fill allocated: {trace:?}");
+        }
+        match (ok, r) {
+            (true, Ok(v)) => assert_eq!(v["aggregations"]["s"]["value"], 20000.0),
+            (false, Err(e)) => assert!(crate::memory::is_breaking(&e) || format!("{e:?}").contains("circuit_breaking"), "{e:?}"),
+            (ok, r) => panic!("{limit}: expected ok={ok}, got {r:?}"),
+        }
+        assert_eq!(b.request.reserved(), 0);
+    }
+}
+
+/// #366: aggregation collection scores with the field's configured
+/// similarity, so `min_score` keeps the same docs for hits and aggregations.
+#[test]
+fn aggregations_score_with_the_configured_similarity() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    let svc = node.create_index("sim", &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+        "mappings": {"properties": {"t": {"type": "text", "similarity": "boolean"}, "k": {"type": "keyword"}}}})).unwrap();
+    let reqs = vec![WriteReq::Index { id: Some("1".into()), source: json!({"t": "abc", "k": "x"}).to_string(), routing: None, cond: WriteCond::default() }];
+    assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+    svc.refresh().unwrap();
+    let r = crate::ml::search(&node, "sim", &json!({"query": {"match": {"t": "abc"}}, "min_score": 0.5, "track_total_hits": true,
+        "aggs": {"c": {"value_count": {"field": "k"}}, "top": {"top_hits": {"size": 1}}}})).unwrap();
+    assert_eq!(r["hits"]["total"]["value"], 1, "{r}");
+    assert_eq!(r["hits"]["hits"][0]["_score"], 1.0);
+    assert_eq!(r["aggregations"]["c"]["value"], 1, "{r}");
+    assert_eq!(r["aggregations"]["top"]["hits"]["hits"][0]["_score"], 1.0, "{r}");
+}
+
+/// #358: a shard's cartesian_centroid over shapes ships its weighted state,
+/// so shards reduce by area (and dimension), not by doc count.
+#[test]
+fn cartesian_shape_centroid_ships_weighted_state() {
+    use crate::index::WriteReq;
+    use crate::shard::WriteCond;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::node::Node::open(data.path()).unwrap();
+    let square = |x0: f64, side: f64| json!({"type": "polygon", "coordinates": [[[x0, 0.0], [x0 + side, 0.0], [x0 + side, side], [x0, side], [x0, 0.0]]]});
+    for (name, shape) in [("cs1", square(0.0, 1.0)), ("cs2", square(10.0, 3.0))] {
+        let svc = node.create_index(name, &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {"properties": {"s": {"type": "shape"}}}})).unwrap();
+        let reqs = vec![WriteReq::Index { id: Some("1".into()), source: json!({"s": shape}).to_string(), routing: None, cond: WriteCond::default() }];
+        assert!(svc.write(reqs, false).iter().all(|r| r.is_ok()));
+        svc.refresh().unwrap();
+    }
+    let body = json!({"size": 0, "aggs": {"c": {"cartesian_centroid": {"field": "s"}}}});
+    // One search over both: areas 1 and 9 at x 0.5 and 11.5.
+    let both = crate::ml::search(&node, "cs1,cs2", &body).unwrap();
+    let want = (0.5 + 9.0 * 11.5) / 10.0;
+    assert!((both["aggregations"]["c"]["location"]["x"].as_f64().unwrap() - want).abs() < 1e-4, "{both}");
+    // Each as a cluster shard, then the coordinator's reduce.
+    let parts: Vec<Value> = {
+        let _shard = crate::search::ReadShardCountScope::enter(Some(1));
+        ["cs1", "cs2"].iter().map(|i| crate::ml::search(&node, i, &body).unwrap()["aggregations"]["c"].clone()).collect()
+    };
+    assert!(parts.iter().all(|p| p["__p"]["centroid"][0]["weight"].as_f64().is_some()), "{parts:?}");
+    let reduced = crate::aggs::reduce_cartesian_centroid_states(&parts.iter().collect::<Vec<_>>()).unwrap();
+    assert!((reduced["location"]["x"].as_f64().unwrap() - want).abs() < 1e-4, "{reduced}");
+    assert!((reduced["location"]["y"].as_f64().unwrap() - (0.5 + 9.0 * 1.5) / 10.0).abs() < 1e-4, "{reduced}");
+    assert_eq!(reduced["count"], 2);
+}
+
+/// SIDE 007: a nested aggregation's child lists are charged before they
+/// grow: a few roots with many children trip a small request breaker
+/// (nothing left reserved), and fit a normal one.
+#[test]
+fn nested_child_lists_are_admitted_before_they_grow() {
+    let b = crate::memory::Breakers::leak_for_tests(1 << 31);
+    let kids: Vec<Value> = (0..3000).map(|i| json!({"v": i})).collect();
+    let f = fixture(
+        json!({"properties": {"c": {"type": "nested", "properties": {"v": {"type": "long"}}}}}),
+        &[json!({"c": kids}), json!({"c": [{"v": 1}]}), json!({"c": [{"v": 2}]})],
+    );
+    let aggs = json!({"n": {"nested": {"path": "c"}, "aggs": {"s": {"sum": {"field": "c.v"}}}}});
+    let e = run_limited(&f, b, "8kb", aggs.clone()).unwrap_err();
+    assert_eq!(e.kind, "circuit_breaking_exception", "{}", e.reason);
+    let r = run_limited(&f, b, "64mb", aggs).unwrap();
+    assert_eq!(r["n"]["doc_count"], 3002);
 }

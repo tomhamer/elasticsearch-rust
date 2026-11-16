@@ -145,6 +145,12 @@ fn decode_v2(body: &[u8]) -> Result<EnvelopeV2, RemoteError> {
 fn fatal(why: &str) -> ! {
     tracing::error!("{why}; exiting");
     eprintln!("FATAL [{}]: {why}; exiting", std::thread::current().name().unwrap_or("?"));
+    // Unit tests: a node a finished test left running (its data directory
+    // already removed) stops its own thread, not the whole test binary,
+    // which then ended with exit status 1 and no failing test named.
+    if cfg!(test) {
+        panic!("FATAL: {why}");
+    }
     std::process::exit(1)
 }
 
@@ -357,7 +363,8 @@ async fn verify_message_capabilities(transport: &TransportService, from: &str, m
         Message::PublishRequest { state, .. } => {
             crate::capability_probe::verify_sender(transport, from).await
                 .map_err(|reason| RemoteError::new("unsupported_operation_exception", reason, 503))?;
-            crate::capability_probe::observe_members(transport, &state.nodes).await;
+            // Never on the apply path: members are probed in the background.
+            crate::capability_probe::observe_members_async(transport, &state.nodes);
             crate::capability_probe::require_publication_proof(transport, state)
         },
         _ => Ok(()),
@@ -1075,7 +1082,7 @@ pub fn start(coord: Coordinator, gateway: Gateway, transport: TransportService, 
                         crate::capability_probe::verify_sender(&responder, &env.from).await
                             .map_err(|reason| RemoteError::new("unsupported_operation_exception", reason, 503))?;
                         if let Some(nodes) = &diff.nodes {
-                            crate::capability_probe::observe_members(&responder, nodes).await;
+                            crate::capability_probe::observe_members_async(&responder, nodes);
                         }
                         tx.send(Cmd::InboundDiff { from: env.from, request_id, diff }).map_err(closed)?;
                     }

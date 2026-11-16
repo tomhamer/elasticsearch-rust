@@ -410,6 +410,48 @@ fn full_cluster_restart_uses_only_in_sync_copies() {
     assert_eq!(w.health().status, HealthStatus::Green);
 }
 
+/// A full restart where the former primary's store is marked corrupted
+/// (its translog failed its checks): that copy is never chosen; the other
+/// in-sync copy becomes the primary, the corrupted one is shown with its
+/// store exception. With no other copy the shard stays red.
+#[test]
+fn a_copy_with_a_store_exception_is_never_chosen_as_primary() {
+    for replicas in [1, 0] {
+        let mut w = three();
+        w.create("idx", 1, replicas, &[]);
+        w.converge();
+        let pn = w.primary("idx", 0).node_id.unwrap();
+        let saved: Vec<DiscoveryNode> = w.state.nodes.values().cloned().collect();
+        w.state.nodes.clear();
+        w.state = w.svc.disassociate_dead_nodes(&w.state, w.now);
+        w.check();
+        for n in &saved {
+            w.add_node(n.clone());
+        }
+        let aid = w.disk[&("idx".to_string(), 0, pn.clone())].0.clone();
+        let mut stores = w.stores();
+        stores.add_store_exception("idx", 0, &pn, Some(&aid), "translog generation [3] is corrupted");
+        w.state = w.svc.reroute(&w.state, w.now, &w.info, &stores);
+        w.check();
+        let p = w.primary("idx", 0);
+        let ex = w.svc.explain(&w.state, &json!({"index": "idx", "shard": 0, "primary": true}), ExplainOptions::default(), w.now, &w.info, &stores);
+        if replicas == 1 {
+            assert_eq!(p.state, ShardState::Initializing, "replicas={replicas}");
+            assert_ne!(p.node_id.as_deref(), Some(pn.as_str()), "the corrupted copy was chosen");
+        } else {
+            assert_eq!(p.state, ShardState::Unassigned);
+            assert_eq!(w.health().status, HealthStatus::Red);
+            let ex = ex.unwrap();
+            assert_eq!(ex["can_allocate"], json!("no_valid_shard_copy"));
+            assert_eq!(ex["allocate_explanation"], json!("cannot allocate because all found copies of the shard are either stale or corrupt"));
+            let corrupted = ex["node_allocation_decisions"].as_array().unwrap().iter().find(|n| n["node_id"] == json!(pn)).unwrap().clone();
+            assert_eq!(corrupted["store"]["in_sync"], json!(true), "{corrupted}");
+            assert_eq!(corrupted["store"]["store_exception"]["type"], json!("corrupt_index_exception"), "{corrupted}");
+            assert!(corrupted["store"]["store_exception"]["reason"].as_str().unwrap().contains("corrupted"), "{corrupted}");
+        }
+    }
+}
+
 #[test]
 fn restart_with_only_stale_copy_stays_red() {
     let mut w = three();
@@ -1719,4 +1761,107 @@ fn pressure_ranking_skips_larger_decider_ineligible_copy(){
     let(index,_,next)=best.expect("smaller eligible shard must remain selectable");assert_eq!(index,"small");
     assert!(next.routing_table.indices["small"].shards[0].copies.iter().any(|copy|copy.node_id.as_deref()==Some("n2")&&copy.state==ShardState::Initializing));
     assert!(next.routing_table.indices["large"].shards[0].copies.iter().all(|copy|copy.state==ShardState::Started&&copy.node_id.as_deref()==Some("n1")));
+}
+
+// ------------------------------------------------- ILM routed lifecycle steps --
+
+/// ILM's `check-allocation` (`AllocationRoutedStep`) and `check-migration`
+/// (`DataTierMigrationRoutedStep`) read the routing table: a fully
+/// allocated replicated index is routed; an unassigned replica, or a copy
+/// on a node the filters (or the tier preference) exclude, is pending.
+#[test]
+fn lifecycle_routing_reads_the_routing_table() {
+    let mut w = World::new(&[node("n1", &[("box", "warm")]), node("n2", &[("box", "warm")]), node("n3", &[("box", "hot")])]);
+    w.create("idx", 2, 1, &[]);
+    w.converge();
+    assert_eq!(w.health().status, HealthStatus::Green);
+    let meta = |w: &World| w.state.metadata.indices["idx"].clone();
+    // A green index with one replica: routed (no replica-count heuristic).
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), false), LifecycleRouting::Routed);
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), true), LifecycleRouting::Routed);
+    // Filters the copies do not satisfy yet: pending until they moved.
+    w.set_index("idx", "index.routing.allocation.require.box", "warm");
+    let on_hot = w.state.routing_table.shards_on_node("n3").count();
+    if on_hot > 0 {
+        assert_eq!(lifecycle_routing(&w.state, &meta(&w), false), LifecycleRouting::Pending { shards: on_hot, tier: Some("data_content".into()) });
+        // The tier preference alone is satisfied everywhere.
+        assert_eq!(lifecycle_routing(&w.state, &meta(&w), true), LifecycleRouting::Routed);
+    }
+    w.converge();
+    assert_eq!(w.state.routing_table.shards_on_node("n3").count(), 0);
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), false), LifecycleRouting::Routed);
+    // A replica that cannot be allocated (one warm node left): the copies
+    // are not all active.
+    w.kill("n2");
+    w.converge();
+    assert!(w.state.routing_table.all_shards().any(|c| c.state == ShardState::Unassigned));
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), false), LifecycleRouting::CopiesInactive);
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), true), LifecycleRouting::CopiesInactive);
+}
+
+/// `check-migration`: copies on a node outside the preferred available
+/// tier are pending; with no node of any preferred tier, the tier is `None`.
+#[test]
+fn lifecycle_routing_tier_migration() {
+    let mut hot = node("hot", &[]);
+    hot.roles = BTreeSet::from([Role::DataHot, Role::DataContent, Role::Master]);
+    let mut warm = node("warm", &[]);
+    warm.roles = BTreeSet::from([Role::DataWarm]);
+    let mut w = World::new(&[hot, warm]);
+    w.create("idx", 1, 0, &[("index.routing.allocation.include._tier_preference", "data_hot")]);
+    w.converge();
+    let meta = |w: &World| w.state.metadata.indices["idx"].clone();
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), true), LifecycleRouting::Routed);
+    w.set_index("idx", "index.routing.allocation.include._tier_preference", "data_warm,data_hot");
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), true), LifecycleRouting::Pending { shards: 1, tier: Some("data_warm".into()) });
+    w.converge();
+    assert_eq!(w.primary("idx", 0).node_id.as_deref(), Some("warm"));
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), true), LifecycleRouting::Routed);
+    w.set_index("idx", "index.routing.allocation.include._tier_preference", "data_frozen");
+    assert_eq!(lifecycle_routing(&w.state, &meta(&w), true), LifecycleRouting::Pending { shards: 1, tier: None });
+}
+
+/// Production review #290: `cluster.routing.allocation.same_shard.host`
+/// keeps copies of a shard on different hosts (address or name), from the
+/// persistent cluster setting or the node setting; with one host left the
+/// replica stays unassigned.
+#[test]
+fn same_shard_host_separates_copies_across_hosts() {
+    let on = |id: &str, host: &str, ip: &str| {
+        let mut n = node(id, &[]);
+        n.host = host.into();
+        n.ip = ip.into();
+        n
+    };
+    for node_level in [false, true] {
+        let nodes = [on("xa", "host-x", "10.1.0.1"), on("xb", "host-x", "10.1.0.1"), on("ya", "host-y", "10.2.0.1")];
+        let mut w = World::new(&nodes);
+        if node_level {
+            let mut s = Map::new();
+            s.insert("cluster.routing.allocation.same_shard.host".into(), json!("true"));
+            w.svc = AllocationService::new(s);
+        } else {
+            w.state.metadata.persistent_settings.insert("cluster.routing.allocation.same_shard.host".into(), json!("true"));
+        }
+        w.create("idx", 4, 1, &[]);
+        for _ in 0..4 {
+            w.reroute();
+            w.start_all();
+        }
+        for k in 0..4 {
+            let hosts: BTreeSet<String> = w.copies("idx", k).iter().map(|c| w.state.nodes[c.node_id.as_deref().expect("assigned")].host.clone()).collect();
+            assert_eq!(hosts.len(), 2, "node_level={node_level} shard {k}: copies on {hosts:?}");
+        }
+        // Only host X left: each replica waits rather than sharing the host.
+        let mut w = World::new(&nodes[..2]);
+        w.state.metadata.persistent_settings.insert("cluster.routing.allocation.same_shard.host".into(), json!("true"));
+        w.create("one", 1, 1, &[]);
+        for _ in 0..3 {
+            w.reroute();
+            w.start_all();
+        }
+        let c = w.copies("one", 0);
+        assert_eq!(c.iter().filter(|c| c.state == ShardState::Started).count(), 1, "{c:?}");
+        assert!(c.iter().any(|c| c.state == ShardState::Unassigned), "{c:?}");
+    }
 }

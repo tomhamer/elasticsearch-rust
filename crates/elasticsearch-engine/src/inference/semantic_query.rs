@@ -3,7 +3,7 @@
 //! queries on a `semantic_text` field, or `nested` queries over its
 //! `<field>.inference.chunks`, into chunk queries ([`ChunkQuery`]).
 
-use super::chunk_query::{ChunkQuery, ChunkVec};
+use super::chunk_query::{ChunkElem, ChunkQuery, ChunkVec};
 use super::semantic::DEFAULT_INFERENCE_ID;
 use super::Embedded;
 use crate::error::{EsError, Result};
@@ -50,6 +50,11 @@ fn similarity(ms: &Value) -> Similarity {
         "max_inner_product" => Similarity::MaxInnerProduct,
         _ => Similarity::Cosine,
     }
+}
+
+/// The element type of the field's model (`model_settings.element_type`).
+fn elem(ms: &Value) -> ChunkElem {
+    ChunkElem::of(ms.get("element_type").and_then(Value::as_str))
 }
 
 fn aux(f: &ResolvedField) -> Option<u16> {
@@ -226,9 +231,9 @@ pub fn semantic_query(f: &ResolvedField, text: &str, ctx: Option<&QueryContext>)
                 Some(c) => c.knn_prefilter_query()?,
                 None => None,
             };
-            let q = ChunkQuery { field: f.name.clone(), aux, vec: ChunkVec::Dense { v: Arc::new(v), sim: similarity(&ms), threshold: None }, mode: NestedScoreMode::Max, k: Some(k), filter: filter.map(Box::new), fixed: None };
+            let q = ChunkQuery { field: f.name.clone(), aux, vec: ChunkVec::Dense { v: Arc::new(v), sim: similarity(&ms), elem: elem(&ms), threshold: None }, mode: NestedScoreMode::Max, k: Some(k), filter: filter.map(Box::new), fixed: None };
             return Ok(Query::Custom(Arc::new(match ctx {
-                Some(c) => q.with_top_k(c.leaves)?,
+                Some(c) => q.with_top_k(c.leaves, c.deadline)?,
                 None => q,
             })));
         }
@@ -359,14 +364,17 @@ pub fn knn(f: &ResolvedField, o: &Map<String, Value>, ctx: &QueryContext, k: usi
         return Err(EsError::illegal_argument(format!("Field [{}] is not a text_embedding semantic_text field", f.name)));
     }
     let dims = ms.get("dimensions").and_then(Value::as_u64).unwrap_or(0) as usize;
-    if dims != v.len() {
-        return Err(EsError::query_shard(ctx.index_name, ctx.index_uuid, format!("failed to create query: The query vector has a different number of dimensions [{}] than the document vectors [{dims}].", v.len())));
+    // A bit model's query vector holds one byte per 8 dimensions.
+    let el = elem(&ms);
+    let query_dims = if el == ChunkElem::Bit { v.len() * 8 } else { v.len() };
+    if dims != query_dims {
+        return Err(EsError::query_shard(ctx.index_name, ctx.index_uuid, format!("failed to create query: The query vector has a different number of dimensions [{query_dims}] than the document vectors [{dims}].")));
     }
     let sim_name = ms.get("similarity").and_then(Value::as_str).unwrap_or("cosine").to_string();
-    let threshold = o.get("similarity").and_then(Value::as_f64).map(|s| crate::vectors::score_of_similarity(s as f32, &sim_name, crate::vectors::ElementType::Float, dims));
+    let threshold = o.get("similarity").and_then(Value::as_f64).map(|s| crate::vectors::score_of_similarity(s as f32, &sim_name, el.es(), dims));
     let filter = knn_filter(o, ctx)?;
-    let q = ChunkQuery { field: f.name.clone(), aux, vec: ChunkVec::Dense { v: Arc::new(v), sim: similarity(&ms), threshold }, mode: NestedScoreMode::Max, k: Some(k), filter: filter.map(Box::new), fixed: None };
-    Ok(Query::Custom(Arc::new(q.with_top_k(ctx.leaves)?)))
+    let q = ChunkQuery { field: f.name.clone(), aux, vec: ChunkVec::Dense { v: Arc::new(v), sim: similarity(&ms), elem: el, threshold }, mode: NestedScoreMode::Max, k: Some(k), filter: filter.map(Box::new), fixed: None };
+    Ok(Query::Custom(Arc::new(q.with_top_k(ctx.leaves, ctx.deadline)?)))
 }
 
 /// Whether a query (JSON) holds a query the semantic interceptors turn into
@@ -429,7 +437,7 @@ pub fn nested(f: &ResolvedField, inner: &Value, mode: NestedScoreMode, ctx: &Que
     let body = body.as_object().cloned().unwrap_or_default();
     let field_of = |b: &Map<String, Value>| b.get("field").and_then(Value::as_str).map(str::to_string);
     let wrap = |vec: ChunkVec, k: Option<usize>, filter: Option<Query>| -> Result<Query> {
-        Ok(Query::Custom(Arc::new(ChunkQuery { field: f.name.clone(), aux, vec, mode, k, filter: filter.map(Box::new), fixed: None }.with_top_k(ctx.leaves)?)))
+        Ok(Query::Custom(Arc::new(ChunkQuery { field: f.name.clone(), aux, vec, mode, k, filter: filter.map(Box::new), fixed: None }.with_top_k(ctx.leaves, ctx.deadline)?)))
     };
     let boost = body.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     let boosted = |q: Query| if boost != 1.0 { Query::Boost { query: Box::new(q), boost } } else { q };
@@ -463,9 +471,11 @@ pub fn nested(f: &ResolvedField, inner: &Value, mode: NestedScoreMode, ctx: &Que
             };
             let k = body.get("k").and_then(Value::as_u64).map(|k| k as usize).or_else(|| body.get("num_candidates").and_then(Value::as_u64).map(|n| (n as usize).min(10))).unwrap_or(10);
             let sim_name = ms.get("similarity").and_then(Value::as_str).unwrap_or("cosine").to_string();
-            let threshold = body.get("similarity").and_then(Value::as_f64).map(|s| crate::vectors::score_of_similarity(s as f32, &sim_name, crate::vectors::ElementType::Float, v.len()));
+            let el = elem(&ms);
+            let dims = if el == ChunkElem::Bit { v.len() * 8 } else { v.len() };
+            let threshold = body.get("similarity").and_then(Value::as_f64).map(|s| crate::vectors::score_of_similarity(s as f32, &sim_name, el.es(), dims));
             let filter = knn_filter(&body, ctx)?;
-            Ok(boosted(wrap(ChunkVec::Dense { v: Arc::new(v), sim: similarity(&ms), threshold }, Some(k), filter)?))
+            Ok(boosted(wrap(ChunkVec::Dense { v: Arc::new(v), sim: similarity(&ms), elem: el, threshold }, Some(k), filter)?))
         }
         _ => Err(EsError::query_shard(ctx.index_name, ctx.index_uuid, format!("failed to create query: [{kind}] queries are not supported on the chunks of semantic_text field [{}]", f.name))),
     }

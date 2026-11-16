@@ -82,6 +82,8 @@ pub struct MutableIngestField {
     /// Rows the newest durable graph checkpoint still references although
     /// the live graph removed their nodes (see [`CheckpointPins`]).
     checkpoint_pins: Mutex<CheckpointPins>,
+    /// A full graph checkpoint was asked for ([`Self::request_full_save`]).
+    full_save: std::sync::atomic::AtomicBool,
     /// Graph insertions since this owner opened (staged writes and the
     /// open-time catch-up): a copy recovered from files inserts only what
     /// its shipped checkpoint lacked.
@@ -658,7 +660,7 @@ impl MutableIngestField {
             abandoned: Mutex::new(Vec::new()), inflight: AtomicUsize::new(0), admitting: Default::default(),
             identities: parking_lot::RwLock::new(Default::default()), projection_cache: Mutex::new(Default::default()), projection_epoch: AtomicU64::new(0), pending_deletes: Mutex::new(std::collections::VecDeque::new()), extra_references: Mutex::new(Default::default()),
             checkpoint_pins: Mutex::new(Default::default()), graph_inserts: Default::default(),
-            successor: Default::default(), predecessors: Default::default(), off_heap: Default::default() }))
+            successor: Default::default(), predecessors: Default::default(), off_heap: Default::default(), full_save: Default::default() }))
     }
 
     pub(crate) fn commit_batch(&self) -> Result<super::hnsw::MutableCommitBatch> {
@@ -725,13 +727,13 @@ impl MutableIngestField {
     /// rebuild it with from the committed vector rows (the file must not be
     /// reused then).
     pub(crate) fn open_checkpoint(store: Arc<VectorStore>, field_id: u16,
-        dir: &dyn crate::codec::directory::Directory, name: &str, threads: usize) -> Result<OpenedCheckpoint>
+        dir: &dyn crate::codec::directory::Directory, name: &str, deltas: &[String], threads: usize) -> Result<OpenedCheckpoint>
     {
         // Rows the checkpoint references (not embedded) are read from the
         // store's segments of the same commit.
         let raw = super::store::StoreRows(Arc::downgrade(&store));
         let snapshot = super::hnsw::RawRows::snapshot(&raw)?;
-        let opened = MutableVectorOwner::open_file_with(dir, name, snapshot.as_deref());
+        let opened = MutableVectorOwner::open_chain_with(dir, name, deltas, snapshot.as_deref());
         drop(snapshot);
         let (graph, owner) = match opened {
             Ok(opened) => opened,
@@ -755,7 +757,7 @@ impl MutableIngestField {
             owner: Arc::new(owner), reserve: Mutex::new(()), abandoned: Mutex::new(Vec::new()), inflight: AtomicUsize::new(0), admitting: Default::default(),
             identities: parking_lot::RwLock::new(identities), projection_cache: Mutex::new(Default::default()), projection_epoch: AtomicU64::new(0), pending_deletes: Mutex::new(std::collections::VecDeque::new()), extra_references: Mutex::new(Default::default()),
             checkpoint_pins: Mutex::new(Default::default()), graph_inserts: Default::default(),
-            successor: Default::default(), predecessors: Default::default(), off_heap: Default::default() })))
+            successor: Default::default(), predecessors: Default::default(), off_heap: Default::default(), full_save: Default::default() })))
     }
 
     /// A graph snapshot can contain a staged-but-uncommitted point or a point
@@ -844,21 +846,21 @@ impl MutableIngestField {
     /// Insert committed `points` (their rows read from the vector
     /// segments) into the graph under their existing ids (open time, a
     /// migration's catch-up, rows a seal stored without a reservation).
+    ///
+    /// Committed points were allocated long ago and may lie below keys the
+    /// graph already issued (a newer write inserted first, or this point's
+    /// own reservation was issued and then abandoned): they are inserted as
+    /// backfill, never refused for being "out of order".
     pub(crate) fn insert_committed_points(&self, points: &[u64]) -> Result<()> {
         let store = self.store()?;
-        self.insert_points_with(points, |point| store.with_vector(point, <[f32]>::to_vec)
+        self.insert_points_backfill(points, |point| store.with_vector(point, <[f32]>::to_vec)
             .map(Some).ok_or_else(|| RusticError::Corrupted("committed vector point has no stored row".into())))
     }
 
     /// Insert `points` with the rows `row` returns (`None`: skip the point)
     /// under their existing ids, in bounded batches; points already in the
-    /// graph are skipped.
-    fn insert_points_with(&self, points: &[u64], row: impl Fn(u64) -> Result<Option<Vec<f32>>>) -> Result<()> {
-        self.insert_points_inner(points, row, false)
-    }
-
-    /// [`Self::insert_points_with`] at open: points absent from the restored
-    /// graph may lie below its highest key (`MutableHnsw::reserve_insert_backfill`).
+    /// graph are skipped. Backfill: they may lie below the graph's highest
+    /// key (`MutableHnsw::reserve_insert_backfill`).
     fn insert_points_backfill(&self, points: &[u64], row: impl Fn(u64) -> Result<Option<Vec<f32>>>) -> Result<()> {
         self.insert_points_inner(points, row, true)
     }
@@ -895,6 +897,10 @@ impl MutableIngestField {
             let mut reservations = Vec::with_capacity(batch.len());
             for ((point, values), encoded) in batch.iter().zip(&slices).zip(&encoded) {
                 let reservation = if backfill { self.graph.reserve_insert_backfill(*point)? } else { self.graph.reserve_insert(*point)? };
+                #[cfg(test)]
+                if FAIL_INSTALLS.with(|left| { let n = left.get(); left.set(n.saturating_sub(1)); n > 0 }) {
+                    return Err(RusticError::Memory("test: installing a reserved row refused".into()));
+                }
                 self.owner.install_prepared(&reservation, values, encoded.as_ref())?;
                 reservations.push(reservation);
             }
@@ -1049,7 +1055,10 @@ impl MutableIngestField {
         use super::hnsw::MutableVectorSource;
         let store = self.store()?;
         let source = previous.owner.pin()?;
-        self.insert_points_with(&missing, |point| Ok(wanted.get(&point).and_then(|handle| source.get_node(*handle, point)).map(<[f32]>::to_vec)
+        // Backfill: a failed earlier copy may have issued keys above these
+        // (its reservation dropped, the watermark kept), and a retry after
+        // the retirement runs once this graph admitted points of its own.
+        self.insert_points_backfill(&missing, |point| Ok(wanted.get(&point).and_then(|handle| source.get_node(*handle, point)).map(<[f32]>::to_vec)
             .or_else(|| store.with_vector(point, <[f32]>::to_vec))))?;
         drop(source);
         copied.try_reserve(missing.len()).map_err(|_| RusticError::Memory("vector field migration point set".into()))?;
@@ -1327,6 +1336,14 @@ impl MutableIngestField {
             row.len() != dim || !self.graph.similarity().valid_row(row))) {
             return Err(RusticError::InvalidQuery("invalid GPU mutable document batch".into()));
         }
+        // Retired by a migration: the CPU path forwards to the successor.
+        if self.successor().is_some() { return Ok(None); }
+        // The host side of a device build is admitted before any of it is
+        // allocated and held until the batch is staged: the row copy, the
+        // exported graph and its assembly into the insertion graph (about
+        // two neighbor arrays of up to 2m per row at once, upper levels
+        // included). Refused: the ordinary CPU path, which admits per row.
+        let Ok(_host_memory) = crate::admission::shared().reserve(gpu_host_bytes(count, dim, self.params.m), "GPU batch host workspace") else { return Ok(None) };
         let Some(mut lease) = super::gpu::try_lease() else { return Ok(None) };
         let mut data = Vec::new();
         data.try_reserve_exact(count.checked_mul(dim).ok_or_else(|| RusticError::Memory("GPU batch dimension overflow".into()))?)
@@ -1343,29 +1360,8 @@ impl MutableIngestField {
         let rows: Vec<_> = documents.iter().flatten().copied().collect();
         let encoded = self.owner.prepare_codes(&rows)?;
         let mut encoded = encoded.iter();
-        let mut staged = Vec::with_capacity(documents.len());
-        let mut reservations = Vec::with_capacity(count);
-        let mut owners = Vec::with_capacity(count);
-        {
-            let _sequence = self.reserve.lock();
-            self.drain_on_write_locked()?;
-            let store = self.store()?;
-            for (doc, rows) in documents.iter().enumerate() {
-                self.inflight.fetch_add(1, Ordering::AcqRel);
-                staged.push(StagedMutableRows { field: self.clone(), reservation: None,
-                    handles: Vec::with_capacity(rows.len()), accepted: false, first_point: None });
-                let points = store.reserve_points(rows.len())?;
-                self.admitting.lock().insert(points.points().start);
-                staged[doc].first_point = Some(points.points().start);
-                for (key, row) in points.points().zip(rows) {
-                    let reservation = self.graph.reserve_insert(key)?;
-                    self.owner.install_prepared(&reservation, row, encoded.next().expect("validated encoded GPU row").as_ref())?;
-                    reservations.push(Some(reservation));
-                    owners.push(doc);
-                }
-                staged[doc].reservation = Some(points);
-            }
-        }
+        let Some((mut staged, mut reservations, owners)) = self.reserve_gpu_rows(documents,
+            |reservation, row| self.owner.install_prepared(reservation, row, encoded.next().expect("validated encoded GPU row").as_ref()))? else { return Ok(None) };
         let handles: Vec<_> = reservations.iter().map(|r| r.as_ref().expect("reserved row").handle()).collect();
         let commit_batch = self.graph.commit_batch()?;
         for ordinal in order {
@@ -1385,6 +1381,48 @@ impl MutableIngestField {
         for batch in &mut staged { batch.handles.clear(); }
         for (handle, doc) in handles.into_iter().zip(owners) { staged[doc].handles.push(handle); }
         Ok(Some(staged))
+    }
+
+    /// The reservation step of [`stage_gpu_documents`](Self::stage_gpu_documents),
+    /// once the device build is done: under the sequencer, points and graph
+    /// keys for every row, each row installed with `install`. `None` (nothing
+    /// reserved) when a migration retired this owner meanwhile (#308): its
+    /// successor would never see rows reserved here; the caller then stages
+    /// them on the CPU path, which forwards to the successor.
+    #[allow(clippy::type_complexity)]
+    fn reserve_gpu_rows(self: &Arc<Self>, documents: &[Vec<&[f32]>],
+        mut install: impl FnMut(&super::hnsw::InsertReservation, &[f32]) -> Result<()>)
+        -> Result<Option<(Vec<StagedMutableRows>, Vec<Option<super::hnsw::InsertReservation>>, Vec<usize>)>>
+    {
+        let count: usize = documents.iter().map(Vec::len).sum();
+        let mut staged = Vec::with_capacity(documents.len());
+        let mut reservations = Vec::with_capacity(count);
+        let mut owners = Vec::with_capacity(count);
+        {
+            let _sequence = self.reserve.lock();
+            // A migration may have retired this owner during the device
+            // build: its successor never sees rows reserved here. Nothing is
+            // reserved yet; the CPU path stages them on the current owner.
+            if self.successor().is_some() { return Ok(None); }
+            self.drain_on_write_locked()?;
+            let store = self.store()?;
+            for (doc, rows) in documents.iter().enumerate() {
+                self.inflight.fetch_add(1, Ordering::AcqRel);
+                staged.push(StagedMutableRows { field: self.clone(), reservation: None,
+                    handles: Vec::with_capacity(rows.len()), accepted: false, first_point: None });
+                let points = store.reserve_points(rows.len())?;
+                self.admitting.lock().insert(points.points().start);
+                staged[doc].first_point = Some(points.points().start);
+                for (key, row) in points.points().zip(rows) {
+                    let reservation = self.graph.reserve_insert(key)?;
+                    install(&reservation, row)?;
+                    reservations.push(Some(reservation));
+                    owners.push(doc);
+                }
+                staged[doc].reservation = Some(points);
+            }
+        }
+        Ok(Some((staged, reservations, owners)))
     }
 
     /// Execute the shared Vespa ANN plan over this field. `accept` must include
@@ -1601,8 +1639,10 @@ impl MutableIngestField {
         }
         // Quantized rows whose f32 is durable keep only codes in memory.
         let shed = self.owner.shed_some(max)?;
+        // Restored 1-bit nodes get the maintenance rows pruning compares.
+        let filled = self.owner.backfill_maintenance_rows(max)?;
         self.memory_diagnostic();
-        Ok(more || shed == max)
+        Ok(more || shed == max || filled > 0 || self.owner.maintenance_backfill_pending())
     }
 
     /// Opt-in diagnostic (`RUSTIC_VECTOR_MEMORY_DIAGNOSTIC=<seconds>`, off by
@@ -1657,6 +1697,11 @@ impl MutableIngestField {
         self.owner.set_code_log_compact_min_rows(rows);
     }
 
+    /// Test seam: see `MutableVectorOwner::set_code_log_chunk_bytes`.
+    #[cfg(test)]
+    pub(crate) fn set_code_log_chunk_bytes(&self, bytes: usize) {
+        self.owner.set_code_log_chunk_bytes(bytes);
+    }
     /// Test seam: see `MutableVectorOwner::set_code_log_capacity`.
     #[cfg(test)]
     pub(crate) fn set_code_log_capacity(&self, rows: u64) {
@@ -1779,7 +1824,18 @@ impl MutableIngestField {
     /// A checkpoint of this field at mutation generation `generation` is
     /// durable (the commit point referencing it is published): rows of
     /// nodes removed before its capture are free.
+    /// The next checkpoint of this field is a full one.
+    pub(crate) fn request_full_save(&self) {
+        self.full_save.store(true, Ordering::Release);
+    }
+    /// Whether a full checkpoint was asked for (cleared).
+    pub(crate) fn take_full_save_request(&self) -> bool {
+        self.full_save.swap(false, Ordering::AcqRel)
+    }
+
     pub(crate) fn checkpoint_durable(&self, generation: u64) {
+        // The next incremental graph save is relative to this checkpoint.
+        self.owner.saves_durable(generation);
         let mut pins = self.checkpoint_pins.lock();
         pins.durable = Some(generation);
         if pins.capturing.is_some_and(|capturing| capturing <= generation) { pins.capturing = None; }
@@ -2324,6 +2380,78 @@ mod tests {
         assert!(fresh.admitting.lock().is_empty() && previous.admitting.lock().is_empty());
     }
 
+    /// #294: the retirement's last copy is refused after it issued a key
+    /// (a write that landed after the preliminary catch-up). The migration
+    /// completes only once every admitted point is in the new graph; a
+    /// repair that fails too keeps it scheduled (no false completion) and
+    /// the next pass finishes the copy. Every point is then found by kNN.
+    #[test]
+    fn failed_final_migration_copy_completes_only_with_every_point_searchable() {
+        use super::super::vespa_policy::*;
+        for failures in [1u32, 2] {
+            let store = VectorStore::new();
+            let previous = store.mutable_field(1, 2, Similarity::L2, HnswParams::default()).unwrap();
+            let (early, _) = previous.stage(&[&[1.,2.], &[3.,4.]]).unwrap().accept().unwrap();
+            let params = HnswParams { m: 24, ..HnswParams::default() };
+            store.request_migration(1, 2, Similarity::L2, params, true);
+            let late = Arc::new(std::sync::Mutex::new(None));
+            let (writer, slot) = (previous.clone(), late.clone());
+            super::super::store::BEFORE_RETIRE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                *slot.lock().unwrap() = Some(writer.stage(&[&[5.,6.]]).unwrap().accept().unwrap().0);
+                FAIL_INSTALLS.with(|left| left.set(failures));
+            })));
+            let first = store.run_migrations().unwrap();
+            let refusals_left = FAIL_INSTALLS.with(|left| left.replace(0));
+            assert_eq!(refusals_left, 0, "failures {failures}: every refusal was hit");
+            let late = late.lock().unwrap().take().expect("the hook ran");
+            if failures == 1 {
+                assert_eq!(first, 1, "the retried copy completes the migration");
+            } else {
+                assert_eq!(first, 0, "a failed repair is not a completed migration");
+                assert_eq!(store.migrations_pending(), 1);
+                assert_eq!(store.run_migrations().unwrap(), 1);
+            }
+            assert_eq!(store.migrations_pending(), 0);
+            let current = store.registered_mutable_field(1).unwrap();
+            assert!(current.matches_config(2, Similarity::L2, params), "the new graph serves");
+            let points: Vec<u64> = early.points().chain(late.points()).collect();
+            assert_eq!(points.len(), 3);
+            let plan = choose_filter_preparation(PreparationInput { approximate: true, has_index: true,
+                estimated_query_ratio: 1. }, PolicyConfig::default()).unwrap().finish(
+                    HitBudget { target_hits: 10, explore_additional_hits: 90 }, current.document_limit(), PreparedGlobalFilter::Inactive).unwrap();
+            let hits = current.search_ann(&[5.,6.], &plan, |_| true, None).unwrap().hits;
+            let found: std::collections::HashSet<u64> = hits.iter().map(|(point, _)| *point).collect();
+            assert!(points.iter().all(|point| found.contains(point)), "failures {failures}: {points:?} vs {found:?}");
+            assert_eq!(hits[0].0, late.points().next().unwrap(), "the late row is the nearest");
+        }
+    }
+
+    /// #308: rows reserved after a device build land on the owner that is
+    /// current then; one a migration retired during the build reserves
+    /// nothing (its successor would never see them) and the CPU path takes
+    /// the batch. No device needed: this is the step after the build.
+    #[test]
+    fn gpu_rows_are_not_reserved_on_a_retired_owner() {
+        let row: &[f32] = &[1., 2.];
+        let documents = vec![vec![row]];
+        // Control: a current owner reserves and installs the rows.
+        let store = VectorStore::new();
+        let current = store.mutable_field(1, 2, Similarity::L2, HnswParams::default()).unwrap();
+        let mut installed = 0;
+        let reserved = current.reserve_gpu_rows(&documents, |reservation, row| { installed += 1; current.owner.install_prepared(reservation, row, None) }).unwrap();
+        assert!(reserved.is_some());
+        assert_eq!((installed, store.next_point_id()), (1, 1));
+        // Retired: nothing reserved, nothing installed.
+        let store = VectorStore::new();
+        let retired = store.mutable_field(1, 2, Similarity::L2, HnswParams::default()).unwrap();
+        let fresh = MutableIngestField::new(store.clone(), 1, 2, Similarity::L2, HnswParams::default()).unwrap();
+        retired.retire_into(&fresh, &mut std::collections::HashSet::new()).unwrap();
+        let none = retired.reserve_gpu_rows(&documents, |_, _| panic!("nothing is installed on a retired owner")).unwrap();
+        assert!(none.is_none());
+        assert_eq!(store.next_point_id(), 0, "no point reserved");
+        assert!(retired.admitting.lock().is_empty() && fresh.admitting.lock().is_empty());
+    }
+
     #[test]
     fn projection_reuses_only_matching_document_masks_and_identity_revision() {
         let store = VectorStore::new();
@@ -2763,5 +2891,36 @@ mod writer_tests {
         mismatch.add_document(&document(2.), &custom);
         assert!(mismatch.stage_mutable_field(1, &a).is_err());
         assert_eq!(store.next_point_id(), 1, "rejected mappings do not reserve IDs");
+    }
+}
+
+/// Host bytes a GPU batch of `count` rows of `dim` floats builds at once
+/// with `m` (see [`MutableIngestField::stage_gpu_documents`]): the row copy,
+/// plus the exported level-0 graph and its assembled copy (2m neighbors a
+#[cfg(test)]
+thread_local! {
+    /// Test seam: refuse this many row installations, each right after its
+    /// graph key was issued (an admission refused in `install_prepared`).
+    pub(crate) static FAIL_INSTALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// row each) with as much again for upper levels and offsets.
+pub(crate) fn gpu_host_bytes(count: usize, dim: usize, m: usize) -> u64 {
+    let rows = (count as u64).saturating_mul(dim as u64).saturating_mul(4);
+    let neighbors = (count as u64).saturating_mul(2 * m as u64).saturating_mul(4);
+    rows.saturating_add(neighbors.saturating_mul(4)).saturating_add(4096)
+}
+
+#[cfg(test)]
+mod gpu_host_tests {
+    /// #307: the host workspace of a GPU batch scales with rows x fanout
+    /// (the illustrated 100k rows at m 64: over 200 MB), so it is admitted
+    /// before the device build.
+    #[test]
+    fn gpu_host_workspace_estimate_covers_the_overlap() {
+        let bytes = super::gpu_host_bytes(100_000, 0, 64);
+        // Two overlapping level-0 neighbor arrays alone: 2 * n * 2m * 4.
+        assert!(bytes >= 2 * 100_000 * 128 * 4, "{bytes}");
+        assert!(super::gpu_host_bytes(100_000, 128, 16) >= 100_000 * 128 * 4);
     }
 }

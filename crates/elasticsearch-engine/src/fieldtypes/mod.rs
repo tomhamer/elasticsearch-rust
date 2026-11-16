@@ -228,6 +228,11 @@ pub fn validate(name: &str, f: &FieldMapping, registry: &AnalysisRegistry) -> Re
                 return Err(ia(format!("Field [{p}] cannot be set in conjunction with field [script]")));
             }
         }
+        // ES: a script's values must land somewhere (indexed or doc values).
+        let off = |p: &str| f.param(p).is_some_and(|v| v == &serde_json::Value::Bool(false) || v.as_str() == Some("false"));
+        if off("index") && off("doc_values") {
+            return Err(mp("Cannot define script on field with index:false and doc_values:false".to_string()));
+        }
     }
     if f.ty == EsType::PatternText {
         if let Some(io) = f.param("index_options") {
@@ -642,7 +647,9 @@ pub fn core_fields(rf: &ResolvedField) -> Option<Vec<CoreField>> {
         }
         EsType::AnnotatedText => {
             if let Some(id) = main {
-                out.push(mk(id, n, CoreType::Text, rf.indexed, false).with_analyzer("whitespace").with_position_increment_gap(rf.position_increment_gap));
+                // Indexed as positioned tokens (annotations injected at their
+                // text's position, finding 352).
+                out.push(mk(id, n, CoreType::Text, rf.indexed, false).with_analyzer("_pretokenized").with_position_increment_gap(rf.position_increment_gap));
             }
         }
         EsType::Binary => {
@@ -718,8 +725,7 @@ impl TokenFilter for ShingleFilter {
                 text: w.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(TOKEN_JOIN),
                 position: i as u32,
                 offset_from: w[0].offset_from,
-                offset_to: w[w.len() - 1].offset_to,
-            })
+                offset_to: w[w.len() - 1].offset_to, keyword: false })
             .collect()
     }
     fn clone_box(&self) -> Box<dyn TokenFilter> {
@@ -741,7 +747,7 @@ impl TokenFilter for IndexPrefixFilter {
             let shingle: String = tokens[i..i + n].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(TOKEN_JOIN);
             let chars: Vec<char> = shingle.chars().collect();
             for l in 1..=chars.len().min(20) {
-                out.push(Token { text: chars[..l].iter().collect(), position: i as u32, offset_from: tokens[i].offset_from, offset_to: tokens[i + n - 1].offset_to });
+                out.push(Token { text: chars[..l].iter().collect(), position: i as u32, offset_from: tokens[i].offset_from, offset_to: tokens[i + n - 1].offset_to, keyword: false });
             }
         }
         out
@@ -751,15 +757,12 @@ impl TokenFilter for IndexPrefixFilter {
     }
 }
 
-fn analyzer_with(base: &str, registry: &AnalysisRegistry, filter: Box<dyn TokenFilter>) -> Analyzer {
-    // `standard` tokenizer + lowercase, like the default text analysis.
-    let _ = (base, registry);
-    let tok = Analyzer::tokenizer_by_name("standard").expect("standard tokenizer");
-    let mut a = Analyzer::new(tok);
-    if let Some(l) = Analyzer::token_filter_by_name("lowercase") {
-        a = a.with_filter(l);
-    }
-    a.with_filter(filter)
+/// A `search_as_you_type` sub-field analyzer: the parent field's resolved
+/// analyzer (index, search or search-quote) followed by `filter`, as ES's
+/// `SearchAsYouTypeAnalyzer` wraps the configured analyzers (finding 355:
+/// a hardcoded standard chain dropped folding, stemming, ...).
+fn analyzer_with(base: &Analyzer, filter: Box<dyn TokenFilter>) -> Analyzer {
+    base.clone().with_filter(filter)
 }
 
 /// Fields that exist in the lookup without being leaves of the mapping:
@@ -790,16 +793,23 @@ pub fn extend_lookup(lk: &mut FieldLookup, m: &Mappings) {
     for f in sayt {
         let n = f.ext.as_ref().and_then(|e| e.u64("max_shingle_size")).unwrap_or(3) as usize;
         let mut subs = Vec::new();
-        let mut add = |suffix: String, analyzer: Analyzer, search: Option<Arc<Analyzer>>| {
+        // The parent's resolved analyzers.
+        let index: Arc<Analyzer> = match &f.index_analyzer {
+            Some(crate::analysis::IndexAnalyzer::Custom(a)) => a.clone(),
+            Some(crate::analysis::IndexAnalyzer::Builtin(name)) => lk.registry.analyzer(name).unwrap_or_else(|| Arc::new(Analyzer::standard())),
+            None => Arc::new(Analyzer::standard()),
+        };
+        let search = f.search_analyzer.clone().unwrap_or_else(|| index.clone());
+        let quote = f.search_quote_analyzer.clone().unwrap_or_else(|| search.clone());
+        let mut add = |suffix: String, analyzer: Analyzer, search: Analyzer, quote: Analyzer| {
             let name = format!("{}.{suffix}", f.name);
             let Some(id) = m.core_ids.get(&name).copied() else { return };
             let mut sf = (*f).clone();
             sf.name = name.clone();
             sf.core_id = Some(id);
-            let a = Arc::new(analyzer);
-            sf.index_analyzer = Some(crate::analysis::IndexAnalyzer::Custom(a.clone()));
-            sf.search_analyzer = Some(search.clone().unwrap_or_else(|| a.clone()));
-            sf.search_quote_analyzer = Some(search.unwrap_or(a));
+            sf.index_analyzer = Some(crate::analysis::IndexAnalyzer::Custom(Arc::new(analyzer)));
+            sf.search_analyzer = Some(Arc::new(search));
+            sf.search_quote_analyzer = Some(Arc::new(quote));
             sf.is_multi_field = true;
             sf.multi_fields = Vec::new();
             sf.copy_to = Vec::new();
@@ -807,16 +817,12 @@ pub fn extend_lookup(lk: &mut FieldLookup, m: &Mappings) {
             lk.fields.insert(name, Arc::new(sf));
         };
         for k in 2..=n {
-            add(format!("_{k}gram"), analyzer_with("standard", &lk.registry, Box::new(ShingleFilter { size: k })), None);
+            let shingles = || Box::new(ShingleFilter { size: k });
+            add(format!("_{k}gram"), analyzer_with(&index, shingles()), analyzer_with(&search, shingles()), analyzer_with(&quote, shingles()));
         }
-        let search_prefix = {
-            let mut a = Analyzer::new(Analyzer::tokenizer_by_name("standard").expect("standard tokenizer"));
-            if let Some(l) = Analyzer::token_filter_by_name("lowercase") {
-                a = a.with_filter(l);
-            }
-            Arc::new(a)
-        };
-        add("_index_prefix".to_string(), analyzer_with("standard", &lk.registry, Box::new(IndexPrefixFilter { max_shingle: n })), Some(search_prefix));
+        // The prefix field matches query terms against indexed prefixes:
+        // its queries use the parent's search analysis as is.
+        add("_index_prefix".to_string(), analyzer_with(&index, Box::new(IndexPrefixFilter { max_shingle: n })), (*search).clone(), (*quote).clone());
         let mut main = (*f).clone();
         main.multi_fields.extend(subs);
         lk.fields.insert(f.name.clone(), Arc::new(main));

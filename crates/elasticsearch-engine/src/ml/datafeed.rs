@@ -480,3 +480,55 @@ mod tests {
         assert_eq!(default_query_delay("p7aspot-j1"), "102822ms");
     }
 }
+
+/// The time span a datafeed searches at once (`chunking_config`):
+/// `manual` its `time_span`; `auto` for an aggregated datafeed 1000 of its
+/// histogram intervals (ES `ChunkedDataExtractor`: the aggregation's
+/// bucket count per search stays bounded); `None` for the whole window
+/// (`off`, or `auto` over a scroll, which pages by itself).
+pub fn chunk_span_ms(df: &Value) -> Option<i64> {
+    let cc = &df["chunking_config"];
+    match cc["mode"].as_str().unwrap_or("auto") {
+        "off" => None,
+        "manual" => cc["time_span"].as_str().and_then(|t| super::job::parse_time(t, "time_span").ok()).map(|t| t.millis()).filter(|ms| *ms > 0),
+        _ => histogram_interval_ms(&df["aggregations"]).map(|ms| ms.saturating_mul(1000)),
+    }
+}
+
+/// The interval of the first `date_histogram` (or composite
+/// `date_histogram` source) in an aggregations tree.
+fn histogram_interval_ms(aggs: &Value) -> Option<i64> {
+    fn interval(h: &Value) -> Option<i64> {
+        if let Some(i) = h["fixed_interval"].as_str().or_else(|| h["interval"].as_str()) {
+            return super::job::parse_time(i, "interval").ok().map(|t| t.millis());
+        }
+        let calendar = h["calendar_interval"].as_str()?;
+        Some(match calendar {
+            "1s" | "second" => 1_000,
+            "1m" | "minute" => 60_000,
+            "1h" | "hour" => 3_600_000,
+            "1d" | "day" => 86_400_000,
+            "1w" | "week" => 604_800_000,
+            "1M" | "month" => 2_592_000_000,
+            "1q" | "quarter" => 7_776_000_000,
+            "1y" | "year" => 31_536_000_000,
+            _ => return None,
+        })
+    }
+    for (_, a) in aggs.as_object()? {
+        if let Some(h) = a.get("date_histogram") {
+            return interval(h);
+        }
+        if let Some(sources) = a.get("composite").and_then(|c| c["sources"].as_array()) {
+            for s in sources.iter().filter_map(Value::as_object).flat_map(|s| s.values()) {
+                if let Some(h) = s.get("date_histogram") {
+                    return interval(h);
+                }
+            }
+        }
+        if let Some(i) = histogram_interval_ms(a.get("aggregations").or_else(|| a.get("aggs")).unwrap_or(&Value::Null)) {
+            return Some(i);
+        }
+    }
+    None
+}

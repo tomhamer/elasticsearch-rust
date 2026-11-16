@@ -1139,3 +1139,24 @@ fn huge_string_allocations_are_script_errors_not_aborts() {
     assert_eq!((c["type"].as_str(), c["reason"].as_str()), (Some("illegal_format_width_exception"), Some("-2147483648")));
     assert_eq!(run("return String.format('%5s', new def[] {'a'})"), json!("    a"));
 }
+
+/// Review finding 630: a conditional with numeric branches of different
+/// types promotes to their common type whichever branch is taken
+/// (int/double -> double, int/long -> long), before the enclosing
+/// arithmetic; same-typed branches and `def` storage keep it.
+#[test]
+fn conditional_numeric_promotion() {
+    let _compilation_budget = rate_limit::fixture_budget("10000/1m");
+    for (src, want) in [
+        ("return (true ? 1 : 2.0) / 2;", json!(0.5)),
+        ("return (false ? 2.0 : 1) / 2;", json!(0.5)),
+        ("return (true ? 2000000000 : 0L) + 2000000000;", json!(4000000000i64)),
+        ("boolean b = params.x > 5; return (b ? 2000000000 : 0L) + 2000000000;", json!(4000000000i64)),
+        ("def v = (true ? 1 : 2.0); return v / 2;", json!(0.5)),
+        ("return (true ? (false ? 1 : 2L) : 3.0) / 4;", json!(0.5)),
+        ("return (true ? 1 : 2) / 2;", json!(0)),
+        ("return (true ? 1.0 : 2.0) / 2;", json!(0.5)),
+    ] {
+        assert_eq!(run(src), want, "{src}");
+    }
+}

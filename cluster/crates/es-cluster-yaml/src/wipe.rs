@@ -68,6 +68,29 @@ impl Wiper {
     }
 
     /// Returns a list of problems (empty = clean).
+    /// Persistent and transient cluster settings only (ES
+    /// `wipeClusterSettings`, for suites that preserve their indices).
+    pub async fn wipe_settings(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let s = self.get("/_cluster/settings?flat_settings=true").await;
+        let mut reset = Map::new();
+        for scope in ["persistent", "transient"] {
+            if let Some(m) = s[scope].as_object() {
+                if !m.is_empty() {
+                    reset.insert(scope.into(), Value::Object(m.keys().map(|k| (k.clone(), Value::Null)).collect()));
+                }
+            }
+        }
+        if !reset.is_empty() {
+            match self.call(reqwest::Method::PUT, "/_cluster/settings", Some(Value::Object(reset))).await {
+                Ok((st, _)) if st < 300 => {}
+                Ok((st, v)) => problems.push(format!("reset cluster settings: HTTP {st} {v}")),
+                Err(e) => problems.push(format!("reset cluster settings: {e}")),
+            }
+        }
+        problems
+    }
+
     pub async fn wipe(&self) -> Vec<String> {
         let mut problems = Vec::new();
         let mut note = |r: Result<u16, String>, what: &str| match r {
@@ -269,7 +292,7 @@ mod template_tests {
     #[test]
     fn cleanup_preserves_only_reference_history_prefixes_and_existing_security_policy() {
         for name in [".ds-ilm-history-7-2026.10.24-000001", ".ds-.slm-history-7-2026.10.24-000001",
-            ".ds-.watcher-history-17-2026.10.24-000001", ".ds-.triggered_watches-1-000001", ".security-7"] {
+            ".ds-.watcher-history-18-2026.10.24-000001", ".ds-.triggered_watches-1-000001", ".security-7"] {
             assert!(preserved_during_index_cleanup(name), "{name}");
         }
         for name in [".ds-logs-test-000001", "ilm-history-test", ".ds-ilm-history", ".ds-.slm-history",

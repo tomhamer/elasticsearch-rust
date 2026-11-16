@@ -27,6 +27,17 @@
 //! Dictionaries whose block data or first keys exceed 4 GiB use 24-byte
 //! index entries with u64 offsets. The exact index length identifies the
 //! width; the trailer and narrow representation remain unchanged.
+//!
+//! An interleaved dictionary (segment format
+//! [`crate::codec::INTERLEAVED_TERMS_SINCE`]+, written by merges) shares its
+//! bytes with the postings section: a merge streams the dictionary's closed
+//! blocks into the segment file between postings runs as they fill, so the
+//! section starts where the postings do and holds them as gaps between
+//! block runs. A gap table between the blocks' end (the sentinel's block
+//! offset) and the first keys lists them: `n × (u64 block, u64 len)`, the
+//! `len` foreign bytes lying right before block `block` (`num_blocks`: before
+//! the sentinel's offset), by block. A dictionary without gaps has an empty
+//! table, the layout above byte for byte.
 
 use super::directory::FileSlice;
 use super::varint::{read_bytes, read_vint, write_vint};
@@ -104,9 +115,15 @@ pub struct TermDictWriter {
     pend_suffix: Vec<u8>,
     pend_loc: Vec<u8>,
     pend: Vec<(u32, u32, u32, u32, u32)>,
-    /// Block bytes already handed out by [`TermDictWriter::take_spill`]:
-    /// `out` holds the section from this offset on.
+    /// Block bytes already handed out by [`TermDictWriter::take_spill`]
+    /// (and foreign bytes skipped, [`TermDictWriter::skip`]): `out` holds
+    /// the section from this offset on.
     spilled: usize,
+    /// Blocks handed out by [`TermDictWriter::take_spill`] (the others are
+    /// in `out` or open).
+    spilled_blocks: usize,
+    /// Interleaved dictionaries: `(block, len)` foreign bytes before `block`.
+    gaps: Vec<(u64, u64)>,
     /// Integer-keyed blocks ([`TermDictWriter::int_keys`], v34+): the open
     /// block's keys (ends in `pend_kend`), and its shape once it grows
     /// past [`BLOCK_TERMS`] as an integer-keyed block.
@@ -392,6 +409,8 @@ impl TermDictWriter {
             pend_loc: Vec::new(),
             pend: Vec::new(),
             spilled: 0,
+            spilled_blocks: 0,
+            gaps: Vec::new(),
             int_keys: false,
             pend_keys: Vec::new(),
             pend_kend: Vec::new(),
@@ -690,7 +709,28 @@ impl TermDictWriter {
             return None;
         }
         self.spilled += self.out.len();
+        self.spilled_blocks = self.blocks.len();
         Some(std::mem::take(&mut self.out))
+    }
+
+    /// `n` foreign bytes (postings) were written to the section's file
+    /// right after what [`Self::take_spill`] handed out so far: the blocks
+    /// not yet handed out land after them (an interleaved dictionary,
+    /// whose section starts where the first foreign bytes do).
+    pub fn skip(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let first = self.spilled_blocks;
+        for b in &mut self.blocks[first..] {
+            b.0 += n;
+        }
+        self.block_start += n;
+        self.spilled += n;
+        match self.gaps.last_mut() {
+            Some((block, len)) if *block == first as u64 => *len += n as u64,
+            _ => self.gaps.push((first as u64, n as u64)),
+        }
     }
 
     /// Bytes the writer holds now (buffers it keeps until [`Self::finish`]).
@@ -710,6 +750,11 @@ impl TermDictWriter {
 
     fn finish_with_width(mut self, num_docs: u32, wide: bool) -> Vec<u8> {
         let blocks_end = self.spilled + self.out.len();
+        // The gap table (interleaved dictionaries only; empty otherwise).
+        for &(block, len) in &self.gaps {
+            self.out.extend_from_slice(&block.to_le_bytes());
+            self.out.extend_from_slice(&len.to_le_bytes());
+        }
         let keys_start = self.spilled + self.out.len();
         self.out.extend_from_slice(&self.first_keys);
         let index_start = self.spilled + self.out.len();
@@ -758,7 +803,9 @@ pub struct TermDictReader {
     index_entry: usize,
     num_terms: u64,
     num_docs: u32,
-    negative_filter: std::sync::OnceLock<Option<(u16, Vec<u64>)>>,
+    /// The ID negative-lookup filter: its bits admitted for as long as the
+    /// reader keeps them.
+    negative_filter: std::sync::OnceLock<Option<(u16, crate::admission::Allocation<Vec<u64>>)>>,
     /// Entries hold tagged offsets ([`TermDictWriter::tagged`]).
     tagged: bool,
     /// Compact entries ([`TermDictWriter::compact`]).
@@ -767,7 +814,12 @@ pub struct TermDictReader {
     positions: bool,
     /// Blocks open with a header byte ([`TermDictWriter::packed`]).
     packed: bool,
+    /// Interleaved dictionaries: the gap table's start and entry count.
+    gaps_start: usize,
+    gaps: usize,
 }
+
+const GAP_ENTRY: usize = 16;
 
 pub(crate) fn negative_filter_address(bytes: &[u8], words: usize) -> (usize, u64) {
     negative_filter_slot(negative_filter_hash(bytes), words)
@@ -845,7 +897,61 @@ impl TermDictReader {
     fn block_bytes(&self, b: usize) -> &[u8] {
         let (o0, _) = self.offsets(b);
         let (o1, _) = self.offsets(b + 1);
+        let o1 = if self.gaps == 0 { o1 } else { o1.saturating_sub(self.gap_before(b + 1)).max(o0) };
         &self.bytes()[o0..o1]
+    }
+
+    /// Gap table entry `i`: `(block, len)`.
+    #[inline]
+    fn gap(&self, i: usize) -> (u64, u64) {
+        let at = self.gaps_start + i * GAP_ENTRY;
+        let e = &self.bytes()[at..at + GAP_ENTRY];
+        (u64::from_le_bytes(e[..8].try_into().unwrap()), u64::from_le_bytes(e[8..].try_into().unwrap()))
+    }
+
+    /// Foreign bytes right before block `b` (an interleaved dictionary).
+    #[inline]
+    fn gap_before(&self, b: usize) -> usize {
+        let (mut lo, mut hi) = (0usize, self.gaps);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let (block, len) = self.gap(mid);
+            match block.cmp(&(b as u64)) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return len as usize,
+            }
+        }
+        0
+    }
+
+    /// Foreign bytes the section holds between its blocks (an interleaved
+    /// dictionary's postings; 0 for any other).
+    pub fn gap_bytes(&self) -> u64 {
+        (0..self.gaps).map(|i| self.gap(i).1).sum()
+    }
+
+    /// The `[start, end)` runs of this dictionary's own bytes before its
+    /// first keys, in section offsets (one run when it has no gaps).
+    pub fn block_runs(&self) -> Vec<(u64, u64)> {
+        if self.gaps == 0 {
+            return vec![(0, self.len as u64)];
+        }
+        let mut runs = Vec::with_capacity(self.gaps + 1);
+        let mut start = self.offsets(0).0 as u64;
+        for i in 0..self.gaps {
+            let (block, len) = self.gap(i);
+            let at = self.offsets(block as usize).0 as u64;
+            let end = at.saturating_sub(len);
+            if end > start { runs.push((start, end)); }
+            start = start.max(at);
+        }
+        let (end, _) = self.offsets(self.num_blocks);
+        let end = (end as u64).saturating_sub(self.gap_before(self.num_blocks) as u64);
+        if end > start { runs.push((start, end)); }
+        // The gap table, first keys, index and trailer.
+        runs.push((self.gaps_start as u64, self.len as u64));
+        runs
     }
 
     /// Block `b`'s header byte ([`TermDictWriter::packed`]; 0 otherwise)
@@ -999,12 +1105,24 @@ impl TermDictReader {
             compact,
             positions: false,
             packed: false,
+            gaps_start: 0,
+            gaps: 0,
         };
+        let mut r = r;
         // O(1) sanity check of the sentinel; per-block offsets are checked
         // by slice indexing when a block is read.
         let (blocks_end, keys_len) = r.offsets(num_blocks);
         if blocks_end > keys_start || keys_start.checked_add(keys_len) != Some(index_start) {
             return Err(corrupted("index out of range"));
+        }
+        // An interleaved dictionary's gap table sits between the blocks and
+        // the first keys (nothing does in any other).
+        if keys_start > blocks_end {
+            if (keys_start - blocks_end) % GAP_ENTRY != 0 {
+                return Err(corrupted("bad gap table"));
+            }
+            r.gaps_start = blocks_end;
+            r.gaps = (keys_start - blocks_end) / GAP_ENTRY;
         }
         Ok(r)
     }
@@ -1122,7 +1240,7 @@ impl TermDictReader {
                 each(&key, n, &loc);
             }
         }
-        Ok((self.index_entry + TRAILER) as u64)
+        Ok((self.index_entry + TRAILER + self.gaps * GAP_ENTRY) as u64)
     }
 
     pub fn num_docs(&self) -> u32 {
@@ -1410,17 +1528,27 @@ impl TermDictReader {
     /// [`TermDictReader::may_contain_unique_term`] by the term's
     /// [`negative_filter_hash`] (hashed once for many filters).
     pub fn may_contain_unique_hash(&self, field: u16, hash: u64) -> bool {
-        let filter = self.negative_filter.get_or_init(|| self.build_negative_filter(field).ok().map(|bits| (field, bits)));
-        let Some((filter_field, bits)) = filter else { return true };
+        if self.negative_filter.get().is_none() {
+            match self.build_negative_filter(field) {
+                Ok(bits) => { let _ = self.negative_filter.set(Some((field, bits))); }
+                // Memory refused: the exact lookup, and another try later
+                // (the filter is only an accelerator).
+                Err(crate::error::RusticError::Memory(_)) => return true,
+                Err(_) => { let _ = self.negative_filter.set(None); }
+            }
+        }
+        let Some(Some((filter_field, bits))) = self.negative_filter.get() else { return true };
         if *filter_field != field { return true; }
         let (word, mask) = negative_filter_slot(hash, bits.len());
         bits[word] & mask == mask
     }
 
-    fn build_negative_filter(&self, field: u16) -> Result<Vec<u64>> {
+    fn build_negative_filter(&self, field: u16) -> Result<crate::admission::Allocation<Vec<u64>>> {
         // 12 bits/document, capped at 64 MiB per segment. Saturation only
-        // increases false positives; it cannot affect correctness.
+        // increases false positives; it cannot affect correctness. Admitted
+        // before it is allocated, kept with the reader.
         let words = ((self.num_docs as u64 * 12).div_ceil(64).max(1).next_power_of_two()).min(8 * 1024 * 1024) as usize;
+        let memory = crate::admission::shared().reserve(words as u64 * 8, "id negative lookup filter")?;
         let mut bits = vec![0u64; words];
         let lower = field.to_le_bytes();
         let upper = crate::types::field_key_end(field);
@@ -1435,7 +1563,7 @@ impl TermDictReader {
                 true
             })?;
         }
-        Ok(bits)
+        Ok(crate::admission::Allocation::new(bits, memory))
     }
 
     pub fn contains(&self, term: &Term) -> bool {
@@ -1507,6 +1635,56 @@ impl TermDictReader {
             None => crate::types::Term::field_key_end(field),
         };
         self.range(&lo, hi.as_deref()).unwrap_or_default()
+    }
+
+    /// Visit the terms of `field` with text in `[lower, upper)` in order,
+    /// one at a time (nothing materialized); `f` returns `false` to stop.
+    pub fn range_visit(&self, field: u16, lower: Option<&[u8]>, upper: Option<&[u8]>, f: &mut dyn FnMut(&[u8], PostingsLocation) -> bool) {
+        let prefix = field.to_le_bytes();
+        let mut lo = prefix.to_vec();
+        if let Some(l) = lower {
+            lo.extend_from_slice(l);
+        }
+        let hi: Option<Vec<u8>> = match upper {
+            Some(u) => {
+                let mut h = prefix.to_vec();
+                h.extend_from_slice(u);
+                Some(h)
+            }
+            None => crate::types::Term::field_key_end(field),
+        };
+        let (lower, upper) = (lo.as_slice(), hi.as_deref());
+        let start = self.locate_block(lower).unwrap_or(0);
+        let mut done = false;
+        for b in start..self.num_blocks {
+            if done {
+                break;
+            }
+            if let Some(u) = upper {
+                if self.first_key(b) >= u {
+                    break;
+                }
+            }
+            let visited = self.for_each_in_block(b, |k, loc| {
+                if k < lower {
+                    return true;
+                }
+                if let Some(u) = upper {
+                    if k >= u {
+                        done = true;
+                        return false;
+                    }
+                }
+                if !f(k, loc) {
+                    done = true;
+                    return false;
+                }
+                true
+            });
+            if visited.is_err() {
+                break;
+            }
+        }
     }
 
     /// Every term in the dictionary, in order.
@@ -1706,6 +1884,72 @@ mod tests {
                 spilled.extend_from_slice(&w.finish(5000));
                 assert_eq!(spilled, whole, "{name} threshold {threshold}");
             }
+        }
+    }
+
+    /// An interleaved dictionary (v38 merges): foreign bytes written between
+    /// its spilled blocks (and before its first, and before its tail) read
+    /// back as gaps: every lookup, the cursor, per-term bytes and the gap
+    /// accounting match the contiguous dictionary.
+    #[test]
+    fn interleaved_dictionary_reads_like_a_contiguous_one() {
+        let mut keys: Vec<Vec<u8>> = (0..4000u32).map(|i| Term::new_text(0, &format!("value {}_{}", i % 41, i * 7919 % 100_003)).key()).collect();
+        keys.extend((0..3000u32).map(|i| Term::new_text(1, &format!("AaGc2ZTwVrHG6{:07x}", i * 3)).key()));
+        keys.sort();
+        keys.dedup();
+        let locs: Vec<PostingsLocation> = (0..keys.len()).map(|i| if i % 3 == 0 {
+            PostingsLocation { offset: INLINE_POSTINGS | (i as u64 % 100_000), doc_freq: 1, total_term_freq: 1 }
+        } else {
+            PostingsLocation { offset: 64 + i as u64 * 24, doc_freq: 2, total_term_freq: 5 }
+        }).collect();
+        // As a v38 merge writes it (see `merge::stream_postings_with`).
+        let writer = || TermDictWriter::new().tagged(true).compact(true).inline_positions(true).packed(true).int_keys(true);
+        let mut whole = writer();
+        for (k, l) in keys.iter().zip(&locs) { whole.add(k, l); }
+        let whole = TermDictReader::open_versioned(FileSlice::from_vec(whole.finish(9000)), crate::codec::VERSION).unwrap();
+        for (threshold, every) in [(1usize, 7usize), (900, 50), (64 << 10, 400), (usize::MAX, 1000)] {
+            let mut w = writer();
+            let mut file = Vec::new();
+            let mut junk = 0u64;
+            let mut put_junk = |w: &mut TermDictWriter, file: &mut Vec<u8>, n: usize| {
+                file.extend(std::iter::repeat_n(0xEEu8, n));
+                w.skip(n);
+                junk += n as u64;
+            };
+            put_junk(&mut w, &mut file, 13);
+            for (i, (k, l)) in keys.iter().zip(&locs).enumerate() {
+                w.add(k, l);
+                if i % every == every - 1 {
+                    put_junk(&mut w, &mut file, 1 + i % 97);
+                    if let Some(blocks) = w.take_spill(threshold) {
+                        file.extend_from_slice(&blocks);
+                    }
+                }
+            }
+            put_junk(&mut w, &mut file, 29);
+            file.extend_from_slice(&w.finish(9000));
+            let r = TermDictReader::open_versioned(FileSlice::from_vec(file.clone()), crate::codec::VERSION).unwrap();
+            assert_eq!(r.gap_bytes(), junk, "threshold {threshold}");
+            let own: u64 = r.block_runs().iter().map(|&(a, b)| b - a).sum();
+            assert_eq!(own, file.len() as u64 - junk, "threshold {threshold}");
+            for &(a, b) in &r.block_runs() {
+                assert!(!file[a as usize..b as usize].is_empty());
+            }
+            for (k, l) in keys.iter().zip(&locs) {
+                assert_eq!(r.lookup(k).unwrap(), Some(*l), "threshold {threshold}");
+            }
+            assert_eq!(r.lookup(&Term::new_text(0, "value 0_zzz").key()).unwrap(), None);
+            assert_eq!(r.iter_all().unwrap(), whole.iter_all().unwrap(), "threshold {threshold}");
+            let mut c = r.cursor();
+            let mut n = 0;
+            while c.advance().unwrap() { assert_eq!(c.key(), &keys[n][..]); n += 1; }
+            assert_eq!(n, keys.len());
+            let (mut a, mut b) = (0u64, 0u64);
+            let ua = r.for_each_term_bytes(|_, n, _| a += n).unwrap();
+            let ub = whole.for_each_term_bytes(|_, n, _| b += n).unwrap();
+            assert_eq!(a, b, "threshold {threshold}");
+            assert_eq!(a + ua, file.len() as u64 - junk, "threshold {threshold}");
+            assert!(ub <= ua);
         }
     }
 

@@ -574,6 +574,9 @@ pub fn term_vectors(node: &Node, index: &str, id: Option<&str>, req: &TvRequest)
         Some(s) => serde_json::from_str(s)?,
         None => Value::Object(Map::new()),
     };
+    // Fields with stored term vectors that `_source` does not keep
+    // (excluded or disabled) are rebuilt from the values kept for them.
+    let src = crate::stored::with_term_vector_values(src, &g.doc);
     let tv = render(&sh, &lookup, &src, req, false)?;
     for f in tv.keys() {
         crate::field_usage::bump(&svc.uuid, f, "term_vectors");
@@ -598,6 +601,12 @@ fn item_error(e: &EsError) -> Value {
 
 /// `_mtermvectors`: `docs` (per-doc `_index`/`_id`/options) or `ids`.
 pub fn mterm_vectors(node: &Node, index: Option<&str>, params: &HashMap<String, String>, body: &Value) -> Result<Value> {
+    mterm_vectors_with(node, index, params, body, &|_| Ok(()))
+}
+
+/// [`mterm_vectors`] with each document's index authorized by `authorize`
+/// first (a refused document is that item's failure).
+pub fn mterm_vectors_with(node: &Node, index: Option<&str>, params: &HashMap<String, String>, body: &Value, authorize: &dyn Fn(&str) -> Result<()>) -> Result<Value> {
     // Request-level options (URL params, except the multi-request ones).
     let mut base = TvRequest::default();
     let mut ids_param: Option<Vec<String>> = None;
@@ -662,6 +671,16 @@ pub fn mterm_vectors(node: &Node, index: Option<&str>, params: &HashMap<String, 
         let Some(idx) = idx else {
             return Err(EsError::action_validation(&[&format!("index is missing for doc {i}")]));
         };
+        if let Err(e) = authorize(&idx) {
+            let mut m = Map::new();
+            m.insert("_index".into(), json!(idx));
+            if let Some(id) = id {
+                m.insert("_id".into(), json!(id));
+            }
+            m.insert("error".into(), item_error(&e));
+            out.push(Value::Object(m));
+            continue;
+        }
         let res = term_vectors(node, &idx, id.as_deref(), &r);
         match res {
             Ok(v) => out.push(v),

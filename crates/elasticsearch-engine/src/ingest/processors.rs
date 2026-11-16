@@ -237,26 +237,44 @@ fn parse_date_formats(formats: &[String]) -> Vec<DateFmt> {
         .collect()
 }
 
-fn parse_with(fmts: &[DateFmt], s: &str, tz: Tz) -> Option<i64> {
+#[cfg(test)]
+thread_local! {
+    /// Tests: the "current" UTC year yearless dates take.
+    pub(crate) static INGEST_YEAR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The current UTC year (ES ingest `DateFormat` completes a date parsed
+/// without a year with it, finding 252).
+fn current_year() -> i32 {
+    #[cfg(test)]
+    if let Some(y) = INGEST_YEAR.with(|y| y.get()) {
+        return y;
+    }
+    chrono::Datelike::year(&chrono::Utc::now())
+}
+
+/// Parse an ingest date to epoch nanoseconds (finding 243: the
+/// sub-millisecond digits survive to the output format).
+fn parse_with(fmts: &[DateFmt], s: &str, tz: Tz) -> Option<i128> {
     for f in fmts {
         let r = match f {
-            DateFmt::Iso => DateFormatter::new("date_optional_time").ok().and_then(|d| d.parse_with_tz(s, tz).ok()),
-            DateFmt::Unix => s.trim().parse::<f64>().ok().map(|x| (x * 1000.0).round() as i64),
-            DateFmt::UnixMs => s.trim().parse::<i64>().ok(),
+            DateFmt::Iso => DateFormatter::new("date_optional_time").ok().and_then(|d| d.parse_nanos_with(s, tz, None).ok()),
+            DateFmt::Unix => s.trim().parse::<f64>().ok().map(|x| (x * 1000.0).round() as i64 as i128 * 1_000_000),
+            DateFmt::UnixMs => s.trim().parse::<i64>().ok().map(|m| m as i128 * 1_000_000),
             DateFmt::Tai64n => {
                 let t = s.trim().trim_start_matches('@');
                 if t.len() >= 24 {
                     let base = i64::from_str_radix(&t[..16], 16).ok();
                     let rest = i64::from_str_radix(&t[16..24], 16).ok();
                     match (base, rest) {
-                        (Some(b), Some(r)) => Some((b - 4611686018427387914) * 1000 + r / 1_000_000),
+                        (Some(b), Some(r)) => Some((b - 4611686018427387914) as i128 * 1_000_000_000 + r as i128),
                         _ => None,
                     }
                 } else {
                     None
                 }
             }
-            DateFmt::Java(p) => DateFormatter::new(p).ok().and_then(|d| d.parse_with_tz(s, tz).ok()),
+            DateFmt::Java(p) => DateFormatter::new(p).ok().and_then(|d| d.parse_nanos_with(s, tz, Some(current_year())).ok()),
         };
         if r.is_some() {
             return r;
@@ -268,40 +286,32 @@ fn parse_with(fmts: &[DateFmt], s: &str, tz: Tz) -> Option<i64> {
 const EN_MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const EN_DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
-/// (months full, months abbreviated, weekdays) for a few common locales.
-fn locale_names(lang: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, Vec<&'static str>)> {
-    let v = |s: &'static str| s.split(' ').collect::<Vec<_>>();
-    Some(match lang {
-        "fr" => (v("janvier février mars avril mai juin juillet août septembre octobre novembre décembre"), v("janv. févr. mars avr. mai juin juil. août sept. oct. nov. déc."), v("lundi mardi mercredi jeudi vendredi samedi dimanche")),
-        "de" => (v("Januar Februar März April Mai Juni Juli August September Oktober November Dezember"), v("Jan. Feb. März Apr. Mai Juni Juli Aug. Sept. Okt. Nov. Dez."), v("Montag Dienstag Mittwoch Donnerstag Freitag Samstag Sonntag")),
-        "es" => (v("enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre"), v("ene feb mar abr may jun jul ago sept oct nov dic"), v("lunes martes miércoles jueves viernes sábado domingo")),
-        "it" => (v("gennaio febbraio marzo aprile maggio giugno luglio agosto settembre ottobre novembre dicembre"), v("gen feb mar apr mag giu lug ago set ott nov dic"), v("lunedì martedì mercoledì giovedì venerdì sabato domenica")),
-        "pt" => (v("janeiro fevereiro março abril maio junho julho agosto setembro outubro novembro dezembro"), v("jan. fev. mar. abr. mai. jun. jul. ago. set. out. nov. dez."), v("segunda-feira terça-feira quarta-feira quinta-feira sexta-feira sábado domingo")),
-        "nl" => (v("januari februari maart april mei juni juli augustus september oktober november december"), v("jan feb mrt apr mei jun jul aug sep okt nov dec"), v("maandag dinsdag woensdag donderdag vrijdag zaterdag zondag")),
-        _ => return None,
-    })
-}
-
 /// Rewrite locale month/weekday names to English so the English-only parser can read them;
 /// `None` when the text uses English names under a non-English locale (ES fails that parse).
-fn localize_input(s: &str, locale: &str) -> Option<String> {
+fn localize_input(s: &str, locale: &str, ampm: bool) -> Option<String> {
     let lang = locale.split(['_', '-']).next().unwrap_or("").to_lowercase();
     if lang.is_empty() || lang == "en" {
         return Some(s.to_string());
     }
-    let Some((months, abbr, days)) = locale_names(&lang) else { return Some(s.to_string()) };
-    let mut out = s.to_string();
+    let Some((months, days)) = crate::locale_names::month_and_day_names(locale) else { return Some(s.to_string()) };
+    let out = s.to_string();
     let mut pairs: Vec<(String, &str)> = Vec::new();
-    for (i, m) in months.iter().enumerate() {
+    for (m, i) in months {
         pairs.push((m.to_string(), EN_MONTHS[i]));
     }
-    for (i, m) in abbr.iter().enumerate() {
-        pairs.push((m.to_string(), EN_MONTHS[i]));
-    }
-    for (i, d) in days.iter().enumerate() {
+    for (d, i) in days {
         pairs.push((d.to_string(), EN_DAYS[i]));
     }
-    pairs.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+    // The locale's AM / PM markers for a pattern with `a`
+    // (`crate::locale_names::am_pm`, CLDR day periods).
+    if ampm {
+        if let Some([am, pm]) = crate::locale_names::am_pm(locale) {
+            pairs.push((am.to_string(), "AM"));
+            pairs.push((pm.to_string(), "PM"));
+        }
+    }
+    pairs.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    pairs.dedup_by(|a, b| a.0.to_lowercase() == b.0.to_lowercase());
     let lower = out.to_lowercase();
     // English names that are not also valid locale names make the parse fail
     let local_set: Vec<String> = pairs.iter().map(|p| p.0.to_lowercase()).collect();
@@ -311,13 +321,58 @@ fn localize_input(s: &str, locale: &str) -> Option<String> {
             return None;
         }
     }
-    for (name, en) in &pairs {
-        let lo = out.to_lowercase();
-        if let Some(pos) = lo.find(&name.to_lowercase()) {
-            out.replace_range(pos..pos + name.len(), en);
+    // One pass over the original text: at each word start the longest
+    // locale name matching a whole word is replaced; replaced text is never
+    // scanned again (finding 462: `marzo` -> `March` must not then match
+    // `mar` inside `March`).
+    let chars: Vec<char> = out.chars().collect();
+    let lowered: Vec<Vec<char>> = pairs.iter().map(|(n, _)| n.to_lowercase().chars().collect()).collect();
+    let mut res = String::with_capacity(out.len());
+    // Letters that form words with their neighbours (ideographic scripts
+    // write names without spaces: `2025年3月2日`).
+    let word = |c: char| c.is_alphabetic() && !matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF);
+    let mut i = 0;
+    while i < chars.len() {
+        let at_start = i == 0 || !word(chars[i - 1]);
+        let hit = at_start
+            .then(|| {
+                pairs.iter().zip(&lowered).find(|(_, name)| {
+                    let n = name.len();
+                    i + n <= chars.len()
+                        && chars[i..i + n].iter().zip(name.iter()).all(|(c, l)| c.to_lowercase().eq(std::iter::once(*l)))
+                        && (!word(name[n - 1]) || chars.get(i + n).is_none_or(|c| !word(*c)))
+                })
+            })
+            .flatten();
+        match hit {
+            Some(((_, en), name)) => {
+                res.push_str(en);
+                i += name.len();
+            }
+            None => {
+                res.push(chars[i]);
+                i += 1;
+            }
         }
     }
-    Some(out)
+    Some(res)
+}
+
+/// Whether a Java pattern among `fmts` has an AM/PM field (`a` outside
+/// quoted literals).
+fn uses_am_pm(fmts: &[DateFmt]) -> bool {
+    fmts.iter().any(|f| match f {
+        DateFmt::Java(p) => {
+            let mut quoted = false;
+            p.chars().any(|c| {
+                if c == '\'' {
+                    quoted = !quoted;
+                }
+                !quoted && c == 'a'
+            })
+        }
+        _ => false,
+    })
 }
 
 fn fmt_label(f: &DateFmt) -> String {
@@ -382,11 +437,11 @@ impl Processor for DateP {
             None => Tz::UTC,
         };
         let parse_src = match &self.locale {
-            Some(l) => localize_input(&s, &rf(doc, l)),
+            Some(l) => localize_input(&s, &rf(doc, l), uses_am_pm(&self.formats)),
             None => Some(s.clone()),
         };
-        let ms = parse_src.and_then(|p| parse_with(&self.formats, &p, tz)).ok_or_else(|| date_parse_error(&self.formats, &s))?;
-        let out = DateFormatter::new(&self.output_format)?.format(ms, tz);
+        let nanos = parse_src.and_then(|p| parse_with(&self.formats, &p, tz)).ok_or_else(|| date_parse_error(&self.formats, &s))?;
+        let out = DateFormatter::new(&self.output_format)?.format_nanos(nanos, tz);
         doc.set(&self.target, Value::String(out))?;
         Ok(())
     }
@@ -400,6 +455,8 @@ struct DateIndexNameP {
     formats: Vec<DateFmt>,
     timezone: String,
     index_format: String,
+    /// The `locale` input dates are parsed in (finding 461).
+    locale: Option<String>,
 }
 
 impl Processor for DateIndexNameP {
@@ -407,7 +464,11 @@ impl Processor for DateIndexNameP {
         let v = doc.require(&self.field)?.clone();
         let s = value_to_string(&v);
         let tz = parse_tz(&rf(doc, &self.timezone))?;
-        let ms = parse_with(&self.formats, &s, tz).ok_or_else(|| date_parse_error(&self.formats, &s))?;
+        let parse_src = match &self.locale {
+            Some(l) => localize_input(&s, &rf(doc, l), uses_am_pm(&self.formats)),
+            None => Some(s.clone()),
+        };
+        let ms = parse_src.and_then(|p| parse_with(&self.formats, &p, tz)).ok_or_else(|| date_parse_error(&self.formats, &s))?.div_euclid(1_000_000) as i64;
         let fmt = rf(doc, &self.index_format);
         let day = DateFormatter::new(&fmt)?.format(ms, tz);
         let rounding = rf(doc, &self.rounding);
@@ -663,7 +724,7 @@ impl Processor for DissectP {
         let mut appends: BTreeMap<String, Vec<(i64, usize, String)>> = BTreeMap::new();
         let mut refs_k: BTreeMap<String, String> = BTreeMap::new();
         let mut refs_v: BTreeMap<String, String> = BTreeMap::new();
-        let mut plain: Vec<(String, String)> = Vec::new();
+        let mut plain: Vec<(String, usize, String)> = Vec::new();
         for (i, (k, v)) in vals.into_iter().enumerate() {
             if k.skip {
                 continue;
@@ -675,12 +736,14 @@ impl Processor for DissectP {
             } else if k.append {
                 appends.entry(k.name.clone()).or_default().push((k.order, i, v));
             } else {
-                plain.push((k.name, v));
+                plain.push((k.name, i, v));
             }
         }
-        for (n, v) in plain {
+        for (n, i, v) in plain {
             if appends.contains_key(&n) {
-                appends.get_mut(&n).unwrap().push((0, 0, v));
+                // A plain capture of an appended key keeps its pattern
+                // position (finding 463).
+                appends.get_mut(&n).unwrap().push((0, i, v));
             } else {
                 doc.set(&n, Value::String(v))?;
             }
@@ -745,7 +808,7 @@ impl DissectP {
         let mut appends: BTreeMap<String, Vec<(i64, usize, Vec<u16>)>> = BTreeMap::new();
         let mut refs_k: BTreeMap<String, Vec<u16>> = BTreeMap::new();
         let mut refs_v: BTreeMap<String, Vec<u16>> = BTreeMap::new();
-        let mut plain: Vec<(String, Vec<u16>)> = Vec::new();
+        let mut plain: Vec<(String, usize, Vec<u16>)> = Vec::new();
         for (i, (k, v)) in vals.into_iter().enumerate() {
             if k.skip {
                 continue;
@@ -757,13 +820,13 @@ impl DissectP {
             } else if k.append {
                 appends.entry(k.name.clone()).or_default().push((k.order, i, v));
             } else {
-                plain.push((k.name, v));
+                plain.push((k.name, i, v));
             }
         }
         let mut output=Vec::new();
-        for (n, v) in plain {
+        for (n, i, v) in plain {
             if appends.contains_key(&n) {
-                appends.get_mut(&n).unwrap().push((0, 0, v));
+                appends.get_mut(&n).unwrap().push((0, i, v));
             } else {
                 output.push((n,v));
             }
@@ -804,14 +867,17 @@ struct GsubP {
     field: String,
     target: String,
     re: Regex,
-    replacement: String,
+    /// The replacement in regex crate syntax, or why Java would refuse it
+    /// (reported when the processor runs, as Java's `replaceAll` does).
+    replacement: std::result::Result<String, String>,
     ignore_missing: bool,
 }
 
 impl Processor for GsubP {
     fn process(&self, doc: &mut IngestDocument, _: &PipelineContext) -> PResult {
         let Some(v) = input(doc, &self.field, self.ignore_missing, "cannot process it.")? else { return Ok(()) };
-        let f = |s: &str| self.re.replace_all(s, self.replacement.as_str()).into_owned();
+        let replacement = self.replacement.as_ref().map_err(|e| ia(e.clone()))?;
+        let f = |s: &str| self.re.replace_all(s, replacement.as_str()).into_owned();
         let out = match v {
             Value::String(s) => Value::String(f(&s)),
             Value::Array(a) => Value::Array(a.iter().map(|x| match x {
@@ -825,36 +891,58 @@ impl Processor for GsubP {
     }
 }
 
-/// Java replacement syntax (`$1`, `${name}`, `\$`) → regex crate syntax.
-fn java_replacement(r: &str) -> String {
+/// Java replacement syntax (`$1`, `${name}`, `\$`) → regex crate syntax,
+/// for a pattern with `groups` capturing groups. As Java's
+/// `Matcher.appendReplacement`, digits after `$` extend the group number
+/// only while that group exists (`$10` with one group is group 1 then `0`,
+/// finding 250); a reference to a missing group or a bare `$` is an error.
+fn java_replacement(r: &str, groups: usize) -> std::result::Result<String, String> {
     let mut out = String::new();
     let cs: Vec<char> = r.chars().collect();
     let mut i = 0;
     while i < cs.len() {
         match cs[i] {
-            '\\' if i + 1 < cs.len() => {
-                if cs[i + 1] == '$' {
+            '\\' => {
+                let Some(&next) = cs.get(i + 1) else { return Err("character to be escaped is missing".into()) };
+                if next == '$' {
                     out.push_str("$$");
                 } else {
-                    out.push(cs[i + 1]);
+                    out.push(next);
                 }
                 i += 2;
             }
-            '$' if i + 1 < cs.len() && cs[i + 1].is_ascii_digit() => {
-                let mut j = i + 1;
-                while j < cs.len() && cs[j].is_ascii_digit() {
-                    j += 1;
+            '$' => match cs.get(i + 1) {
+                Some('{') => {
+                    let end = cs[i + 2..].iter().position(|c| *c == '}').ok_or("named capturing group is missing trailing '}'")?;
+                    out.extend(&cs[i..i + 2 + end + 1]);
+                    i += 2 + end + 1;
                 }
-                out.push_str(&format!("${{{}}}", cs[i + 1..j].iter().collect::<String>()));
-                i = j;
-            }
+                Some(d) if d.is_ascii_digit() => {
+                    let mut n = d.to_digit(10).unwrap_or(0) as usize;
+                    if n > groups {
+                        return Err(format!("No group {n}"));
+                    }
+                    let mut j = i + 2;
+                    while let Some(d) = cs.get(j).and_then(|c| c.to_digit(10)) {
+                        let next = n * 10 + d as usize;
+                        if next > groups {
+                            break;
+                        }
+                        n = next;
+                        j += 1;
+                    }
+                    out.push_str(&format!("${{{n}}}"));
+                    i = j;
+                }
+                _ => return Err("Illegal group reference".into()),
+            },
             c => {
                 out.push(c);
                 i += 1;
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Java regex → regex crate (possessive quantifiers become greedy). Syntax
@@ -1006,9 +1094,14 @@ impl Processor for ForeachP {
                         doc.ingest_map_mut().insert("_key".into(), Value::String(k.clone()));
                         doc.ingest_map_mut().insert("_value".into(), x);
                         run_node(&self.inner, doc, cx)?;
-                        let nk = doc.ingest_map_mut().insert("_key".into(), prev_key.clone()).map(|k| value_to_string(&k)).unwrap_or(k);
+                        let nk = doc.ingest_map_mut().insert("_key".into(), prev_key.clone()).filter(|k| !k.is_null()).map(|k| value_to_string(&k));
                         let nv = doc.ingest_map_mut().insert("_value".into(), prev_value.clone()).unwrap_or(Value::Null);
-                        out.insert(nk, nv);
+                        // A null or blank new key removes the entry (ES
+                        // `Strings.hasText`, finding 476).
+                        if let Some(nk) = nk.filter(|k| !k.trim().is_empty()) {
+                            out.insert(nk, nv);
+                        }
+                        let _ = k;
                     }
                     doc.set(&self.field, Value::Object(out))?;
                     Ok(())
@@ -1053,6 +1146,22 @@ impl Processor for DotExpanderP {
             }
         }
         for k in keys {
+            let target = match &self.path {
+                Some(p) => format!("{p}.{k}"),
+                None => k.clone(),
+            };
+            // Every ancestor is checked before the dotted key is removed (ES
+            // `DotExpanderProcessor`): a failed expansion leaves it in place,
+            // under ignore_failure / on_failure too (finding 249).
+            let segs: Vec<&str> = target.split('.').collect();
+            for i in 1..segs.len() {
+                let pre = segs[..i].join(".");
+                if let Ok(Some(pv)) = doc.get(&pre) {
+                    if !pv.is_object() && !pv.is_null() && !pv.is_array() {
+                        return Err(ia(format!("cannot expand [{k}], because [{pre}] is not an object field, but a value field")).into());
+                    }
+                }
+            }
             let v = match &self.path {
                 Some(p) => {
                     let parent = doc.get(p)?.cloned();
@@ -1066,19 +1175,6 @@ impl Processor for DotExpanderP {
                 }
                 None => doc.ctx_map_mut().shift_remove(&k).unwrap_or(Value::Null),
             };
-            let target = match &self.path {
-                Some(p) => format!("{p}.{k}"),
-                None => k.clone(),
-            };
-            let segs: Vec<&str> = target.split('.').collect();
-            for i in 1..segs.len() {
-                let pre = segs[..i].join(".");
-                if let Ok(Some(pv)) = doc.get(&pre) {
-                    if !pv.is_object() && !pv.is_null() && !pv.is_array() {
-                        return Err(ia(format!("cannot expand [{k}], because [{pre}] is not an object field, but a value field")).into());
-                    }
-                }
-            }
             if doc.has(&target) && !self.overwrite {
                 doc.append(&target, v, true)?;
             } else {
@@ -1184,7 +1280,13 @@ impl Processor for SecurityUserP {
             return Err(EsError::new(500, "illegal_state_exception", "Security (authentication) is not enabled on this cluster, so there is no active user - the [set_security_user] processor cannot be used without security").into());
         };
         let e = u.effective();
-        let mut out = Map::new();
+        // ES `SetSecurityUserProcessor`: the selected properties are set on
+        // the existing target object (a non-object target is replaced);
+        // its other members are kept.
+        let mut out = match doc.get(&self.field)? {
+            Some(Value::Object(m)) => m.clone(),
+            _ => Map::new(),
+        };
         let want = |k: &str| self.properties.as_ref().map(|p| p.iter().any(|x| x == k)).unwrap_or(true);
         if want("username") {
             out.insert("username".into(), json!(e.username));
@@ -1207,15 +1309,20 @@ impl Processor for SecurityUserP {
         }
         if want("api_key") {
             if let crate::security::Principal::ApiKey { id, name, metadata } = &u.principal {
-                let mut k = json!({"id": id, "name": name});
+                let mut k = out.get("api_key").and_then(Value::as_object).cloned().unwrap_or_default();
+                k.insert("id".into(), json!(id));
+                k.insert("name".into(), json!(name));
                 if metadata.as_object().is_some_and(|m| !m.is_empty()) {
-                    k["metadata"] = metadata.clone();
+                    k.insert("metadata".into(), metadata.clone());
                 }
-                out.insert("api_key".into(), k);
+                out.insert("api_key".into(), Value::Object(k));
             }
         }
         if want("realm") {
-            out.insert("realm".into(), json!({"name": u.realm_name, "type": u.realm_type}));
+            let mut r = out.get("realm").and_then(Value::as_object).cloned().unwrap_or_default();
+            r.insert("name".into(), json!(u.realm_name));
+            r.insert("type".into(), json!(u.realm_type));
+            out.insert("realm".into(), Value::Object(r));
         }
         if want("authentication_type") {
             out.insert("authentication_type".into(), json!(u.auth_type.to_uppercase()));
@@ -1477,7 +1584,8 @@ pub fn build(cfg: &mut Cfg) -> Result<Box<dyn Processor>> {
             let target = cfg.opt_str("target_field")?.unwrap_or_else(|| field.clone());
             let ignore_missing = cfg.bool_or("ignore_missing", false)?;
             let re = java_regex(&pattern).map_err(|e| cfg.err("pattern", e.reason))?;
-            Box::new(GsubP { field, target, re, replacement: java_replacement(&replacement), ignore_missing })
+            let groups = re.captures_len() - 1;
+            Box::new(GsubP { field, target, re, replacement: java_replacement(&replacement, groups), ignore_missing })
         }
         "split" => {
             let field = cfg.req_str("field")?;
@@ -1543,9 +1651,9 @@ pub fn build(cfg: &mut Cfg) -> Result<Box<dyn Processor>> {
             let rounding = cfg.req_str("date_rounding")?;
             let formats = cfg.opt_list_str("date_formats")?.unwrap_or_else(|| vec!["yyyy-MM-dd'T'HH:mm:ss.SSSXX".into()]);
             let timezone = cfg.str_or("timezone", "UTC")?;
-            cfg.ignore(&["locale"]);
+            let locale = cfg.opt_str("locale")?;
             let index_format = cfg.str_or("index_name_format", "yyyy-MM-dd")?;
-            Box::new(DateIndexNameP { field, prefix, rounding, formats: parse_date_formats(&formats), timezone, index_format })
+            Box::new(DateIndexNameP { field, prefix, rounding, formats: parse_date_formats(&formats), timezone, index_format, locale })
         }
         "grok" => {
             let field = cfg.req_str("field")?;
@@ -1726,9 +1834,142 @@ fn config_err(cfg: &Cfg, msg: &str) -> EsError {
 mod tests {
     use super::*;
 
+    fn run_one(kind: &str, cfg: Value, doc: Value) -> std::result::Result<IngestDocument, String> {
+        let mut c = Cfg { kind: kind.into(), tag: None, m: cfg.as_object().unwrap().clone(), raw: None };
+        let p = build(&mut c).map_err(|e| e.reason)?;
+        let store = super::super::IngestService::in_memory();
+        let cx = PipelineContext::new(&store);
+        let mut d = IngestDocument::new(doc.as_object().unwrap().clone(), "i", None, None, "now".into());
+        match p.process(&mut d, &cx) {
+            Ok(()) => Ok(d),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    }
+
+    /// Dates outside the 64-bit nanosecond range still parse in the date
+    /// processor (it only formats them).
+    #[test]
+    fn far_dates_parse() {
+        for (input, want) in [("9999-12-31T00:00:00Z", "9999-12-31T00:00:00.000Z"), ("1500-01-01T00:00:00Z", "1500-01-01T00:00:00.000Z")] {
+            let d = run_one("date", json!({"field": "t", "formats": ["ISO8601"]}), json!({"t": input})).unwrap();
+            assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!(want), "{input}");
+        }
+    }
+
+    /// Finding 243: an explicit nanosecond output_format keeps the
+    /// sub-millisecond digits; the default output keeps milliseconds.
+    #[test]
+    fn date_keeps_requested_nanoseconds() {
+        let nanos = json!({"field": "t", "formats": ["ISO8601"], "output_format": "yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX"});
+        for input in ["2026-11-09T12:00:00.123456789Z", "2026-11-09T12:00:00.123456788Z"] {
+            let d = run_one("date", nanos.clone(), json!({"t": input})).unwrap();
+            assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!(input));
+        }
+        let d = run_one("date", json!({"field": "t", "formats": ["ISO8601"]}), json!({"t": "2026-11-09T12:00:00.123456789Z"})).unwrap();
+        assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!("2026-11-09T12:00:00.123Z"));
+        let d = run_one("date", json!({"field": "t", "formats": ["yyyy-MM-dd HH:mm:ss.SSSSSSSSS"], "output_format": "yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX"}), json!({"t": "2026-11-09 12:00:00.000000007"})).unwrap();
+        assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!("2026-11-09T12:00:00.000000007Z"));
+    }
+
+    /// Finding 252: a yearless pattern takes the current UTC year (ES ingest
+    /// `DateFormat`), for date and date_index_name; explicit years stay.
+    #[test]
+    fn yearless_dates_take_the_current_year() {
+        INGEST_YEAR.with(|y| y.set(Some(2026)));
+        let d = run_one("date", json!({"field": "t", "formats": ["MMM dd HH:mm:ss"]}), json!({"t": "Nov 09 12:34:56"})).unwrap();
+        assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!("2026-11-09T12:34:56.000Z"));
+        let d = run_one("date", json!({"field": "t", "formats": ["yyyy MMM dd HH:mm:ss"]}), json!({"t": "2019 Nov 09 12:34:56"})).unwrap();
+        assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!("2019-11-09T12:34:56.000Z"));
+        // February 29th in a common year does not exist.
+        assert!(run_one("date", json!({"field": "t", "formats": ["MMM dd HH:mm:ss"]}), json!({"t": "Feb 29 00:00:00"})).is_err());
+        INGEST_YEAR.with(|y| y.set(Some(2024)));
+        assert!(run_one("date", json!({"field": "t", "formats": ["MMM dd HH:mm:ss"]}), json!({"t": "Feb 29 00:00:00"})).is_ok());
+        INGEST_YEAR.with(|y| y.set(Some(2026)));
+        let d = run_one("date_index_name", json!({"field": "t", "date_formats": ["MMM dd HH:mm:ss"], "date_rounding": "d", "index_name_prefix": "logs-", "index_name_format": "yyyy-MM-dd"}), json!({"t": "Nov 09 12:34:56"})).unwrap();
+        let index = d.get("_index").unwrap().unwrap().as_str().unwrap().to_string();
+        assert_eq!(resolve_index_expression(&index).unwrap(), "logs-2026-11-09");
+        INGEST_YEAR.with(|y| y.set(None));
+    }
+
+    /// Finding 251: a wall time in a DST gap moves later by the gap (java.time):
+    /// a valid Sao Paulo midday routes to its own day, and a Paris spring
+    /// 02:30 is 03:30+02:00.
+    #[test]
+    fn dst_gaps_resolve_forward() {
+        let d = run_one("date_index_name", json!({"field": "t", "date_formats": ["ISO8601"], "timezone": "America/Sao_Paulo", "date_rounding": "d", "index_name_prefix": "logs-", "index_name_format": "yyyy-MM-dd"}), json!({"t": "2018-11-04T12:00:00-02:00"})).unwrap();
+        let index = d.get("_index").unwrap().unwrap().as_str().unwrap().to_string();
+        assert_eq!(resolve_index_expression(&index).unwrap(), "logs-2018-11-04");
+        let d = run_one("date", json!({"field": "t", "formats": ["yyyy-MM-dd HH:mm:ss"], "timezone": "Europe/Paris"}), json!({"t": "2024-03-31 02:30:00"})).unwrap();
+        assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!("2024-03-31T03:30:00.000+02:00"));
+        // An ordinary time and an autumn overlap (earlier offset) are unchanged.
+        let d = run_one("date", json!({"field": "t", "formats": ["yyyy-MM-dd HH:mm:ss"], "timezone": "Europe/Paris"}), json!({"t": "2024-10-27 02:30:00"})).unwrap();
+        assert_eq!(d.get("@timestamp").unwrap().unwrap(), &json!("2024-10-27T02:30:00.000+02:00"));
+    }
+
+    /// Finding 246: set_security_user sets the selected properties on the
+    /// existing target object and keeps its other members (also inside
+    /// `realm`); an absent or non-object target is created.
+    #[test]
+    fn set_security_user_merges_into_the_target() {
+        let store = super::super::IngestService::in_memory();
+        let user = crate::security::Security::system();
+        let cx = PipelineContext { user: Some(user.clone()), ..PipelineContext::new(&store) };
+        let p = SecurityUserP { field: "user".into(), properties: Some(vec!["username".into(), "realm".into()]) };
+        let mut doc = IngestDocument::new(json!({"user": {"id": "u1", "domain": "corp", "username": "old", "realm": {"note": "kept"}}}).as_object().unwrap().clone(), "i", None, None, "now".into());
+        p.process(&mut doc, &cx).unwrap();
+        let u = doc.get("user").unwrap().unwrap().clone();
+        assert_eq!((&u["id"], &u["domain"], &u["realm"]["note"]), (&json!("u1"), &json!("corp"), &json!("kept")), "{u}");
+        assert_eq!(u["username"], json!(user.effective().username));
+        assert_eq!(u["realm"]["name"], json!(user.realm_name));
+        for start in [json!({}), json!({"user": "scalar"})] {
+            let mut doc = IngestDocument::new(start.as_object().unwrap().clone(), "i", None, None, "now".into());
+            p.process(&mut doc, &cx).unwrap();
+            assert_eq!(doc.get("user.username").unwrap().unwrap(), &json!(user.effective().username));
+        }
+    }
+
+    /// Localized month and weekday names come from the JDK's (CLDR) locale
+    /// data for every locale, with regional variants and genitive forms
+    /// (findings 461/462).
+    #[test]
+    fn localized_names_cover_cldr_locales() {
+        let l = |s: &str, loc: &str| localize_input(s, loc, false).unwrap();
+        // `a`: the locale's day periods.
+        let pm = crate::locale_names::am_pm("es").unwrap()[1];
+        assert_eq!(localize_input(&format!("02-marzo-2025 3:15 {pm}"), "es", true).unwrap(), "02-March-2025 3:15 PM");
+        let am = crate::locale_names::am_pm("de").unwrap()[0];
+        assert_eq!(localize_input(&format!("2 März 2025 9:00 {am}"), "de", true).unwrap(), "2 March 2025 9:00 AM");
+        assert_eq!(l("02-marzo-2025", "es"), "02-March-2025");
+        assert_eq!(l("2 марта 2025", "ru"), "2 March 2025");
+        assert_eq!(l("2 de março de 2025", "pt_BR"), "2 de March de 2025");
+        assert_eq!(l("lundi 3 février", "fr_CA"), "Monday 3 February");
+        assert_eq!(l("3. Mai 2025", "de-CH"), "3. May 2025");
+        assert_eq!(l("2025年3月2日", "zh"), "2025年March2日");
+        assert_eq!(l("2025年三月2日", "zh"), "2025年March2日");
+        assert_eq!(l("2 maart 2025", "nl"), "2 March 2025");
+        assert_eq!(l("2 marca 2025", "pl"), "2 March 2025");
+        assert_eq!(l("2 Mart 2025", "tr"), "2 March 2025");
+        assert_eq!(l("2 ottobre 2025", "it_IT"), "2 October 2025");
+        // Legacy Java codes resolve to their CLDR locale.
+        assert_eq!(l("2 מרץ 2025", "iw"), "2 March 2025");
+        // An unknown locale leaves the text alone.
+        assert_eq!(l("2 x 2025", "xx"), "2 x 2025");
+    }
+
     #[test]
     fn helpers() {
-        assert_eq!(java_replacement("$1-${x}\\$"), "${1}-${x}$$");
+        assert_eq!(java_replacement("$1-${x}\\$", 1).unwrap(), "${1}-${x}$$");
+        // Finding 250: digits extend a group reference only while that
+        // group exists (Java `appendReplacement`).
+        assert_eq!(java_replacement("id-$10", 1).unwrap(), "id-${1}0");
+        assert_eq!(java_replacement("$21", 2).unwrap(), "${2}1");
+        assert_eq!(java_replacement("$10", 10).unwrap(), "${10}");
+        assert_eq!(java_replacement("$2", 1).unwrap_err(), "No group 2");
+        assert_eq!(java_replacement("a$b", 1).unwrap_err(), "Illegal group reference");
+        assert_eq!(java_replacement("\\$5 off", 0).unwrap(), "$$5 off");
+        let re = java_regex("^(.+)$").unwrap();
+        let rep = java_replacement("id-$10", re.captures_len() - 1).unwrap();
+        assert_eq!((re.replace_all("a", rep.as_str()), re.replace_all("b", rep.as_str())), ("id-a0".into(), "id-b0".into()));
         assert_eq!(url_decode("a%20b+c").unwrap(), "a b c");
         let (pre, keys) = parse_dissect("%{a} %{+a} - %{?skip} [%{ts}]").unwrap();
         assert_eq!(pre, "");

@@ -277,6 +277,17 @@ fn deriv(samples: &[(i64, f64)]) -> Option<f64> {
     Some((n * sxy - sx * sy) / den)
 }
 
+/// Whether the series of `rows` reports delta temporality (its
+/// temporality dimension, from the series key, is `delta`).
+fn series_is_delta(ctx: &Ctx, t: &Table, rows: &[usize]) -> bool {
+    let Some(field) = &ctx.ts_temporality else { return false };
+    let Some(i) = t.cols.iter().position(|c| c.name == TSID) else { return false };
+    let Some(&r) = rows.first() else { return false };
+    serde_json::from_str::<serde_json::Value>(&t.rows[r][i].to_text()).ok()
+        .and_then(|v| v.get(field.as_str()).and_then(|x| x.as_str().map(str::to_string)))
+        .is_some_and(|x| x.eq_ignore_ascii_case("delta"))
+}
+
 /// The per-series result of an inner function over one group.
 #[allow(clippy::too_many_arguments)]
 fn inner_value(ctx: &Ctx, inner: &Inner, arg: &Expr, extra: Option<Val>, t: &Table, ts_i: usize, rows: &[usize], neighbors: (Option<&[usize]>, Option<&[usize]>), range: Option<(i64, i64)>, arg_ty: &str) -> Result<Val> {
@@ -347,7 +358,25 @@ fn inner_value(ctx: &Ctx, inner: &Inner, arg: &Expr, extra: Option<Val>, t: &Tab
             } else if nums.is_empty() {
                 Val::Null
             } else if matches!(arg_ty, "integer" | "long") {
-                Val::Long(nums.iter().map(|x| x.1 as i64).sum())
+                // ES `SumOverTime` is `Sum`: exact longs, `addExact`; an
+                // overflow is a warning and a null series value.
+                let mut sum: i64 = 0;
+                let mut overflow = false;
+                for v in samples.iter().filter_map(|(_, v)| v.as_i64()) {
+                    match sum.checked_add(v) {
+                        Some(x) => sum = x,
+                        None => {
+                            overflow = true;
+                            break;
+                        }
+                    }
+                }
+                if overflow {
+                    super::exec::sum_overflow_warning(f, inner.pos);
+                    Val::Null
+                } else {
+                    Val::Long(sum)
+                }
             } else {
                 Val::Double(nums.iter().map(|x| x.1).sum())
             }
@@ -398,6 +427,23 @@ fn inner_value(ctx: &Ctx, inner: &Inner, arg: &Expr, extra: Option<Val>, t: &Tab
         "RATE" | "INCREASE" | "DELTA" => {
             let counter = inner.name != "DELTA";
             let per_second = inner.name == "RATE";
+            // A delta-temporality series (`index.time_series.temporality_field`
+            // says `delta`): each sample is the change since the previous
+            // one, so RATE / INCREASE read the running total (ES
+            // `RateDoubleGroupingAggregatorFunction`'s delta state).
+            if counter && series_is_delta(ctx, t, rows) {
+                let mut total = 0.0;
+                let cumulative: Vec<(i64, f64)> = nums.iter().map(|(ts, v)| { total += v; (*ts, total) }).collect();
+                let Some(s) = rate_state(&cumulative, true) else { return Ok(Val::Null) };
+                let r = match range {
+                    Some((start, end)) => bucket_rate(&s, None, None, start as f64 / 1000.0, end as f64 / 1000.0, per_second, true),
+                    None => plain_rate(&s, per_second),
+                };
+                return Ok(match r {
+                    Some(v) if v.is_finite() => Val::Double(v),
+                    _ => Val::Null,
+                });
+            }
             let Some(s) = rate_state(&nums, counter) else { return Ok(Val::Null) };
             let r = match range {
                 Some((start, end)) => {
@@ -522,7 +568,60 @@ pub fn ts_stats(ctx: &mut Ctx, t: Table, aggs: &[Field], by: &[Field], pos: usiz
         groups[gi].rows.push(ri);
     }
     let order: Vec<usize> = index.values().copied().collect();
-    // Inner function columns.
+    // Inner function columns, each with its time window (ms), if given:
+    // the optional `window` argument (the third of PERCENTILE_OVER_TIME,
+    // whose second is the percentile; the second of the others).
+    let mut windows: Vec<Option<i64>> = Vec::new();
+    for i in &inners {
+        let wi = if i.name == "PERCENTILE_OVER_TIME" { 2 } else { 1 };
+        let w = match i.args.get(wi) {
+            None => None,
+            Some(e) => {
+                let v = eval(&bind(ctx, e, &t.cols)?, &[], &ctx.fctx).unwrap_or(Val::Null);
+                let v = match &v {
+                    Val::Str(s) => super::func::parse_temporal(s).unwrap_or(v),
+                    _ => v,
+                };
+                match v {
+                    Val::Null => None,
+                    Val::Dur(ms) if ms > 0 => Some(ms),
+                    other => {
+                        return Err(verification_err(
+                            ctx.full,
+                            i.pos,
+                            format!("the time window of [{}] must be a positive time duration, found [{}]", super::exec::call_src(ctx.full, i.pos), other.to_text()),
+                        ))
+                    }
+                }
+            }
+        };
+        // A window is anchored at the end of each output time bucket.
+        if w.is_some() && bucket.is_none() {
+            return Err(verification_err(
+                ctx.full,
+                i.pos,
+                format!("the time window of [{}] requires grouping by a time bucket (TBUCKET)", super::exec::call_src(ctx.full, i.pos)),
+            ));
+        }
+        windows.push(w);
+    }
+    // Each series' rows by timestamp (the windows select from them).
+    let mut by_series: HashMap<&str, Vec<(i64, usize)>> = HashMap::new();
+    if windows.iter().any(Option::is_some) {
+        for grp in &groups {
+            let v = by_series.entry(grp.tsid.as_str()).or_default();
+            v.extend(grp.rows.iter().map(|&r| (t.rows[r][ts_i].as_i64().unwrap_or(i64::MIN), r)));
+        }
+        for v in by_series.values_mut() {
+            v.sort_unstable();
+        }
+    }
+    let in_range = |tsid: &str, lo: i64, hi: i64| -> Vec<usize> {
+        let Some(v) = by_series.get(tsid) else { return Vec::new() };
+        let a = v.partition_point(|(ts, _)| *ts < lo);
+        let b = v.partition_point(|(ts, _)| *ts < hi);
+        v[a..b].iter().map(|(_, r)| *r).collect()
+    };
     let mut bound_inner: Vec<(Expr, Option<Val>, String)> = Vec::new();
     for i in &inners {
         let arg = match i.args.first() {
@@ -560,7 +659,20 @@ pub fn ts_stats(ctx: &mut Ctx, t: Table, aggs: &[Field], by: &[Field], pos: usiz
         let mut row = Vec::with_capacity(cols.len());
         for (k, i) in inners.iter().enumerate() {
             let (arg, extra, ty) = &bound_inner[k];
-            row.push(inner_value(ctx, i, arg, extra.clone(), &t, ts_i, &grp.rows, (prev, next), range, ty)?);
+            match (windows[k], range) {
+                // The series' samples in the window ending with the bucket,
+                // `[end - window, end)`; a rate interpolates with the
+                // samples of the windows just before and after it.
+                (Some(w), Some((_, end))) => {
+                    let start = end - w;
+                    let rows = in_range(&grp.tsid, start, end);
+                    let before = in_range(&grp.tsid, start - w, start);
+                    let after = in_range(&grp.tsid, end, end + w);
+                    let nb = ((!before.is_empty()).then_some(before.as_slice()), (!after.is_empty()).then_some(after.as_slice()));
+                    row.push(inner_value(ctx, i, arg, extra.clone(), &t, ts_i, &rows, nb, Some((start, end)), ty)?);
+                }
+                _ => row.push(inner_value(ctx, i, arg, extra.clone(), &t, ts_i, &grp.rows, (prev, next), range, ty)?),
+            }
         }
         for (gi, e) in &others {
             // A dimension reads the series' most recent document.
@@ -624,4 +736,71 @@ pub fn ts_stats(ctx: &mut Ctx, t: Table, aggs: &[Field], by: &[Field], pos: usiz
     // Second pass: the user's aggregations over the series results.
     let new_by: Vec<Field> = by.iter().map(|g| Field { name: g.name.clone(), expr: Expr::Col(g.name.clone(), g.pos), filter: None, pos: g.pos }).collect();
     super::exec::stats_pub(ctx, mid, &outer, &new_by, pos)
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn num(v: &Val) -> f64 {
+        match v {
+            Val::Double(x) => *x,
+            Val::Long(x) | Val::Int(x) => *x as f64,
+            _ => f64::NAN,
+        }
+    }
+
+    /// Review finding 174: an explicit time window of a time-series
+    /// function selects each series' samples in the window ending with the
+    /// output bucket, not the bucket's own samples: over one-minute
+    /// TBUCKETs a 5-minute AVG/SUM_OVER_TIME averages/sums the last five
+    /// minutes (a reference computed here), a one-minute window equals the
+    /// unwindowed value, a 5-minute RATE differs from the one-minute one
+    /// (across a counter reset too), and a window without a time bucket is
+    /// refused.
+    #[test]
+    fn time_series_windows_select_their_own_samples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let now = crate::date::now_millis();
+        let base = now - now.rem_euclid(3_600_000) - 3_600_000;
+        node.create_index("m", &json!({
+            "settings": {"index.mode": "time_series", "index.routing_path": ["host"], "index.number_of_replicas": 0,
+                "index.time_series.start_time": crate::ilm::iso_date(base - 3_600_000), "index.time_series.end_time": crate::ilm::iso_date(now + 3_600_000)},
+            "mappings": {"properties": {"@timestamp": {"type": "date"}, "host": {"type": "keyword", "time_series_dimension": true},
+                "cpu": {"type": "double", "time_series_metric": "gauge"}, "req": {"type": "long", "time_series_metric": "counter"}}}}))
+            .unwrap();
+        // Minute k: cpu = k * k, req climbs 10 a minute and resets at minute 6.
+        let req = |k: i64| if k < 6 { 10 * (k + 1) } else { 10 * (k - 5) };
+        let docs: Vec<Value> = (0..10).map(|k| json!({"@timestamp": crate::ilm::iso_date(base + k * 60_000 + 30_000), "host": "a", "cpu": (k * k) as f64, "req": req(k)})).collect();
+        let svc = node.get_index("m").unwrap();
+        let reqs = docs.iter().map(|d| crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let run = |q: &str| crate::esql::run(&node, q, crate::esql::EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() });
+        let out = run("TS m | STATS a1 = AVG(AVG_OVER_TIME(cpu)), a1w = AVG(AVG_OVER_TIME(cpu, 1 minute)), a5 = AVG(AVG_OVER_TIME(cpu, 5 minutes)), s5 = SUM(SUM_OVER_TIME(cpu, 5 minutes)), r1 = SUM(RATE(req)), r5 = SUM(RATE(req, 5 minutes)) BY b = TBUCKET(1 minute) | SORT b").unwrap();
+        let col = |n: &str| out.table.cols.iter().position(|c| c.name == n).unwrap_or_else(|| panic!("{n}: {:?}", out.table.cols));
+        let (a1, a1w, a5, s5, r1, r5) = (col("a1"), col("a1w"), col("a5"), col("s5"), col("r1"), col("r5"));
+        assert_eq!(out.table.rows.len(), 10);
+        let mut rates_differ = false;
+        for (k, row) in out.table.rows.iter().enumerate() {
+            let k = k as i64;
+            let window: Vec<f64> = ((k - 4).max(0)..=k).map(|m| (m * m) as f64).collect();
+            assert_eq!(num(&row[a1]), (k * k) as f64, "minute {k}");
+            assert_eq!(num(&row[a1w]), (k * k) as f64, "minute {k}: a one-minute window is the bucket");
+            let avg5 = window.iter().sum::<f64>() / window.len() as f64;
+            assert!((num(&row[a5]) - avg5).abs() < 1e-9, "minute {k}: {} vs {avg5}", num(&row[a5]));
+            assert!((num(&row[s5]) - window.iter().sum::<f64>()).abs() < 1e-9, "minute {k}");
+            let (x1, x5) = (num(&row[r1]), num(&row[r5]));
+            if x5.is_finite() && (x1.is_nan() || (x1 - x5).abs() > 1e-9) {
+                rates_differ = true;
+            }
+        }
+        assert!(rates_differ, "a 5-minute rate is not the one-minute bucket's rate: {:?}", out.table.rows);
+        let Err(e) = run("TS m | STATS a5 = AVG(AVG_OVER_TIME(cpu, 5 minutes))") else { panic!("a window without a time bucket was accepted") };
+        assert!(e.reason.contains("requires grouping by a time bucket"), "{}", e.reason);
+    }
 }

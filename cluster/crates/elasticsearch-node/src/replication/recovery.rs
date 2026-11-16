@@ -304,6 +304,11 @@ impl RecoverySource {
         // source strings commonly retain spare output capacity after encoding.
         let mut retained_strings = 0u64;
         let term = self.info.primary_term;
+        let lookup = self.svc.lookup();
+        let recovery_source_id = lookup.recovery_source_id;
+        // Disabled / filtered source: indexed dense vectors are rebuilt from
+        // the vector store (`_recovery_source` never keeps them).
+        let rebuild_peak = if recovery_source_id.is_some() { elasticsearch_engine::vector_source::rebuilt_vectors_peak(&lookup) } else { 0 };
         'outer: while self.cursor.0 < self.segments.len() {
             let (seg, dels) = &self.segments[self.cursor.0];
             let leaf = LeafReader::Segment(seg);
@@ -330,9 +335,15 @@ impl RecoverySource {
                 })?
                     .ok_or_else(|| ReplicationError::Corrupt { what: "segment".into(), detail: format!("stored fields of doc {d} in segment {} missing", seg.id) })?;
                 let text = |f: u16| doc.get(f).and_then(|v| v.as_text()).map(str::to_string);
+                // ES `_recovery_source`: the original input of a document
+                // whose stored `_source` is disabled or filtered. The op
+                // must carry it, or the target re-indexes an empty or
+                // partial document (production review #92).
+                let recovery_source = recovery_source_id.and_then(|field| doc.get(field)).and_then(|value| value.as_text());
+                let source_field = if recovery_source.is_some() { recovery_source_id.unwrap_or(SOURCE_FIELD) } else { SOURCE_FIELD };
                 // Stored text copies and the owned op slot coexist with the
                 // decoded document until the next loop iteration.
-                let copied = [ID_FIELD, SOURCE_FIELD, ROUTING_FIELD].into_iter()
+                let copied = [ID_FIELD, source_field, ROUTING_FIELD].into_iter()
                     .filter_map(|field| doc.get(field).and_then(|value| value.as_text()))
                     .fold(0u64, |sum, text| sum.saturating_add(text.len() as u64));
                 // Reallocation can keep the complete old allocation alive
@@ -342,11 +353,20 @@ impl RecoverySource {
                 out.try_reserve_exact(1).map_err(|_| ReplicationError::IllegalState("recovery batch allocation failed".into()))?;
                 let retained = retained_strings.saturating_add((out.capacity() as u64)
                     .saturating_mul(std::mem::size_of::<ReplicaOp>() as u64));
-                let source_json = match doc.get(SOURCE_FIELD).and_then(|value| value.as_text()) {
+                let mut source_json = match recovery_source {
+                    Some(original) => original.to_string(),
+                    None => match doc.get(SOURCE_FIELD).and_then(|value| value.as_text()) {
                     Some(raw) => elasticsearch_engine::vector_source::load_guarded(raw, &self.svc.lookup(), &leaf, d,
                         |peak| before(retained.saturating_add(decode_peak).saturating_add(copied).saturating_add(peak)))?.into_owned(),
                     None => String::new(),
+                    },
                 };
+                if rebuild_peak > 0 {
+                    before(retained.saturating_add(decode_peak).saturating_add(copied).saturating_add(source_json.len() as u64 * 2).saturating_add(rebuild_peak))?;
+                    if let Some(rebuilt) = elasticsearch_engine::vector_source::with_rebuilt_vectors(&source_json, &lookup, &|f| leaf.vector(f, d)) {
+                        source_json = rebuilt;
+                    }
+                }
                 let id = text(ID_FIELD).ok_or_else(|| ReplicationError::Corrupt { what: "segment".into(), detail: format!("doc {d} in segment {} has no _id", seg.id) })?;
                 let op = ReplicaOp::Index {
                     id,

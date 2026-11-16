@@ -261,6 +261,7 @@ impl EsError {
         !matches!(
             kind,
             "illegal_argument_exception"
+                | "tika_exception"
                 | "illegal_state_exception"
                 | "number_format_exception"
                 | "x_content_parse_exception"

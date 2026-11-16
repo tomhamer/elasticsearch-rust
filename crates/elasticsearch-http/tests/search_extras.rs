@@ -407,3 +407,49 @@ async fn highlight_max_analyzed_offset() {
     assert_eq!(st, 200, "{v}");
     assert_eq!(v["hits"]["hits"][0]["highlight"]["g"][0], "The quick brown <em>fox</em> went to the forest and saw another <em>fox</em>.");
 }
+
+// ---- runtime lookup fields ----
+
+/// Finding 222: a `lookup` runtime field on an ordinary target field (ip,
+/// keyword) fetches the matching target doc's fields; a true non-match
+/// returns nothing; the `_id` target keeps working.
+#[tokio::test]
+async fn runtime_lookup_fields_on_ordinary_target_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, c) = start(tmp.path()).await;
+    setup(
+        &c,
+        &base,
+        "ips",
+        json!({"mappings": {"properties": {"ip": {"type": "ip"}, "owner": {"type": "keyword"}, "code": {"type": "keyword"}}}}),
+        &[json!({"ip": "10.0.0.1", "owner": "alice", "code": "k1"}), json!({"ip": "10.0.0.2", "owner": "bob", "code": "k2"})],
+    )
+    .await;
+    setup(
+        &c,
+        &base,
+        "logs",
+        json!({"mappings": {"properties": {"host_ip": {"type": "ip"}, "code": {"type": "keyword"}, "ref": {"type": "keyword"}}}}),
+        &[json!({"host_ip": "10.0.0.1", "code": "k2", "ref": "2"}), json!({"host_ip": "10.9.9.9", "code": "zz", "ref": "nope"})],
+    )
+    .await;
+    let body = json!({
+        "runtime_mappings": {
+            "by_ip": {"type": "lookup", "target_index": "ips", "input_field": "host_ip", "target_field": "ip", "fetch_fields": ["owner"]},
+            "by_code": {"type": "lookup", "target_index": "ips", "input_field": "code", "target_field": "code", "fetch_fields": ["owner", "ip"]},
+            "by_id": {"type": "lookup", "target_index": "ips", "input_field": "ref", "target_field": "_id", "fetch_fields": ["owner"]}
+        },
+        "fields": ["by_ip", "by_code", "by_id"],
+        "_source": false,
+        "sort": [{"code": "asc"}]
+    });
+    let (st, v) = call(&c, Method::POST, format!("{base}/logs/_search"), Some(body)).await;
+    assert_eq!(st, 200, "{v}");
+    let hit = &v["hits"]["hits"][0]["fields"];
+    assert_eq!(hit["by_ip"], json!([{"owner": ["alice"]}]), "{v}");
+    assert_eq!(hit["by_code"], json!([{"owner": ["bob"], "ip": ["10.0.0.2"]}]), "{v}");
+    assert_eq!(hit["by_id"], json!([{"owner": ["bob"]}]), "{v}");
+    // No target doc matches: the lookup fields are omitted.
+    let miss = &v["hits"]["hits"][1];
+    assert!(miss.get("fields").is_none_or(|f| f.get("by_ip").is_none() && f.get("by_code").is_none() && f.get("by_id").is_none()), "{v}");
+}

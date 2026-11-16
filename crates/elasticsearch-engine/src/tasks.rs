@@ -1,9 +1,13 @@
 //! Task manager behind `_tasks`: ids are `<node_id>:<n>`, running tasks
 //! live in a registry (with a cancellation flag and a status object the
 //! task updates as it goes), and completed tasks that were started with
-//! `wait_for_completion=false` keep their result (ES stores these in the
-//! `.tasks` system index; here they are kept in memory and are lost on
-//! restart).
+//! `wait_for_completion=false` keep their result in memory; the REST layers
+//! also store them in the `.tasks` system index (ES `TaskResultsService`)
+//! and look them up there once the in-memory record is gone (a restart).
+//!
+//! Task numbers never repeat across restarts of a node with a data path
+//! ([`TaskManager::persist_ids`]): the node id in a task id is persistent,
+//! so a reused number would make an old task id name unrelated new work.
 
 use crate::error::{EsError, Result};
 use crate::node::NODE_ID;
@@ -169,15 +173,24 @@ pub struct TaskResult {
 /// released then, never left to the reclamation.
 pub struct TaskManager {
     next: AtomicU64,
+    /// Highest task number covered by the durable reservation
+    /// ([`Self::persist_ids`]); `u64::MAX` without one.
+    reserved: AtomicU64,
+    /// Where the reservation is kept (`None`: not persisted).
+    reservation: Mutex<Option<std::path::PathBuf>>,
     running: SkipMap<u64, Slot>,
     done: SkipMap<u64, TaskResult>,
 }
 
 impl Default for TaskManager {
     fn default() -> Self {
-        TaskManager { next: AtomicU64::new(0), running: SkipMap::new(), done: SkipMap::new() }
+        TaskManager { next: AtomicU64::new(0), reserved: AtomicU64::new(u64::MAX), reservation: Mutex::new(None), running: SkipMap::new(), done: SkipMap::new() }
     }
 }
+
+/// Task numbers reserved per durable write of the high-water mark: a
+/// restart skips at most this many numbers.
+const ID_BLOCK: u64 = 1 << 16;
 
 /// A running entry's task: given up when the task finishes (see
 /// [`TaskManager`]). A plain lock, not an `ArcSwapOption`: emptying an
@@ -205,6 +218,14 @@ impl Slot {
 /// is released with the task and needs no shared accounting.
 const REGISTRY_NODE_BYTES: u64 = 128;
 
+/// A task number above any a node could have reached by now (seconds
+/// since the epoch × 2^8; below the cluster layer's 40-bit task numbers
+/// until the year 6300).
+fn clock_floor() -> u64 {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    secs << 8
+}
+
 /// Parse `node:n`.
 pub fn parse_task_id(s: &str) -> Result<(String, u64)> {
     let bad = || EsError::illegal_argument(format!("malformed task id {s}"));
@@ -217,13 +238,64 @@ pub fn parse_task_id(s: &str) -> Result<(String, u64)> {
 }
 
 impl TaskManager {
+    /// Make task numbers durable at `path`: numbers continue above every
+    /// number a previous run of this node could have handed out, and each
+    /// block of numbers is recorded (fsynced) before the first of it is used.
+    pub fn persist_ids(&self, path: std::path::PathBuf) -> std::io::Result<()> {
+        let mut guard = self.reservation.lock();
+        let floor = match std::fs::read_to_string(&path) {
+            Ok(s) => match s.trim().parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    // Unreadable mark (never written partially: the write
+                    // is atomic): continue above a clock-derived floor no
+                    // earlier run can have reached.
+                    tracing::error!(path = %path.display(), "task id reservation is unreadable; continuing above a clock-derived floor");
+                    clock_floor()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        self.next.fetch_max(floor, Ordering::SeqCst);
+        let mark = self.next.load(Ordering::SeqCst) + ID_BLOCK;
+        crate::hooks::write_durable(&path, mark.to_string().as_bytes())?;
+        self.reserved.store(mark, Ordering::SeqCst);
+        *guard = Some(path);
+        Ok(())
+    }
+
+    /// The next task number (see [`Self::persist_ids`]).
+    fn next_id(&self) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        if id > self.reserved.load(Ordering::Acquire) {
+            self.reserve(id);
+        }
+        id
+    }
+
+    #[cold]
+    fn reserve(&self, id: u64) {
+        let guard = self.reservation.lock();
+        let Some(path) = guard.as_ref() else { return };
+        while self.reserved.load(Ordering::Acquire) < id {
+            let mark = id.max(self.reserved.load(Ordering::Acquire)).saturating_add(ID_BLOCK);
+            if let Err(e) = crate::hooks::write_durable(path, mark.to_string().as_bytes()) {
+                // Still advance (a failing disk must not stall every
+                // request); the next block retries the write.
+                tracing::error!(path = %path.display(), "cannot record the task id reservation: {e}");
+            }
+            self.reserved.store(mark, Ordering::Release);
+        }
+    }
+
     pub fn register(&self, action: &str, description: Option<String>, cancellable: bool, store_result: bool, headers: Map<String, Value>) -> Arc<Task> {
         self.register_with_parent(action, description, cancellable, store_result, headers, None)
     }
 
     /// [`Self::register`] for a child task (`parent_task_id`).
     pub fn register_with_parent(&self, action: &str, description: Option<String>, cancellable: bool, store_result: bool, headers: Map<String, Value>, parent: Option<String>) -> Arc<Task> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self.next_id();
         let t = Arc::new(Task {
             id,
             action: action.to_string(),
@@ -275,7 +347,7 @@ impl TaskManager {
         // task's own reservation (skip-list nodes are freed with their entry).
         memory.grow((std::mem::size_of::<Task>()+2*std::mem::size_of::<usize>())as u64,"task registration")?;
         memory.grow(REGISTRY_NODE_BYTES,"task registry node")?;
-        let id=self.next.fetch_add(1,Ordering::Relaxed)+1;
+        let id=self.next_id();
         let cancel=if parent_token.is_some(){rustic_core::cancel::Token::child_of(parent_token)}else{rustic_core::cancel::Token::new()};
         let task=Arc::new(Task{id,action,description,describe,start_millis:crate::date::now_millis(),start:Instant::now(),cancellable,cancel,status:Mutex::new(None),parent,headers:owned_headers,store_result,rps_bits:AtomicU64::new((-1.0f64).to_bits()),_metadata_owner:Some(memory.into_result_owner())});
         self.running.insert(id,Slot::new(task.clone()));
@@ -289,6 +361,14 @@ impl TaskManager {
             let info = task.info_with_runtime(true, elapsed);
             self.done.insert(task.id, TaskResult { task: info, outcome });
         }
+        if let Some(entry) = self.running.remove(&task.id) {
+            drop(entry.value().take());
+        }
+    }
+
+    /// Roll back a registration whose work never started (its admission
+    /// was rejected): the task leaves the running list and keeps no result.
+    pub fn discard(&self, task: &Task) {
         if let Some(entry) = self.running.remove(&task.id) {
             drop(entry.value().take());
         }
@@ -389,6 +469,30 @@ mod tests {
         assert!(tm.running().is_empty(), "no task left registered");
         let stored = all.iter().filter(|id| tm.get_result(**id).is_some()).count();
         assert_eq!(stored, 16 * 20, "results of store_result tasks are kept");
+    }
+
+    /// #96: a node opened again on the same data path never hands out a
+    /// task number an earlier run used.
+    #[test]
+    fn task_numbers_never_repeat_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("task-ids-{}-{}", std::process::id(), crate::date::now_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("task_ids");
+        let mut seen = std::collections::BTreeSet::new();
+        for run in 0..3 {
+            let tm = TaskManager::default();
+            tm.persist_ids(path.clone()).unwrap();
+            // Cross a reservation block in the second run.
+            let n = if run == 1 { ID_BLOCK as usize + 10 } else { 50 };
+            for _ in 0..n {
+                let t = tm.register("x", None, false, false, Map::new());
+                assert!(seen.insert(t.id), "run {run} reused task number {}", t.id);
+                tm.finish(&t, Ok(Value::Null));
+            }
+        }
+        // A node without a data path numbers from 1, as before.
+        assert_eq!(TaskManager::default().register("x", None, false, false, Map::new()).id, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A finished task is released when it finishes, not when the skip

@@ -13,7 +13,7 @@
 //! Scores go through a [`Similarity`] (BM25 by default), chosen per field
 //! by [`SearchContext::sim`].
 
-use crate::automaton::levenshtein::{edit_distance, LevenshteinMatcher};
+use crate::automaton::levenshtein::{edit_distance_bounded, LevenshteinMatcher};
 use crate::automaton::regexp::{RegexpFlags, RegexpMatcher};
 use crate::automaton::wildcard::WildcardMatcher;
 use crate::automaton::TermMatcher;
@@ -25,7 +25,7 @@ use crate::query::function_score::{
     BoostMode, FunctionScoreParams, FunctionScoreScorer, PreparedFunctions, ScoreFunction, ScoreMode,
 };
 use crate::query::multi_term::{
-    const_union, const_union_sorted, enumerate_terms, expand_global_bounded, scoring_union, ExpandedTerm, Fuzziness, MultiTermRewrite,
+    const_union, const_union_matching, const_union_sorted, enumerate_terms, expand_global_bounded, scoring_union, ExpandedTerm, Fuzziness, MultiTermRewrite,
 };
 use crate::codec::postings::PostingsReader;
 use crate::query::reader::{field_stats, term_stats_with_infos, FieldStats, LeafReader, TermStats};
@@ -68,12 +68,10 @@ pub enum Query {
     /// A phrase whose every position accepts any of several terms (Lucene
     /// `MultiPhraseQuery`; `match_phrase` with synonyms).
     MultiPhrase { field: u16, positions: Vec<Vec<Term>>, slop: u32 },
-    /// Terms starting with `prefix`. With `case_insensitive` the prefix is
-    /// lowercased (the field's analyzer must have lowercased the indexed
-    /// terms for this to be a true case-insensitive match).
+    /// Terms starting with `prefix`; with `case_insensitive`, ignoring case
+    /// (whatever case the indexed terms have).
     Prefix { field: u16, prefix: Vec<u8>, max_expansions: usize, case_insensitive: bool, rewrite: MultiTermRewrite },
-    /// `*`/`?` pattern over term text. `case_insensitive` lowercases the
-    /// pattern (see [`Query::Prefix`]).
+    /// `*`/`?` pattern over term text; `case_insensitive` ignores case.
     Wildcard { field: u16, pattern: String, max_expansions: usize, case_insensitive: bool, rewrite: MultiTermRewrite },
     /// Whole-term regular expression; `case_insensitive` matches terms
     /// regardless of case.
@@ -319,10 +317,12 @@ impl Query {
         Query::Term(Term::new_text(field, text))
     }
 
-    /// A term query with the text lowercased (ES `case_insensitive`); only
-    /// a true case-insensitive match when the field's analyzer lowercases.
+    /// A term query ignoring case (ES `case_insensitive`).
     pub fn term_case_insensitive(field: u16, text: &str) -> Self {
-        Query::Term(Term::new_text(field, &text.to_lowercase()))
+        // ES `AutomatonQueries.caseInsensitiveTermQuery`: every indexed
+        // term equal to `text` ignoring case (not only a lower-cased one),
+        // constant scoring.
+        Query::Regexp { field, pattern: literal_regex(text.chars()), case_insensitive: true, max_expansions: usize::MAX, rewrite: MultiTermRewrite::ConstantScore }
     }
 
     /// An exact phrase.
@@ -661,15 +661,24 @@ impl Query {
 
     /// The enumeration this node performs, for multi-term queries.
     fn multi_term_spec(&self) -> Option<MultiTermSpec> {
-        let lower_ci = |b: &[u8]| String::from_utf8_lossy(b).to_lowercase().into_bytes();
         Some(match self {
-            Query::Prefix { field, prefix, max_expansions, case_insensitive, rewrite } => {
-                let p = if *case_insensitive { lower_ci(prefix) } else { prefix.clone() };
-                MultiTermSpec::new(*field, Box::new(PrefixMatcher(p)), *max_expansions, *rewrite)
+            // Case-insensitive prefix / wildcard: an automaton over the
+            // indexed terms ignoring case (ES `AutomatonQueries
+            // .caseInsensitivePrefix` / `toCaseInsensitiveWildcardAutomaton`),
+            // not a lower-cased pattern compared with case.
+            Query::Prefix { field, prefix, max_expansions, case_insensitive: true, rewrite } => {
+                let mut re = literal_regex(String::from_utf8_lossy(prefix).chars());
+                re.push_str(".*");
+                MultiTermSpec::new(*field, Box::new(SharedRegexp(shared_regexp(&re, true)?)), *max_expansions, *rewrite)
             }
-            Query::Wildcard { field, pattern, max_expansions, case_insensitive, rewrite } => {
-                let p = if *case_insensitive { pattern.to_lowercase() } else { pattern.clone() };
-                MultiTermSpec::new(*field, Box::new(WildcardMatcher::new(&p)), *max_expansions, *rewrite)
+            Query::Wildcard { field, pattern, max_expansions, case_insensitive: true, rewrite } => {
+                MultiTermSpec::new(*field, Box::new(SharedRegexp(shared_regexp(&glob_regex(pattern), true)?)), *max_expansions, *rewrite)
+            }
+            Query::Prefix { field, prefix, max_expansions, rewrite, .. } => {
+                MultiTermSpec::new(*field, Box::new(PrefixMatcher(prefix.clone())), *max_expansions, *rewrite)
+            }
+            Query::Wildcard { field, pattern, max_expansions, rewrite, .. } => {
+                MultiTermSpec::new(*field, Box::new(WildcardMatcher::new(pattern)), *max_expansions, *rewrite)
             }
             Query::Regexp { field, pattern, case_insensitive, max_expansions, rewrite } => {
                 let m = shared_regexp(pattern, *case_insensitive)?;
@@ -723,6 +732,31 @@ impl TermMatcher for SharedRegexp {
 /// keyword is one) was compiled to an automaton for every leaf of every
 /// search (EQL's `startsWith` stages: ~5% of a sequence query). `None`: the
 /// pattern does not compile (not cached).
+/// A regexp matching `chars` literally (every non-alphanumeric character
+/// as a `\x{..}` escape, which the Lucene operator check passes).
+fn literal_regex(chars: impl Iterator<Item = char>) -> String {
+    let mut out = String::new();
+    for c in chars {
+        if c.is_alphanumeric() { out.push(c) } else { out.push_str(&format!("\\x{{{:x}}}", c as u32)) }
+    }
+    out
+}
+
+/// A Lucene wildcard pattern (`*`, `?`, `\` escapes) as a regexp.
+fn glob_regex(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut it = pattern.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '\\' => out.push_str(&literal_regex(it.next().into_iter())),
+            c => out.push_str(&literal_regex(std::iter::once(c))),
+        }
+    }
+    out
+}
+
 fn shared_regexp(pattern: &str, case_insensitive: bool) -> Option<Arc<RegexpMatcher>> {
     const ENTRIES: usize = 256;
     static CACHE: std::sync::LazyLock<parking_lot::Mutex<HashMap<(String, bool), Arc<RegexpMatcher>>>> = std::sync::LazyLock::new(Default::default);
@@ -757,7 +791,9 @@ impl MultiTermSpec {
     fn expand(&self, leaves: &[LeafReader<'_>], clause_limit: Option<usize>) -> Result<Vec<ExpandedTerm>, ()> {
         let dist = self.fuzzy.as_ref().map(|(text, tr, max)| {
             let (text, tr, max) = (text.clone(), *tr, *max);
-            move |b: &[u8]| std::str::from_utf8(b).map(|t| edit_distance(&text, t, tr) as u8).unwrap_or(max)
+            // The distance within the matcher's edit bound (banded: linear
+            // in the term length), never an unrestricted DP.
+            move |b: &[u8]| std::str::from_utf8(b).map(|t| edit_distance_bounded(&text, t, tr, max as usize).min(max as usize) as u8).unwrap_or(max)
         });
         let qlen = self.fuzzy.as_ref().map(|(t, _, _)| t.chars().count()).unwrap_or(1);
         let bounds = (self.lower.as_deref(), self.upper.as_deref());
@@ -861,6 +897,9 @@ pub struct SearchContext {
     /// First doc a `function_score` gave a negative or NaN score (ES fails
     /// the shard: "function score query returned an invalid score").
     pub invalid_score: Arc<parking_lot::Mutex<Option<(DocId, f32)>>>,
+    /// A scoring function's failure (ES `field_value_factor` on a document
+    /// without a value and no `missing`: "Missing value for field [f]").
+    pub function_error: Arc<parking_lot::Mutex<Option<String>>>,
     /// Rescore steps: the previous pass's window, per leaf id, as
     /// `(doc, score)` sorted by doc (ES `KnnScoreDocQuery` over the top N).
     pub prev_pass: HashMap<usize, Vec<(DocId, f32)>>,
@@ -892,6 +931,7 @@ impl Default for SearchContext {
             range_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dense_scopes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             invalid_score: Arc::default(),
+            function_error: Arc::default(),
             prev_pass: HashMap::new(),
         }
     }
@@ -992,6 +1032,7 @@ impl SearchContext {
             range_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dense_scopes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             invalid_score: Arc::default(),
+            function_error: Arc::default(),
             prev_pass: HashMap::new(),
         };
         terms.sort_unstable_by(|a, b| a.field.cmp(&b.field).then_with(|| a.text.cmp(&b.text)));
@@ -2014,6 +2055,10 @@ impl Query {
             Query::Custom(c) => c.scorer_b(leaf, ctx, boost),
             Query::Bool { must, should, must_not, filter, minimum_should_match } => bool_scorer(must, should, must_not, filter, minimum_should_match, leaf, ctx, boost),
             Query::DisMax { queries, tie_breaker } => dis_max_scorer(queries, *tie_breaker, leaf, ctx, Some(boost)),
+            // ES `FunctionScoreQuery.createWeight`: the accumulated boost
+            // goes to the inner query, before the functions combine and
+            // before `min_score` decides.
+            Query::FunctionScore { .. } => function_score_scorer(self, leaf, ctx, boost),
             _ => Some(Box::new(Scaled::new(self.scorer(leaf, ctx)?, boost))),
         }
     }
@@ -2056,9 +2101,9 @@ impl Query {
             Query::Prefix { .. } | Query::Wildcard { .. } | Query::Regexp { .. } | Query::Fuzzy { .. } | Query::TermRange { .. } => {
                 let spec = self.multi_term_spec()?;
                 if spec.rewrite == MultiTermRewrite::ConstantScore {
-                    let terms = enumerate_terms(leaf, spec.field, &*spec.matcher, spec.lower.as_deref(), spec.upper.as_deref(), spec.max_expansions);
-                    // Constant-score rewrites (plain and boolean) score the boost, 1.
-                    return Some(const_union(leaf, &terms, 1.0).unwrap_or_else(empty));
+                    // Constant-score rewrites (plain and boolean) score the
+                    // boost, 1; the matching terms are streamed.
+                    return Some(const_union_matching(leaf, spec.field, &*spec.matcher, spec.lower.as_deref(), spec.upper.as_deref(), spec.max_expansions, 1.0).unwrap_or_else(empty));
                 }
                 let expanded = match ctx.expansions.get(&self.node_key()) {
                     Some(e) => e.clone(),
@@ -2158,13 +2203,7 @@ impl Query {
                 }
                 Some(Box::new(ScoredDocs::new(hits)))
             }
-            Query::FunctionScore { query, functions, score_mode, boost_mode, max_boost, min_score } => {
-                let inner = query.scorer(leaf, ctx)?;
-                let params = FunctionScoreParams { score_mode: *score_mode, boost_mode: *boost_mode, max_boost: *max_boost, min_score: *min_score };
-                let funcs = PreparedFunctions::prepare(functions, params, leaf, ctx);
-                let scorer = FunctionScoreScorer::new(inner, funcs);
-                Some(Box::new(if matches!(query.as_ref(), Query::MatchAll) { scorer.with_match_all(leaf.num_docs()) } else { scorer }))
-            }
+            Query::FunctionScore { .. } => function_score_scorer(self, leaf, ctx, 1.0),
             Query::Span(sq) => {
                 let expanded = match ctx.span_expansions.get(&self.node_key()) {
                     Some(span)=>span.clone(),
@@ -2401,12 +2440,10 @@ impl Query {
         let reuse = cursor.as_ref().is_some_and(|c| c.leaf == leaf.id() && c.last < start);
         if !reuse {
             // Inner joins inside `query` are relative to this node's path.
-            let prev = NESTED_PARENT_DEPTH.with(|c| c.replace(info.ord_depth(ord)));
-            let s = match &**query {
+            let s = in_nested_scope(info.ord_depth(ord), ord, || match &**query {
                 Query::Custom(c) => c.inner_hits_scorer(leaf, ctx),
                 q => q.scorer(leaf, ctx),
-            };
-            NESTED_PARENT_DEPTH.with(|c| c.set(prev));
+            });
             *cursor = s.map(|s| InnerHitsCursor { scorer: s, leaf: leaf.id(), last: 0 });
         }
         let Some(cur) = cursor.as_mut() else { return Vec::new() };
@@ -2581,9 +2618,16 @@ impl Query {
             (None, true) => Some(PointFilter::Docs(&docs)),
             (None, false) => None,
         };
-        let (hits, stats) = match store.search_filtered(*field, vector, *k, ef, pf, &cfg) {
+        // Native vector search (DiskBBQ) polls the search's deadline and
+        // cancellation between its posting waves.
+        let searched = crate::cancel::with_search_deadline(ctx.deadline, ctx.cancel.clone(), || store.search_filtered(*field, vector, *k, ef, pf, &cfg));
+        let (hits, stats) = match searched {
             Ok(result)=>result, Err(error)=>{
-                match error { crate::error::RusticError::Memory(reason)=>ctx.record_memory_error(reason), other=>{*ctx.execution_error.lock()=Some(other.to_string());} }
+                match error {
+                    crate::error::RusticError::Memory(reason)=>ctx.record_memory_error(reason),
+                    _ if ctx.stopped() => ctx.vector_timed_out.store(true, std::sync::atomic::Ordering::Relaxed),
+                    other=>{*ctx.execution_error.lock()=Some(other.to_string());}
+                }
                 return Some((Vec::new(),0));
             }
         };
@@ -2692,6 +2736,10 @@ impl Query {
         // Queries that cannot take the boost into their weights are scaled afterwards.
         let absorbs = match self {
             Query::Term(_) | Query::Phrase { .. } | Query::Boost { .. } | Query::Bool { .. } | Query::DisMax { .. } => true,
+            // ES `FunctionScoreQuery`: the boost is inside the sub-query's
+            // weight, so its explanation shows it (and the functions combine
+            // with the boosted score).
+            Query::FunctionScore { .. } => true,
             Query::MultiPhrase { positions, .. } => positions.len() > 1,
             Query::Custom(c) => c.absorbs_boost(),
             _ => false,
@@ -2751,7 +2799,7 @@ impl Query {
             Query::FunctionScore { query, functions, score_mode, boost_mode, max_boost, min_score } => {
                 let params = FunctionScoreParams { score_mode: *score_mode, boost_mode: *boost_mode, max_boost: *max_boost, min_score: *min_score };
                 let funcs = PreparedFunctions::prepare(functions, params, leaf, ctx);
-                funcs.explain(doc, query.explain(leaf, ctx, doc))
+                funcs.explain(doc, query.explain_b(leaf, ctx, doc, boost))
             }
             Query::Custom(c) => c.explain_b(leaf, ctx, doc, score, boost),
             // ES `KnnScoreDocQuery`: the kNN winners as fixed docs.
@@ -2761,8 +2809,20 @@ impl Query {
     }
 }
 
+/// The scorer of `function_score` query `q` whose inner query scores with
+/// `boost` (the function score's own and its parents').
+fn function_score_scorer(q: &Query, leaf: &LeafReader<'_>, ctx: &SearchContext, boost: f32) -> Option<Box<dyn Scorer>> {
+    let Query::FunctionScore { query, functions, score_mode, boost_mode, max_boost, min_score } = q else { return None };
+    let inner = query.scorer_b(leaf, ctx, boost)?;
+    let params = FunctionScoreParams { score_mode: *score_mode, boost_mode: *boost_mode, max_boost: *max_boost, min_score: *min_score };
+    let funcs = PreparedFunctions::prepare(functions, params, leaf, ctx);
+    let scorer = FunctionScoreScorer::new(inner, funcs);
+    // The bulk top-k path scores the match-all query as 1.
+    Some(Box::new(if boost == 1.0 && matches!(query.as_ref(), Query::MatchAll) { scorer.with_match_all(leaf.num_docs()) } else { scorer }))
+}
+
 fn explain_phrase(positions: &[Vec<Term>], slop: u32, leaf: &LeafReader<'_>, ctx: &SearchContext, doc: DocId, score: f32, boost: f32) -> Explanation {
-    let field = positions[0][0].field;
+    let Some(field) = positions.iter().find_map(|p| p.first()).map(|t| t.field) else { return Explanation::leaf(score, "phrase match") };
     let stats: Vec<TermStats> = positions.iter().flatten().map(|t| ctx.stats(t)).collect();
     if let Some(mut p) = leaf.multi_phrase_raw_boosted(positions, slop, ctx.sim(field), &stats, ctx.fstats(field), boost, &|t| leaf.postings(t)) {
         if p.seek(doc) == doc {
@@ -2776,11 +2836,16 @@ fn explain_phrase(positions: &[Vec<Term>], slop: u32, leaf: &LeafReader<'_>, ctx
 /// Lucene's `PhraseQuery` / `MultiPhraseQuery` `toString`: `field:"a b"` with
 /// `(x y)` for alternatives at one position and `~slop` when sloppy.
 fn phrase_text(positions: &[Vec<Term>], slop: u32) -> String {
-    let field = positions[0][0].field;
+    let field = positions.iter().find_map(|p| p.first()).map_or(0, |t| t.field);
     let word = |t: &Term| String::from_utf8_lossy(&t.text).into_owned();
     let parts: Vec<String> = positions
         .iter()
-        .map(|alts| if alts.len() == 1 { word(&alts[0]) } else { format!("({})", alts.iter().map(word).collect::<Vec<_>>().join(" ")) })
+        .map(|alts| match alts.len() {
+            // A hole (Lucene prints `?`).
+            0 => "?".to_string(),
+            1 => word(&alts[0]),
+            _ => format!("({})", alts.iter().map(word).collect::<Vec<_>>().join(" ")),
+        })
         .collect();
     let mut s = format!("field{field}:\"{}\"", parts.join(" "));
     if slop > 0 {
@@ -2795,8 +2860,10 @@ fn explain_span(sq: &SpanQuery, leaf: &LeafReader<'_>, ctx: &SearchContext, doc:
 fn explain_span_scorer(scorer:Option<SpanScorer>, doc:DocId, score:f32) -> Explanation {
     if let Some(mut s) = scorer {
         if s.seek(doc) == doc {
+            let freq = s.sloppy_freq();
+            let value = s.weight().score_freq(freq, s.field_len());
             let e = s.weight().explain(s.freq(), s.field_len());
-            return Explanation::new(e.value, format!("weight(span in {doc}), spanFreq={}", s.freq()), vec![e]);
+            return Explanation::new(value, format!("weight(span in {doc}), spanFreq={freq}, sum of 1 / (1 + width) over {} spans", s.freq()), vec![e]);
         }
     }
     Explanation::leaf(score, "span match")
@@ -2834,7 +2901,7 @@ fn span_scorer_with_stats(sq:&SpanQuery, leaf:&LeafReader<'_>, ctx:&SearchContex
         stats.push(TermStats { doc_freq: 1, total_term_freq: 1, num_docs: leaf.num_docs() as u64 });
     }
     let weight = ctx.sim(field).phrase_weight(&stats, fs, 1.0);
-    Some(SpanScorer::new(spans, weight, Arc::new(leaf.norms(field))))
+    Some(SpanScorer::new(spans, weight, Arc::new(leaf.norms(field))).with_min_len(sq.min_len()))
 }
 
 thread_local! {
@@ -2842,6 +2909,28 @@ thread_local! {
     /// being built (0 = root documents): nested joins are relative to their
     /// enclosing join, as ES parent filters are.
     static NESTED_PARENT_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+    /// Nested path ordinal (of the leaf being scored) of the `Nested` node
+    /// whose inner scorer is being built (0 = root documents): the
+    /// documents a leaf query that walks every doc itself (scripts) may
+    /// match, as ES ANDs the nested type filter in front of the inner query.
+    static NESTED_SCOPE_ORD: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// The nested path ordinal whose documents the scorer being built may
+/// match: `0` = root documents (top level), else the path of the
+/// enclosing `nested` query (see [`crate::nested::NestedInfo::ord`]).
+pub fn nested_scope_ord() -> u16 {
+    NESTED_SCOPE_ORD.with(|c| c.get())
+}
+
+/// Run `f` with the inner query of nested path `ord` (at `depth`) in scope.
+fn in_nested_scope<R>(depth: u16, ord: u16, f: impl FnOnce() -> R) -> R {
+    let prev = NESTED_PARENT_DEPTH.with(|c| c.replace(depth));
+    let prev_ord = NESTED_SCOPE_ORD.with(|c| c.replace(ord));
+    let r = f();
+    NESTED_PARENT_DEPTH.with(|c| c.set(prev));
+    NESTED_SCOPE_ORD.with(|c| c.set(prev_ord));
+    r
 }
 
 /// Block join: run `query` over the leaf, keep the live docs of nested
@@ -2862,9 +2951,7 @@ fn nested_scorer(path: &str, query: &Query, mode: NestedScoreMode, leaf: &LeafRe
             return s;
         }
     }
-    let prev = NESTED_PARENT_DEPTH.with(|c| c.replace(depth));
-    let s = query.scorer(leaf, ctx);
-    NESTED_PARENT_DEPTH.with(|c| c.set(prev));
+    let s = in_nested_scope(depth, ord, || query.scorer(leaf, ctx));
     let s = s?;
     let bound = nested_bound(mode, s.score_upper_bound());
     // SAFETY: the scorer never outlives the search holding the leaf (the
@@ -3406,9 +3493,7 @@ fn nested_filter_scorer(path: &str, query: &Query, leaf: &LeafReader<'_>, ctx: &
             return s;
         }
     }
-    let prev = NESTED_PARENT_DEPTH.with(|c| c.replace(depth));
-    let s = query.scorer(leaf, ctx);
-    NESTED_PARENT_DEPTH.with(|c| c.set(prev));
+    let s = in_nested_scope(depth, ord, || query.scorer(leaf, ctx));
     let mut s = s?;
     let nwords = (leaf.num_docs() as usize / 64) + 1;
     let mut words = vec![0u64; nwords];
@@ -3480,16 +3565,22 @@ fn bool_scorer(
     // field (a distance ring, `>=` distances): one KD-tree pass instead of
     // a conjunction / exclusion of per-clause doc sets. Scores 0 like any
     // filter-only bool.
-    // `must` clauses that score a constant +0 (`geo_shape` without a
-    // boost, e.g. Rally's distance rings `must: [intersects R2, disjoint
-    // R1]`) add nothing to the score either, so they join the same pass.
-    let zero_musts = must.iter().all(|q| matches!(q, Query::ConstScore { score, .. } if *score == 0.0 && score.is_sign_positive()))
-        && (must.is_empty() || minimum_should_match.resolve(0) == 0);
-    if should.is_empty() && zero_musts && !(must.is_empty() && filter.is_empty()) && must.len() + filter.len() + must_not.len() > 1 {
+    // `must` clauses that score a constant (`geo_shape` queries score their
+    // boost, 1 by default: Rally's distance rings `must: [intersects R2,
+    // disjoint R1]`) give every match the same score, their sum under the
+    // enclosing boost (Lucene's conjunction sums its clauses' scores), so
+    // they join the same pass, scoring that constant.
+    let const_musts = must.iter().try_fold(0.0f64, |sum, q| match q {
+        Query::ConstScore { score, .. } if score.is_finite() => Some(sum + *score as f64),
+        _ => None,
+    });
+    let const_musts = const_musts.filter(|_| must.is_empty() || minimum_should_match.resolve(0) == 0);
+    if let (true, Some(sum)) = (should.is_empty() && !(must.is_empty() && filter.is_empty()) && must.len() + filter.len() + must_not.len() > 1, const_musts) {
         if let LeafReader::Segment(seg) = leaf {
             if let Some((field, pred)) = bool_geo_pred(must, must_not, filter) {
                 if let Some(g) = seg.geo_index(field) {
-                    if let Some(s) = crate::query::geo_scorer::geo_pred_scorer(g, pred, false, seg.num_docs, 0.0) {
+                    let score = if must.is_empty() { 0.0 } else { (sum * boost as f64) as f32 };
+                    if let Some(s) = crate::query::geo_scorer::geo_pred_scorer(g, pred, false, seg.num_docs, score) {
                         return Some(s);
                     }
                 } else {
@@ -4667,6 +4758,46 @@ mod geo_pure_negative_tests {
     use crate::geo::GeoShape;
     use crate::segment::SegmentWriter;
     use crate::types::{Document, Field, FieldType};
+
+    /// A distance ring whose `must` clauses score a constant (`geo_shape`
+    /// queries score their boost, 1 by default) still takes the one
+    /// KD-tree pass, scoring the clauses' sum (under the enclosing boost):
+    /// the same docs and scores as the conjunction.
+    #[test]
+    fn constant_scoring_ring_takes_the_kd_pass() {
+        let schema = vec![Field::new(0, "g", FieldType::GeoPoint)];
+        let mut w = SegmentWriter::new(0);
+        for i in 0..20_000u32 {
+            let mut d = Document::new();
+            d.add_geo_point(0, 51.0 + (i % 101) as f64 * 0.08, 1.0 + (i % 103) as f64 * 0.12);
+            w.add_document(&d, &schema);
+        }
+        let seg = w.write_to(&RamDirectory::new()).unwrap();
+        let leaf = LeafReader::Segment(&seg);
+        let circle = |m: f64, score: f32| Query::ConstScore { query: Box::new(Query::GeoDistance { field: 0, lat: 55.0, lon: 7.0, meters: m }), score, point_set: false };
+        let neg = |m: f64, score: f32| Query::ConstScore {
+            query: Box::new(Query::Bool { must: vec![], should: vec![], minimum_should_match: MinShouldMatch::Count(0), filter: vec![Query::GeoBoundingBox { field: 0, top: 90.0, bottom: -90.0, left: -180.0, right: 180.0 }], must_not: vec![Query::GeoDistance { field: 0, lat: 55.0, lon: 7.0, meters: m }] }),
+            score,
+            point_set: false,
+        };
+        let ring = |score: f32| Query::Bool { must: vec![circle(300_000.0, score), neg(200_000.0, score)], should: vec![], minimum_should_match: MinShouldMatch::Count(0), filter: vec![], must_not: vec![] };
+        let ctx = SearchContext::default();
+        let collect = |q: &Query, boost: f32| {
+            let mut s = q.scorer_b(&leaf, &ctx, boost).unwrap();
+            let mut out = Vec::new();
+            while s.advance() != TERMINATED {
+                out.push((s.doc(), s.score()));
+            }
+            out
+        };
+        let zero = collect(&ring(0.0), 1.0);
+        assert!(!zero.is_empty());
+        let one = collect(&ring(1.0), 1.0);
+        assert_eq!(one.iter().map(|x| x.0).collect::<Vec<_>>(), zero.iter().map(|x| x.0).collect::<Vec<_>>());
+        assert!(one.iter().all(|x| x.1 == 2.0), "{:?}", &one[..3]);
+        let boosted = collect(&ring(1.0), 3.0);
+        assert!(boosted.iter().all(|x| x.1 == 6.0));
+    }
 
     /// ES's pure-negative ring (`must: [circle R2, bool { must: [match_all],
     /// must_not: [circle R1] }]`, Rally `distanceFilterCount200x300-alt`)

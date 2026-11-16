@@ -22,7 +22,14 @@ use serde_json::{json, Value};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub const INDEX_TEMPLATE_VERSION: i64 = 14;
+/// `ProfilingIndexTemplateRegistry.INDEX_TEMPLATE_VERSION` (ES 9.5.5; 15:
+/// LogsDB mode for `profiling-events-*`).
+pub const INDEX_TEMPLATE_VERSION: i64 = 15;
+/// `PROFILING_EVENTS_VERSION` (6 with the LogsDB events template: a new
+/// backing index, by rollover).
+const PROFILING_EVENTS_VERSION: i64 = 6;
+/// `xpack.profiling.check_outdated_indices` (default true).
+pub const CHECK_OUTDATED_INDICES: &str = "xpack.profiling.check_outdated_indices";
 const VERSION_VARIABLE: &str = "xpack.profiling.template.version";
 pub const TEMPLATES_ENABLED: &str = "xpack.profiling.templates.enabled";
 pub const PROFILING_ENABLED: &str = "xpack.profiling.enabled";
@@ -35,7 +42,7 @@ macro_rules! res {
 
 /// (name, raw resource, index-version variable).
 const COMPONENT_TEMPLATES: &[(&str, &str, Option<(&str, i64)>)] = &[
-    ("profiling-events", res!("component-template/profiling-events.json"), Some(("events", 5))),
+    ("profiling-events", res!("component-template/profiling-events.json"), Some(("events", PROFILING_EVENTS_VERSION))),
     ("profiling-executables", res!("component-template/profiling-executables.json"), Some(("executables", 1))),
     ("profiling-ilm", res!("component-template/profiling-ilm.json"), None),
     ("profiling-hot-tier", res!("component-template/profiling-hot-tier.json"), None),
@@ -74,6 +81,53 @@ const MANAGED_INDICES: &[(&str, i64, Option<&str>)] = &[
     ("profiling-stacktraces", 1, Some("000001")),
     ("profiling-symbols-global", 1, Some("000001")),
 ];
+
+/// `ProfilingIndexManager.OnVersionBump.DELETE_OLD`: the regular indices
+/// whose older versions are deleted on a version bump (the rest keep them;
+/// K/V indices age out through ILM).
+const DELETE_OLD_ON_BUMP: &[&str] = &["profiling-sq-executables", "profiling-sq-leafframes"];
+
+/// One `Migration` (ES `Migration.Builder`): a mapping change or dynamic
+/// settings, reaching index template version `target`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Migration {
+    PutMapping { target: i64, body: Value },
+    DynamicSettings { target: i64, settings: Value },
+}
+
+impl Migration {
+    fn target(&self) -> i64 {
+        match self {
+            Migration::PutMapping { target, .. } | Migration::DynamicSettings { target, .. } => *target,
+        }
+    }
+}
+
+/// The migrations of a managed index or data stream (ES 9.5.5 defines none:
+/// every `ProfilingIndex` / `ProfilingDataStream` is built without a
+/// `Migration.Builder`). `Migration.Builder.build` appends the `_meta`
+/// version update to a non-empty list.
+fn migrations_of(_name: &str) -> Vec<Migration> {
+    #[cfg(test)]
+    if let Some(m) = TEST_MIGRATIONS.with(|t| t.borrow().get(_name).cloned()) {
+        return m;
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MIGRATIONS: std::cell::RefCell<std::collections::HashMap<String, Vec<Migration>>> = std::cell::RefCell::new(Default::default());
+}
+
+/// `Migration.Builder.build(indexVersion)`.
+fn built_migrations(name: &str, index_version: i64) -> Vec<Migration> {
+    let mut m = migrations_of(name);
+    if let Some(last) = m.last().map(Migration::target) {
+        m.push(Migration::PutMapping { target: last, body: json!({"_meta": {"index-template-version": last, "index-version": index_version}}) });
+    }
+    m
+}
 
 const EVENTS_PREFIX: &str = "profiling-events";
 pub const ALL_EVENTS: &str = "profiling-events-all";
@@ -118,7 +172,7 @@ pub fn java_round(x: f64) -> i64 {
 
 /// Data streams managed by `ProfilingDataStreamManager`: (name, version).
 fn managed_data_streams() -> Vec<(String, i64)> {
-    let mut out: Vec<(String, i64)> = (0..=MAX_EXPONENT).filter(|e| *e == 0 || *e >= MIN_EXPONENT).map(|e| (events_index_name(e), 5)).collect();
+    let mut out: Vec<(String, i64)> = (0..=MAX_EXPONENT).filter(|e| *e == 0 || *e >= MIN_EXPONENT).map(|e| (events_index_name(e), PROFILING_EVENTS_VERSION)).collect();
     out.push(("profiling-metrics".into(), 2));
     out.push(("profiling-hosts".into(), 2));
     out
@@ -166,20 +220,36 @@ pub fn plugin_enabled(node: &Node) -> bool {
     bool_setting(node, PROFILING_ENABLED, true)
 }
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Debug, Clone)]
 enum IndexStatus {
     NeedsCreation,
     NeedsVersionBump,
+    /// Template version behind with pending migrations (applied to the
+    /// write index).
+    NeedsMappingsUpdate(String, Vec<Migration>),
     Closed,
     UpToDate,
     Unhealthy,
+    /// Created before 8.9.1 (`checkOutdatedIndices`): the managers abort.
+    TooOld,
 }
 
-/// `IndexStateResolver.getIndexState` for an index's mapping `_meta`.
-fn index_status(svc: Option<std::sync::Arc<crate::index::IndexService>>, version: i64) -> IndexStatus {
+/// `IndexStateResolver.getIndexState`: `svc` is the index (or the data
+/// stream's write index) named `name` in the manager, `version` its
+/// managed version.
+fn index_status(node: &Node, svc: Option<std::sync::Arc<crate::index::IndexService>>, name: &str, version: i64) -> IndexStatus {
     let Some(svc) = svc else { return IndexStatus::NeedsCreation };
     if !svc.is_open() {
         return IndexStatus::Closed;
+    }
+    // A red index waits (pending mapping upgrades included).
+    if !svc.failed_shards().is_empty() {
+        return IndexStatus::Unhealthy;
+    }
+    if bool_setting(node, CHECK_OUTDATED_INDICES, true)
+        && svc.setting("index.version.created").is_some_and(|v| crate::version::IndexVersion::from_setting(Some(&json!(v))) < crate::version::IndexVersion(8_09_01_99))
+    {
+        return IndexStatus::TooOld;
     }
     let mapping = svc.meta().mappings.to_json();
     let (index_version, template_version) = match mapping.get("_meta") {
@@ -194,6 +264,13 @@ fn index_status(svc: Option<std::sync::Arc<crate::index::IndexService>>, version
     }
     if version > index_version {
         return IndexStatus::NeedsVersionBump;
+    }
+    if INDEX_TEMPLATE_VERSION > template_version {
+        // No pending migrations: up to date whatever the template version.
+        let pending: Vec<Migration> = built_migrations(name, version).into_iter().filter(|m| m.target() > template_version).collect();
+        if !pending.is_empty() {
+            return IndexStatus::NeedsMappingsUpdate(svc.name.clone(), pending);
+        }
     }
     IndexStatus::UpToDate
 }
@@ -220,7 +297,7 @@ fn managed_index_state(node: &Node, prefix: &str, version: i64, generation: Opti
         let p = format!(".{prefix}-v");
         svc = newest(&|n| n.starts_with(&p) && n.len() >= p.len() + 3 && n[p.len()..p.len() + 3].bytes().all(|b| b.is_ascii_digit()));
     }
-    index_status(svc, version)
+    index_status(node, svc, prefix, version)
 }
 
 fn data_stream_state(node: &Node, name: &str, version: i64) -> IndexStatus {
@@ -229,7 +306,7 @@ fn data_stream_state(node: &Node, name: &str, version: i64) -> IndexStatus {
     if svc.is_none() {
         return IndexStatus::NeedsCreation;
     }
-    index_status(svc, version)
+    index_status(node, svc, name, version)
 }
 
 fn template_version(v: &Value) -> i64 {
@@ -281,6 +358,34 @@ pub fn ensure_resources(node: &Node) -> Result<()> {
         return Ok(());
     }
     let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
+    install_registry(node)?;
+    if !templates_created(node) {
+        return Ok(());
+    }
+    manage_indices(node)
+}
+
+/// `ProfilingIndexTemplateRegistry` alone (component templates, the
+/// `profiling-60-days` policy, composable templates), missing or older
+/// ones installed, as ES does on every cluster-state change once
+/// `xpack.profiling.templates.enabled` is set; called by
+/// [`crate::registry::ensure`] (they used to appear only with the first
+/// profiling API call). Returns whether anything changed.
+pub fn ensure_registry(node: &Node) -> bool {
+    if !templates_enabled(node) || !plugin_enabled(node) {
+        return false;
+    }
+    let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
+    match install_registry(node) {
+        Ok(changed) => changed,
+        Err(e) => {
+            tracing::warn!("installing the profiling templates failed: {e}");
+            false
+        }
+    }
+}
+
+fn install_registry(node: &Node) -> Result<bool> {
     // Registry: component templates, ILM policy, composable templates.
     let mut changed = false;
     {
@@ -292,9 +397,11 @@ pub fn ensure_resources(node: &Node) -> Result<()> {
             }
         }
     }
+    // ES `isUpgradeRequired`: the policy's `_meta.version`.
     if policy_version(node) < INDEX_TEMPLATE_VERSION {
         let p = crate::ilm::policy::parse_put_body(&json!({"policy": render(ILM_POLICY.1, None)}))?;
         node.ilm.put_policy(node, ILM_POLICY.0, p)?;
+        changed = true;
     }
     {
         let mut t = node.templates.write();
@@ -308,24 +415,41 @@ pub fn ensure_resources(node: &Node) -> Result<()> {
     if changed {
         node.persist_state()?;
     }
-    if !templates_created(node) {
+    Ok(changed)
+}
+
+/// `ProfilingIndexManager` / `ProfilingDataStreamManager`.
+fn manage_indices(node: &Node) -> Result<()> {
+    // `AbstractProfilingPersistenceManager.onClusterChanged`: an index
+    // considered too old aborts the whole pass (it must be deleted first).
+    let indices: Vec<_> = MANAGED_INDICES.iter().map(|(p, v, g)| (*p, *v, *g, managed_index_state(node, p, *v, *g))).collect();
+    if indices.iter().any(|(_, _, _, s)| *s == IndexStatus::TooOld) {
+        tracing::info!("aborting profiling index creation: an index is considered too old");
         return Ok(());
     }
     // Index manager.
-    for (prefix, version, generation) in MANAGED_INDICES {
-        match managed_index_state(node, prefix, *version, *generation) {
+    for (prefix, version, generation, status) in indices {
+        match status {
             IndexStatus::NeedsCreation | IndexStatus::NeedsVersionBump => {
                 let base = format!(".{prefix}-v{version:03}");
                 let name = match generation {
                     Some(g) => format!("{base}-{g}"),
-                    None => base,
+                    None => base.clone(),
                 };
+                // `OnVersionBump.DELETE_OLD`: older versions go first.
+                if status == IndexStatus::NeedsVersionBump && DELETE_OLD_ON_BUMP.contains(&prefix) {
+                    let older: Vec<String> = node.all_indices().iter().map(|s| s.name.clone())
+                        .filter(|n| n != &name && is_version_match(n, prefix)).collect();
+                    for n in older {
+                        node.delete_index(&n)?;
+                    }
+                }
                 // An alias left behind by an older version: move the write
                 // alias to the new index.
                 if node.get_index(prefix).is_some() || alias_exists(node, prefix) {
                     for svc in node.all_indices() {
                         let mut a = svc.aliases();
-                        if let Some(def) = a.get_mut(*prefix) {
+                        if let Some(def) = a.get_mut(prefix) {
                             if let Some(o) = def.as_object_mut() {
                                 o.insert("is_write_index".into(), json!(false));
                             }
@@ -333,28 +457,61 @@ pub fn ensure_resources(node: &Node) -> Result<()> {
                         }
                     }
                 }
-                let body = json!({"aliases": {*prefix: {"is_write_index": true}}});
+                let body = json!({"aliases": {prefix: {"is_write_index": true}}});
                 match node.create_index(&name, &body) {
                     Ok(_) => {}
                     Err(e) if e.kind.contains("already_exists") => {}
                     Err(e) => return Err(e),
                 }
             }
+            IndexStatus::NeedsMappingsUpdate(write, pending) => apply_migrations(node, &write, &pending)?,
             _ => {}
         }
     }
     // Data stream manager.
-    for (name, version) in managed_data_streams() {
-        match data_stream_state(node, &name, version) {
+    let streams: Vec<_> = managed_data_streams().into_iter().map(|(n, v)| { let s = data_stream_state(node, &n, v); (n, s) }).collect();
+    if streams.iter().any(|(_, s)| *s == IndexStatus::TooOld) {
+        tracing::info!("aborting profiling data stream creation: an index is considered too old");
+        return Ok(());
+    }
+    for (name, status) in streams {
+        match status {
             IndexStatus::NeedsCreation => match node.create_data_stream(&name) {
                 Ok(_) => {}
                 Err(e) if e.kind.contains("already_exists") => {}
                 Err(e) => return Err(e),
             },
+            // A new backing index from the current template (v15: LogsDB
+            // events).
             IndexStatus::NeedsVersionBump => {
                 node.rollover(&name, None, &json!({}), false)?;
             }
+            IndexStatus::NeedsMappingsUpdate(write, pending) => apply_migrations(node, &write, &pending)?,
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `ProfilingIndex.isMatchWithoutVersion`: `.<prefix>-v<3 latin digits>…`.
+fn is_version_match(name: &str, prefix: &str) -> bool {
+    let p = format!(".{prefix}-v");
+    name.starts_with(&p) && name.len() >= p.len() + 3 && name.as_bytes()[p.len()..p.len() + 3].iter().all(u8::is_ascii_digit)
+}
+
+/// `AbstractProfilingPersistenceManager.applyMigrations`: each pending
+/// migration on the write index, in order (put mapping / update settings).
+fn apply_migrations(node: &Node, write_index: &str, pending: &[Migration]) -> Result<()> {
+    let Some(svc) = node.get_index(write_index) else { return Ok(()) };
+    for m in pending {
+        match m {
+            Migration::PutMapping { body, .. } => {
+                svc.put_mapping(body)?;
+            }
+            Migration::DynamicSettings { settings, .. } => {
+                let flat: crate::settings::FlatSettings = settings.as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
+                svc.put_settings(flat, false)?;
+            }
         }
     }
     Ok(())
@@ -418,4 +575,85 @@ pub fn check_license(node: &Node) -> Result<()> {
 
 pub(crate) fn not_found(e: &EsError) -> bool {
     e.kind == "index_not_found_exception"
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    fn node() -> (tempfile::TempDir, std::sync::Arc<Node>) {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        node.cluster_settings.write().0.insert(TEMPLATES_ENABLED.into(), json!("true"));
+        (dir, node)
+    }
+
+    fn write_index(node: &Node, ds: &str) -> std::sync::Arc<crate::index::IndexService> {
+        let d = node.data_stream(ds).unwrap();
+        node.get_index(d.write_index()).unwrap()
+    }
+
+    /// ES 9.5.5 registry v15: LogsDB events; an events data stream at events
+    /// version 5 (an older install) is rolled over to a LogsDB backing
+    /// index; the other streams stay.
+    #[test]
+    fn v15_events_are_logsdb_and_older_streams_roll_over() {
+        let (_d, node) = node();
+        ensure_resources(&node).unwrap();
+        assert!(resources_created(&node));
+        let events = write_index(&node, ALL_EVENTS);
+        assert_eq!(events.setting("index.mode").as_deref(), Some("logsdb"), "v15 events template");
+        let meta = events.meta().mappings.to_json()["_meta"].clone();
+        assert_eq!((meta["index-version"].as_i64(), meta["index-template-version"].as_i64()), (Some(6), Some(15)), "{meta}");
+        // An older install's write index (events version 5, template 14).
+        events.put_mapping(&json!({"_meta": {"index-version": 5, "index-template-version": 14}})).unwrap();
+        let hosts_before = write_index(&node, "profiling-hosts").name.clone();
+        assert!(!resources_created(&node));
+        ensure_resources(&node).unwrap();
+        let rolled = write_index(&node, ALL_EVENTS);
+        assert_ne!(rolled.name, events.name, "rolled over");
+        assert_eq!(rolled.setting("index.mode").as_deref(), Some("logsdb"));
+        assert_eq!(write_index(&node, "profiling-hosts").name, hosts_before, "no migrations, no version bump: untouched");
+        assert!(resources_created(&node));
+    }
+
+    /// Pending migrations (`Migration.Builder`) apply to the write index and
+    /// end with the `_meta` version update; without any (ES 9.5.5) an older
+    /// template version is up to date.
+    #[test]
+    fn migrations_apply_to_the_write_index() {
+        let (_d, node) = node();
+        ensure_resources(&node).unwrap();
+        let hosts = write_index(&node, "profiling-hosts");
+        hosts.put_mapping(&json!({"_meta": {"index-version": 2, "index-template-version": 14}})).unwrap();
+        assert!(resources_created(&node), "no migrations: up to date at an older template version");
+        TEST_MIGRATIONS.with(|t| t.borrow_mut().insert("profiling-hosts".into(), vec![
+            Migration::PutMapping { target: 15, body: json!({"properties": {"migrated.field": {"type": "keyword"}}}) },
+        ]));
+        assert!(!resources_created(&node));
+        ensure_resources(&node).unwrap();
+        let m = write_index(&node, "profiling-hosts").meta().mappings.to_json();
+        assert_eq!(m["properties"]["migrated"]["properties"]["field"]["type"], "keyword", "{m}");
+        assert_eq!(m["_meta"]["index-template-version"], 15);
+        assert!(resources_created(&node));
+        TEST_MIGRATIONS.with(|t| t.borrow_mut().clear());
+    }
+
+    /// `OnVersionBump.DELETE_OLD` (sq-executables, sq-leafframes): an older
+    /// version is deleted when the new one is created; KEEP_OLD indices keep
+    /// theirs.
+    #[test]
+    fn version_bumps_delete_old_only_where_es_does() {
+        let (_d, node) = node();
+        install_registry(&node).unwrap();
+        for prefix in ["profiling-sq-executables", "profiling-symbols-private"] {
+            let old = format!(".{prefix}-v000");
+            node.create_index(&old, &json!({"aliases": {prefix: {"is_write_index": true}}, "mappings": {"_meta": {"index-version": 0, "index-template-version": 14}}})).unwrap();
+        }
+        ensure_resources(&node).unwrap();
+        assert!(node.get_index(".profiling-sq-executables-v000").is_none(), "DELETE_OLD");
+        assert!(node.get_index(".profiling-sq-executables-v001").is_some());
+        assert!(node.get_index(".profiling-symbols-private-v000").is_some(), "KEEP_OLD");
+        assert!(node.get_index(".profiling-symbols-private-v001").is_some());
+    }
 }

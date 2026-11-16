@@ -672,32 +672,31 @@ pub fn reserved_roles() -> &'static BTreeMap<String, Value> {
 #[derive(Clone, Debug)]
 enum NamePat {
     Glob(String),
-    /// Lucene-style `/regex/`: `pos` must match (if any), `neg` must not.
-    Regex { pos: Option<regex::Regex>, neg: Option<regex::Regex> },
+    /// Lucene-style `/regex/` (ES role names use Lucene `RegExp` syntax):
+    /// every `pos` must match, no `neg` may.
+    Regex { pos: Vec<regex::Regex>, neg: Vec<regex::Regex> },
+    /// A `/regex/` this cannot evaluate faithfully: matches nothing
+    /// (never reinterpreted in another regex language; production review
+    /// #312: `~(private-<0-9>)` read `<0-9>` literally and granted
+    /// `private-1`).
+    Unsupported,
 }
 
 fn anchored(src: &str) -> Option<regex::Regex> {
-    regex::Regex::new(&format!("^(?:{src})$")).ok()
+    regex::RegexBuilder::new(&format!("^(?:{src})$")).size_limit(1 << 20).build().ok()
 }
 
 impl NamePat {
     fn new(p: &str) -> NamePat {
         if p.len() >= 2 && p.starts_with('/') && p.ends_with('/') {
             let inner = &p[1..p.len() - 1];
-            // Lucene `~(x)` is a complement; `a&~(b)` = a and not b.
-            let (pos, neg) = match inner.split_once("&~(") {
-                Some((a, b)) => (Some(a), Some(b.strip_suffix(')').unwrap_or(b))),
-                None => match inner.strip_prefix("~(").and_then(|r| r.strip_suffix(')')) {
-                    Some(r) => (None, Some(r)),
-                    None => (Some(inner), None),
-                },
-            };
-            let pos_re = pos.map(anchored);
-            let neg_re = neg.map(anchored);
-            if pos_re.as_ref().map(|r| r.is_none()).unwrap_or(false) || neg_re.as_ref().map(|r| r.is_none()).unwrap_or(false) {
-                return NamePat::Glob(p.to_string());
+            let Some(operands) = crate::query::regexp::lucene_operands(inner) else { return NamePat::Unsupported };
+            let (mut pos, mut neg) = (Vec::new(), Vec::new());
+            for (negated, src) in operands {
+                let Some(re) = anchored(&src) else { return NamePat::Unsupported };
+                if negated { neg.push(re) } else { pos.push(re) }
             }
-            NamePat::Regex { pos: pos_re.flatten(), neg: neg_re.flatten() }
+            NamePat::Regex { pos, neg }
         } else {
             NamePat::Glob(p.to_string())
         }
@@ -706,7 +705,8 @@ impl NamePat {
     fn matches(&self, name: &str) -> bool {
         match self {
             NamePat::Glob(g) => glob(g, name),
-            NamePat::Regex { pos, neg } => pos.as_ref().map(|r| r.is_match(name)).unwrap_or(true) && !neg.as_ref().map(|r| r.is_match(name)).unwrap_or(false),
+            NamePat::Regex { pos, neg } => pos.iter().all(|r| r.is_match(name)) && !neg.iter().any(|r| r.is_match(name)),
+            NamePat::Unsupported => false,
         }
     }
 }
@@ -783,6 +783,12 @@ impl FieldAccess {
     /// The `_source` with only the permitted leaf paths. Objects survive when
     /// some child does (or when empty and granted); arrays are transparent.
     pub fn filter_source(&self, src: &Value) -> Value {
+        self.filter_at(src, "").unwrap_or_else(|| Value::Object(Map::new()))
+    }
+
+    /// [`Self::filter_source`] of a value found at path `prefix` (`""`: the
+    /// whole source): `None` when nothing of it is permitted.
+    pub fn filter_at(&self, src: &Value, prefix: &str) -> Option<Value> {
         fn walk(a: &FieldAccess, v: &Value, prefix: &str) -> Option<Value> {
             match v {
                 Value::Object(m) => {
@@ -810,7 +816,7 @@ impl FieldAccess {
                 leaf => a.allows(prefix).then(|| leaf.clone()),
             }
         }
-        walk(self, src, "").unwrap_or_else(|| Value::Object(Map::new()))
+        walk(self, src, prefix)
     }
 }
 
@@ -956,8 +962,14 @@ impl Role {
     }
 
     pub fn check_index(&self, action: &str, name: &str) -> bool {
+        self.check_index_component(action, name, false)
+    }
+
+    /// [`Self::check_index`] of `name`'s `::failures` component (`failures`)
+    /// or of its data.
+    pub fn check_index_component(&self, action: &str, name: &str, failures: bool) -> bool {
         let restricted = is_restricted(name);
-        self.indices.iter().any(|g| (g.restricted || !restricted) && g.pats.iter().any(|p| p.matches(name)) && g.privs.iter().any(|p| p.matches(action)))
+        self.indices.iter().any(|g| (g.restricted || !restricted) && g.pats.iter().any(|p| p.matches(name)) && g.privs.iter().any(|p| p.applies_to(failures) && p.matches(action)))
     }
 
     /// Does the role grant index privilege `privilege` (named or action) on `name`?
@@ -1003,10 +1015,16 @@ impl Role {
     /// Multiple groups union: unrestricted when any group has no query /
     /// grants all fields. Default-deny: no matching group is an error.
     pub fn index_access(&self, action: &str, names: &[&str], user: &Authn) -> Result<IndexAccess, EsError> {
+        // Only groups granting the action on the component read: a
+        // failure-store-only grant (`read_failure_store`) never lifts the
+        // DLS/FLS of regular data, nor the reverse (production review
+        // #313). The concrete index comes first: a failure store's
+        // backing indices are `.fs-*`.
+        let failures = names.first().is_some_and(|n| n.starts_with(".fs-") || n.ends_with("::failures"));
         let groups: Vec<&IndexGroup> = self
             .indices
             .iter()
-            .filter(|g| g.privs.iter().any(|p| p.matches(action)) && names.iter().any(|n| (g.restricted || !is_restricted(n)) && g.pats.iter().any(|p| p.matches(n))))
+            .filter(|g| g.privs.iter().any(|p| p.applies_to(failures) && p.matches(action)) && names.iter().any(|n| (g.restricted || !is_restricted(n)) && g.pats.iter().any(|p| p.matches(n))))
             .collect();
         if groups.is_empty() {
             return Err(EsError::new(403, "security_exception", format!("no index privilege grants action [{action}] on [{}]", names.join(","))));
@@ -1083,6 +1101,40 @@ fn covers_name(p: &str, q: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Production review #312: role name regexes are Lucene `RegExp`:
+    /// numeric intervals, complement and intersection keep their meaning,
+    /// and an expression that cannot be evaluated faithfully matches
+    /// nothing (never another regex language's reading).
+    #[test]
+    fn role_name_regexes_follow_lucene_syntax() {
+        let r = role_of(json!([{"names": ["/~(private-<0-9>)/"], "privileges": ["read"]}]));
+        for i in 0..10 {
+            assert!(!r.check_index(SEARCH, &format!("private-{i}")), "private-{i} is excluded");
+        }
+        assert!(r.check_index(SEARCH, "private-10") && r.check_index(SEARCH, "public"));
+        let r = role_of(json!([{"names": ["/logs-.*&~(logs-<00-15>)/"], "privileges": ["read"]}]));
+        assert!(!r.check_index(SEARCH, "logs-07") && !r.check_index(SEARCH, "logs-15"));
+        assert!(r.check_index(SEARCH, "logs-16") && r.check_index(SEARCH, "logs-7") && !r.check_index(SEARCH, "metrics-1"));
+        let r = role_of(json!([{"names": ["/a(~b)c/"], "privileges": ["read"]}]));
+        assert!(!r.check_index(SEARCH, "axc") && !r.check_index(SEARCH, "a~bc"), "a nested complement is not evaluated as text");
+    }
+
+    /// Production review #313: an unrestricted `read_failure_store` group
+    /// does not lift the DLS/FLS a `read` group puts on regular data; the
+    /// failure store's own reads use the failure-store group.
+    #[test]
+    fn failure_store_grants_do_not_remove_regular_restrictions() {
+        let r = role_of(json!([
+            {"names": ["logs"], "privileges": ["read"], "query": {"term": {"public": true}}, "field_security": {"grant": ["public", "msg"]}},
+            {"names": ["logs"], "privileges": ["read_failure_store"]}
+        ]));
+        let regular = r.index_access(SEARCH, &[".ds-logs-2026.11.09-000001", "logs"], &user("u")).unwrap();
+        assert!(regular.dls.is_some(), "regular data keeps its document filter");
+        assert!(regular.fields.is_some(), "regular data keeps its field restriction");
+        let failures = r.index_access(SEARCH, &[".fs-logs-2026.11.09-000002", "logs"], &user("u")).unwrap();
+        assert!(failures.dls.is_none() && failures.fields.is_none(), "failure documents per the failure-store grant");
+    }
 
     #[test]
     fn viewer_regex() {

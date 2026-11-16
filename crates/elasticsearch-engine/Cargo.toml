@@ -12,8 +12,18 @@ rustic-core = { path = "../rustic-core" }
 elasticsearch-routing = { path = "../elasticsearch-routing" }
 # `reindex.ssl.*`: TLS for `_reindex` from an `https://` remote.
 elasticsearch-ssl = { path = "../elasticsearch-ssl" }
+# HTTPS to hosted inference providers: Mozilla roots plus the platform's
+# trust store (`SSL_CERT_FILE` / `SSL_CERT_DIR` honoured).
+webpki-roots = "1"
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip"] }
+# Java `Pattern.CANON_EQ` (script regexes): NFD decomposition.
+icu_normalizer = "1.5"
+# `Pattern.CANON_EQ`: grapheme clusters (`Grapheme.nextBoundary`) and the
+# code points a class or property accepts.
+unicode-segmentation = "1"
+regex-syntax = "0.8"
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip", "unbounded_depth"] }
 parking_lot = "0.12"
 # The task registry: a lock-free skip list (every search registers tasks)
 # whose entries give up their task when it finishes.
@@ -51,7 +61,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 
 [features]
 gpu = ["rustic-core/gpu"]
-default = ["mutable-hnsw"]
+# `candle-models`: real CPU inference for `.multilingual-e5-small` (its
+# weights are installed separately; without them the model fails clearly).
+default = ["mutable-hnsw", "candle-models"]
 mutable-hnsw = ["rustic-core/mutable-hnsw-poc"]
 # rustic-core's query execution counters (wiki_search_bench WB_SLOW).
 query-stats = ["rustic-core/query-stats"]
@@ -62,6 +74,8 @@ candle-models = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", 
 rustic-core = { path = "../rustic-core", features = ["test-seams"] }
 tempfile = "3"
 criterion = "0.5"
+# Certificates for the HTTPS provider mock (`tests/inference_https.rs`).
+rcgen = { workspace = true }
 
 [[bench]]
 name = "script_score"

@@ -4,6 +4,7 @@
 //! bucket, labels`), with one `step` per evaluation step (the end of its
 //! bucket).
 
+use super::func;
 use super::parse::{BinOp, Cmd, Expr, Field, Params};
 use super::{parsing_err, verification_err, Val};
 use crate::error::Result;
@@ -31,7 +32,9 @@ pub enum PExpr {
     Sel { metric: String, matchers: Vec<Matcher>, range: Option<i64>, pos: usize },
     Call { name: String, args: Vec<PExpr>, pos: usize },
     Agg { op: String, param: Option<Box<PExpr>>, expr: Box<PExpr>, by: Vec<String>, without: bool, pos: usize },
-    Bin { op: String, l: Box<PExpr>, r: Box<PExpr> },
+    /// `bool_mod`: the comparison's `bool` modifier (0/1 samples instead
+    /// of filtering).
+    Bin { op: String, l: Box<PExpr>, r: Box<PExpr>, bool_mod: bool },
     Neg(Box<PExpr>),
 }
 
@@ -428,11 +431,12 @@ impl<'a> P<'a> {
             self.i += op.len();
             // `bool` modifier of comparisons.
             let save = self.i;
-            if self.ident().as_deref() != Some("bool") {
+            let bool_mod = self.ident().as_deref() == Some("bool");
+            if !bool_mod {
                 self.i = save;
             }
             let r = self.expr(if op == "^" { p } else { p + 1 })?;
-            l = PExpr::Bin { op: op.to_string(), l: Box::new(l), r: Box::new(r) };
+            l = PExpr::Bin { op: op.to_string(), l: Box::new(l), r: Box::new(r), bool_mod };
         }
         Ok(l)
     }
@@ -531,10 +535,12 @@ fn compile(full: &str, e: &PExpr, c: &mut Compiled, in_agg: bool) -> Result<Expr
         PExpr::Sel { metric, matchers, .. } => {
             c.matchers.extend(matchers.iter().cloned());
             c.metrics.push(metric.clone());
-            col(metric)
+            // An instant-vector selector outside an aggregation or range
+            // function is each series' latest sample per step.
+            if in_agg { col(metric) } else { Expr::Call("LAST_OVER_TIME".into(), vec![col(metric)], 0) }
         }
         PExpr::Neg(a) => Expr::Neg(Box::new(compile(full, a, c, in_agg)?)),
-        PExpr::Bin { op, l, r } => {
+        PExpr::Bin { op, l, r, .. } => {
             let (a, b) = (compile(full, l, c, in_agg)?, compile(full, r, c, in_agg)?);
             let bop = match op.as_str() {
                 "+" => BinOp::Add,
@@ -556,12 +562,13 @@ fn compile(full: &str, e: &PExpr, c: &mut Compiled, in_agg: bool) -> Result<Expr
         PExpr::Call { name, args, pos } => {
             if let Some(f) = range_fn(name) {
                 // `quantile_over_time(q, v)` → `PERCENTILE_OVER_TIME(v, q * 100)`.
+                // (A range function reads its selector's samples.)
                 if name == "quantile_over_time" && args.len() == 2 {
-                    let q = compile(full, &args[0], c, in_agg)?;
-                    let v = compile(full, &args[1], c, in_agg)?;
+                    let q = compile(full, &args[0], c, true)?;
+                    let v = compile(full, &args[1], c, true)?;
                     return Ok(Expr::Call(f.into(), vec![v, Expr::Bin(BinOp::Mul, Box::new(q), Box::new(Expr::Lit(Val::Double(100.0))))], *pos));
                 }
-                let a: Vec<Expr> = args.iter().map(|x| compile(full, x, c, in_agg)).collect::<Result<_>>()?;
+                let a: Vec<Expr> = args.iter().map(|x| compile(full, x, c, true)).collect::<Result<_>>()?;
                 return Ok(Expr::Call(f.into(), a, *pos));
             }
             if let Some(f) = math_fn(name) {
@@ -609,13 +616,374 @@ fn compile(full: &str, e: &PExpr, c: &mut Compiled, in_agg: bool) -> Result<Expr
     })
 }
 
-/// Whether a regex is a plain literal (no metacharacters).
-fn is_literal(s: &str) -> bool {
-    !s.chars().any(|c| ".+*?()[]{}|^$\\".contains(c))
+
+/// Whether a matcher selects a series without its label (the empty value).
+fn accepts_empty(m: &Matcher) -> bool {
+    let re_empty = || regex::Regex::new(&format!("^(?:{})$", m.value)).is_ok_and(|r| r.is_match(""));
+    match m.op {
+        MatchOp::Eq => m.value.is_empty(),
+        MatchOp::Ne => !m.value.is_empty(),
+        MatchOp::Re => re_empty(),
+        MatchOp::Nre => !re_empty(),
+    }
+}
+
+/// A label matcher as a row condition with PromQL's semantics: a series
+/// without the label has the empty value, so a matcher that accepts `""`
+/// also selects it; regexes are RE2, fully anchored.
+fn matcher_condition(m: &Matcher) -> Expr {
+    let lab = col(&m.label);
+    let absent = Expr::IsNull(Box::new(lab.clone()), false);
+    let present = Expr::IsNull(Box::new(lab.clone()), true);
+    let or = |a: Expr, b: Expr| Expr::Bin(BinOp::Or, Box::new(a), Box::new(b));
+    let and = |a: Expr, b: Expr| Expr::Bin(BinOp::And, Box::new(a), Box::new(b));
+    let eq = |v: &str| Expr::Bin(BinOp::Eq, Box::new(lab.clone()), Box::new(Expr::Lit(Val::Str(v.to_string()))));
+    let re = |v: &str| Expr::Call(func::PROMQL_RE.into(), vec![lab.clone(), Expr::Lit(Val::Str(v.to_string()))], 0);
+    let matches_empty = |v: &str| regex::Regex::new(&format!("^(?:{v})$")).is_ok_and(|r| r.is_match(""));
+    match m.op {
+        MatchOp::Eq if m.value.is_empty() => or(absent, eq("")),
+        MatchOp::Eq => eq(&m.value),
+        MatchOp::Ne if m.value.is_empty() => and(present, Expr::Not(Box::new(eq("")))),
+        MatchOp::Ne => or(absent, Expr::Not(Box::new(eq(&m.value)))),
+        MatchOp::Re if matches_empty(&m.value) => or(absent, re(&m.value)),
+        MatchOp::Re => re(&m.value),
+        MatchOp::Nre if matches_empty(&m.value) => and(present, Expr::Not(Box::new(re(&m.value)))),
+        MatchOp::Nre => or(absent, Expr::Not(Box::new(re(&m.value)))),
+    }
 }
 
 /// Compile to an ES|QL pipeline and run it.
 pub fn run(ctx: &mut super::exec::Ctx, q: &Promql) -> Result<super::exec::Table> {
+    // `without(labels)`: grouped by every other label (dimension) of the
+    // series; the output keeps those remaining labels.
+    let mut q = q.clone();
+    if has_without(&q.expr) {
+        let node = ctx.node.ok_or_else(|| crate::error::EsError::internal("no node"))?;
+        let dims = match super::exec::index_dimensions_as(node, &q.index, ctx.authorize.as_ref()) {
+            Ok(d) => d,
+            Err(e) if e.kind == "verification_exception" || e.kind == "index_not_found_exception" => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        resolve_without(&mut q.expr, &dims);
+    }
+    if !needs_split(&q.expr) {
+        return run_single(ctx, &q);
+    }
+    // Comparisons, and arithmetic between operands with different
+    // selectors: each vector operand runs as its own pipeline (with only
+    // its own label matchers) and the results are matched per step and
+    // label set.
+    match eval(ctx, &q, &q.expr)? {
+        PVal::Vector(v) => Ok(v.into_table(&q.name)),
+        PVal::Scalar(_) => Err(verification_err(ctx.full, q.pos, "a PromQL expression without a selector must be evaluated against a series; scalar-only comparisons are not supported")),
+    }
+}
+
+/// Whether any aggregation uses `without`.
+fn has_without(e: &PExpr) -> bool {
+    match e {
+        PExpr::Agg { without, expr, param, .. } => *without || has_without(expr) || param.as_deref().is_some_and(has_without),
+        PExpr::Bin { l, r, .. } => has_without(l) || has_without(r),
+        PExpr::Neg(a) => has_without(a),
+        PExpr::Call { args, .. } => args.iter().any(has_without),
+        _ => false,
+    }
+}
+
+/// Turn `without(labels)` into `by(<the other dimensions>)`.
+fn resolve_without(e: &mut PExpr, dims: &[String]) {
+    match e {
+        PExpr::Agg { without, by, expr, param, .. } => {
+            if *without {
+                *by = dims.iter().filter(|d| !by.contains(d)).cloned().collect();
+                *without = false;
+            }
+            resolve_without(expr, dims);
+            if let Some(p) = param.as_deref_mut() {
+                resolve_without(p, dims);
+            }
+        }
+        PExpr::Bin { l, r, .. } => {
+            resolve_without(l, dims);
+            resolve_without(r, dims);
+        }
+        PExpr::Neg(a) => resolve_without(a, dims),
+        PExpr::Call { args, .. } => args.iter_mut().for_each(|a| resolve_without(a, dims)),
+        _ => {}
+    }
+}
+
+fn is_comparison(op: &str) -> bool {
+    matches!(op, "==" | "!=" | ">" | "<" | ">=" | "<=")
+}
+
+/// Whether the expression reads a selector.
+fn has_sel(e: &PExpr) -> bool {
+    match e {
+        PExpr::Sel { .. } => true,
+        PExpr::Agg { expr, param, .. } => has_sel(expr) || param.as_deref().is_some_and(has_sel),
+        PExpr::Bin { l, r, .. } => has_sel(l) || has_sel(r),
+        PExpr::Neg(a) => has_sel(a),
+        PExpr::Call { args, .. } => args.iter().any(has_sel),
+        _ => false,
+    }
+}
+
+/// Every selector's label matchers (canonical text), in order.
+fn selector_scopes(e: &PExpr, out: &mut Vec<String>) {
+    match e {
+        PExpr::Sel { matchers, .. } => {
+            let mut m: Vec<String> = matchers.iter().map(|m| format!("{:?}\u{0}{}\u{0}{}", m.op, m.label, m.value)).collect();
+            m.sort();
+            out.push(m.join("\u{1}"));
+        }
+        PExpr::Agg { expr, param, .. } => {
+            selector_scopes(expr, out);
+            if let Some(p) = param.as_deref() {
+                selector_scopes(p, out);
+            }
+        }
+        PExpr::Bin { l, r, .. } => {
+            selector_scopes(l, out);
+            selector_scopes(r, out);
+        }
+        PExpr::Neg(a) => selector_scopes(a, out),
+        PExpr::Call { args, .. } => args.iter().for_each(|a| selector_scopes(a, out)),
+        _ => {}
+    }
+}
+
+/// Whether the single-pipeline compilation would be wrong: a comparison
+/// (it filters / yields 0-1 samples), or a binary operation whose operands
+/// select series with different label matchers (one pipeline applies every
+/// selector's matchers to all of its input).
+fn needs_split(e: &PExpr) -> bool {
+    match e {
+        PExpr::Bin { op, l, r, .. } => {
+            if is_comparison(op) || needs_split(l) || needs_split(r) {
+                return true;
+            }
+            if has_sel(l) && has_sel(r) {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                selector_scopes(l, &mut a);
+                selector_scopes(r, &mut b);
+                let mut all = a;
+                all.extend(b);
+                all.sort();
+                all.dedup();
+                return all.len() > 1;
+            }
+            false
+        }
+        PExpr::Agg { expr, param, .. } => needs_split(expr) || param.as_deref().is_some_and(needs_split),
+        PExpr::Neg(a) => needs_split(a),
+        PExpr::Call { args, .. } => args.iter().any(needs_split),
+        _ => false,
+    }
+}
+
+/// An evaluated PromQL value.
+enum PVal {
+    Scalar(f64),
+    Vector(PVector),
+}
+
+/// An instant vector per step: the label columns and, per (step, labels),
+/// the sample.
+struct PVector {
+    labels: Vec<super::exec::Column>,
+    rows: Vec<(Val, Vec<Val>, f64)>,
+}
+
+impl PVector {
+    fn key(step: &Val, labels: &[Val]) -> (Option<i64>, Vec<String>) {
+        (step.as_i64(), labels.iter().map(|v| v.to_text()).collect())
+    }
+
+    fn into_table(self, name: &str) -> super::exec::Table {
+        use super::exec::{Column, Table};
+        let mut cols = vec![Column { name: name.to_string(), ty: "double".into() }, Column { name: "step".into(), ty: "date".into() }];
+        cols.extend(self.labels);
+        let rows = self
+            .rows
+            .into_iter()
+            .map(|(step, labels, v)| {
+                let mut r = vec![Val::Double(v), step];
+                r.extend(labels);
+                r
+            })
+            .collect();
+        Table { cols, rows }
+    }
+}
+
+/// Evaluate `e` (some part of the expression needs the split evaluation).
+fn eval(ctx: &mut super::exec::Ctx, q: &Promql, e: &PExpr) -> Result<PVal> {
+    if !has_sel(e) {
+        return Ok(PVal::Scalar(scalar(ctx.full, q.pos, e)?));
+    }
+    if !needs_split(e) {
+        // A vector operand: its own pipeline, with only its own matchers.
+        let sub = Promql { expr: e.clone(), name: "\u{0}v".into(), ..q.clone() };
+        let t = run_single(ctx, &sub)?;
+        let labels: Vec<super::exec::Column> = t.cols.iter().skip(2).cloned().collect();
+        let rows = t
+            .rows
+            .into_iter()
+            .filter_map(|mut r| {
+                let v = r[0].as_f64()?;
+                let step = std::mem::replace(&mut r[1], Val::Null);
+                Some((step, r.split_off(2), v))
+            })
+            .collect();
+        return Ok(PVal::Vector(PVector { labels, rows }));
+    }
+    match e {
+        PExpr::Neg(a) => Ok(match eval(ctx, q, a)? {
+            PVal::Scalar(x) => PVal::Scalar(-x),
+            PVal::Vector(mut v) => {
+                v.rows.iter_mut().for_each(|r| r.2 = -r.2);
+                PVal::Vector(v)
+            }
+        }),
+        PExpr::Bin { op, l, r, bool_mod } => {
+            let (a, b) = (eval(ctx, q, l)?, eval(ctx, q, r)?);
+            combine(ctx.full, q.pos, op, *bool_mod, a, b)
+        }
+        _ => Err(verification_err(
+            ctx.full,
+            q.pos,
+            "PromQL comparisons, and binary operations between differently filtered selectors, are supported only at the top level of the expression, not inside an aggregation or function",
+        )),
+    }
+}
+
+/// A selector-free (scalar) expression.
+fn scalar(full: &str, pos: usize, e: &PExpr) -> Result<f64> {
+    Ok(match e {
+        PExpr::Num(n) => *n,
+        PExpr::Neg(a) => -scalar(full, pos, a)?,
+        PExpr::Bin { op, l, r, bool_mod } if !is_comparison(op) || *bool_mod => {
+            let (a, b) = (scalar(full, pos, l)?, scalar(full, pos, r)?);
+            if is_comparison(op) {
+                if cmp(op, a, b) { 1.0 } else { 0.0 }
+            } else {
+                arith(full, pos, op, a, b)?
+            }
+        }
+        PExpr::Bin { .. } => return Err(verification_err(full, pos, "comparisons between scalars must use BOOL modifier")),
+        _ => return Err(verification_err(full, pos, "unsupported scalar PromQL expression")),
+    })
+}
+
+fn cmp(op: &str, a: f64, b: f64) -> bool {
+    match op {
+        "==" => a == b,
+        "!=" => a != b,
+        ">" => a > b,
+        "<" => a < b,
+        ">=" => a >= b,
+        _ => a <= b,
+    }
+}
+
+fn arith(full: &str, pos: usize, op: &str, a: f64, b: f64) -> Result<f64> {
+    Ok(match op {
+        "+" => a + b,
+        "-" => a - b,
+        "*" => a * b,
+        "/" => a / b,
+        "%" => a % b,
+        "^" => a.powf(b),
+        other => return Err(verification_err(full, pos, format!("unsupported PromQL operator [{other}]"))),
+    })
+}
+
+/// A binary operation on evaluated operands (Prometheus semantics):
+/// arithmetic maps / matches samples; a comparison without `bool` keeps
+/// the samples for which it holds (with the vector's value), with `bool`
+/// every sample becomes 0 or 1. Two vectors match one-to-one on step and
+/// their (identical) label set.
+fn combine(full: &str, pos: usize, op: &str, bool_mod: bool, a: PVal, b: PVal) -> Result<PVal> {
+    let comparison = is_comparison(op);
+    // The sample a matched pair yields, if kept.
+    let apply = |x: f64, y: f64, keep: f64| -> Result<Option<f64>> {
+        Ok(if comparison {
+            let holds = cmp(op, x, y);
+            if bool_mod {
+                Some(if holds { 1.0 } else { 0.0 })
+            } else {
+                holds.then_some(keep)
+            }
+        } else {
+            Some(arith(full, pos, op, x, y)?)
+        })
+    };
+    Ok(match (a, b) {
+        (PVal::Scalar(x), PVal::Scalar(y)) => {
+            if comparison && !bool_mod {
+                return Err(verification_err(full, pos, "comparisons between scalars must use BOOL modifier"));
+            }
+            PVal::Scalar(apply(x, y, x)?.unwrap_or(f64::NAN))
+        }
+        (PVal::Vector(mut v), PVal::Scalar(y)) => {
+            let mut rows = Vec::with_capacity(v.rows.len());
+            for (s, l, x) in v.rows.drain(..) {
+                if let Some(out) = apply(x, y, x)? {
+                    rows.push((s, l, out));
+                }
+            }
+            v.rows = rows;
+            PVal::Vector(v)
+        }
+        (PVal::Scalar(x), PVal::Vector(mut v)) => {
+            let mut rows = Vec::with_capacity(v.rows.len());
+            for (s, l, y) in v.rows.drain(..) {
+                if let Some(out) = apply(x, y, y)? {
+                    rows.push((s, l, out));
+                }
+            }
+            v.rows = rows;
+            PVal::Vector(v)
+        }
+        (PVal::Vector(lv), PVal::Vector(rv)) => {
+            // One-to-one matching on the same label set (in any order).
+            let mut ln: Vec<&str> = lv.labels.iter().map(|c| c.name.as_str()).collect();
+            let mut rn: Vec<&str> = rv.labels.iter().map(|c| c.name.as_str()).collect();
+            ln.sort_unstable();
+            rn.sort_unstable();
+            if ln != rn {
+                return Err(verification_err(
+                    full,
+                    pos,
+                    format!(
+                        "PromQL vector matching between operands with different label sets ([{}] and [{}]) is not supported; group both operands by the same labels",
+                        ln.join(", "),
+                        rn.join(", ")
+                    ),
+                ));
+            }
+            let order: Vec<usize> = lv.labels.iter().map(|c| rv.labels.iter().position(|x| x.name == c.name).unwrap_or(0)).collect();
+            let mut right: std::collections::HashMap<(Option<i64>, Vec<String>), f64> = std::collections::HashMap::new();
+            for (s, l, y) in &rv.rows {
+                let reordered: Vec<Val> = order.iter().map(|&i| l.get(i).cloned().unwrap_or(Val::Null)).collect();
+                right.insert(PVector::key(s, &reordered), *y);
+            }
+            let mut rows = Vec::with_capacity(lv.rows.len());
+            for (s, l, x) in lv.rows {
+                let Some(&y) = right.get(&PVector::key(&s, &l)) else { continue };
+                if let Some(out) = apply(x, y, x)? {
+                    rows.push((s, l, out));
+                }
+            }
+            PVal::Vector(PVector { labels: lv.labels, rows })
+        }
+    })
+}
+
+/// The single-pipeline compilation (no comparison, and every selector of
+/// a binary operation has the same matchers).
+fn run_single(ctx: &mut super::exec::Ctx, q: &Promql) -> Result<super::exec::Table> {
     use super::exec::{Column, Table};
     let mut c = Compiled { matchers: vec![], by: vec![], aggregated: false, metrics: vec![] };
     let agg = compile(ctx.full, &q.expr, &mut c, false)?;
@@ -638,7 +1006,7 @@ pub fn run(ctx: &mut super::exec::Ctx, q: &Promql) -> Result<super::exec::Table>
     };
     // Unmapped metrics select no series.
     let node = ctx.node.ok_or_else(|| crate::error::EsError::internal("no node"))?;
-    let cols = match super::exec::index_columns(node, &q.index) {
+    let cols = match super::exec::index_columns_as(node, &q.index, ctx.authorize.as_ref()) {
         Ok(c) => c,
         Err(e) if e.kind == "verification_exception" || e.kind == "index_not_found_exception" => return Ok(empty(&c.by)),
         Err(e) => return Err(e),
@@ -656,15 +1024,15 @@ pub fn run(ctx: &mut super::exec::Ctx, q: &Promql) -> Result<super::exec::Table>
         cmds.push(Cmd::Where(Expr::Bin(BinOp::Le, Box::new(ts.clone()), Box::new(Expr::Lit(Val::Date(e)))), q.pos));
     }
     for m in &c.matchers {
-        let lab = col(&m.label);
-        let cond = match (&m.op, is_literal(&m.value)) {
-            (MatchOp::Eq, _) => Expr::Bin(BinOp::Eq, Box::new(lab), Box::new(Expr::Lit(Val::Str(m.value.clone())))),
-            (MatchOp::Ne, _) => Expr::Not(Box::new(Expr::Bin(BinOp::Eq, Box::new(lab), Box::new(Expr::Lit(Val::Str(m.value.clone())))))),
-            (MatchOp::Re, true) => Expr::Bin(BinOp::Eq, Box::new(lab), Box::new(Expr::Lit(Val::Str(m.value.clone())))),
-            (MatchOp::Re, false) => Expr::Like(Box::new(lab), vec![m.value.clone()], false, true),
-            (MatchOp::Nre, _) => Expr::Like(Box::new(lab), vec![m.value.clone()], true, true),
-        };
-        cmds.push(Cmd::Where(cond, q.pos));
+        // A label no index maps is absent from every series: its matcher
+        // keeps them all when it accepts the empty value, else none.
+        if !cols.iter().any(|x| x.name == m.label) {
+            if !accepts_empty(m) {
+                cmds.push(Cmd::Where(Expr::Lit(Val::Bool(false)), q.pos));
+            }
+            continue;
+        }
+        cmds.push(Cmd::Where(matcher_condition(m), q.pos));
     }
     let bucket = "\u{0}step".to_string();
     let mut by = vec![Field { name: bucket.clone(), expr: Expr::Call("BUCKET".into(), vec![ts.clone(), Expr::Lit(Val::Dur(step))], q.pos), filter: None, pos: q.pos }];
@@ -707,4 +1075,207 @@ pub fn run(ctx: &mut super::exec::Ctx, q: &Promql) -> Result<super::exec::Table>
         }
     }
     Ok(t)
+}
+
+#[cfg(test)]
+mod semantics_tests {
+    use super::*;
+    use crate::node::Node;
+    use serde_json::json;
+
+    /// A time series index `name` with keyword dimensions `dims` and double
+    /// gauges `metrics`, holding `docs`; returns the hour its data starts.
+    fn ts_index(node: &Node, name: &str, dims: &[&str], metrics: &[&str], docs: &[(i64, Value)], base: i64) {
+        let now = crate::date::now_millis();
+        let mut props = serde_json::Map::new();
+        props.insert("@timestamp".into(), json!({"type": "date"}));
+        for d in dims {
+            props.insert(d.to_string(), json!({"type": "keyword", "time_series_dimension": true}));
+        }
+        for m in metrics {
+            props.insert(m.to_string(), json!({"type": "double", "time_series_metric": "gauge"}));
+        }
+        node.create_index(name, &json!({
+            "settings": {"index.mode": "time_series", "index.routing_path": dims, "index.number_of_replicas": 0,
+                "index.time_series.start_time": crate::ilm::iso_date(base - 3_600_000), "index.time_series.end_time": crate::ilm::iso_date(now + 3_600_000)},
+            "mappings": {"properties": props}}))
+            .unwrap();
+        let svc = node.get_index(name).unwrap();
+        let reqs = docs
+            .iter()
+            .map(|(at, d)| {
+                let mut d = d.clone();
+                d["@timestamp"] = json!(crate::ilm::iso_date(base + at));
+                crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }
+            })
+            .collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    fn base() -> i64 {
+        let now = crate::date::now_millis();
+        now - now.rem_euclid(3_600_000) - 3_600_000
+    }
+
+    /// `(value, step, labels...)` rows of a PROMQL query, sorted.
+    fn promql(node: &Node, q: &str) -> Result<Vec<(f64, i64, Vec<String>)>> {
+        let out = crate::esql::run(node, q, crate::esql::EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() })?;
+        let mut rows: Vec<(f64, i64, Vec<String>)> = out
+            .table
+            .rows
+            .iter()
+            .map(|r| (r[0].as_f64().unwrap_or(f64::NAN), r[1].as_i64().unwrap_or(0), r[2..].iter().map(|v| v.to_text()).collect()))
+            .collect();
+        rows.sort_by(|a, b| (a.1, &a.2).cmp(&(b.1, &b.2)));
+        Ok(rows)
+    }
+
+    /// Review finding 188: `without(instance)` groups by every other label
+    /// (job), keeping the jobs apart and the job label in the output; `by
+    /// (job)` and the ungrouped sum are the controls.
+    #[test]
+    fn without_groups_by_the_remaining_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let b = base();
+        let docs: Vec<(i64, Value)> = [("a", "i1", 1.0), ("a", "i2", 2.0), ("b", "i1", 10.0), ("b", "i2", 20.0)]
+            .iter()
+            .map(|(j, i, v)| (30_000, json!({"job": j, "instance": i, "gauge": v})))
+            .collect();
+        ts_index(&node, "pm188", &["job", "instance"], &["gauge"], &docs, b);
+        let q = |e: &str| format!("PROMQL index=pm188 step=1m start={b} end={} v=({e})", b + 59_999);
+        let without = promql(&node, &q("sum without(instance)(gauge)")).unwrap();
+        let by = promql(&node, &q("sum by(job)(gauge)")).unwrap();
+        assert_eq!(without.iter().map(|r| (r.0, r.2.clone())).collect::<Vec<_>>(), vec![(3.0, vec!["a".to_string()]), (30.0, vec!["b".to_string()])], "{without:?}");
+        assert_eq!(without, by);
+        let all = promql(&node, &q("sum(gauge)")).unwrap();
+        assert_eq!(all.iter().map(|r| r.0).collect::<Vec<_>>(), vec![33.0]);
+    }
+
+    /// Review finding 189: each operand keeps its own selector matchers:
+    /// errors / all is 0.1 (not 1), disjoint selectors add up, grouped
+    /// operands match per label set, and identical selectors stay 1.
+    #[test]
+    fn binary_operands_keep_their_own_selectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let b = base();
+        let docs: Vec<(i64, Value)> = [("500", "i1", 10.0), ("200", "i1", 50.0), ("200", "i2", 40.0)]
+            .iter()
+            .map(|(s, i, v)| (30_000, json!({"status": s, "instance": i, "requests": v})))
+            .collect();
+        ts_index(&node, "pm189", &["status", "instance"], &["requests"], &docs, b);
+        let q = |e: &str| format!("PROMQL index=pm189 step=1m start={b} end={} v=({e})", b + 59_999);
+        let ratio = promql(&node, &q("sum(requests{status=\"500\"}) / sum(requests)")).unwrap();
+        assert_eq!(ratio.len(), 1, "{ratio:?}");
+        assert!((ratio[0].0 - 0.1).abs() < 1e-12, "{ratio:?}");
+        let both = promql(&node, &q("sum(requests{status=\"500\"}) + sum(requests{status=\"200\"})")).unwrap();
+        assert_eq!(both.iter().map(|r| r.0).collect::<Vec<_>>(), vec![100.0], "disjoint selectors");
+        let same = promql(&node, &q("sum(requests) / sum(requests)")).unwrap();
+        assert_eq!(same.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1.0]);
+        let grouped = promql(&node, &q("sum by(instance)(requests{status=\"500\"}) / sum by(instance)(requests)")).unwrap();
+        assert_eq!(grouped.len(), 1, "only i1 has errors: {grouped:?}");
+        assert_eq!(grouped[0].2, vec!["i1".to_string()]);
+        assert!((grouped[0].0 - 10.0 / 60.0).abs() < 1e-12, "{grouped:?}");
+        // Unsupported matching is refused, not computed wrongly.
+        assert!(promql(&node, &q("sum by(instance)(requests{status=\"500\"}) / sum(requests)")).is_err());
+    }
+
+    /// Review finding 190: a comparison without `bool` keeps only the
+    /// samples for which it holds, with their values; with `bool` every
+    /// sample becomes 0 or 1 (doubles); a step without observations has no
+    /// sample either way.
+    #[test]
+    fn comparisons_filter_or_yield_bool_samples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let b = base();
+        let docs = vec![(30_000, json!({"host": "h", "gauge": 50.0})), (90_000, json!({"host": "h", "gauge": 150.0}))];
+        ts_index(&node, "pm190", &["host"], &["gauge"], &docs, b);
+        let q = |e: &str| format!("PROMQL index=pm190 step=1m start={b} end={} v=({e})", b + 3 * 60_000 - 1);
+        let filtered = promql(&node, &q("sum(gauge) > 100")).unwrap();
+        assert_eq!(filtered.iter().map(|r| r.0).collect::<Vec<_>>(), vec![150.0], "{filtered:?}");
+        let flags = promql(&node, &q("sum(gauge) > bool 100")).unwrap();
+        assert_eq!(flags.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0.0, 1.0], "{flags:?}");
+        let lower = promql(&node, &q("sum(gauge) <= 100")).unwrap();
+        assert_eq!(lower.iter().map(|r| r.0).collect::<Vec<_>>(), vec![50.0]);
+        let scalar_left = promql(&node, &q("100 < sum(gauge)")).unwrap();
+        assert_eq!(scalar_left.iter().map(|r| r.0).collect::<Vec<_>>(), vec![150.0]);
+    }
+
+    /// Review finding 478: a bare selector (and scalar math over it) is
+    /// each series' latest sample per step; last_over_time is the control.
+    #[test]
+    fn bare_selectors_answer_per_series() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let b = base();
+        let docs: Vec<(i64, Value)> = vec![(10_000, json!({"host": "h1", "temperature": 20.0})), (40_000, json!({"host": "h1", "temperature": -21.0})), (30_000, json!({"host": "h2", "temperature": 30.0}))];
+        ts_index(&node, "pm478", &["host"], &["temperature"], &docs, b);
+        let q = |e: &str| format!("PROMQL index=pm478 step=1m start={b} end={} v=({e})", b + 59_999);
+        let bare = promql(&node, &q("temperature")).unwrap();
+        let control = promql(&node, &q("last_over_time(temperature[1m])")).unwrap();
+        assert_eq!(bare.iter().map(|r| r.0).collect::<Vec<_>>(), vec![-21.0, 30.0], "{bare:?}");
+        assert_eq!(bare.iter().map(|r| r.0).collect::<Vec<_>>(), control.iter().map(|r| r.0).collect::<Vec<_>>());
+        let abs = promql(&node, &q("abs(temperature)")).unwrap();
+        assert_eq!(abs.iter().map(|r| r.0).collect::<Vec<_>>(), vec![21.0, 30.0], "{abs:?}");
+    }
+
+    /// Review finding 479: a series without a label has the empty value: a
+    /// matcher accepting "" selects it (`!=`, `=""`, `=~` / `!~`).
+    #[test]
+    fn matchers_select_series_without_the_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let b = base();
+        let docs: Vec<(i64, Value)> = vec![(30_000, json!({"host": "h1", "region": "us", "gauge": 10.0})), (30_000, json!({"host": "h2", "gauge": 20.0}))];
+        ts_index(&node, "pm479", &["host", "region"], &["gauge"], &docs, b);
+        let q = |e: &str| format!("PROMQL index=pm479 step=1m start={b} end={} v=({e})", b + 59_999);
+        let sum = |e: &str| promql(&node, &q(e)).unwrap().iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!(sum("sum(gauge{region!=\"us\"})"), vec![20.0]);
+        assert_eq!(sum("sum(gauge{region=\"\"})"), vec![20.0]);
+        assert_eq!(sum("sum(gauge{region=\"us\"})"), vec![10.0]);
+        assert_eq!(sum("sum(gauge{region=~\"u.*|\"})"), vec![30.0]);
+        assert_eq!(sum("sum(gauge{region!~\"u.*\"})"), vec![20.0]);
+        assert_eq!(sum("sum(gauge{region!=\"\"})"), vec![10.0]);
+        // A label no index maps.
+        assert_eq!(sum("sum(gauge{zone!=\"x\"})"), vec![30.0]);
+        assert!(sum("sum(gauge{zone=\"x\"})").is_empty());
+    }
+
+    /// Review finding 480: a delta-temporality counter rates its running
+    /// total (5 every 10 s: rate 0.5/s, increase 10), a cumulative counter
+    /// as before.
+    #[test]
+    fn delta_counters_rate_their_running_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        let b = base();
+        let now = crate::date::now_millis();
+        node.create_index("ts480", &json!({
+            "settings": {"index.mode": "time_series", "index.routing_path": ["host", "temporality"], "index.number_of_replicas": 0,
+                "index.time_series.temporality_field": "temporality",
+                "index.time_series.start_time": crate::ilm::iso_date(b - 3_600_000), "index.time_series.end_time": crate::ilm::iso_date(now + 3_600_000)},
+            "mappings": {"properties": {"@timestamp": {"type": "date"}, "host": {"type": "keyword", "time_series_dimension": true},
+                "temporality": {"type": "keyword", "time_series_dimension": true},
+                "requests": {"type": "double", "time_series_metric": "counter"}}}})).unwrap();
+        let svc = node.get_index("ts480").unwrap();
+        let mut reqs = Vec::new();
+        for (i, at) in [10_000, 20_000, 30_000].iter().enumerate() {
+            reqs.push(json!({"@timestamp": crate::ilm::iso_date(b + at), "host": "d", "temporality": "delta", "requests": 5.0}));
+            reqs.push(json!({"@timestamp": crate::ilm::iso_date(b + at), "host": "c", "temporality": "cumulative", "requests": 5.0 * (i + 1) as f64}));
+        }
+        let reqs = reqs.into_iter().map(|d| crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let out = crate::esql::run(&node, "TS ts480 | STATS r = SUM(RATE(requests)), i = SUM(INCREASE(requests)) BY host | SORT host", crate::esql::EsqlOptions::default()).unwrap();
+        let rows: Vec<(f64, f64, String)> = out.table.rows.iter().map(|r| (r[0].as_f64().unwrap_or(f64::NAN), r[1].as_f64().unwrap_or(f64::NAN), r[2].to_text())).collect();
+        assert_eq!(rows, vec![(0.5, 10.0, "c".to_string()), (0.5, 10.0, "d".to_string())]);
+    }
+
 }

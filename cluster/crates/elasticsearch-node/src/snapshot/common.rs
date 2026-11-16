@@ -49,6 +49,9 @@ pub struct Pending {
     pub partial: bool,
     pub indices: Vec<String>,
     pub data_streams: Vec<String>,
+    /// `feature_states`: each requested feature with the system indices it
+    /// contributed (recorded in the progress entry, so a new master keeps it).
+    pub feature_states: Vec<(String, Vec<String>)>,
     pub metadata: Option<Map<String, Value>>,
     pub start_time: i64,
     /// Index -> id of the node that held its primary when the snapshot
@@ -320,7 +323,7 @@ pub fn render_state_customs(st: &ClusterState) -> Map<String, Value> {
                     let node = st.routing_table.shard_table(i, 0).and_then(|t| t.active_primary()).and_then(|p| p.node_id.clone());
                     json!({"index": {"index_name": i, "index_uuid": uuid_of(i)}, "shard": 0, "state": if node.is_some() { "INIT" } else { "MISSING" }, "node": node})
                 }).collect::<Vec<_>>(),
-                "feature_states": [],
+                "feature_states": e["feature_states"].as_array().cloned().unwrap_or_default(),
                 "data_streams": e["data_streams"].clone(),
             })
         })
@@ -334,7 +337,15 @@ pub fn render_state_customs(st: &ClusterState) -> Map<String, Value> {
                 "uuid": e["uuid"],
                 "state": e["state"].as_str().unwrap_or("STARTED"),
                 "indices": e["indices"],
-                "shards": e["indices"].as_array().map(|a| a.iter().map(|i| json!({"index": i, "shard": 0, "state": "INIT"})).collect::<Vec<_>>()).unwrap_or_default(),
+                // Per-target progress (`restore` module): ES's shard states.
+                "shards": e["indices"].as_array().map(|a| a.iter().map(|i| {
+                    let state = match i.as_str().map(|i| &e["targets"][i]["state"]).and_then(Value::as_str) {
+                        Some("done") => "SUCCESS",
+                        Some("failed") => "FAILURE",
+                        _ => "INIT",
+                    };
+                    json!({"index": i, "shard": 0, "state": state})
+                }).collect::<Vec<_>>()).unwrap_or_default(),
             })
         })
         .collect();

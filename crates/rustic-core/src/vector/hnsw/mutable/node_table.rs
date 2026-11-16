@@ -15,6 +15,7 @@
 //! reads do not lock. A guard owns hold cells, so reads also borrow this table.
 
 use super::array_store::LevelsRef;
+use super::huge::Slab;
 use super::generation::{GenerationGuard, GenerationHandler};
 use parking_lot::{Mutex, MutexGuard};
 use std::fmt;
@@ -228,7 +229,7 @@ impl std::error::Error for NodeTableError {}
 /// Compact hot references are separate from cold identity/publication metadata.
 /// One allocation owner publishes both arrays, avoiding mixed growth snapshots.
 struct NodeAllocation {
-    levels: Vec<AtomicU32>,
+    levels: Slab<AtomicU32>,
     /// Each slot's visibility word, dense by id, for a graph whose source
     /// keeps its rows or codes dense by id (empty otherwise, see
     /// [`NodeTable::enable_dense`]): the record's publication while the slot
@@ -238,10 +239,17 @@ struct NodeAllocation {
     /// levels word and the neighbour's 32-byte record (its key and
     /// incarnation are only read for the nodes a search admits).
     /// Publication stores it (Release) after the levels; removal resets it.
-    publications: Vec<HotSlot>,
-    records: Vec<NodeRecord>,
-    removed: Vec<RemovedLevels>,
+    publications: Slab<HotSlot>,
+    records: Slab<NodeRecord>,
+    removed: Slab<RemovedLevels>,
     _memory: crate::admission::Reservation,
+    /// Slots admission is charged for. A table reserved far ahead
+    /// ([`RESERVE_FROM`]) is charged for its exposed slots and a step
+    /// ([`NODE_CHARGE_STEP`]) ahead, its untouched address space costing no
+    /// memory; any other allocation for its whole capacity.
+    charged: usize,
+    /// Charges added as `len` grew past `charged`.
+    topups: Vec<crate::admission::Reservation>,
 }
 
 /// A slot's dense traversal words ([`NodeAllocation::publications`]): its
@@ -332,18 +340,35 @@ impl NodeAllocation {
     }
 }
 const NODE_BYTES: usize = size_of::<NodeRecord>() + size_of::<AtomicU32>() + size_of::<RemovedLevels>();
+/// Growth to at least this many slots reserves address space for
+/// [`RESERVE_SLOTS`] at once (where the platform maps it lazily): the arrays
+/// then never move again. Doubling growth copied every record into a new
+/// allocation charged for twice the nodes while the old one stayed held for
+/// its readers, a step of three times the table's size (gigabytes on a
+/// shard of tens of millions of vectors, on every shard at about the same
+/// time under uniform routing).
+const RESERVE_FROM: usize = 1 << 20;
+/// Slots a reserved table spans (bounded by `max_slots`); past them it
+/// grows by copying again.
+const RESERVE_SLOTS: usize = 1 << 31;
+/// Slots a reserved table's admission charge grows by at least.
+const NODE_CHARGE_STEP: usize = 1 << 16;
+
 /// `capacity` zeroed elements (one zeroed allocation, not written element
-/// by element). Only for this table's element types, whose all-zero bytes
-/// are a valid value (atomics).
-fn zeroed_vec<T>(capacity: usize) -> Result<Vec<T>, NodeTableError> {
-    if capacity == 0 || size_of::<T>() == 0 { return Ok(Vec::new()); }
-    let layout = std::alloc::Layout::array::<T>(capacity).map_err(|_| NodeTableError::CapacityLimit)?;
-    // SAFETY: a nonzero layout; the elements are atomics, valid when zero.
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<T>();
-    if ptr.is_null() { return Err(NodeTableError::AllocationFailed); }
-    // SAFETY: allocated by the global allocator with `T`'s alignment and
-    // `capacity` elements, all initialized (zero).
-    Ok(unsafe { Vec::from_raw_parts(ptr, capacity, capacity) })
+/// by element; reserved address space only when `reserve`). Only for this
+/// table's element types, whose all-zero bytes are a valid value (atomics).
+fn zeroed_slab<T>(capacity: usize, reserve: bool) -> Result<Slab<T>, NodeTableError> {
+    capacity.checked_mul(size_of::<T>()).filter(|bytes| *bytes <= isize::MAX as usize).ok_or(NodeTableError::CapacityLimit)?;
+    if reserve { return Slab::reserved(capacity).ok_or(NodeTableError::AllocationFailed); }
+    Slab::zeroed(capacity).ok_or(NodeTableError::AllocationFailed)
+}
+
+/// `capacity` zeroed elements mapped from a spill file (`None`: no spill
+/// file; see `huge::spilled`).
+fn spilled_slab<T>(capacity: usize) -> Option<Slab<T>> {
+    let bytes = capacity.checked_mul(size_of::<T>())?;
+    if bytes == 0 { return Some(Slab::default()); }
+    Some(Slab::from_block(super::huge::spilled(bytes)?, capacity))
 }
 
 /// Per node with the dense publication copy.
@@ -521,7 +546,7 @@ impl NodeTable {
         // Bounded hold-list capacity including old/new Vec overlap. The
         // separate payload owners remain charged until generation reclamation.
         let metadata = budget.reserve((limits.max_held_allocations as u64).saturating_mul((3 * size_of::<HeldAllocation>()) as u64).saturating_add(size_of::<Self>() as u64).saturating_add(256), "mutable node hold metadata").map_err(|_| NodeTableError::MemoryLimit)?;
-        let mut rows = Self::allocate(limits.initial_capacity as usize, false, &budget)?;
+        let mut rows = Self::allocate(limits.initial_capacity as usize, 1, false, false, &budget)?;
         if Self::bytes(&rows) > limits.max_payload_bytes {
             return Err(NodeTableError::PayloadLimit);
         }
@@ -544,11 +569,29 @@ impl NodeTable {
         })
     }
 
-    fn allocate(capacity: usize, dense: bool, budget: &std::sync::Arc<crate::admission::Budget>) -> Result<Box<NodeAllocation>, NodeTableError> {
+    /// `reserve`: `capacity` is address space reserved ahead, charged for
+    /// `exposed` slots and a step ahead (the rest as it is exposed, see
+    /// [`Self::charge`]); otherwise charged whole.
+    fn allocate(capacity: usize, exposed: usize, dense: bool, reserve: bool, budget: &std::sync::Arc<crate::admission::Budget>) -> Result<Box<NodeAllocation>, NodeTableError> {
         let node_bytes = if dense { DENSE_NODE_BYTES } else { NODE_BYTES };
         capacity.checked_mul(node_bytes).filter(|bytes| *bytes <= isize::MAX as usize)
             .ok_or(NodeTableError::CapacityLimit)?;
-        let memory = budget.reserve((capacity as u64).saturating_mul(node_bytes as u64).saturating_add(size_of::<NodeAllocation>() as u64), "mutable node arrays").map_err(|_| NodeTableError::MemoryLimit)?;
+        // Past the budget's spill threshold an allocation that is not
+        // reserved ahead maps spill files and is not charged.
+        if !reserve && super::huge::spill_due(capacity.saturating_mul(node_bytes), budget) {
+            let spilled = (|| -> Option<NodeAllocation> {
+                let records = spilled_slab::<NodeRecord>(capacity)?;
+                let levels = spilled_slab::<AtomicU32>(capacity)?;
+                let publications = if dense { spilled_slab::<HotSlot>(capacity)? } else { Slab::default() };
+                let removed = spilled_slab::<RemovedLevels>(capacity)?;
+                let memory = budget.reserve(size_of::<NodeAllocation>() as u64, "mutable node arrays").ok()?;
+                // Not charged and never topped up (`charged` covers it).
+                Some(NodeAllocation { levels, publications, records, removed, _memory: memory, charged: capacity, topups: Vec::new() })
+            })();
+            if let Some(allocation) = spilled { return Ok(Box::new(allocation)); }
+        }
+        let charged = if reserve { exposed.saturating_add(NODE_CHARGE_STEP).min(capacity) } else { capacity };
+        let memory = budget.reserve((charged as u64).saturating_mul(node_bytes as u64).saturating_add(size_of::<NodeAllocation>() as u64), "mutable node arrays").map_err(|_| NodeTableError::MemoryLimit)?;
         // Zeroed, not written: an all-zero record, levels word and removal
         // record are their vacant values, and fresh pages stay unbacked
         // until a slot is used, so the capacity growth reserves ahead (up
@@ -556,16 +599,34 @@ impl NodeTable {
         // A dense word's vacant value is not zero: `ensure_len` writes it
         // into each slot before the slot is exposed (`len`), and growth
         // copies the exposed ones.
-        let records = zeroed_vec::<NodeRecord>(capacity)?;
-        let levels = zeroed_vec::<AtomicU32>(capacity)?;
-        let publications = if dense { zeroed_vec::<HotSlot>(capacity)? } else { Vec::new() };
-        let removed = zeroed_vec::<RemovedLevels>(capacity)?;
-        Ok(Box::new(NodeAllocation { levels, publications, records, removed, _memory: memory }))
+        let records = zeroed_slab::<NodeRecord>(capacity, reserve)?;
+        let levels = zeroed_slab::<AtomicU32>(capacity, reserve)?;
+        let publications = if dense { zeroed_slab::<HotSlot>(capacity, reserve)? } else { Slab::default() };
+        let removed = zeroed_slab::<RemovedLevels>(capacity, reserve)?;
+        Ok(Box::new(NodeAllocation { levels, publications, records, removed, _memory: memory, charged, topups: Vec::new() }))
     }
+    /// Payload bytes an allocation holds in memory: its charged slots (a
+    /// reserved table's untouched address space is not memory).
     fn bytes(rows: &NodeAllocation) -> usize {
-        rows.records.capacity() * size_of::<NodeRecord>() + rows.levels.capacity() * size_of::<AtomicU32>()
-            + rows.publications.capacity() * size_of::<HotSlot>()
-            + rows.removed.capacity() * size_of::<RemovedLevels>()
+        let node_bytes = size_of::<NodeRecord>() + size_of::<AtomicU32>() + size_of::<RemovedLevels>()
+            + if rows.publications.is_empty() { 0 } else { size_of::<HotSlot>() };
+        rows.charged.min(rows.records.capacity()) * node_bytes
+    }
+
+    /// Charge admission for the current allocation's slots below
+    /// `required`, a [`NODE_CHARGE_STEP`] ahead (at most its capacity),
+    /// before they are exposed. A refusal leaves the table unchanged.
+    fn charge(&self, writer: &mut Writer, required: usize) -> Result<(), NodeTableError> {
+        let current = &mut writer.current;
+        if required <= current.charged { return Ok(()); }
+        let node_bytes = if current.publications.is_empty() { NODE_BYTES } else { DENSE_NODE_BYTES };
+        let to = required.saturating_add(NODE_CHARGE_STEP).min(current.records.len()).max(required);
+        let memory = self.budget.reserve(((to - current.charged) as u64).saturating_mul(node_bytes as u64), "mutable node arrays")
+            .map_err(|_| NodeTableError::MemoryLimit)?;
+        current.topups.try_reserve(1).map_err(|_| NodeTableError::AllocationFailed)?;
+        current.topups.push(memory);
+        current.charged = to;
+        Ok(())
     }
 
     #[inline]
@@ -606,8 +667,14 @@ impl NodeTable {
                 + u64::from(required) * u64::from(self.limits.grow_percent) / 100
                 + u64::from(self.limits.grow_delta);
             let capacity = grown.min(u64::from(self.limits.max_slots)) as usize;
-            self.replace_allocation(&mut writer, capacity)?;
+            // Large: reserve far ahead once, so it never moves again (see
+            // `RESERVE_FROM`); where address space cannot be reserved
+            // lazily, grow as before.
+            let reserve = capacity >= RESERVE_FROM && (required as usize) < RESERVE_SLOTS.min(self.limits.max_slots as usize);
+            let reserved = reserve && self.replace_allocation_with(&mut writer, RESERVE_SLOTS.min(self.limits.max_slots as usize), true).is_ok();
+            if !reserved { self.replace_allocation(&mut writer, capacity)?; }
         }
+        self.charge(&mut writer, required as usize)?;
         // The slots this exposes get their vacant dense word (allocations
         // start zeroed, see `allocate`) before readers can reach them.
         let exposed = self.len.load(Ordering::Relaxed) as usize;
@@ -642,6 +709,12 @@ impl NodeTable {
     /// current length) with the same contents, holding the old one for its
     /// readers. Caller holds the table writer lock.
     fn replace_allocation(&self, writer: &mut Writer, capacity: usize) -> Result<(), NodeTableError> {
+        // A reserved table keeps its kind (only `enable_dense` replaces one).
+        let reserve = writer.current.charged < writer.current.records.len();
+        self.replace_allocation_with(writer, capacity, reserve)
+    }
+
+    fn replace_allocation_with(&self, writer: &mut Writer, capacity: usize, reserve: bool) -> Result<(), NodeTableError> {
         let dense = self.dense.load(Ordering::Relaxed);
         let old_bytes = Self::bytes(&writer.current);
         let held_after = writer
@@ -653,7 +726,9 @@ impl NodeTable {
         {
             return Err(NodeTableError::HeldLimit);
         }
-        let wanted_bytes = capacity
+        let exposed_now = (self.len.load(Ordering::Relaxed) as usize).min(capacity);
+        let charged_slots = if reserve { exposed_now.saturating_add(NODE_CHARGE_STEP).min(capacity) } else { capacity };
+        let wanted_bytes = charged_slots
             .checked_mul(if dense { DENSE_NODE_BYTES } else { NODE_BYTES })
             .ok_or(NodeTableError::CapacityLimit)?;
         if held_after
@@ -672,7 +747,7 @@ impl NodeTable {
         if std::mem::take(&mut writer.fail_next_allocation) {
             return Err(NodeTableError::AllocationFailed);
         }
-        let mut replacement = Self::allocate(capacity, dense, &self.budget)?;
+        let mut replacement = Self::allocate(capacity, exposed_now, dense, reserve, &self.budget)?;
         if held_after
             .checked_add(Self::bytes(&replacement))
             .is_none_or(|bytes| bytes > self.limits.max_payload_bytes)
@@ -1188,6 +1263,39 @@ mod tests {
         drop(table);assert_eq!(budget.used(), 0);
     }
 
+    /// Past `RESERVE_FROM` a table reserves its address space once: later
+    /// growth neither moves nor copies it, holds no old allocation, and
+    /// charges admission for the exposed slots (a step ahead), not for a
+    /// doubled capacity.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn large_tables_grow_in_place_and_are_charged_as_exposed() {
+        let d = domain();
+        let budget = crate::admission::Budget::new(1 << 34);
+        let limits = NodeTableLimits { max_held_bytes: 1 << 30, ..NodeTableLimits::default() };
+        let table = NodeTable::with_budget(d.clone(), limits, budget.clone()).unwrap();
+        table.enable_dense().unwrap();
+        table.ensure_len(RESERVE_FROM as u32 + 1).unwrap();
+        let pointer = table.current.load(Ordering::Acquire);
+        let held = table.held_payload_bytes();
+        let charged = budget.used();
+        for len in [RESERVE_FROM + 2, 3 * RESERVE_FROM, 3 * RESERVE_FROM + NODE_CHARGE_STEP + 5] {
+            table.ensure_len(len as u32).unwrap();
+            assert_eq!(table.current.load(Ordering::Acquire), pointer, "a reserved table never moves");
+            assert_eq!(table.held_payload_bytes(), held, "nothing new held");
+            let used = budget.used() - charged;
+            let exposed = (len - RESERVE_FROM - 1) * DENSE_NODE_BYTES;
+            assert!(used <= (exposed + NODE_CHARGE_STEP * DENSE_NODE_BYTES) as u64, "{len}: charged {used} for {exposed} exposed bytes");
+        }
+        let usage = table.memory_usage();
+        assert_eq!(usage.capacity, RESERVE_SLOTS);
+        assert!(usage.current_payload_bytes <= (3 * RESERVE_FROM + 2 * NODE_CHARGE_STEP + 5) * DENSE_NODE_BYTES);
+        // Exposed slots read as vacant, with their dense word written.
+        let guard = d.take_guard().unwrap();
+        let view = table.read(&guard).unwrap();
+        assert_eq!(view.get(3 * RESERVE_FROM as u32).unwrap().metadata().state, NodeState::Vacant);
+    }
+
     #[test]
     fn shared_admission_retains_old_node_arrays_until_guards_drain() {
         let d = domain();
@@ -1233,7 +1341,7 @@ mod tests {
     fn dense_layout_reserved_zero_and_foreign_guard() {
         assert_eq!(size_of::<AtomicU32>(), 4);
         assert_eq!(size_of::<NodeRecord>(), 32);
-        let allocation = NodeTable::allocate(4, false, &crate::admission::Budget::new(1 << 20)).unwrap();
+        let allocation = NodeTable::allocate(4, 1, false, false, &crate::admission::Budget::new(1 << 20)).unwrap();
         assert_eq!(unsafe { allocation.levels.as_ptr().add(1) } as usize - allocation.levels.as_ptr() as usize, 4);
         assert_eq!(size_of::<LevelsRef>(), 4);
         let d = domain();
@@ -1296,7 +1404,7 @@ mod tests {
             // through a reference to uninitialized memory: compared below).
             unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }.to_vec()
         }
-        let zeroed = zeroed_vec::<NodeRecord>(3).unwrap();
+        let zeroed = zeroed_slab::<NodeRecord>(3, false).unwrap();
         assert!(zeroed.iter().all(|r| r.state.load(Ordering::Relaxed) == NodeState::Vacant as u32
             && r.incarnation.load(Ordering::Relaxed) == 0 && r.source_key.load(Ordering::Relaxed) == 0
             && r.publication.load(Ordering::Relaxed) == 0 && r.norm.load(Ordering::Relaxed) == 0));

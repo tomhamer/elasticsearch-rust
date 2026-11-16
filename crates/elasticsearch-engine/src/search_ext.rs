@@ -46,6 +46,89 @@ pub struct SqlCursor {
     pub rows: SqlRows,
     pub fetch: usize,
     pub expires: Instant,
+    /// The authenticated subject that opened it (`None` with security
+    /// off): only that subject may page or close it.
+    pub owner: Option<crate::security::owner::ResourceOwner>,
+    /// The request's `time_zone`: later pages evaluate and render in it.
+    pub zone: crate::date::Tz,
+    /// The request's `field_multi_value_leniency`: later pages apply it too.
+    pub lenient: bool,
+}
+
+#[cfg(test)]
+mod rule_review_tests {
+    use super::*;
+
+    /// #413: fuzzy criteria use ES's normalized similarity (> 0.5).
+    #[test]
+    fn fuzzy_criteria_use_normalized_similarity() {
+        assert!(!fuzzy_similar("pc", "tv"), "two substitutions of two: similarity 0");
+        assert!(!fuzzy_similar("ab", "ac"), "exactly 0.5 is not above it");
+        assert!(fuzzy_similar("abc", "abd"));
+        assert!(fuzzy_similar("television", "televisoin"));
+        assert!(fuzzy_similar("internationalization", "internationalisatoin"), "three edits of twenty");
+        assert!(fuzzy_similar("", ""));
+        assert!(!fuzzy_similar("", "a"));
+        let crit = json!({"type": "fuzzy", "metadata": "q", "values": ["tv"]});
+        let m = |q: &str| json!({"q": q}).as_object().unwrap().clone();
+        assert!(!crit_match(&crit, &m("pc")));
+        assert!(crit_match(&crit, &m("tv")));
+    }
+
+    /// #414: a save that snapshotted first cannot overwrite a later save's
+    /// file: both concurrently saved rulesets survive a reload.
+    #[test]
+    fn concurrent_saves_keep_every_acknowledged_ruleset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_ext_state.json");
+        let st = Arc::new(ExtState { path: path.clone(), ..Default::default() });
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel::<()>();
+        let (a_snap_tx, a_snap_rx) = std::sync::mpsc::channel::<()>();
+        // A pauses after its snapshot until B is done (or 300 ms pass: B
+        // may be waiting for A's save to finish).
+        *st.after_snapshot.lock() = Some(Box::new(move || {
+            a_snap_tx.send(()).unwrap();
+            let _ = b_done_rx.recv_timeout(std::time::Duration::from_millis(300));
+        }));
+        st.rulesets.write().insert("a".into(), vec![json!({"rule_id": "1"})]);
+        let a = {
+            let st = st.clone();
+            std::thread::spawn(move || st.persist().unwrap())
+        };
+        a_snap_rx.recv().unwrap();
+        st.rulesets.write().insert("b".into(), vec![json!({"rule_id": "2"})]);
+        let b = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                st.persist().unwrap();
+                let _ = b_done_tx.send(());
+            })
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+        let reloaded = load(path);
+        let names: Vec<String> = reloaded.rulesets.read().keys().cloned().collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// #409: a field named `rule` in a leaf query is not a rule query;
+    /// rule queries inside compound queries still are.
+    #[test]
+    fn rule_named_fields_are_not_rule_queries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        for body in [
+            json!({"query": {"term": {"rule": "shipping"}}}),
+            json!({"query": {"term": {"rule": {"value": "shipping"}}}}),
+            json!({"query": {"match": {"rule_query": "shipping"}}}),
+            json!({"query": {"bool": {"filter": [{"range": {"rule": {"gte": "a"}}}]}}}),
+        ] {
+            assert_eq!(preprocess_search_body(&node, &body).unwrap(), None, "{body}");
+        }
+        let nested = json!({"query": {"bool": {"must": [{"rule": {"organic": {"match_all": {}}, "ruleset_ids": ["missing"], "match_criteria": {"q": "x"}}}]}}});
+        let e = preprocess_search_body(&node, &nested).unwrap_err();
+        assert_eq!(e.status, 404, "{e:?}");
+    }
 }
 
 #[cfg(test)]
@@ -55,7 +138,7 @@ mod sql_cursor_tests {
 
     fn cursor(expires: Instant) -> SqlCursor {
         SqlCursor { columns: vec![json!({"name": "value"})],
-            rows: SqlRows::Materialized(vec![json!([1]), json!([2])].into_iter()), fetch: 1, expires }
+            rows: SqlRows::Materialized(vec![json!([1]), json!([2])].into_iter()), fetch: 1, expires, owner: None, zone: crate::date::Tz::UTC, lenient: false }
     }
 
     #[test]
@@ -97,6 +180,12 @@ mod sql_cursor_tests {
 #[derive(Default)]
 pub struct ExtState {
     path: PathBuf,
+    /// Held from the snapshot of the maps to the file's replacement, so a
+    /// later save never loses to an older snapshot written after it.
+    persist_lock: Mutex<()>,
+    /// Test hook: runs once, between a save's snapshot and its write.
+    #[cfg(test)]
+    after_snapshot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// set id → ordered rules `(rule id, synonyms)`.
     pub synonyms: RwLock<BTreeMap<String, Vec<(String, String)>>>,
     /// name → application definition (with `updated_at_millis`).
@@ -130,6 +219,27 @@ static STATES: OnceLock<Mutex<HashMap<PathBuf, Arc<ExtState>>>> = OnceLock::new(
 /// Remove expired contexts without dropping their potentially large row buffers
 /// under a mutex. Cluster callers must drop the returned values off async workers.
 /// A busy metadata/cursor lock is retried on the next maintenance tick.
+/// [`ExtState::reap_expired_async_results`] of `node` (none loaded: nothing).
+pub fn reap_expired_async_results(node: &Node) {
+    let Some(states) = STATES.get() else { return };
+    let state = {
+        let Some(states) = states.try_lock() else { return };
+        states.get(&node.data).cloned()
+    };
+    if let Some(state) = state {
+        state.reap_expired_async_results(crate::date::now_millis());
+    }
+}
+
+/// Cancels the running async query whose result expired (set by the HTTP
+/// layer, which owns the query tasks).
+static ASYNC_EXPIRY_CANCEL: OnceLock<fn(&str) -> bool> = OnceLock::new();
+
+/// Register [`ASYNC_EXPIRY_CANCEL`] (first registration wins).
+pub fn set_async_expiry_cancel(cancel: fn(&str) -> bool) {
+    let _ = ASYNC_EXPIRY_CANCEL.set(cancel);
+}
+
 pub fn take_expired_sql_cursors(node: &Node, now: Instant) -> Vec<SqlCursor> {
     let Some(states) = STATES.get() else { return Vec::new(); };
     let state = {
@@ -204,6 +314,30 @@ fn load(path: PathBuf) -> ExtState {
 }
 
 impl ExtState {
+    /// Drop saved SQL / ES|QL / EQL async results past their `keep_alive`
+    /// deadline (`__expires`, epoch millis).
+    pub fn reap_expired_async_results(&self, now_millis: i64) {
+        let mut running = Vec::new();
+        for m in [&self.esql_async, &self.sql_async, &self.eql_async] {
+            if let Some(mut stored) = m.try_lock() {
+                stored.retain(|k, v| {
+                    let expired = v["__expires"].as_i64().is_some_and(|e| e <= now_millis);
+                    if expired && v["__running"] == true {
+                        running.push(k.clone());
+                    }
+                    !expired
+                });
+            }
+        }
+        // ES: an expired async search's task is cancelled with its result
+        // (outside the maps' locks).
+        if let Some(cancel) = ASYNC_EXPIRY_CANCEL.get() {
+            for key in running {
+                cancel(&key);
+            }
+        }
+    }
+
     pub fn take_expired_sql_cursors(&self, now: Instant) -> Vec<SqlCursor> {
         let Some(mut cursors) = self.sql_cursors.try_lock() else { return Vec::new(); };
         let expired: Vec<String> = cursors.iter().filter(|(_, cursor)| cursor.expires <= now).map(|(id, _)| id.clone()).collect();
@@ -211,6 +345,7 @@ impl ExtState {
     }
 
     pub fn persist(&self) -> Result<()> {
+        let _serial = self.persist_lock.lock();
         let syn: Map<String, Value> = self
             .synonyms
             .read()
@@ -224,6 +359,10 @@ impl ExtState {
             "rollup_jobs": self.rollup_jobs.read().clone(),
             "autoscaling_policies": self.autoscaling_policies.read().clone(),
         });
+        #[cfg(test)]
+        if let Some(hook) = self.after_snapshot.lock().take() {
+            hook();
+        }
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, v.to_string()).map_err(|e| EsError::internal(format!("failed to persist state: {e}")))?;
         std::fs::rename(&tmp, &self.path).map_err(|e| EsError::internal(format!("failed to persist state: {e}")))?;
@@ -357,7 +496,7 @@ pub fn reload_dependents(node: &Node, set: &str) -> Result<Value> {
 }
 
 /// ES `RestStatus` constant name of an HTTP status (shard failure `status`).
-fn rest_status_name(status: u16) -> &'static str {
+pub fn rest_status_name(status: u16) -> &'static str {
     match status {
         400 => "BAD_REQUEST",
         403 => "FORBIDDEN",
@@ -598,6 +737,30 @@ pub fn validate_rule_def(rule: &Value) -> Result<()> {
     Ok(())
 }
 
+/// ES `QueryRuleCriteriaType.FUZZY`: Lucene `LevenshteinDistance`
+/// similarity (`1 - edits / max(len)` over UTF-16 units, in `f32`) above
+/// 0.5; two empty strings are identical (1), one empty string 0.
+fn fuzzy_similar(input: &str, value: &str) -> bool {
+    let a: Vec<u16> = input.encode_utf16().collect();
+    let b: Vec<u16> = value.encode_utf16().collect();
+    let sim = if a.is_empty() || b.is_empty() {
+        if a.len() == b.len() { 1.0f32 } else { 0.0 }
+    } else {
+        let mut prev: Vec<usize> = (0..=a.len()).collect();
+        let mut cur = vec![0; a.len() + 1];
+        for (j, &bj) in b.iter().enumerate() {
+            cur[0] = j + 1;
+            for i in 1..=a.len() {
+                let cost = usize::from(a[i - 1] != bj);
+                cur[i] = (cur[i - 1] + 1).min(prev[i] + 1).min(prev[i - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        1.0f32 - prev[a.len()] as f32 / a.len().max(b.len()) as f32
+    };
+    sim > 0.5f32
+}
+
 fn crit_match(c: &Value, criteria: &Map<String, Value>) -> bool {
     let ct = c.get("type").and_then(Value::as_str).unwrap_or("");
     if ct == "always" || ct == "global" {
@@ -622,7 +785,7 @@ fn crit_match(c: &Value, criteria: &Map<String, Value>) -> bool {
     inputs.iter().any(|inp| {
         values.iter().any(|val| match ct {
             "exact" => s(inp) == s(val),
-            "fuzzy" | "exact_fuzzy" => crate::esql::levenshtein(&s(inp), &s(val)) <= 2 || s(inp) == s(val),
+            "fuzzy" | "exact_fuzzy" => fuzzy_similar(&s(inp), &s(val)),
             "prefix" => s(inp).starts_with(&s(val)),
             "suffix" => s(inp).ends_with(&s(val)),
             "contains" => s(inp).contains(&s(val)),
@@ -754,24 +917,55 @@ fn rewrite_rule_query(node: &Node, rq: &Value) -> Result<Value> {
     Ok(b)
 }
 
-/// Walk a query, rewriting `rule` queries.
+/// Rewrite the `rule` queries of query `q`, descending only through the
+/// query positions of compound queries (a field named `rule` inside a
+/// leaf query, `{"term": {"rule": ...}}`, is a field, not a rule query).
 pub fn rewrite_query(node: &Node, q: &Value) -> Result<Value> {
-    match q {
-        Value::Object(m) => {
-            if m.len() == 1 {
-                if let Some(rq) = m.get("rule").or_else(|| m.get("rule_query")) {
-                    return rewrite_rule_query(node, rq);
-                }
-            }
-            let mut out = Map::new();
-            for (k, v) in m {
-                out.insert(k.clone(), rewrite_query(node, v)?);
-            }
-            Ok(Value::Object(out))
-        }
-        Value::Array(a) => Ok(Value::Array(a.iter().map(|x| rewrite_query(node, x)).collect::<Result<_>>()?)),
-        other => Ok(other.clone()),
+    let Value::Object(m) = q else { return Ok(q.clone()) };
+    if m.len() != 1 {
+        return Ok(q.clone());
     }
+    let (name, body) = m.iter().next().unwrap();
+    if name == "rule" || name == "rule_query" {
+        return rewrite_rule_query(node, body);
+    }
+    // (key, holds a list of queries or one) of each compound query.
+    let slots: &[&str] = match name.as_str() {
+        "bool" => &["must", "should", "filter", "must_not"],
+        "dis_max" => &["queries"],
+        "constant_score" => &["filter"],
+        "boosting" => &["positive", "negative"],
+        "function_score" | "nested" | "has_child" | "has_parent" | "script_score" => &["query"],
+        "pinned" => &["organic"],
+        _ => &[],
+    };
+    let Value::Object(inner) = body else { return Ok(q.clone()) };
+    let mut out = inner.clone();
+    for slot in slots {
+        match inner.get(*slot) {
+            Some(Value::Array(a)) => {
+                out.insert(slot.to_string(), Value::Array(a.iter().map(|x| rewrite_query(node, x)).collect::<Result<_>>()?));
+            }
+            Some(v) => {
+                out.insert(slot.to_string(), rewrite_query(node, v)?);
+            }
+            None => {}
+        }
+    }
+    if name == "function_score" {
+        if let Some(Value::Array(fs)) = inner.get("functions") {
+            let mut list = Vec::with_capacity(fs.len());
+            for f in fs {
+                let mut f = f.clone();
+                if let Some(filter) = f.get("filter").cloned() {
+                    f["filter"] = rewrite_query(node, &filter)?;
+                }
+                list.push(f);
+            }
+            out.insert("functions".into(), Value::Array(list));
+        }
+    }
+    Ok(json!({ name.clone(): Value::Object(out) }))
 }
 
 fn mentions(v: &Value, keys: &[&str]) -> bool {

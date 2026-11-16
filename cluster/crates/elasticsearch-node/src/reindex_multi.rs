@@ -22,7 +22,7 @@
 use crate::front::{await_mirror, dispatch, RestReq, RestResp};
 use crate::node::ClusterNode;
 use elasticsearch_engine::error::EsError;
-use elasticsearch_engine::reindex::{parse_reindex, ByQueryRequest, Kind, Stats};
+use elasticsearch_engine::reindex::{parse_reindex, response_status, ByQueryRequest, Kind, PageCheck, Stats};
 use elasticsearch_engine::script::update::{run_doc_script_source, DocMeta, DocOp};
 use elasticsearch_engine::shard::VersionType;
 use serde_json::{json, Value};
@@ -36,12 +36,19 @@ use std::time::Instant;
 fn internal(creds: &[(String, String)], method: &str, uri: std::fmt::Arguments<'_>, body: impl AsRef<[u8]>, ndjson: bool) -> elasticsearch_engine::error::Result<RestReq> {
     let ct = if ndjson { "application/x-ndjson" } else { "application/json" };
     let mut req=RestReq::try_new_uri(method,uri,creds,body.as_ref(),0,Default::default(),None)?;
-    req.push_header("content-type",ct)?;Ok(req)
+    req.push_header("content-type",ct)?;
+    // The reindex's own bulks may carry its internal action metadata.
+    if ndjson { req.push_header(elasticsearch_http::util::REINDEX_BULK_HEADER, "1")?; }
+    Ok(req)
 }
+
+/// Bulk delete metadata of a reindex's scripted delete: ES's internal
+/// version equality (see `elasticsearch_http::util::REINDEX_VERSION_EQ`).
+const REINDEX_VERSION_EQ: &str = elasticsearch_http::util::REINDEX_VERSION_EQ;
 
 /// The caller's credential headers (or its `_system` identity).
 pub(crate) fn credentials(req: &RestReq) -> Result<crate::front::SharedHeaders,EsError> {
-    crate::front::SharedHeaders::try_filtered(&req.headers,|(name,_)|name.eq_ignore_ascii_case("authorization")||name.eq_ignore_ascii_case("es-security-runas-user")||name.eq_ignore_ascii_case(crate::front::SYSTEM_HEADER))
+    crate::front::SharedHeaders::try_filtered(&req.headers,|(name,_)|name.eq_ignore_ascii_case("authorization")||name.eq_ignore_ascii_case("es-security-runas-user")||name.eq_ignore_ascii_case(crate::front::SYSTEM_HEADER)||name.eq_ignore_ascii_case(crate::front::IDENTITY_HEADER))
 }
 
 /// `dispatch` behind a boxed future (`dispatch` is what calls in here).
@@ -71,6 +78,29 @@ pub async fn maybe(node: &Arc<ClusterNode>, req: &RestReq) -> Option<RestResp> {
     r.raw_script=raw.as_ref().and_then(|r|r.get("script")).cloned();
     let dest = r.dest_index.clone()?;
     await_mirror(node).await;
+    // A remote source (ES `RemoteScrollableHitSource`) is read from the
+    // remote cluster, whatever indices of the same name exist here. With
+    // one destination shard (and no possible redirection) the engine path
+    // runs it on the destination primary; otherwise the reindex runs here,
+    // reading the remote source and writing through the cluster.
+    if r.remote.is_some() {
+        let distributed = { let st = node.state(); dest_shards(node, &dest) > 1 || may_redirect(&st, node, &r, &dest) };
+        if !distributed {
+            return None;
+        }
+        if let Some(spec) = &r.remote {
+            if let Err(e) = spec.check_whitelist(&elasticsearch_http::remote_whitelist(&node.engine)) {
+                return Some(err_resp(&e));
+            }
+        }
+        let creds=match credentials(req) {Ok(v)=>v,Err(e)=>return Some(err_resp(&e))};
+        if !wait {
+            let (n, desc, rps) = (node.clone(), r.description(), r.rps);
+            let work = async move { run(&n, &creds, &r, &body, &dest).await };
+            return Some(crate::front::bg_task::spawn(node, req, Kind::Reindex.action(), desc, rps, work));
+        }
+        return Some(run(node, &creds, &r, &body, &dest).await);
+    }
     let engine = node.engine.clone();
     let (expr, opts) = (r.source.clone(), r.resolve);
     let sources = tokio::task::spawn_blocking(move || engine.resolve(&expr, opts).map(|ts| ts.iter().map(|t| t.svc.name.clone()).collect::<BTreeSet<_>>())).await.ok()?.ok()?;
@@ -84,6 +114,11 @@ pub async fn maybe(node: &Arc<ClusterNode>, req: &RestReq) -> Option<RestResp> {
             // The engine path runs on the destination primary's node and reads
             // the source from that node only.
             || !colocated(&st, &sources, &dest)
+            // A script or ingest pipeline can send documents to another
+            // index than `dest`: every write must go through the primary of
+            // the index it lands in (and wait for its replicas), as ES's
+            // bulk action routes each item.
+            || may_redirect(&st, node, &r, &dest)
     };
     if !multi {
         return None;
@@ -91,10 +126,22 @@ pub async fn maybe(node: &Arc<ClusterNode>, req: &RestReq) -> Option<RestResp> {
     let creds=match credentials(req) {Ok(v)=>v,Err(e)=>return Some(err_resp(&e))};
     if !wait {
         let (n, desc, rps) = (node.clone(), r.description(), r.rps);
-        let work = async move { run(&n, &creds, &r, &body, &sources, &dest).await };
+        let work = async move { run(&n, &creds, &r, &body, &dest).await };
         return Some(crate::front::bg_task::spawn(node, req, Kind::Reindex.action(), desc, rps, work));
     }
-    Some(run(node, &creds, &r, &body, &sources, &dest).await)
+    Some(run(node, &creds, &r, &body, &dest).await)
+}
+
+/// Whether a document of the reindex can land in another index than
+/// `dest`: a script (`ctx._index`), a request pipeline, or a default /
+/// final pipeline of the destination.
+fn may_redirect(st: &elasticsearch_cluster::state::ClusterState, node: &ClusterNode, r: &ByQueryRequest, dest: &str) -> bool {
+    if r.script.is_some() || r.pipeline.as_deref().is_some_and(|p| p != "_none") {
+        return true;
+    }
+    let name = if st.metadata.indices.contains_key(dest) { Some(dest.to_string()) } else { node.engine.write_index(dest, false).ok().map(|svc| svc.name.clone()) };
+    let Some(im) = name.as_deref().and_then(|n| st.metadata.indices.get(n)) else { return false };
+    ["index.default_pipeline", "index.final_pipeline"].iter().any(|k| im.settings.get(*k).and_then(Value::as_str).is_some_and(|p| !p.is_empty() && p != "_none"))
 }
 
 /// Whether every source shard has a started copy on the node holding the
@@ -145,7 +192,7 @@ fn source_page(bytes:&[u8])->Result<(Value,Vec<Option<String>>),EsError>{
     Ok((serde_json::from_str(&page.text())?,sources))
 }
 
-async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryRequest, body: &Value, sources: &BTreeSet<String>, dest: &str) -> RestResp {
+async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryRequest, body: &Value, dest: &str) -> RestResp {
     let start = Instant::now();
     let mut st = Stats::default();
     let data = node.engine.data.clone();
@@ -160,15 +207,51 @@ async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryReq
     if let Some(q) = &r.query {
         sbody["query"] = q.clone();
     }
-    if let Some(sf) = body["source"].get("_source") {
-        sbody["_source"] = sf.clone();
+    // The complete source, vectors included (ES reindex reads sources with
+    // `exclude_vectors: false` unless the request says otherwise).
+    sbody["_source"] = reindex_source_filter(body["source"].get("_source"), r.source_exclude_vectors);
+    // A manual slice reads only its partition (ES `source.slice`).
+    if let Some((id, max)) = r.slice {
+        sbody["slice"] = json!({"id": id, "max": max});
     }
-    // The concrete source indices (already resolved with the request's
-    // index options).
-    let src = crate::front::UriJoin(sources.iter(),",");
-    // Finish admitted URI construction before suspension: fmt::Arguments is not Send.
-    let prepared_call = call(node, creds, "POST", format_args!("/{src}/_search?scroll=5m&size={page_size}&expand_wildcards=all"), Some(sbody));
-    let first = prepared_call.await;
+    let remote = match &r.remote {
+        Some(spec) => match spec.with_node_tls(&node.engine.node_settings.read()) {
+            Ok(spec) => Some(Arc::new(spec)),
+            Err(e) => return err_resp(&e),
+        },
+        None => None,
+    };
+    // The source expression itself, with the request's index options (ES
+    // reindex searches `source.index`): aliases keep their filter and
+    // `search_routing`. A partial page would silently drop the documents
+    // of the shards that failed: the search must be complete (ES
+    // BulkByScroll requests never allow partial results), and every page
+    // is checked again below.
+    let src = source_expression(&r.source);
+    let opts = resolve_params(&r.resolve);
+    let first = match &remote {
+        Some(spec) => {
+            // Version probe, as the remote reindex does before searching.
+            let probe = remote_call(spec.clone(), "GET", "/".to_string(), None).await;
+            if !probe.is_success() {
+                return probe;
+            }
+            let mut rbody = serde_json::Map::new();
+            if let Some(q) = &r.query {
+                rbody.insert("query".into(), q.clone());
+            }
+            if let Some(s) = &r.remote_source {
+                rbody.insert("_source".into(), s.clone());
+            }
+            let path = format!("/{src}/_search?scroll={}&sort=_doc%3Aasc&size={page_size}&allow_partial_search_results=false&version=true", r.scroll);
+            remote_call(spec.clone(), "POST", path, Some(Value::Object(rbody).to_string())).await
+        }
+        None => {
+            // Finish admitted URI construction before suspension: fmt::Arguments is not Send.
+            let prepared_call = call(node, creds, "POST", format_args!("/{src}/_search?scroll=5m&size={page_size}&allow_partial_search_results=false&{opts}"), Some(sbody));
+            prepared_call.await
+        }
+    };
     if !first.is_success() {
         return first;
     }
@@ -177,7 +260,6 @@ async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryReq
         let t = page["hits"]["total"]["value"].as_u64().unwrap_or(0);
         r.max_docs.map(|m| m.min(t)).unwrap_or(t)
     };
-    let mut processed = 0u64;
     let mut scroll_id: Option<String> = None;
     let mut touched: BTreeSet<String> = BTreeSet::new();
     let mut error: Option<RestResp> = None;
@@ -185,9 +267,20 @@ async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryReq
         if let Some(id) = page["_scroll_id"].as_str() {
             scroll_id = Some(id.to_string());
         }
+        // ES `AbstractAsyncBulkByScrollAction.onScrollResponse`: a page with
+        // shard failures or a timeout ends the run with them; its hits are
+        // not processed.
+        let check = PageCheck::of(&page);
+        if !check.complete() {
+            st.timed_out |= check.timed_out;
+            st.failures.extend(check.failures);
+            break;
+        }
         let mut hits = page["hits"]["hits"].as_array().cloned().unwrap_or_default();
         if let Some(m) = r.max_docs {
-            hits.truncate(m.saturating_sub(processed) as usize);
+            // Successfully processed documents count toward `max_docs`
+            // (ES): conflicts skipped with `conflicts: proceed` do not.
+            hits.truncate(m.saturating_sub(st.successful()) as usize);
         }
         if hits.is_empty() {
             break;
@@ -198,7 +291,8 @@ async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryReq
             st.canceled = Some("by user request".into());
             break;
         }
-        processed += hits.len() as u64;
+        let batch_start = Instant::now();
+        let docs = hits.len();
         st.batches += 1;
         let actions = match build_actions_source(r, dest, &hits, &raw_sources, &data, &mut st) {
             Ok(a) => a,
@@ -220,12 +314,20 @@ async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryReq
                 }
             }
         }
-        if abort || r.max_docs.map(|m| processed >= m).unwrap_or(false) {
+        if abort || r.max_docs.map(|m| st.successful() >= m).unwrap_or(false) {
             break;
         }
+        // `requests_per_second` (the task's current rate: `_rethrottle`
+        // applies from the next batch on).
+        throttle(r.rps, batch_start, docs, &mut st).await;
         let Some(id) = scroll_id.clone() else { break };
-        let prepared_call = call(node, creds, "POST", format_args!("/_search/scroll"), Some(json!({"scroll": "5m", "scroll_id": id})));
-        let next = prepared_call.await;
+        let next = match &remote {
+            Some(spec) => remote_call(spec.clone(), "POST", "/_search/scroll".to_string(), Some(json!({"scroll": r.scroll, "scroll_id": id}).to_string())).await,
+            None => {
+                let prepared_call = call(node, creds, "POST", format_args!("/_search/scroll"), Some(json!({"scroll": "5m", "scroll_id": id})));
+                prepared_call.await
+            }
+        };
         if !next.is_success() {
             error = Some(next);
             break;
@@ -233,8 +335,15 @@ async fn run(node: &Arc<ClusterNode>, creds: &[(String, String)], r: &ByQueryReq
         match source_page(&next.body) { Ok((p,s))=>{page=p;raw_sources=s;}, Err(e)=>{error=Some(err_resp(&e));break;} }
     }
     if let Some(id) = scroll_id {
-        let prepared_call = call(node, creds, "DELETE", format_args!("/_search/scroll"), Some(json!({"scroll_id": id})));
-        let _ = prepared_call.await;
+        match &remote {
+            Some(spec) => {
+                let _ = remote_call(spec.clone(), "DELETE", "/_search/scroll".to_string(), Some(json!({"scroll_id": [id]}).to_string())).await;
+            }
+            None => {
+                let prepared_call = call(node, creds, "DELETE", format_args!("/_search/scroll"), Some(json!({"scroll_id": id})));
+                let _ = prepared_call.await;
+            }
+        }
     }
     if let Some(e) = error {
         return e;
@@ -256,6 +365,31 @@ fn bulk_body(actions: &[Action], positions: &[usize]) -> Result<axum::body::Byte
             if let Some(source)=&a.source {out.write_all(source.as_bytes())?;out.write_all(b"\n")?;}
         } Ok(())
     })
+}
+
+/// Wait until `docs` at the current rate have had their time since
+/// `batch_start` (ES `WorkerBulkByScrollTaskState.delayPrepareBulkRequest`).
+/// The rate is re-read while waiting, so a rethrottle takes effect at once;
+/// a cancelled task stops waiting.
+async fn throttle(rps: f64, batch_start: Instant, docs: usize, st: &mut Stats) {
+    loop {
+        let task = crate::front::bg_task::current();
+        if task.as_ref().is_some_and(|t| t.is_cancelled()) {
+            return;
+        }
+        let rps = task.as_ref().map(|t| t.rps()).unwrap_or(rps);
+        if rps.is_nan() || rps <= 0.0 || rps.is_infinite() {
+            return;
+        }
+        let target = batch_start + std::time::Duration::from_secs_f64(docs as f64 / rps);
+        let now = Instant::now();
+        if now >= target {
+            return;
+        }
+        let nap = (target - now).min(std::time::Duration::from_millis(50));
+        tokio::time::sleep(nap).await;
+        st.throttled_micros += nap.as_micros() as u64;
+    }
 }
 
 fn cancelled() -> bool {
@@ -316,11 +450,54 @@ where
 pub(crate) fn response(st: &Stats, rps: f64, took: u128) -> (u16, Value) {
     let mut m = serde_json::Map::new();
     m.insert("took".into(), json!(took as u64));
-    m.insert("timed_out".into(), json!(false));
+    m.insert("timed_out".into(), json!(st.timed_out));
     m.extend(st.status_json(Kind::Reindex, rps, 0, None));
     m.insert("failures".into(), Value::Array(st.failures.iter().map(|f| f.1.clone()).collect()));
-    let status = st.failures.iter().map(|f| f.0).max().unwrap_or(200).max(200);
-    (status, Value::Object(m))
+    (response_status(&st.failures, st.timed_out), Value::Object(m))
+}
+
+/// A call to the remote source cluster (blocking client, off the runtime
+/// workers), as a response.
+async fn remote_call(spec: Arc<elasticsearch_engine::remote::RemoteSpec>, method: &'static str, path: String, body: Option<String>) -> RestResp {
+    let out = tokio::task::spawn_blocking(move || spec.call(method, &path, body.as_deref())).await;
+    match out {
+        Ok(Ok(text)) => RestResp::new(200, vec![], text.as_bytes()),
+        Ok(Err(e)) => err_resp(&e),
+        Err(e) => err_resp(&EsError::internal(format!("remote source call failed: {e}"))),
+    }
+}
+
+/// The `_source` of the reindex source search: the request's filter with
+/// vectors included unless `exclude_vectors` asks otherwise.
+fn reindex_source_filter(user: Option<&Value>, exclude_vectors: Option<bool>) -> Value {
+    let ex = json!(exclude_vectors.unwrap_or(false));
+    match user {
+        Some(Value::Bool(false)) => json!(false),
+        None | Some(Value::Bool(true)) | Some(Value::Null) => json!({"exclude_vectors": ex}),
+        Some(Value::Object(o)) => {
+            let mut o = o.clone();
+            o.entry("exclude_vectors").or_insert(ex);
+            Value::Object(o)
+        }
+        Some(other) => json!({"includes": other, "exclude_vectors": ex}),
+    }
+}
+
+/// `source.index` as a URI path component (each comma-separated part
+/// encoded).
+fn source_expression(source: &str) -> String {
+    let source = if source.is_empty() { "_all" } else { source };
+    source.split(',').map(crate::front::encode_component).collect::<Vec<_>>().join(",")
+}
+
+/// The index options of a resolve as search URI parameters.
+fn resolve_params(o: &elasticsearch_engine::node::ResolveOpts) -> String {
+    let mut wildcards: Vec<&str> = Vec::new();
+    if o.expand_open { wildcards.push("open"); }
+    if o.expand_closed { wildcards.push("closed"); }
+    if o.expand_hidden { wildcards.push("hidden"); }
+    if wildcards.is_empty() { wildcards.push("none"); }
+    format!("ignore_unavailable={}&allow_no_indices={}&expand_wildcards={}", o.ignore_unavailable, o.allow_no_indices, wildcards.join(","))
 }
 
 /// One bulk action built from a source hit.
@@ -347,14 +524,36 @@ fn build_actions_source(r:&ByQueryRequest,dest:&str,hits:&[Value],raw_sources:&[
     for (pos,h) in hits.iter().enumerate() {
         let Some(hid) = h["_id"].as_str() else { continue };
         let mut index = dest.to_string();
-        let mut id = hid.to_string();
-        let mut routing = h["_routing"].as_str().map(str::to_string);
-        let mut version = h["_version"].as_u64().unwrap_or(1);
-        let mut source = raw_sources.get(pos).and_then(|s|s.clone()).unwrap_or_else(||h.get("_source").cloned().unwrap_or_else(||json!({})).to_string());
+        // ES `Reindexer`: the destination request first (id, `dest.routing`
+        // policy, external version), then the script's metadata changes over
+        // it: a cleared `_id` generates one (production review #191), a
+        // changed `_routing` wins over the policy (#199), and a scripted
+        // delete keeps the version condition (#241).
+        let source_routing = h["_routing"].as_str().map(str::to_string);
+        let source_version = h["_version"].as_u64().unwrap_or(1);
+        let mut id: Option<String> = Some(hid.to_string());
+        let mut routing = match r.dest_routing.as_deref() {
+            None | Some("keep") => source_routing.clone(),
+            Some("discard") => None,
+            Some(v) => Some(v.strip_prefix('=').unwrap_or(v).to_string()),
+        };
+        let mut version = match r.dest_version_type {
+            Some(VersionType::External) | Some(VersionType::ExternalGte) => Some(source_version),
+            _ => None,
+        };
+        // ES `Reindexer.buildRequest`: a hit without `_source` (disabled in
+        // the source mapping, `"_source": false` in the request, stored
+        // fields only) fails the request before this batch is written;
+        // it is never indexed as `{}`.
+        let raw = raw_sources.get(pos).and_then(|s| s.clone()).filter(|s| s.trim() != "null");
+        let parsed = h.get("_source").filter(|s| !s.is_null()).map(|s| s.to_string());
+        let Some(mut source) = raw.or(parsed) else {
+            return Err(EsError::illegal_argument(format!("[{}][{hid}] didn't store _source", h["_index"].as_str().unwrap_or_default())));
+        };
         let mut delete = false;
         if let Some(sc) = &script {
             let hit_index = h["_index"].as_str().unwrap_or_default().to_string();
-            let meta = DocMeta { index: hit_index.clone(), id: Some(id.clone()), routing: routing.clone(), version: Some(version), ..Default::default() };
+            let meta = DocMeta { index: hit_index.clone(), id: Some(hid.to_string()), routing: source_routing.clone(), version: Some(source_version), ..Default::default() };
             let (o,transformed) = run_doc_script_source(sc, &source, &meta, "index")?;
             match o.op {
                 DocOp::Noop => {
@@ -368,47 +567,41 @@ fn build_actions_source(r:&ByQueryRequest,dest:&str,hits:&[Value],raw_sources:&[
             if o.meta.index != hit_index {
                 index = o.meta.index;
             }
-            if let Some(i) = o.meta.id {
-                id = i;
+            if o.meta.id.as_deref() != Some(hid) {
+                id = o.meta.id;
             }
-            routing = o.meta.routing;
-            if let Some(v) = o.meta.version {
-                version = v;
+            if o.meta.routing != source_routing {
+                routing = o.meta.routing;
+            }
+            if let Some(v) = o.meta.version.filter(|v| *v != source_version) {
+                version = Some(v);
             }
         }
-        if delete {
-            let mut a = json!({"_index": index, "_id": id});
-            if let Some(rt) = &routing {
-                a["routing"] = json!(rt);
-            }
-            out.push(Action { index, id, action: json!({"delete": a}), source: None });
-            continue;
+        let mut a = json!({"_index": index});
+        if let Some(id) = &id {
+            a["_id"] = json!(id);
         }
-        let routing = match r.dest_routing.as_deref() {
-            None | Some("keep") => routing,
-            Some("discard") => None,
-            Some(v) => Some(v.strip_prefix('=').unwrap_or(v).to_string()),
-        };
-        let mut a = json!({"_index": index, "_id": id});
         if let Some(rt) = &routing {
             a["routing"] = json!(rt);
         }
-        match r.dest_version_type {
-            Some(VersionType::External) => {
-                a["version"] = json!(version);
-                a["version_type"] = json!("external");
+        if delete {
+            // ES deletes with the request's version under internal
+            // (equality) semantics: an older or newer destination conflicts.
+            if let Some(v) = version {
+                a[REINDEX_VERSION_EQ] = json!(v);
             }
-            Some(VersionType::ExternalGte) => {
-                a["version"] = json!(version);
-                a["version_type"] = json!("external_gte");
-            }
-            _ => {}
+            out.push(Action { index, id: id.unwrap_or_default(), action: json!({"delete": a}), source: None });
+            continue;
+        }
+        if let Some(v) = version {
+            a["version"] = json!(v);
+            a["version_type"] = json!(if r.dest_version_type == Some(VersionType::ExternalGte) { "external_gte" } else { "external" });
         }
         if let Some(p) = &r.pipeline {
             a["pipeline"] = json!(p);
         }
         let op = if r.dest_op_create { "create" } else { "index" };
-        out.push(Action { index, id, action: json!({ op: a }), source: Some(source) });
+        out.push(Action { index, id: id.unwrap_or_default(), action: json!({ op: a }), source: Some(source) });
     }
     Ok(out)
 }
@@ -457,6 +650,28 @@ pub(crate) fn tally(r: &ByQueryRequest, actions: &[Action], items: &[Value], st:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_reads_keep_the_expression_and_its_options() {
+        use elasticsearch_engine::node::ResolveOpts;
+        assert_eq!(super::source_expression("al ias,idx-*"), "al%20ias,idx-%2A");
+        assert_eq!(super::source_expression(""), "_all");
+        assert_eq!(super::resolve_params(&ResolveOpts::default()), "ignore_unavailable=false&allow_no_indices=true&expand_wildcards=open");
+        let o = ResolveOpts { ignore_unavailable: true, allow_no_indices: false, expand_open: false, expand_closed: false, expand_hidden: false };
+        assert_eq!(super::resolve_params(&o), "ignore_unavailable=true&allow_no_indices=false&expand_wildcards=none");
+    }
+
+    #[test]
+    fn response_reports_timeouts_and_search_failures() {
+        let mut st = elasticsearch_engine::reindex::Stats::default();
+        st.timed_out = true;
+        let (status, v) = super::response(&st, -1.0, 1);
+        assert_eq!((status, v["timed_out"].as_bool()), (408, Some(true)));
+        st.timed_out = false;
+        st.failures.push((503, serde_json::json!({"index": "s", "shard": 1, "status": 503, "reason": {"type": "no_shard_available_action_exception"}})));
+        let (status, v) = super::response(&st, -1.0, 1);
+        assert_eq!((status, v["failures"].as_array().map(Vec::len)), (503, Some(1)));
+    }
+
     #[test]
     fn credentials_carry_the_system_identity() {
         let req = RestReq::try_new("POST", "/_bulk", &[
@@ -530,6 +745,45 @@ mod tests {
         assert_eq!(a[0].action, json!({"index": {"_index": "dst", "_id": "1"}}));
     }
 
+    /// Production review #191, #199, #241: the destination request is
+    /// built first, then the script's metadata changes apply over it. A
+    /// script clearing `_id` gets a generated id (no `_id` in the action);
+    /// a script changing `_routing` wins over `dest.routing` (`discard` and
+    /// `=constant`), an unchanged one keeps the policy; a scripted delete
+    /// keeps the version condition.
+    #[test]
+    fn script_metadata_applies_over_the_destination_request() {
+        let script = |s: &str| json!({"source": s});
+        let mut st = Stats::default();
+        let r = req(json!({"source": {"index": "src"}, "dest": {"index": "dst"}, "script": script("ctx._id = null")}));
+        let a = build_actions(&r, "dst", &[hit("1", None, 1), hit("1", Some("other"), 1)], Path::new("/nonexistent"), &mut st).unwrap();
+        assert_eq!(a.len(), 2);
+        for x in &a {
+            assert_eq!(x.action["index"].get("_id"), None, "a cleared id is generated: {}", x.action);
+        }
+        for policy in ["discard", "=fixed"] {
+            let r = req(json!({"source": {"index": "src"}, "dest": {"index": "dst", "routing": policy}, "script": script("ctx._routing = ctx._source.f + '-new'")}));
+            let a = build_actions(&r, "dst", &[hit("a", Some("old-a"), 1), hit("b", Some("old-b"), 1)], Path::new("/nonexistent"), &mut st).unwrap();
+            assert_eq!(a[0].action["index"]["routing"], json!("a-new"), "{policy}: {}", a[0].action);
+            assert_eq!(a[1].action["index"]["routing"], json!("b-new"), "{policy}: {}", a[1].action);
+            // A script leaving the routing alone keeps the policy's.
+            let r = req(json!({"source": {"index": "src"}, "dest": {"index": "dst", "routing": policy}, "script": script("ctx._source.g = 1")}));
+            let a = build_actions(&r, "dst", &[hit("a", Some("old-a"), 1)], Path::new("/nonexistent"), &mut st).unwrap();
+            let want = if policy == "discard" { None } else { Some(json!("fixed")) };
+            assert_eq!(a[0].action["index"].get("routing").cloned(), want, "{policy}");
+        }
+        let r = req(json!({"source": {"index": "src"}, "dest": {"index": "dst", "version_type": "external"}, "script": script("ctx.op = 'delete'")}));
+        let a = build_actions(&r, "dst", &[hit("1", Some("r1"), 3)], Path::new("/nonexistent"), &mut st).unwrap();
+        assert_eq!(a[0].action, json!({"delete": {"_index": "dst", "_id": "1", "routing": "r1", REINDEX_VERSION_EQ: 3}}));
+        let r = req(json!({"source": {"index": "src"}, "dest": {"index": "dst", "version_type": "external"}, "script": script("ctx._version = 7; ctx.op = 'delete'")}));
+        let a = build_actions(&r, "dst", &[hit("1", None, 3)], Path::new("/nonexistent"), &mut st).unwrap();
+        assert_eq!(a[0].action["delete"][REINDEX_VERSION_EQ], json!(7));
+        // Internal destination versioning: no version condition (ES MATCH_ANY).
+        let r = req(json!({"source": {"index": "src"}, "dest": {"index": "dst"}, "script": script("ctx.op = 'delete'")}));
+        let a = build_actions(&r, "dst", &[hit("1", None, 3)], Path::new("/nonexistent"), &mut st).unwrap();
+        assert_eq!(a[0].action, json!({"delete": {"_index": "dst", "_id": "1"}}));
+    }
+
     /// ES BulkByScroll retries on the cluster path: a whole-response 429
     /// and per-item 429s are re-sent (only the rejected items), counted in
     /// retries.bulk, and succeed once accepted.
@@ -582,5 +836,24 @@ mod tests {
         let mut st = Stats::default();
         assert!(!tally(&r, &acts, &items, &mut st));
         assert_eq!((st.version_conflicts, st.failures.len()), (1, 0));
+    }
+
+    /// A hit without `_source` (absent or null) fails the batch with ES's
+    /// error; it is never written as `{}`.
+    #[test]
+    fn a_hit_without_source_fails_the_batch() {
+        let r = req(json!({"source": {"index": "src"}, "dest": {"index": "dst"}}));
+        for h in [json!({"_index": "src", "_id": "x", "_version": 1}), json!({"_index": "src", "_id": "x", "_version": 1, "_source": null})] {
+            let mut st = Stats::default();
+            let e = build_actions(&r, "dst", &[hit("1", None, 1), h.clone()], Path::new("/nonexistent"), &mut st).unwrap_err();
+            assert_eq!(e.kind, "illegal_argument_exception", "{h}");
+            assert_eq!(e.reason, "[src][x] didn't store _source", "{h}");
+            let raw = vec![Some("{\"f\":1}".to_string()), None];
+            let e = build_actions_source(&r, "dst", &[hit("1", None, 1), h.clone()], &raw, Path::new("/nonexistent"), &mut st).unwrap_err();
+            assert_eq!(e.reason, "[src][x] didn't store _source", "{h}");
+        }
+        let mut st = Stats::default();
+        let empty = json!({"_index": "src", "_id": "e", "_version": 1, "_source": {}});
+        assert_eq!(build_actions(&r, "dst", &[empty], Path::new("/nonexistent"), &mut st).unwrap().len(), 1, "an empty source is copied");
     }
 }

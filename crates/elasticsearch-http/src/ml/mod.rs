@@ -503,7 +503,8 @@ async fn anomaly_detectors(node: Arc<Node>, req: Req) -> R {
                     check_forecast_params(&req, &body)?;
                     let duration = opt(&req, &body, "duration").map(|d| elasticsearch_engine::ml::job::parse_time(&d, "duration")).transpose()?.map(|t| t.millis()).unwrap_or(86_400_000);
                     let expires = opt(&req, &body, "expires_in").map(|d| elasticsearch_engine::ml::job::parse_time(&d, "expires_in")).transpose()?.map(|t| t.millis()).unwrap_or(14 * 86_400_000);
-                    blocking(move || Ok(Resp::ok(anomaly::forecast(&node, &id, duration, expires)?))).await
+                    let memory = opt(&req, &body, "max_model_memory").map(|m| elasticsearch_engine::ml::job::parse_bytes(&m, "max_model_memory")).transpose()?;
+                    blocking(move || Ok(Resp::ok(anomaly::forecast(&node, &id, duration, expires, memory)?))).await
                 }
                 ("_data", &Method::POST) => {
                     let data = req.body.clone();
@@ -948,7 +949,16 @@ async fn trained_models(node: Arc<Node>, req: Req) -> R {
         4 if s(3) == "_infer" => {
             let id = s(2);
             let body = body_obj(&req)?;
-            blocking(move || Ok(Resp::ok(models::infer(&state, &id, &body)?))).await
+            blocking(move || {
+                let _ = elasticsearch_engine::warnings::take();
+                let mut r = Resp::ok(models::infer(&state, &id, &body)?);
+                // A built-in model served by its opt-in stand-in says so.
+                for w in elasticsearch_engine::warnings::take() {
+                    warn(&mut r, &w);
+                }
+                Ok(r)
+            })
+            .await
         }
         4 if s(3) == "vocabulary" => {
             let id = s(2);
@@ -1011,8 +1021,12 @@ async fn trained_models(node: Arc<Node>, req: Req) -> R {
                 }
                 "_infer" => {
                     blocking(move || {
+                        let _ = elasticsearch_engine::warnings::take();
                         let mut r = Resp::ok(models::infer(&state, &id, &body)?);
                         warn(&mut r, "[POST /_ml/trained_models/{model_id}/deployment/_infer] is deprecated! Use [POST /_ml/trained_models/{model_id}/_infer] instead.");
+                        for w in elasticsearch_engine::warnings::take() {
+                            warn(&mut r, &w);
+                        }
                         Ok(r)
                     })
                     .await

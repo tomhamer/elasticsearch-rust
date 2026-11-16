@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 pub enum ReplicaOp {
     Index {
         id: String,
-        /// Raw `_source` JSON (empty when the primary has `_source` disabled).
+        /// The operation's complete indexing input (the original source,
+        /// whatever `_source` stores: disabled or filtered; a document
+        /// snapshot's op carries its `_recovery_source`). Empty only for a
+        /// document stored before `_recovery_source` was kept.
         source_json: String,
         routing: Option<String>,
         seq_no: i64,

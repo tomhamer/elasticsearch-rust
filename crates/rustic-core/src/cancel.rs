@@ -314,3 +314,27 @@ mod tests {
         assert!(slow.due(1153));
     }
 }
+
+thread_local! {
+    /// The running native vector search's deadline and cancellation
+    /// ([`with_search_deadline`]).
+    static VECTOR_STOP: RefCell<(Option<std::time::Instant>, Option<Arc<Token>>)> = const { RefCell::new((None, None)) };
+}
+
+/// Run `f` (a native search on this thread) with `deadline` and `token` for
+/// [`search_stopped`] to poll.
+pub fn with_search_deadline<T>(deadline: Option<std::time::Instant>, token: Option<Arc<Token>>, f: impl FnOnce() -> T) -> T {
+    let previous = VECTOR_STOP.with(|s| s.replace((deadline, token)));
+    let out = f();
+    VECTOR_STOP.with(|s| *s.borrow_mut() = previous);
+    out
+}
+
+/// Whether the native search running on this thread is past its deadline
+/// or cancelled (its own token or this thread's search task).
+pub fn search_stopped() -> bool {
+    VECTOR_STOP.with(|s| {
+        let s = s.borrow();
+        s.0.is_some_and(|d| std::time::Instant::now() >= d) || s.1.as_ref().is_some_and(|t| t.is_cancelled())
+    }) || is_cancelled()
+}

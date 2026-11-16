@@ -2,13 +2,16 @@
 //! the shard copies a sort or aggregation actually runs on). `_cat/fielddata`
 //! lists only loaded fields, so on a cluster only the nodes that served such
 //! a search report them.
+//!
+//! Keyed by index uuid: an index name is reused across nodes (and engines)
+//! of one process and across a delete and re-create.
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 
 static LOADED: Mutex<BTreeMap<String, BTreeSet<String>>> = Mutex::new(BTreeMap::new());
 
-/// A sort or aggregation on `index`/`field` loaded its fielddata.
+/// A sort or aggregation on the index `uuid` / `field` loaded its fielddata.
 pub fn mark(index: &str, field: &str) {
     let mut m = LOADED.lock();
     if !m.get(index).is_some_and(|s| s.contains(field)) {
@@ -20,7 +23,7 @@ pub fn loaded(index: &str, field: &str) -> bool {
     LOADED.lock().get(index).is_some_and(|s| s.contains(field))
 }
 
-/// A new index of this name starts with nothing loaded.
+/// The index `uuid` is gone: forget its fields.
 pub fn clear_index(index: &str) {
     LOADED.lock().remove(index);
 }

@@ -39,6 +39,51 @@ pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// [`provider`] offering only `ciphers` (`<prefix>.cipher_suites`, as
+/// [`parse_cipher_suites`] resolved them); `None`: every default suite.
+pub fn provider_with(ciphers: Option<&[String]>) -> Arc<CryptoProvider> {
+    let mut p = rustls::crypto::ring::default_provider();
+    if let Some(allowed) = ciphers {
+        p.cipher_suites.retain(|s| allowed.iter().any(|a| *a == suite_name(s)));
+    }
+    Arc::new(p)
+}
+
+/// A rustls suite under its Java / IANA name (`TLS_AES_256_GCM_SHA384`,
+/// `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`), as ES settings name them.
+fn suite_name(s: &rustls::SupportedCipherSuite) -> String {
+    let n = s.suite().as_str().unwrap_or("").to_string();
+    match n.strip_prefix("TLS13_") {
+        Some(rest) => format!("TLS_{rest}"),
+        None => n,
+    }
+}
+
+/// `<prefix>.cipher_suites` (production review #291: the allowlist was
+/// accepted and ignored): the listed suites this node supports, `None`
+/// for the default. Names this node cannot speak are dropped (as ES drops
+/// suites its JVM lacks); a list naming none it can is an error.
+pub fn parse_cipher_suites(list: &[String], setting: &str) -> Result<Option<Vec<String>>, String> {
+    let wanted: Vec<&String> = list.iter().filter(|c| !c.is_empty()).collect();
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let known: Vec<String> = rustls::crypto::ring::default_provider().cipher_suites.iter().map(suite_name).collect();
+    let usable: Vec<String> = wanted.iter().filter(|w| known.contains(w)).map(|w| w.to_string()).collect();
+    if usable.is_empty() {
+        return Err(format!("none of the ciphers [{}] in [{setting}] are supported by this node; supported ciphers are [{}]", wanted.iter().map(|w| w.as_str()).collect::<Vec<_>>().join(", "), known.join(", ")));
+    }
+    Ok(Some(usable))
+}
+
+/// [`parse_protocols`] for callers outside this crate (transport TLS).
+pub fn parse_supported_protocols(list: &[String], setting: &str) -> Result<Vec<&'static rustls::SupportedProtocolVersion>, String> {
+    Ok(parse_protocols(list, setting)?.into_iter().map(|p| match p {
+        Protocol::Tls13 => &rustls::version::TLS13,
+        Protocol::Tls12 => &rustls::version::TLS12,
+    }).collect())
+}
+
 /// `<prefix>.verification_mode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerificationMode {
@@ -166,6 +211,8 @@ pub struct SslConfig {
     pub supported_protocols: Vec<Protocol>,
     /// `trust_restrictions.path` / `.x509_fields`.
     pub trust_restrictions: Option<TrustRestrictionsConfig>,
+    /// `cipher_suites` ([`parse_cipher_suites`]); `None`: the defaults.
+    pub cipher_suites: Option<Vec<String>>,
 }
 
 impl SslConfig {
@@ -229,7 +276,8 @@ impl SslConfig {
         };
         let supported_protocols = parse_protocols(&get_list(&key("supported_protocols")), &key("supported_protocols"))?;
         let trust_restrictions = TrustRestrictionsConfig::parse(prefix, get, get_list, conf_dir)?;
-        Ok(SslConfig { prefix: prefix.to_string(), key: key_material, trust, verification_mode, client_authentication, supported_protocols, trust_restrictions })
+        let cipher_suites = parse_cipher_suites(&get_list(&key("cipher_suites")), &key("cipher_suites"))?;
+        Ok(SslConfig { prefix: prefix.to_string(), key: key_material, trust, verification_mode, client_authentication, supported_protocols, trust_restrictions, cipher_suites })
     }
 
     /// Every file this context reads (ES `SslConfiguration.getDependentFiles`):
@@ -357,10 +405,11 @@ impl SslConfig {
             }
             TrustMaterial::Truststore { path, kind, password } => {
                 let store = self.load_store(path, *kind, password, password, "truststore")?;
-                if store.certs.is_empty() {
+                let anchors = store.trust_anchors();
+                if anchors.is_empty() {
                     return Err(self.fail(format!("the configured [PKCS12] truststore [{}] does not contain any trusted certificate entries", path.display())));
                 }
-                for (_, c) in store.certs {
+                for c in anchors {
                     add(&mut roots, c, &path.display().to_string())?;
                 }
             }
@@ -389,7 +438,7 @@ impl SslConfig {
                 self.context()
             ));
         };
-        let provider = provider();
+        let provider = provider_with(self.cipher_suites.as_deref());
         let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = match (self.client_authentication, self.verification_mode) {
             (ClientAuth::None, _) => WebPkiClientVerifier::no_client_auth(),
             (mode, VerificationMode::None) => Arc::new(verify::AnyClientCert { mandatory: mode == ClientAuth::Required, algs: provider.signature_verification_algorithms }),
@@ -420,7 +469,7 @@ impl SslConfig {
     /// verified per `verification_mode`, the key material (if any) is the
     /// client certificate.
     pub fn client_config(&self) -> Result<Arc<ClientConfig>, String> {
-        let provider = provider();
+        let provider = provider_with(self.cipher_suites.as_deref());
         let key = self.load_key()?;
         let roots = Arc::new(self.load_trust(key.as_ref().map(|(c, _)| c.as_slice()))?);
         let restrictions = match &self.trust_restrictions {
@@ -496,7 +545,11 @@ fn parse_bool(value: Option<String>, setting: &str) -> Result<bool, String> {
     match value.as_deref() {
         None | Some("") | Some("false") => Ok(false),
         Some("true") => Ok(true),
-        Some(other) => Err(format!("Failed to parse value [{other}] for setting [{setting}] as only [true] or [false] are allowed.")),
+        // ES `Booleans.parseBoolean`'s message (it names no setting).
+        Some(other) => {
+            let _ = setting;
+            Err(format!("Failed to parse value [{other}] as only [true] or [false] are allowed."))
+        }
     }
 }
 

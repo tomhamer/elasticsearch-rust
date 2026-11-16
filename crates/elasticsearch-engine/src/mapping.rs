@@ -31,6 +31,14 @@ pub const STORED_FIELD: u16 = 7;
 /// stored, never indexed keyword; indices whose mapping predates it keep
 /// the block in [`STORED_FIELD`], shared with `_field_names`).
 pub const STORED_BLOCK_KEY: &str = "#stored";
+/// `core_ids` key of ES's `_recovery_source` (`SourceFieldMapper`): the
+/// original source of a document whose stored `_source` is disabled or
+/// filtered by `_source.includes` / `excludes`, kept (stored, never
+/// indexed) so that rebuilding a copy from its documents (document-based
+/// peer recovery, stateless commits, a snapshot's document restore,
+/// shrink/split) re-indexes every indexed field. Allocated only for such
+/// mappings.
+pub const RECOVERY_SOURCE_KEY: &str = "#recovery_source";
 /// The schema name the stored-fields block's field had in commits written
 /// before it was named by [`STORED_BLOCK_KEY`] (adopted as that key).
 pub const LEGACY_STORED_BLOCK_NAME: &str = "_stored_fields";
@@ -117,6 +125,7 @@ pub fn reserved_long_field(name: &str, id: u16) -> ResolvedField {
         geo_id: None,
         index_analyzer: None,
         index_analyzer_name: None,
+        search_analyzer_name: None,
         search_analyzer: None,
         search_quote_analyzer: None,
         normalizer: None,
@@ -141,6 +150,7 @@ pub fn reserved_long_field(name: &str, id: u16) -> ResolvedField {
         declared: EsType::Long,
         ext: None,
         aux: Vec::new(),
+        split_queries_on_whitespace: false,
         position_increment_gap: 100,
         norms: true,
         discount_overlaps: true,
@@ -1073,13 +1083,13 @@ impl FieldMapping {
     fn validate(&self, name: &str, registry: &AnalysisRegistry) -> Result<()> {
         for key in ["analyzer", "search_analyzer", "search_quote_analyzer"] {
             if let Some(a) = self.str_param(key) {
-                if !registry.has_analyzer(a) {
+                if !registry.has_analyzer(a) && !registry.lenient_names {
                     return Err(crate::fieldtypes::params::iae(format!("analyzer [{a}] has not been configured in mappings")));
                 }
             }
         }
         if let Some(n) = self.str_param("normalizer") {
-            if registry.normalizer(n).is_none() {
+            if registry.normalizer(n).is_none() && !registry.lenient_names {
                 return Err(EsError::mapper_parsing(format!("normalizer [{n}] not found for field [{name}]")));
             }
         }
@@ -1136,14 +1146,26 @@ impl FieldMapping {
     }
 
     /// A `flattened` field's mapped sub-fields (dotted name, mapping).
-    pub fn flattened_mapped(&self) -> Vec<(String, FieldMapping)> {
+    /// The typed sub-fields of a `flattened` field with `properties`, read
+    /// against `reg` (the index's registry: custom analyzers and normalizers
+    /// resolve, finding 469; `None`: names only, for core-id assignment).
+    pub fn flattened_mapped(&self, reg: Option<&AnalysisRegistry>) -> Vec<(String, FieldMapping)> {
         let Some(o) = self.params.get("properties").and_then(Value::as_object).filter(|_| self.ty == EsType::Flattened) else { return Vec::new() };
-        let reg = AnalysisRegistry::default();
+        let lenient = AnalysisRegistry::lenient();
+        let reg = reg.unwrap_or(&lenient);
         o.iter()
             .filter_map(|(k, v)| {
                 let spec = v.as_object()?;
                 let ty = EsType::parse(spec.get("type")?.as_str()?)?;
-                FieldMapping::parse(k, spec, ty, &reg, false).ok().map(|f| (k.clone(), f))
+                match FieldMapping::parse(k, spec, ty, reg, false) {
+                    Ok(f) => Some((k.clone(), f)),
+                    Err(e) => {
+                        // Validated when the mapping was accepted: a failure
+                        // here would silently drop indexed values.
+                        tracing::error!("flattened sub-field [{k}] of a validated mapping does not parse: {}", e.reason);
+                        None
+                    }
+                }
             })
             .collect()
     }
@@ -1271,6 +1293,24 @@ impl FieldMapping {
     }
 }
 
+thread_local! {
+    /// While the properties of a nested object mapping are parsed: whether
+    /// that nested object's fields reach the root document (`None`: not
+    /// inside a nested object).
+    static NESTED_PARSE_CTX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores [`NESTED_PARSE_CTX`] when the properties of a nested object
+/// are parsed (also on error).
+struct NestedParseScope(Option<bool>);
+
+impl Drop for NestedParseScope {
+    fn drop(&mut self) {
+        let prev = self.0;
+        NESTED_PARSE_CTX.with(|c| c.set(prev));
+    }
+}
+
 impl ObjectMapping {
     fn parse(path: &str, spec: &Map<String, Value>, nested: bool, registry: &AnalysisRegistry, depth: usize) -> Result<Self> {
         use crate::fieldtypes::params;
@@ -1279,6 +1319,9 @@ impl ObjectMapping {
         }
         let mut om = ObjectMapping { nested, explicit_type: spec.contains_key("type"), ..Default::default() };
         let leaf = path.rsplit('.').next().unwrap_or(path);
+        // The enclosing nested object's "included in root" (`None`: not
+        // inside a nested object), as ES's `NestedMapperBuilderContext`.
+        let outer_nested = NESTED_PARSE_CTX.with(|c| c.get());
         let mut unsupported = Vec::new();
         // Object parsing context cannot depend on JSON member order. A delta
         // often writes properties before its committed subobjects setting.
@@ -1311,6 +1354,17 @@ impl ObjectMapping {
                             return Err(EsError::mapper_parsing(m).caused_by(EsError::new(400, "parse_exception", m)));
                         }
                     };
+                    // Children of a nested object see whether it reaches the
+                    // root: a top-level one through either flag, an inner
+                    // one through its own `include_in_root`.
+                    let _scope = nested.then(|| {
+                        let flag = |k: &str| om.params.get(k) == Some(&json!(true));
+                        let own = match outer_nested {
+                            None => flag("include_in_root") || flag("include_in_parent"),
+                            Some(_) => flag("include_in_root"),
+                        };
+                        NestedParseScope(NESTED_PARSE_CTX.with(|c| c.replace(Some(own))))
+                    });
                     for (name, fspec) in props {
                         om.insert_property(path, name, fspec, registry, depth)?;
                     }
@@ -1345,8 +1399,11 @@ impl ObjectMapping {
         if !unsupported.is_empty() {
             return Err(EsError::mapper_parsing(format!("Mapping definition for [{leaf}] has unsupported parameters:  [{}]", unsupported.join("] ["))));
         }
-        // `include_in_root` is moot (dropped) when `include_in_parent` is set too.
-        if om.params.get("include_in_parent") == Some(&json!(true)) && om.params.get("include_in_root") == Some(&json!(true)) {
+        // `include_in_root` is moot (dropped, `NestedObjectMapper.Builder`)
+        // when `include_in_parent` already reaches the root: the parent is
+        // the root (a top-level nested object), or is itself included in
+        // the root. Kept for a nested object inside one that is not.
+        if nested && om.params.get("include_in_parent") == Some(&json!(true)) && om.params.get("include_in_root") == Some(&json!(true)) && outer_nested != Some(false) {
             om.params.remove("include_in_root");
         }
         Ok(om)
@@ -2421,7 +2478,7 @@ impl Mappings {
         walk(&self.root.properties, "", &mut leaves);
         let mut leaves: Vec<(String, FieldMapping)> = leaves.into_iter().map(|(p, f)| (p, f.clone())).collect();
         // `flattened` mapped sub-fields are leaves of their own.
-        let subs: Vec<(String, FieldMapping)> = leaves.iter().flat_map(|(p, f)| f.flattened_mapped().into_iter().map(move |(k, sf)| (format!("{p}.{k}"), sf))).collect();
+        let subs: Vec<(String, FieldMapping)> = leaves.iter().flat_map(|(p, f)| f.flattened_mapped(None).into_iter().map(move |(k, sf)| (format!("{p}.{k}"), sf))).collect();
         leaves.extend(subs);
         if self.size_enabled() {
             leaves.push(("_size".to_string(), FieldMapping::new(EsType::Long)));
@@ -2456,7 +2513,25 @@ impl Mappings {
             self.next_core_id += 1;
             added.push(STORED_BLOCK_KEY.to_string());
         }
+        if self.keeps_recovery_source() && !self.core_ids.contains_key(RECOVERY_SOURCE_KEY) {
+            self.core_ids.insert(RECOVERY_SOURCE_KEY.to_string(), self.next_core_id);
+            self.next_core_id += 1;
+            added.push(RECOVERY_SOURCE_KEY.to_string());
+        }
         added
+    }
+
+    /// Whether the stored `_source` may differ from the indexing input in a
+    /// way a document cannot be rebuilt from: disabled, or filtered by
+    /// `_source.includes` / `excludes` (ES adds `_recovery_source` for
+    /// both). Synthetic source rebuilds from doc values instead.
+    pub fn keeps_recovery_source(&self) -> bool {
+        use crate::synthetic::SourceMode;
+        match self.effective_source_mode() {
+            Some(SourceMode::Synthetic) => false,
+            Some(SourceMode::Disabled) => true,
+            _ => !self.source_enabled() || self.source.as_ref().is_some_and(|s| s.get("includes").is_some() || s.get("excludes").is_some()),
+        }
     }
 
     pub fn source_enabled(&self) -> bool {
@@ -2774,6 +2849,8 @@ pub struct ResolvedField {
     pub geo_id: Option<u16>,
     pub index_analyzer: Option<IndexAnalyzer>,
     pub index_analyzer_name: Option<String>,
+    /// The name of `search_analyzer` (cross_fields groups fields by it).
+    pub search_analyzer_name: Option<String>,
     pub search_analyzer: Option<Arc<Analyzer>>,
     pub search_quote_analyzer: Option<Arc<Analyzer>>,
     pub normalizer: Option<Arc<Analyzer>>,
@@ -2815,6 +2892,10 @@ pub struct ResolvedField {
     pub discount_overlaps: bool,
     /// `store: true`.
     pub stored: bool,
+    /// Keyword `split_queries_on_whitespace`: full-text queries split
+    /// their text on whitespace (each piece normalized) before the term
+    /// queries.
+    pub split_queries_on_whitespace: bool,
     /// Text: `fielddata: true` (uninverted index for sort/agg).
     pub fielddata: bool,
     /// `time_series_dimension: true` (time-series index).
@@ -2991,8 +3072,16 @@ pub struct FieldLookup {
     pub doc_count_id: Option<u16>,
     /// The stored-fields block's field (`None`: [`STORED_FIELD`]).
     pub stored_block_id: Option<u16>,
+    /// The `_recovery_source` field ([`RECOVERY_SOURCE_KEY`]).
+    pub recovery_source_id: Option<u16>,
     /// Some field has an index-time `script`.
     pub has_index_scripts: bool,
+    /// Some object is `nested` or `enabled: false`: a dotted source key
+    /// below it must enter its scope ([`crate::document`]).
+    pub has_scoped_objects: bool,
+    /// Fields (multi-fields included) whose mapping stores term vectors
+    /// (`term_vector` other than `no`), sorted.
+    pub term_vector_fields: Vec<String>,
     /// Fields with `doc_values.nullability: false` (full name, nested scope).
     pub required: Vec<(String, Option<String>)>,
     /// Top-level `store: true` fields (not `_`-prefixed, not nested),
@@ -3038,6 +3127,7 @@ impl FieldLookup {
         let mut lk = FieldLookup { tsdb_fields: crate::tsdb::PreparedFields::new(m), registry: registry.clone(), root_dynamic: m.root.dynamic, root_enabled: m.root.enabled.unwrap_or(true), ..Default::default() };
         lk.doc_count_id = m.core_ids.get(DOC_COUNT_FIELD_NAME).copied();
         lk.stored_block_id = m.core_ids.get(STORED_BLOCK_KEY).copied();
+        lk.recovery_source_id = m.core_ids.get(RECOVERY_SOURCE_KEY).copied();
         let root_dyn = m.root.dynamic.unwrap_or(Dynamic::True);
         lk.walk(m, &m.root.properties, "", root_dyn, None);
         // Columnar roots keep pass-through objects as prefixes.
@@ -3050,6 +3140,8 @@ impl FieldLookup {
         lk.may_have_vector_fields = lk.fields.values().any(|f| matches!(f.declared, EsType::DenseVector | EsType::SparseVector | EsType::RankVectors));
         lk.may_have_semantic_fields = lk.fields.values().any(|f| f.declared.is_semantic());
         lk.has_index_scripts = lk.fields.values().any(|f| f.script.is_some());
+        lk.has_scoped_objects = lk.objects.values().any(|o| o.nested || !o.enabled);
+        lk.term_vector_fields.sort();
         lk.required = lk.fields.values().filter(|f| f.required && f.alias_path.is_none()).map(|f| (f.name.clone(), f.nested_path.clone())).collect();
         lk.required.sort();
         for (name, f) in &lk.fields {
@@ -3103,9 +3195,16 @@ impl FieldLookup {
                 }
                 Mapper::Field(f) => {
                     let rf = self.resolve(m, &full, f, false, nested);
+                    let stores_tv = |fm: &FieldMapping| fm.str_param("term_vector").is_some_and(|t| t != "no");
+                    if stores_tv(f) {
+                        self.term_vector_fields.push(full.clone());
+                    }
                     let mut multi = Vec::new();
                     for (s, sf) in &f.fields {
                         let sub = format!("{full}.{s}");
+                        if stores_tv(sf) {
+                            self.term_vector_fields.push(sub.clone());
+                        }
                         let r = self.resolve(m, &sub, sf, true, nested);
                         self.fields.insert(sub.clone(), Arc::new(r));
                         multi.push(sub);
@@ -3114,7 +3213,8 @@ impl FieldLookup {
                     rf.multi_fields = multi;
                     // `flattened` mapped sub-fields (and their pass-through).
                     if f.ty == EsType::Flattened {
-                        for (k, sf) in f.flattened_mapped() {
+                        let subs = f.flattened_mapped(Some(&self.registry));
+                        for (k, sf) in subs {
                             let sub = format!("{full}.{k}");
                             let r = self.resolve(m, &sub, &sf, false, nested);
                             self.fields.insert(sub, Arc::new(r));
@@ -3149,9 +3249,9 @@ impl FieldLookup {
         };
         let declared = f.ty;
         let behavior = crate::fieldtypes::behavior(f.ty);
-        let (index_analyzer, index_analyzer_name, search_analyzer, quote) = if f.ty == EsType::PatternText {
+        let (index_analyzer, index_analyzer_name, search_analyzer_name, search_analyzer, quote) = if f.ty == EsType::PatternText {
             let an = crate::fieldtypes::pattern_text::analyzer_name(f.str_param("analyzer")).to_string();
-            (Some(reg.index_analyzer(&an)), Some(an.clone()), reg.analyzer(&an), reg.analyzer(&an))
+            (Some(reg.index_analyzer(&an)), Some(an.clone()), Some(an.clone()), reg.analyzer(&an), reg.analyzer(&an))
         } else if f.ty.is_text() {
             let an = f.str_param("analyzer").map(str::to_string).unwrap_or_else(|| reg.default_analyzer_name().to_string());
             let sn = f
@@ -3159,9 +3259,9 @@ impl FieldLookup {
                 .map(str::to_string)
                 .unwrap_or_else(|| if f.str_param("analyzer").is_some() { an.clone() } else { reg.default_search_analyzer_name().to_string() });
             let qn = f.str_param("search_quote_analyzer").map(str::to_string).unwrap_or_else(|| sn.clone());
-            (Some(reg.index_analyzer(&an)), Some(an.clone()), reg.analyzer(&sn), reg.analyzer(&qn))
+            (Some(reg.index_analyzer(&an)), Some(an.clone()), Some(sn.clone()), reg.analyzer(&sn), reg.analyzer(&qn))
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
         let normalizer = f.str_param("normalizer").and_then(|n| reg.normalizer(n));
         let date_format = f.str_param("format").and_then(|s| DateFormatter::new(s).ok()).unwrap_or_else(|| DateFormatter::new(DEFAULT_FORMAT).unwrap()).with_locale(f.str_param("locale"));
@@ -3201,6 +3301,7 @@ impl FieldLookup {
             geo_id: if f.ty == EsType::GeoPoint { m.core_ids.get(&format!("{name}#geo")).copied() } else { None },
             index_analyzer,
             index_analyzer_name,
+            search_analyzer_name,
             search_analyzer,
             search_quote_analyzer: quote,
             normalizer_skip_store: normalizer.is_some()
@@ -3209,7 +3310,8 @@ impl FieldLookup {
             date_format,
             ignore_above: f.param("ignore_above").and_then(Value::as_u64).map(|v| v as usize).or(if matches!(f.ty, EsType::Keyword | EsType::Flattened | EsType::Wildcard) && !multi { reg.default_ignore_above } else { None }),
             null_value: f.param("null_value").cloned().filter(|v| !v.is_null()),
-            coerce: f.bool_param("coerce", true),
+            // `index.mapping.coerce` is the default of a field without its own.
+            coerce: f.bool_param("coerce", !reg.default_no_coerce),
             ignore_malformed: f.bool_param(
                 "ignore_malformed",
                 reg.default_ignore_malformed
@@ -3235,6 +3337,7 @@ impl FieldLookup {
             declared,
             ext: crate::fieldtypes::ext_for(f, reg),
             aux: crate::fieldtypes::aux_ids(m, name),
+            split_queries_on_whitespace: f.bool_param("split_queries_on_whitespace", false),
             position_increment_gap: f.param("position_increment_gap").and_then(Value::as_u64).unwrap_or(100) as u32,
             // ES: text-like fields have norms by default, keyword does not.
             norms: f.bool_param("norms", f.ty != EsType::Keyword),
@@ -3346,6 +3449,14 @@ impl FieldLookup {
             block.indexed = false;
             block.fast = false;
             leaf.push(block);
+        }
+        if let Some(id) = self.recovery_source_id {
+            // Stored only: read back by document-based recovery, never
+            // searched or fetched.
+            let mut recovery = CoreField::new(id, RECOVERY_SOURCE_KEY, CoreType::Keyword);
+            recovery.indexed = false;
+            recovery.fast = false;
+            leaf.push(recovery);
         }
         leaf.sort_by_key(|f| f.id);
         out.extend(leaf);

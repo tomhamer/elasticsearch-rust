@@ -147,3 +147,117 @@ pub fn tokens(a: &Analyzer, text: &str) -> Vec<Tok> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::AnalysisRegistry;
+    use crate::document::parse_with_dynamic;
+    use crate::mapping::Mappings;
+    use rustic_core::types::IndexSettings;
+    use rustic_core::Index;
+    use serde_json::json;
+
+    struct Fx {
+        index: Index,
+        lookup: FieldLookup,
+    }
+
+    fn fx(mapping: Value, docs: &[Value]) -> Fx {
+        let reg = AnalysisRegistry::default();
+        let mut m = Mappings::parse(&mapping, &reg).unwrap();
+        m.assign_core_ids();
+        let lookup = FieldLookup::build(&m, &reg);
+        let mut index = Index::new("idx", lookup.core_schema(), IndexSettings::default());
+        for (i, d) in docs.iter().enumerate() {
+            let (pd, upd) = parse_with_dynamic(d, &i.to_string(), &m, &lookup, 1000).unwrap();
+            assert!(upd.is_none());
+            index.add_document(&pd.doc).unwrap();
+        }
+        index.refresh().unwrap();
+        Fx { index, lookup }
+    }
+
+    fn with_target<T>(f: &Fx, run: impl FnOnce(&[SuggestTarget]) -> T) -> T {
+        let leaves = f.index.leaves();
+        let t = SuggestTarget { index: "idx", leaves: &leaves, lookup: &f.lookup, svc: None };
+        run(std::slice::from_ref(&t))
+    }
+
+    /// Six misspelt tokens, each with four one-edit corrections indexed.
+    fn grid() -> (Fx, String) {
+        let words: Vec<String> = (1..=6).flat_map(|i| ["b", "c", "d", "e"].map(|s| format!("tok{i}{s}"))).collect();
+        let f = fx(json!({"properties": {"body": {"type": "text"}}}), &[json!({"body": words.join(" ")})]);
+        let text = (1..=6).map(|i| format!("tok{i}a")).collect::<Vec<_>>().join(" ");
+        (f, text)
+    }
+
+    /// #167: the correction tree is explored under a path budget, polls
+    /// cancellation, and refuses an excessive depth; within the budget the
+    /// suggestions are unchanged.
+    #[test]
+    fn phrase_correction_search_is_bounded() {
+        let (f, text) = grid();
+        let o = |errors: u64| json!({"field": "body", "max_errors": errors, "confidence": 0.0, "direct_generator": [{"field": "body", "suggest_mode": "always"}]});
+        let one_error = |budget: Option<u64>| {
+            phrase::PATH_BUDGET.with(|b| b.set(budget));
+            let r = with_target(&f, |t| phrase::run(&text, o(1).as_object().unwrap(), t));
+            phrase::PATH_BUDGET.with(|b| b.set(None));
+            r
+        };
+        // One error: ~90 paths, the same options under a 200-path budget.
+        let full = one_error(None).unwrap();
+        assert!(!full[0]["options"].as_array().unwrap().is_empty(), "{full}");
+        assert_eq!(one_error(Some(200)).unwrap(), full);
+        // Six errors: 5^6 paths; a 200-path budget stops the search.
+        phrase::PATH_BUDGET.with(|b| b.set(Some(200)));
+        let e = with_target(&f, |t| phrase::run(&text, o(6).as_object().unwrap(), t)).unwrap_err();
+        phrase::PATH_BUDGET.with(|b| b.set(None));
+        assert_eq!(e.status, 400);
+        assert!(e.reason.contains("explores more than [200] correction paths"), "{}", e.reason);
+        // The same search under the default budget completes, and stops
+        // when its task is cancelled.
+        with_target(&f, |t| phrase::run(&text, o(6).as_object().unwrap(), t)).unwrap();
+        let gone = rustic_core::cancel::Token::cancelled_with("by user request");
+        let e = rustic_core::cancel::with_search(Some(gone), || with_target(&f, |t| phrase::run(&text, o(6).as_object().unwrap(), t))).unwrap_err();
+        assert_eq!(e.kind, "task_cancelled_exception");
+        // Depth: more tokens than the search recurses over, and token_limit 0.
+        let long = vec!["tok1a"; phrase::MAX_PHRASE_TOKENS + 1].join(" ");
+        let deep = json!({"field": "body", "token_limit": 5000, "direct_generator": [{"field": "body", "suggest_mode": "always"}]});
+        let e = with_target(&f, |t| phrase::run(&long, deep.as_object().unwrap(), t)).unwrap_err();
+        assert!(e.reason.contains("corrects at most"), "{}", e.reason);
+        let e = with_target(&f, |t| phrase::run(&text, json!({"field": "body", "token_limit": 0}).as_object().unwrap(), t)).unwrap_err();
+        assert_eq!(e.reason, "token_limit must be >= 1");
+    }
+
+    /// #168: a term suggestion for a 16,000-char keyword one edit from an
+    /// indexed one is found with banded distance work, and polls cancellation.
+    #[test]
+    fn term_suggestion_of_a_long_keyword_is_banded() {
+        let base: String = (0..16_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let f = fx(json!({"properties": {"kw": {"type": "keyword"}}}), &[json!({"kw": base.clone()})]);
+        let mut near: Vec<char> = base.chars().collect();
+        near[15_990] = '#';
+        let text: String = near.into_iter().collect();
+        let o = json!({"field": "kw"});
+        let started = std::time::Instant::now();
+        let r = with_target(&f, |t| term::run(&text, o.as_object().unwrap(), t)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        let opts = r[0]["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0]["text"].as_str().unwrap().len(), 16_000);
+        assert_eq!(opts[0]["text"].as_str().unwrap(), base);
+        // Two edits apart (default max_edits 2) is found; three is not.
+        let mut two: Vec<char> = base.chars().collect();
+        two[100] = '#';
+        two[15_000] = '#';
+        let r = with_target(&f, |t| term::run(&two.iter().collect::<String>(), o.as_object().unwrap(), t)).unwrap();
+        assert_eq!(r[0]["options"].as_array().unwrap().len(), 1);
+        two[9_000] = '#';
+        let r = with_target(&f, |t| term::run(&two.iter().collect::<String>(), o.as_object().unwrap(), t)).unwrap();
+        assert!(r[0]["options"].as_array().unwrap().is_empty());
+        let gone = rustic_core::cancel::Token::cancelled_with("by user request");
+        let e = rustic_core::cancel::with_search(Some(gone), || with_target(&f, |t| term::run(&text, o.as_object().unwrap(), t))).unwrap_err();
+        assert_eq!(e.kind, "task_cancelled_exception");
+    }
+}

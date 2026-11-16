@@ -6,7 +6,7 @@ use axum::http::Method;
 use elasticsearch_engine::error::EsError;
 use elasticsearch_engine::index::{IndexService, WriteReq};
 use elasticsearch_engine::node::Node;
-use elasticsearch_engine::search::{doc_visible, filter_source, parse_source_filter, SourceFilter};
+use elasticsearch_engine::search::{filter_source, parse_source_filter, SourceFilter};
 use elasticsearch_engine::security::roles::IndexAccess;
 use elasticsearch_engine::shard::{GetResult, WriteCond};
 use serde_json::{json, Map, Value};
@@ -22,6 +22,18 @@ pub async fn handle(node: Arc<Node>, req: Req, index: Option<String>) -> R {
     let api = segs.get(off).cloned().unwrap_or_default();
     let id = segs.get(off + 1).cloned();
     let m = req.method.clone();
+    // The write's `refresh` option is validated before the request runs
+    // (ES parses it while building the request): an invalid value must not
+    // leave the document indexed, deleted or updated, nor an index created.
+    let write = match api.as_str() {
+        "_bulk" | "_create" => m == Method::POST || m == Method::PUT,
+        "_update" => m == Method::POST,
+        "_doc" => m == Method::POST || m == Method::PUT || m == Method::DELETE,
+        _ => false,
+    };
+    if write {
+        crate::util::validate_refresh(req.param("refresh"))?;
+    }
     match (api.as_str(), id, &m) {
         ("_bulk", None, &Method::POST) | ("_bulk", None, &Method::PUT) => {
             // The translog sync request durability needs runs after the
@@ -78,6 +90,19 @@ fn mapping_authz(req: &Req) -> elasticsearch_engine::index::MappingAuthzGuard {
     elasticsearch_engine::index::enter_mapping_authz(req.extensions.get::<crate::security::authz::MappingAuthz>().map(|m| m.0.clone()))
 }
 
+/// Security: a destination an ingest pipeline rerouted the document to
+/// (`dest`, other than the requested `original`) must be writable by the
+/// caller ([`crate::security::authz::IngestDestAuthz`]).
+fn authorize_ingest_dest(req: &Req, original: &str, dest: &str, create: bool) -> Result<(), EsError> {
+    if dest == original {
+        return Ok(());
+    }
+    match req.extensions.get::<crate::security::authz::IngestDestAuthz>() {
+        Some(authz) => (authz.0)(dest, create),
+        None => Ok(()),
+    }
+}
+
 fn ingest_user(req: &Req) -> Option<elasticsearch_engine::ingest::IngestContextGuard> {
     req.access.as_deref().map(|a| elasticsearch_engine::ingest::IngestContext::enter(elasticsearch_engine::ingest::IngestContext { user: Some(a.user().clone()) }))
 }
@@ -118,13 +143,22 @@ fn index_doc(node: &Node, req: &Req, index: &str, id: Option<String>, create: bo
     let (orig_id, orig_routing) = (id.clone(), routing.clone());
     // Ingest pipelines (`?pipeline=`, index default/final pipelines).
     let ingest = match req.extensions.get::<crate::PreparedBulkIngestItems>().and_then(|items| items.0.get(&0)) {
+        // A coordinator that ran the pipelines put their version and
+        // concurrency conditions in this request's parameters.
         Some(crate::PreparedBulkIngest::Write { routing, dynamic_templates }) => Ok(crate::ingest::Prepared::Write {
-            index: index.to_string(), id, routing: routing.clone(), source: src, dynamic_templates: dynamic_templates.clone(),
+            index: index.to_string(), id, routing: routing.clone(), source: src, dynamic_templates: dynamic_templates.clone(), cond: None,
         }),
-        _ => crate::ingest::prepare_ext(node, index, id, routing, src, req.param("pipeline")),
+        _ => crate::ingest::prepare_ext(node, index, id, routing, src, req.param("pipeline"), elasticsearch_engine::ingest::WriteMeta::of(&cond)),
     };
     let (index, id, routing, src, ingest_dt) = match ingest {
-        Ok(crate::ingest::Prepared::Write { index, id, routing, source, dynamic_templates }) => (index, id, routing, source, dynamic_templates),
+        Ok(crate::ingest::Prepared::Write { index, id, routing, source, dynamic_templates, cond: after }) => {
+            // Version and concurrency metadata set by the pipelines apply
+            // to the write (ES `updateIndexRequestMetadata`).
+            if let Some(after) = after {
+                after.apply(&mut cond);
+            }
+            (index, id, routing, source, dynamic_templates)
+        }
         Ok(crate::ingest::Prepared::Dropped { index, id }) => return Ok(Resp::ok(Value::Object(crate::ingest::dropped_json(&index, id.as_deref())))),
         // An ingest failure goes to the failure store of the index it was headed for.
         Err(b) => {
@@ -134,6 +168,7 @@ fn index_doc(node: &Node, req: &Req, index: &str, id: Option<String>, create: bo
             });
         }
     };
+    authorize_ingest_dest(req, &original_index, &index, cond.create || (id.is_none() && req.param("op_type").is_none()))?;
     let index = index.as_str();
     let svc = node.write_index(index, true)?;
     if req.extensions.get::<crate::InternalDataStreamBackingWrite>().is_none() {
@@ -328,19 +363,69 @@ fn not_found_json(index: &str, id: &str) -> Value {
 }
 
 /// Document- and field-level security for a single-document read: a document hidden by
-/// DLS is "missing"; FLS removes ungranted fields from the `_source` before anything else
-/// (user `_source` filters, `stored_fields`) sees it.
-fn secure_get(svc: &Arc<IndexService>, id: &str, access: &Option<Arc<IndexAccess>>, found: Option<GetResult>) -> Result<Option<GetResult>, EsError> {
-    let Some(acc) = access else { return Ok(found) };
+/// DLS is "missing"; FLS removes ungranted fields from the `_source` (and the stored
+/// fields) before anything else (user `_source` filters, `stored_fields`) sees it.
+///
+/// DLS is judged on exactly the document returned: its shard (`id` / `routing`), and its
+/// `_seq_no`, after a re-fetch confirms that the version judged is still the one being
+/// returned (a concurrent replacement retries; persistent churn fails closed).
+fn secure_get(svc: &Arc<IndexService>, id: &str, routing: Option<&str>, realtime: bool, access: &Option<Arc<IndexAccess>>) -> Result<Option<GetResult>, EsError> {
+    let fetch = || svc.get_routed(id, routing, realtime);
+    let Some(acc) = access else { return fetch() };
+    let found = if acc.dls.is_none() {
+        fetch()?
+    } else {
+        let mut visible = None;
+        for _ in 0..SECURE_GET_ATTEMPTS {
+            let Some(g) = fetch()? else { return Ok(None) };
+            dls_check_hook();
+            if !elasticsearch_engine::search::fetched_doc_visible(svc, id, routing, &g, acc, true)? {
+                return Ok(None);
+            }
+            // The same version still current: the check judged what is returned.
+            let now = svc.peek(id, routing)?;
+            if now.as_ref().is_some_and(|n| n.seq_no == g.seq_no && n.primary_term == g.primary_term && n.version == g.version) {
+                visible = Some(g);
+                break;
+            }
+        }
+        match visible {
+            Some(g) => Some(g),
+            None => return Ok(None),
+        }
+    };
     let Some(mut g) = found else { return Ok(None) };
-    if !doc_visible(svc, id, acc, true)? {
-        return Ok(None);
-    }
     if let Some(fa) = &acc.fields {
         // Unparseable source is withheld rather than returned unfiltered.
         g.source = g.source.as_deref().map(|raw| serde_json::from_str::<Value>(raw).map(|v| fa.filter_source(&v).to_string()).or_else(|_|elasticsearch_engine::source_json::Source::parse(raw).map(|s|s.retain_leaves(&|p|fa.allows(p)).text())).unwrap_or_default());
+        elasticsearch_engine::stored::restrict(&mut g.doc, &|f| fa.allows(f));
     }
     Ok(Some(g))
+}
+
+/// Fetch / check rounds of [`secure_get`] before a document that keeps
+/// changing is reported missing.
+const SECURE_GET_ATTEMPTS: usize = 8;
+
+/// Test hook: runs in [`secure_get`] between the fetch and the DLS check.
+#[doc(hidden)]
+pub static DLS_CHECK_HOOK: std::sync::RwLock<Option<Arc<dyn Fn() + Send + Sync>>> = std::sync::RwLock::new(None);
+static DLS_CHECK_HOOK_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install (or clear) [`DLS_CHECK_HOOK`].
+#[doc(hidden)]
+pub fn set_dls_check_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    DLS_CHECK_HOOK_SET.store(hook.is_some(), std::sync::atomic::Ordering::Release);
+    *DLS_CHECK_HOOK.write().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+fn dls_check_hook() {
+    if DLS_CHECK_HOOK_SET.load(std::sync::atomic::Ordering::Acquire) {
+        let hook = DLS_CHECK_HOOK.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(h) = hook {
+            h();
+        }
+    }
 }
 
 /// ES 9 `exclude_source_vectors`: a get leaves the vector fields out of
@@ -412,7 +497,7 @@ fn get_doc_in(node: &Node, req: &Req, svc: Arc<IndexService>, index: &str, id: &
         None => None,
     };
     let routing = node.index_routing_for(index, req.param("routing"))?;
-    let found = force_synthetic(req, &svc, secure_get(&svc, id, &access, svc.get_routed(id, routing.as_deref(), realtime)?)?);
+    let found = force_synthetic(req, &svc, secure_get(&svc, id, routing.as_deref(), realtime, &access)?);
     let found = exclude_vectors(req, &svc, found, &filter);
     match found {
         None => {
@@ -510,6 +595,27 @@ fn update_doc(node: &Node, req: &Req, index: &str, id: &str) -> R {
     let c = write_cond(req)?;
     cond.if_seq_no = c.if_seq_no;
     cond.if_primary_term = c.if_primary_term;
+    // ES `UpdateRequest` parses `if_seq_no` / `if_primary_term` from the
+    // body too, after the URL parameters (the body wins). They were accepted
+    // and dropped (production review #429: a stale conditioned update
+    // overwrote the newer revision).
+    if let Some(o) = body.as_object() {
+        let long = |k: &str| -> Result<Option<i64>, EsError> {
+            match o.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Number(n)) => n.as_i64().map(Some).ok_or_else(|| EsError::x_content_parse(format!("[1:2] [UpdateRequest] failed to parse field [{k}]"))),
+                Some(Value::String(s)) => s.trim().parse::<i64>().map(Some).map_err(|_| EsError::x_content_parse(format!("[1:2] [UpdateRequest] failed to parse field [{k}]"))),
+                Some(_) => Err(EsError::x_content_parse(format!("[1:2] [UpdateRequest] failed to parse field [{k}]"))),
+            }
+        };
+        if let Some(v) = long("if_seq_no")? {
+            cond.if_seq_no = Some(v);
+        }
+        if let Some(v) = long("if_primary_term")? {
+            cond.if_primary_term = Some(v as u64);
+        }
+        cond.validate(false)?;
+    }
     if let Some(o) = body.as_object() {
         const KNOWN: &[&str] = &["doc", "upsert", "doc_as_upsert", "script", "scripted_upsert", "detect_noop", "_source", "if_seq_no", "if_primary_term"];
         for k in o.keys() {
@@ -627,10 +733,19 @@ fn mget(node: &Node, req: &Req, index: Option<&str>) -> R {
                 continue;
             }
         }
+        // ES `TransportMultiGetAction`: the item's index expression's alias
+        // `index_routing` routes it (`resolveIndexRouting`), as a single GET.
+        let routing = match node.index_routing_for(&idx, routing.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                out.push(json!({"_index": idx, "_id": id, "error": e.error_object(false)}).to_string());
+                continue;
+            }
+        };
         match node.write_index(&idx, false) {
             Err(e) => out.push(json!({"_index": idx, "_id": id, "error": e.error_object(false)}).to_string()),
             Ok(svc) if req.flag("refresh")? && svc.refresh().is_err() => out.push(not_found_json(&svc.name, &id).to_string()),
-            Ok(svc) => match access_of(req, &svc).and_then(|acc| secure_get(&svc, &id, &acc, svc.get_routed(&id, routing.as_deref(), req.bool_param("realtime")?.unwrap_or(true))?)).map(|f| exclude_vectors(req, &svc, force_synthetic(req, &svc, f), &filter)) {
+            Ok(svc) => match access_of(req, &svc).and_then(|acc| secure_get(&svc, &id, routing.as_deref(), req.bool_param("realtime")?.unwrap_or(true), &acc)).map(|f| exclude_vectors(req, &svc, force_synthetic(req, &svc, f), &filter)) {
                 Err(e) => out.push(json!({"_index": svc.name, "_id": id, "error": e.error_object(false)}).to_string()),
                 Ok(Some(g)) => match &stored {
                     Some(sf) => out.push(docs_stored::apply(&svc, &get_json(&svc, &id, &g, &filter)?, sf, &g)?),
@@ -784,8 +899,12 @@ async fn sync_deferred(services: Vec<Arc<IndexService>>) -> Result<(), EsError> 
 /// `defer`: collect the indices whose request-durability translog sync the
 /// caller runs after this returns (see [`sync_deferred`]); `None` syncs here.
 fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSyncs>) -> R {
+    // A reindex's own bulk (internal header; clients cannot set it: the
+    // cluster front strips internal headers).
+    let reindex_bulk = req.headers.contains_key(crate::util::REINDEX_BULK_HEADER);
     let _ingest_user = ingest_user(req);
     let _mapping_authz = mapping_authz(req);
+    let _restore_replay = req.extensions.get::<crate::RestoreReplay>().map(|r| elasticsearch_engine::index::enter_restore_writes(Some(r.0.clone())));
     let start = std::time::Instant::now();
     // Items the cluster coordinator already split (its own shard group):
     // not parsed again. With security on, they were authorized item by
@@ -848,6 +967,9 @@ fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSync
         // `index` with `op_type: create` is a create.
         let action: &'static str = if action == "index" && meta.get("op_type").and_then(Value::as_str) == Some("create") { "create" } else { action };
         for k in meta.keys() {
+            if k == crate::util::REINDEX_VERSION_EQ && reindex_bulk && action == "delete" {
+                continue;
+            }
             if !matches!(
                 k.as_str(),
                 "_index" | "_id" | "routing" | "version" | "version_type" | "if_seq_no" | "if_primary_term" | "pipeline" | "require_alias" | "require_data_stream"
@@ -987,10 +1109,13 @@ fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSync
         // Ingest pipelines (request / item `pipeline`, index default/final).
         let mut item_source = it.source;
         let routed_plain = plain.as_ref().filter(|(n, svc)| *n == idx_name && node.is_registered_index(n, svc)).map(|(_, svc)| svc.clone());
+        // The item's routing, else the request's (ES's `BulkRequest.add`
+        // gives every item without its own the URL-level `routing`).
+        let requested_routing = it.meta.get("routing").and_then(Value::as_str).or(req.param("routing"));
         let mut item_routing = if routed_plain.is_some() {
-            it.meta.get("routing").and_then(Value::as_str).map(str::to_string)
+            requested_routing.map(str::to_string)
         } else {
-            match node.index_routing_for(&idx_name, it.meta.get("routing").and_then(Value::as_str)) {
+            match node.index_routing_for(&idx_name, requested_routing) {
                 Ok(r) => r,
                 Err(e) => {
                     fail(&mut results, &idx_name, e);
@@ -999,6 +1124,7 @@ fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSync
             }
         };
         let mut item_ingest_dt = None;
+        let mut item_ingest_cond: Option<elasticsearch_engine::ingest::WriteMeta> = None;
         let mut ingested = false;
         let skip_ingest = !it.meta.contains_key("pipeline")
             && (ingest_idle
@@ -1010,16 +1136,23 @@ fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSync
             let source = item_source.take().unwrap_or_default();
             let prepared = req.extensions.get::<crate::PreparedBulkIngestItems>().and_then(|items| items.0.get(&pos));
             let ingest = match prepared {
+                // A coordinator that ran the pipelines wrote their version
+                // and concurrency conditions into the item's metadata.
                 Some(crate::PreparedBulkIngest::Write { routing, dynamic_templates }) => Ok(crate::ingest::Prepared::Write {
                     index: idx_name.clone(), id: id.clone(), routing: routing.clone(), source,
-                    dynamic_templates: dynamic_templates.clone(),
+                    dynamic_templates: dynamic_templates.clone(), cond: None,
                 }),
                 Some(crate::PreparedBulkIngest::Dropped) => Ok(crate::ingest::Prepared::Dropped { index: idx_name.clone(), id: id.clone() }),
                 Some(crate::PreparedBulkIngest::Failed(failure)) => Err(Box::new((failure.clone(), source))),
-                None => crate::ingest::prepare_ext(node, &idx_name, id.clone(), item_routing.clone(), source, pipeline),
+                None => crate::ingest::prepare_ext(node, &idx_name, id.clone(), item_routing.clone(), source, pipeline, elasticsearch_engine::ingest::WriteMeta::of_action(&it.meta)),
             };
             match ingest {
-                Ok(crate::ingest::Prepared::Write { index, id, routing, source, dynamic_templates }) => {
+                Ok(crate::ingest::Prepared::Write { index, id, routing, source, dynamic_templates, cond }) => {
+                    if let Err(e) = authorize_ingest_dest(req, &idx_name, &index, it.action == "create" || id.is_none() || it.meta.get("op_type").and_then(Value::as_str) == Some("create")) {
+                        fail(&mut results, &index, e);
+                        continue;
+                    }
+                    item_ingest_cond = cond;
                     item_ingest_dt = dynamic_templates;
                     item_source = Some(source);
                     item_routing = routing;
@@ -1083,7 +1216,7 @@ fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSync
         // The document's `@timestamp`, read by the data stream check (one
         // scan of the source serves the checks and the routing below).
         let mut probed_ts: Option<serde_json::Value> = None;
-        if let Err(e) = (if is_plain { Ok(()) } else if matches!(it.action, "index" | "create") && !internal_backing_write { node.check_backing_write(&idx_name, it.action == "create", it.meta.contains_key("if_seq_no") || it.meta.contains_key("if_primary_term")) } else { Ok(()) }).and_then(|_| node.check_data_stream_write_ts(&idx_name, ds_create, ds_src).map(|ts| { probed_ts = ts; })) {
+        if let Err(e) = (if is_plain { Ok(()) } else if matches!(it.action, "index" | "create") && !internal_backing_write { node.check_backing_write(&idx_name, it.action == "create", item_ingest_cond.map_or(it.meta.contains_key("if_seq_no") || it.meta.contains_key("if_primary_term"), |c| c.if_seq_no.is_some() || c.if_primary_term.is_some())) } else { Ok(()) }).and_then(|_| node.check_data_stream_write_ts(&idx_name, ds_create, ds_src).map(|ts| { probed_ts = ts; })) {
             if !matches!(fs_target, elasticsearch_engine::datastream::FailureStoreTarget::None) && failure_store_eligible(&e) {
                 // Routing (`timestamp_error`) fails on the data stream, before a backing index is chosen.
                 let shown = if e.kind == "timestamp_error" { idx_name.clone() } else { svc.name.clone() };
@@ -1114,6 +1247,10 @@ fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSync
         }
         let cond = match cond_from_meta(&it.meta) {
             Ok(mut c) => {
+                // Version and concurrency metadata set by the pipelines.
+                if let Some(after) = item_ingest_cond.take() {
+                    after.apply(&mut c);
+                }
                 if it.action == "create" {
                     c.create = true;
                     // The coordinator generated this id for this very
@@ -1288,4 +1425,50 @@ fn bulk(node: &Node, req: &Req, index: Option<&str>, defer: Option<&DeferredSync
         response.insert_path(&["items", &pos.to_string(), "update", "get", "_source"], elasticsearch_engine::source_json::Source::parse(&raw)?);
     }
     Ok(Resp { status:200, body:RespBody::Raw(response.text()), headers })
+}
+
+#[cfg(test)]
+mod mget_alias_routing_tests {
+    use super::*;
+
+    fn mget_req(path_index: &str, body: Value) -> Req {
+        Req { method: axum::http::Method::POST, path: format!("/{path_index}/_mget"), segs: vec![path_index.into(), "_mget".into()], params: Default::default(),
+            body: body.to_string().into_bytes().into(), headers: Default::default(), access: None, extensions: axum::http::Extensions::new(), api_version: crate::RestApiVersion::V9 }
+    }
+
+    fn body_of(r: R) -> Value {
+        match r.unwrap().body {
+            crate::RespBody::Json(v) => v,
+            crate::RespBody::Raw(s) => serde_json::from_str(&s).unwrap(),
+            _ => panic!("unexpected body"),
+        }
+    }
+
+    /// #418: multi-get through an alias with `index_routing` reads the
+    /// documents written through it, as a single GET does.
+    #[test]
+    fn mget_applies_the_alias_index_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        for (index, required) in [("req", true), ("opt", false)] {
+            let svc = node.create_index(index, &json!({"settings": {"number_of_shards": 4, "number_of_replicas": 0},
+                "mappings": {"_routing": {"required": required}}, "aliases": {format!("{index}-a"): {"routing": "cust-a"}}})).unwrap();
+            let reqs = (0..12).map(|i| elasticsearch_engine::index::WriteReq::Index { id: Some(format!("d{i}")), source: json!({"n": i}).to_string(), routing: Some("cust-a".into()), cond: Default::default() }).collect();
+            for r in svc.write(reqs, false) {
+                r.unwrap();
+            }
+            let alias = format!("{index}-a");
+            let ids: Vec<String> = (0..12).map(|i| format!("d{i}")).collect();
+            for body in [json!({"ids": ids}), json!({"docs": ids.iter().map(|i| json!({"_id": i})).collect::<Vec<_>>()})] {
+                let v = body_of(mget(&node, &mget_req(&alias, body.clone()), Some(&alias)));
+                let docs = v["docs"].as_array().unwrap();
+                assert_eq!(docs.len(), 12);
+                assert!(docs.iter().all(|d| d["found"] == true), "{index} {body}: {v}");
+            }
+            // A conflicting item routing fails that item only.
+            let v = body_of(mget(&node, &mget_req(&alias, json!({"docs": [{"_id": "d1", "routing": "other"}, {"_id": "d2"}]})), Some(&alias)));
+            assert_eq!(v["docs"][0]["error"]["type"], "illegal_argument_exception", "{v}");
+            assert_eq!(v["docs"][1]["found"], true, "{v}");
+        }
+    }
 }

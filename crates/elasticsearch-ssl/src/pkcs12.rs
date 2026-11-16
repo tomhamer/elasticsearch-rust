@@ -41,6 +41,9 @@ impl From<String> for StoreError {
 pub(crate) struct Store {
     pub keys: Vec<(Option<Vec<u8>>, PrivateKeyDer<'static>)>,
     pub certs: Vec<(Option<Vec<u8>>, CertificateDer<'static>)>,
+    /// Certificates of trusted-certificate entries (bags carrying Java's
+    /// trusted key usage attribute, as `keytool -importcert` writes them).
+    pub trusted: Vec<CertificateDer<'static>>,
 }
 
 impl Store {
@@ -61,6 +64,20 @@ impl Store {
         out
     }
 
+    /// The store's trust anchors as the JDK's `TrustStoreUtil` reads a
+    /// keystore (and so ES's `StoreTrustConfig`): trusted-certificate
+    /// entries and the leaf certificate of each private-key entry, never the
+    /// supporting certificates of a key's chain (production review #293).
+    pub(crate) fn trust_anchors(&self) -> Vec<CertificateDer<'static>> {
+        let mut out = self.trusted.clone();
+        for (_, leaf) in self.key_entries() {
+            if !out.contains(&leaf) {
+                out.push(leaf);
+            }
+        }
+        out
+    }
+
     /// The first private key and its chain: the certificate sharing its
     /// `localKeyId` (else the first certificate), then its issuers found in
     /// the store.
@@ -72,11 +89,23 @@ impl Store {
         }?;
         let mut chain = vec![leaf.1.clone()];
         while chain.len() < 10 {
-            let Some((issuer, subject)) = names(chain.last().unwrap()) else { break };
-            if issuer == subject {
+            let cur = chain.last().unwrap();
+            let Some((issuer, subject)) = names(cur) else { break };
+            let (aki, ski) = key_ids(cur);
+            // Self-signed (not merely self-issued): the end of the chain.
+            if issuer == subject && (aki.is_none() || aki == ski) {
                 break;
             }
-            let next = self.certs.iter().find(|(_, c)| names(c).is_some_and(|(_, s)| s == issuer) && !chain.contains(c));
+            // The issuer: same DN, and when the certificate names its
+            // authority's key, that key (the JDK's `findIssuer`): a retired
+            // same-name CA with another key is never chosen, whatever the
+            // bag order (production review #292).
+            let next = self.certs.iter().filter(|(_, c)| names(c).is_some_and(|(_, s)| s == issuer) && !chain.contains(c)).find(|(_, c)| {
+                match (&aki, key_ids(c).1) {
+                    (Some(want), Some(have)) => *want == have,
+                    _ => true,
+                }
+            });
             match next {
                 Some((_, c)) => chain.push(c.clone()),
                 None => break,
@@ -84,6 +113,57 @@ impl Store {
         }
         Some((chain, key.clone_key()))
     }
+}
+
+/// `(authority key identifier, subject key identifier)` of an X.509
+/// certificate's extensions, when present.
+pub(crate) fn key_ids(cert: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    (|| -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        let (c, _) = expect(cert, 0x30).ok()?;
+        let (tbs, _) = expect(c, 0x30).ok()?;
+        let mut r = tbs;
+        if let Some((0xA0, _, rest)) = tlv(r) {
+            r = rest;
+        }
+        for _ in 0..6 {
+            // serial, signature, issuer, validity, subject, subjectPublicKeyInfo
+            let (_, _, rest) = tlv(r)?;
+            r = rest;
+        }
+        let (mut aki, mut ski) = (None, None);
+        while let Some((tag, content, rest)) = tlv(r) {
+            r = rest;
+            if tag != 0xA3 {
+                continue; // [1] / [2] unique identifiers
+            }
+            let (mut exts, _) = expect(content, 0x30).ok()?;
+            while let Some((0x30, ext, rest)) = tlv(exts) {
+                exts = rest;
+                let Ok((id, mut v)) = expect(ext, 0x06) else { continue };
+                if let Some((0x01, _, rest)) = tlv(v) {
+                    v = rest; // critical
+                }
+                let Ok((value, _)) = expect(v, 0x04) else { continue };
+                match oid(id).as_str() {
+                    "2.5.29.35" => {
+                        // AuthorityKeyIdentifier ::= SEQUENCE { [0] keyIdentifier OPTIONAL, ... }
+                        if let Ok((seq, _)) = expect(value, 0x30) {
+                            if let Some((0x80, kid, _)) = tlv(seq) {
+                                aki = Some(kid.to_vec());
+                            }
+                        }
+                    }
+                    "2.5.29.14" => {
+                        if let Ok((kid, _)) = expect(value, 0x04) {
+                            ski = Some(kid.to_vec());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some((aki, ski))
+    })().unwrap_or((None, None))
 }
 
 /// `(issuer, subject)`: the DER `Name`s of an X.509 certificate.
@@ -269,9 +349,9 @@ fn bags(safe_contents: &[u8], key_password: &str, store: &mut Store) -> Result<(
         items = next;
         let (id, r) = expect(bag, 0x06)?;
         let (value, r) = expect(r, 0xA0)?;
-        let local_key_id = match tlv(r) {
-            Some((0x31, attrs, _)) => local_key_id(attrs),
-            _ => None,
+        let (local_key_id, trusted) = match tlv(r) {
+            Some((0x31, attrs, _)) => (local_key_id(attrs), has_attr(attrs, JAVA_TRUSTED_KEY_USAGE)),
+            _ => (None, false),
         };
         match oid(id).as_str() {
             KEY_BAG => {
@@ -289,6 +369,9 @@ fn bags(safe_contents: &[u8], key_password: &str, store: &mut Store) -> Result<(
                 if oid(cid) == X509_CERTIFICATE {
                     let (explicit, _) = expect(r, 0xA0)?;
                     let (cert, _) = octets(explicit)?;
+                    if trusted {
+                        store.trusted.push(CertificateDer::from(cert.clone()));
+                    }
                     store.certs.push((local_key_id, CertificateDer::from(cert)));
                 }
             }
@@ -296,6 +379,23 @@ fn bags(safe_contents: &[u8], key_password: &str, store: &mut Store) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Java's trusted key usage bag attribute (`keytool -importcert` marks a
+/// trusted-certificate entry with it; ORACLE_TrustedKeyUsage).
+const JAVA_TRUSTED_KEY_USAGE: &str = "2.16.840.1.113894.746875.1.1";
+
+/// Whether a bag's attribute SET holds attribute `want`.
+fn has_attr(mut attrs: &[u8], want: &str) -> bool {
+    while let Some((0x30, attr, rest)) = tlv(attrs) {
+        attrs = rest;
+        if let Ok((id, _)) = expect(attr, 0x06) {
+            if oid(id) == want {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The `localKeyId` attribute of a bag's attribute SET.
@@ -317,6 +417,80 @@ fn local_key_id(mut attrs: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Ca {
+        key: rcgen::KeyPair,
+        cert: rcgen::Certificate,
+    }
+
+    fn ca(cn: &str, issuer: Option<&Ca>) -> Ca {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        let key = KeyPair::generate().unwrap();
+        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.distinguished_name.push(DnType::CommonName, cn);
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.use_authority_key_identifier_extension = true;
+        let cert = match issuer {
+            Some(i) => p.signed_by(&key, &i.cert, &i.key).unwrap(),
+            None => p.self_signed(&key).unwrap(),
+        };
+        Ca { key, cert }
+    }
+
+    fn leaf(issuer: &Ca) -> (rcgen::KeyPair, CertificateDer<'static>) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec!["node.local".to_string()]).unwrap();
+        p.use_authority_key_identifier_extension = true;
+        let cert = p.signed_by(&key, &issuer.cert, &issuer.key).unwrap();
+        (key, cert.der().clone())
+    }
+
+    fn der(c: &Ca) -> CertificateDer<'static> {
+        c.cert.der().clone()
+    }
+
+    /// Production review #292: during an intermediate rotation (old and new
+    /// intermediates with the same DN), the chain uses the intermediate the
+    /// leaf's authority key identifier names, whatever the bag order.
+    #[test]
+    fn chain_uses_the_issuer_the_leaf_names_by_key() {
+        let root = ca("Root", None);
+        let old = ca("Inter", Some(&root));
+        let new = ca("Inter", Some(&root));
+        let (lkey, lcert) = leaf(&new);
+        assert_ne!(key_ids(&der(&old)).1, key_ids(&der(&new)).1, "distinct keys, distinct SKIs");
+        assert_eq!(key_ids(&lcert).0, key_ids(&der(&new)).1, "the leaf names the new intermediate");
+        for order in [[der(&old), der(&new)], [der(&new), der(&old)]] {
+            let id = vec![1u8];
+            let mut certs = vec![(Some(id.clone()), lcert.clone())];
+            certs.extend(order.iter().map(|c| (None, c.clone())));
+            certs.push((None, der(&root)));
+            let store = Store { keys: vec![(Some(id), PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(lkey.serialize_der())))], certs, trusted: vec![] };
+            let (chain, _) = store.key_and_chain().unwrap();
+            assert_eq!(chain, vec![lcert.clone(), der(&new), der(&root)]);
+        }
+    }
+
+    /// Production review #293: a store's trust anchors are its trusted
+    /// certificate entries and its key entries' leaf certificates, never
+    /// the supporting certificates of a key's chain.
+    #[test]
+    fn supporting_chain_certificates_are_not_trust_anchors() {
+        let retired = ca("Retired CA", None);
+        let current = ca("Current CA", None);
+        let (lkey, lcert) = leaf(&retired);
+        let id = vec![7u8];
+        let store = Store {
+            keys: vec![(Some(id.clone()), PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(lkey.serialize_der())))],
+            certs: vec![(Some(id), lcert.clone()), (None, der(&retired)), (None, der(&current))],
+            trusted: vec![der(&current)],
+        };
+        let anchors = store.trust_anchors();
+        assert!(anchors.contains(&der(&current)) && anchors.contains(&lcert));
+        assert!(!anchors.contains(&der(&retired)), "the retired CA only supports the key's chain");
+        let only_chain = Store { keys: vec![], certs: vec![(None, der(&retired))], trusted: vec![] };
+        assert!(only_chain.trust_anchors().is_empty(), "no trusted entry: no anchor");
+    }
 
     #[test]
     fn kdf_matches_rfc7292_vectors() {

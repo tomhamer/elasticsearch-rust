@@ -73,6 +73,43 @@ fn extract_value<'a>(src: &'a Map<String, Value>, path: &str) -> Option<&'a Valu
     None
 }
 
+/// [`extract_value`], also through ordinary object arrays (ES
+/// `XContentMapValues.extractValue` walks into lists at any path element):
+/// `sections: [{text: a}, {text: b}]` gives `sections.text` = `[a, b]`
+/// (finding 200). An array with no value at the path is absent.
+fn extract_values<'a>(src: &'a Map<String, Value>, path: &str) -> Option<std::borrow::Cow<'a, Value>> {
+    if let Some(v) = extract_value(src, path) {
+        return Some(std::borrow::Cow::Borrowed(v));
+    }
+    for (i, _) in path.match_indices('.') {
+        let rest = &path[i + 1..];
+        match src.get(&path[..i]) {
+            Some(Value::Array(items)) => {
+                let mut out = Vec::new();
+                for item in items {
+                    if let Value::Object(o) = item {
+                        match extract_values(o, rest).map(std::borrow::Cow::into_owned) {
+                            Some(Value::Array(a)) => out.extend(a),
+                            Some(Value::Null) | None => {}
+                            Some(v) => out.push(v),
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    return Some(std::borrow::Cow::Owned(Value::Array(out)));
+                }
+            }
+            Some(Value::Object(o)) => {
+                if let Some(v) = extract_values(o, rest) {
+                    return Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The field's source paths: for a multi-field, its parent field.
 fn source_path(lookup: &FieldLookup, name: &str) -> String {
     match lookup.fields.get(name) {
@@ -84,6 +121,31 @@ fn source_path(lookup: &FieldLookup, name: &str) -> String {
 /// UTF-16 offset (Java `String` index) of byte offset `b` in `s`.
 fn utf16_at(s: &str, b: usize) -> usize {
     s.get(..b.min(s.len())).map(|p| p.encode_utf16().count()).unwrap_or(b)
+}
+
+/// [`utf16_at`] for offsets that only move forward: each call counts only
+/// the text since the previous one.
+#[derive(Default)]
+struct Utf16Cursor {
+    byte: usize,
+    units: usize,
+}
+
+impl Utf16Cursor {
+    fn at(&mut self, s: &str, b: usize) -> usize {
+        let b = b.min(s.len());
+        if b < self.byte {
+            *self = Utf16Cursor::default();
+        }
+        match s.get(self.byte..b) {
+            Some(p) => {
+                self.units += p.encode_utf16().count();
+                self.byte = b;
+                self.units
+            }
+            None => utf16_at(s, b),
+        }
+    }
 }
 
 /// Run the inference of every `semantic_text` field of a document that does
@@ -105,7 +167,8 @@ pub fn infer_document(root: &Value, lookup: &FieldLookup, legacy: bool) -> Resul
         }
         let f = &lookup.fields[name];
         let own = source_path(lookup, name);
-        let own_value = extract_value(root, &own);
+        let own_value = extract_values(root, &own);
+        let own_value = own_value.as_deref();
         if legacy && (own_value.is_some_and(Value::is_object) || own_value.is_some_and(is_legacy_value)) {
             continue;
         }
@@ -123,7 +186,8 @@ pub fn infer_document(root: &Value, lookup: &FieldLookup, legacy: bool) -> Resul
         let mut media: Vec<(String, String, usize)> = Vec::new();
         let mut any = false;
         for src in &sources {
-            let Some(v) = extract_value(root, src) else { continue };
+            let Some(v) = extract_values(root, src) else { continue };
+            let v: &Value = &v;
             if v.is_null() {
                 continue;
             }
@@ -172,10 +236,14 @@ pub fn infer_document(root: &Value, lookup: &FieldLookup, legacy: bool) -> Resul
         let mut order: Vec<usize> = Vec::new();
         let mut inputs: Vec<String> = Vec::new();
         for ((src, t, adj), vi) in requests.iter().zip(&req_index) {
-            let offs = if whole { vec![(0, t.len())] } else { local::chunk(t, &chunking) };
+            // Chunking that would not make progress is refused (finding 126).
+            let offs = if whole { vec![(0, t.len())] } else { local::try_chunk(t, &chunking)? };
+            // Chunk starts and ends only move forward: UTF-16 offsets are
+            // counted incrementally, not by rescanning each prefix.
+            let (mut starts, mut ends) = (Utf16Cursor::default(), Utf16Cursor::default());
             for (s, e) in offs {
                 inputs.push(t[s..e].to_string());
-                spans.push((src.clone(), adj + utf16_at(t, s), adj + utf16_at(t, e)));
+                spans.push((src.clone(), adj + starts.at(t, s), adj + ends.at(t, e)));
                 order.push(*vi);
             }
         }
@@ -186,7 +254,7 @@ pub fn infer_document(root: &Value, lookup: &FieldLookup, legacy: bool) -> Resul
         }
         let mut chunks = Map::new();
         for src in &sources {
-            if extract_value(root, src).is_some_and(|v| !v.is_null()) {
+            if extract_values(root, src).is_some_and(|v| !v.is_null()) {
                 chunks.insert(src.clone(), json!([]));
             }
         }
@@ -199,6 +267,12 @@ pub fn infer_document(root: &Value, lookup: &FieldLookup, legacy: bool) -> Resul
                 Embedded::Dense(v) => v.into_iter().map(|x| json!(x)).collect(),
                 Embedded::Sparse(v) => v.into_iter().map(Value::Object).collect(),
             };
+            // Every chunk gets exactly its own embedding, or the document
+            // fails: nothing is installed for a partial answer.
+            if vecs.len() != spans.len() {
+                return Err(EsError::new(500, "inference_exception", format!("Exception when running inference id [{id}] on field [{name}]"))
+                    .caused_by(EsError::new(500, "status_exception", super::providers::count_mismatch(vecs.len(), spans.len()))));
+            }
             let mut rows: Vec<((String, usize, usize), Value, usize)> = spans.into_iter().zip(vecs).zip(order).map(|((sp, v), o)| (sp, v, o)).collect();
             // Chunks in input order: a `semantic` field's text and media
             // inputs interleave by value position.
@@ -494,7 +568,8 @@ pub fn chunk_texts(lookup: &crate::mapping::FieldLookup, leaf: &LeafReader<'_>, 
     let semantic = f.declared == EsType::Semantic;
     for c in b["c"].as_array().into_iter().flatten() {
         let s = c[0].as_str().unwrap_or_default();
-        let value = extract_value(root, &source_path(lookup, s));
+        let value = extract_values(root, &source_path(lookup, s));
+        let value = value.as_deref();
         // A `semantic` media chunk: its input value.
         if let Some(i) = c.get(3).and_then(Value::as_u64) {
             let inputs = value.map(semantic_inputs).unwrap_or_default();
@@ -682,7 +757,50 @@ pub fn supplied_blob(field: &str, doc_id: &str, mapped_id: &str, mapped_settings
             return Err(bad_metadata(doc_id, v, EsError::illegal_argument("embeddings do not match the field's model settings")));
         }
     }
+    if dense {
+        check_dense_chunks(field, doc_id, effective.as_ref(), &vecs)?;
+    }
     Ok((json!({"k": if dense { "d" } else { "s" }, "c": offsets, "v": vecs}).to_string(), settings))
+}
+
+/// Supplied dense chunk embeddings are indexed into the field's
+/// `<field>.inference.chunks.embeddings` `dense_vector`: ES's mapper checks
+/// each one (`DenseVectorFieldMapper.parse`) and fails the document. Every
+/// vector must have the model's width (`dimensions`, or `dimensions / 8`
+/// bytes for `bit`), numeric finite elements, whole numbers in
+/// `[-128, 127]` for `byte` / `bit`, and unit length for a float
+/// `dot_product` model.
+fn check_dense_chunks(field: &str, doc_id: &str, settings: Option<&Value>, vecs: &[Value]) -> Result<()> {
+    let Some(ms) = settings else { return Ok(()) };
+    let emb = format!("{field}.inference.chunks.embeddings");
+    let doc = if doc_id.is_empty() { "document".to_string() } else { format!("document with id '{doc_id}'") };
+    let parse = |m: String| EsError::document_parsing(format!("[1:1] failed to parse field [{emb}] of type [dense_vector] in {doc}. {m}"));
+    let et = ms.get("element_type").and_then(Value::as_str).unwrap_or("float");
+    let dims = ms.get("dimensions").and_then(Value::as_u64);
+    let want = dims.map(|d| if et == "bit" { d.div_ceil(8) } else { d } as usize);
+    for x in vecs {
+        let a = x.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if let Some(w) = want {
+            if a.len() != w {
+                let got = if et == "bit" { a.len() * 8 } else { a.len() };
+                return Err(parse(format!("The [dense_vector] field [{emb}] in doc [{doc}] has a different number of dimensions [{got}] than defined in the mapping [{}]", dims.unwrap_or(0))));
+            }
+        }
+        let mut norm = 0f64;
+        for e in a {
+            let Some(f) = e.as_f64().filter(|f| f.is_finite() && f.abs() <= f64::from(f32::MAX)) else {
+                return Err(parse(format!("[dense_vector] field [{emb}] only accepts finite numeric values, but got [{e}]")));
+            };
+            if (et == "byte" || et == "bit") && (f.fract() != 0.0 || !(-128.0..=127.0).contains(&f)) {
+                return Err(parse(format!("Element [{e}] of [{emb}] is not a valid {et} value: element_type [{et}] vectors only support integers between -128 and 127")));
+            }
+            norm += f * f;
+        }
+        if et == "float" && ms.get("similarity").and_then(Value::as_str) == Some("dot_product") && (norm.sqrt() - 1.0).abs() > 1e-4 {
+            return Err(parse(format!("The [dot_product] similarity can only be used with unit-length vectors. Preview of invalid vector: {}", x.to_string().chars().take(60).collect::<String>())));
+        }
+    }
+    Ok(())
 }
 
 /// `SemanticQueryBuilder.doToQuery` across the searched indices: the field
@@ -778,6 +896,9 @@ pub fn legacy_blob(field: &str, mapped_id: &str, mapped_settings: Option<&Value>
     let dense = matches!(effective.as_ref().and_then(|s| s.get("task_type")).and_then(Value::as_str), Some("text_embedding" | "embedding"));
     if vecs.iter().any(|x| dense != x.is_array()) {
         return Err(err(EsError::illegal_argument("embeddings do not match the field's model settings")));
+    }
+    if dense {
+        check_dense_chunks(field, "", effective.as_ref(), &vecs)?;
     }
     Ok(json!({"k": if dense { "d" } else { "s" }, "c": offsets, "v": vecs}).to_string())
 }

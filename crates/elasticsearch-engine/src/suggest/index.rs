@@ -40,6 +40,23 @@ pub fn apply_contexts(source: &Value, lookup: &FieldLookup, doc: &mut Document) 
                         from_path.extend(cv.into_iter().map(|x| (d.name.clone(), x)));
                     }
                 }
+            } else if let Some(pf) = lookup.get(p).filter(|pf| pf.core_id.is_some() && (pf.declared == EsType::Keyword || pf.ty.is_text())) {
+                // ES `CategoryContextMapping.parseContext(LuceneDocument)`:
+                // the path field's indexed values in the parsed document
+                // (a keyword's normalized value, a multi-field, `copy_to`
+                // and `null_value` values), not its raw source.
+                let pid = pf.core_id;
+                for (fid, v) in &doc.fields {
+                    if Some(*fid) != pid {
+                        continue;
+                    }
+                    if let FieldValue::Text(x) | FieldValue::Keyword(x) = v {
+                        let c = (d.name.clone(), x.clone());
+                        if !from_path.contains(&c) {
+                            from_path.push(c);
+                        }
+                    }
+                }
             } else {
                 for v in source_values(source, p) {
                     let s = match v {
@@ -106,4 +123,48 @@ pub fn completion_inputs(v: &Value) -> Vec<String> {
         _ => {}
     }
     out
+}
+
+#[cfg(test)]
+mod context_path_tests {
+    use serde_json::{json, Value};
+
+    fn options(node: &crate::node::Node, index: &str, ctx: &str) -> Vec<String> {
+        let r = crate::ml::search(node, index, &json!({"suggest": {"s": {"prefix": "app", "completion": {"field": "suggest", "contexts": {"category": [ctx]}}}}})).unwrap();
+        r["suggest"]["s"][0]["options"].as_array().unwrap_or_else(|| panic!("{r}")).iter().map(|o| o["text"].as_str().unwrap().to_string()).collect()
+    }
+
+    fn index_one(node: &crate::node::Node, index: &str, settings: Value, category: Value) -> Result<(), String> {
+        let svc = node.create_index(index, &settings).unwrap();
+        let w = vec![crate::index::WriteReq::Index { id: Some("1".into()), source: json!({"category": category, "suggest": "apple"}).to_string(), routing: None, cond: Default::default() }];
+        for r in svc.write(w, false) {
+            r.map_err(|e| format!("{e:?}"))?;
+        }
+        svc.refresh().unwrap();
+        Ok(())
+    }
+
+    /// #395: a category context `path` reads the mapped field's indexed
+    /// values: a keyword multi-field, a normalized keyword.
+    #[test]
+    fn context_paths_read_mapped_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        // A keyword multi-field path.
+        index_one(&node, "multi", json!({"mappings": {"properties": {
+            "category": {"type": "text", "fields": {"raw": {"type": "keyword"}}},
+            "suggest": {"type": "completion", "contexts": [{"name": "category", "type": "category", "path": "category.raw"}]}}}}), json!("food")).unwrap();
+        assert_eq!(options(&node, "multi", "food"), vec!["apple"]);
+        // A normalized keyword: the context is the normalized value.
+        index_one(&node, "norm", json!({"settings": {"analysis": {"normalizer": {"lc": {"type": "custom", "filter": ["lowercase"]}}}}, "mappings": {"properties": {
+            "category": {"type": "keyword", "normalizer": "lc"},
+            "suggest": {"type": "completion", "contexts": [{"name": "category", "type": "category", "path": "category"}]}}}}), json!("FOOD")).unwrap();
+        assert_eq!(options(&node, "norm", "food"), vec!["apple"]);
+        assert!(options(&node, "norm", "FOOD").is_empty());
+        // A plain keyword source path (the control).
+        index_one(&node, "plain", json!({"mappings": {"properties": {
+            "category": {"type": "keyword"},
+            "suggest": {"type": "completion", "contexts": [{"name": "category", "type": "category", "path": "category"}]}}}}), json!(["food", "fruit"])).unwrap();
+        assert_eq!(options(&node, "plain", "fruit"), vec!["apple"]);
+    }
 }

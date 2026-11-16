@@ -124,8 +124,43 @@ pub fn enumerate_terms(
     upper: Option<&[u8]>,
     limit: usize,
 ) -> Vec<Term> {
+    let pre_upper = prefix_upper(matcher.literal_prefix());
+    let (lo, hi) = bounds_of(matcher, lower, upper, &pre_upper);
+    let mut out = Vec::new();
+    if limit == 0 {
+        return out;
+    }
+    visit_terms(leaf, field, matcher, lo, hi, &mut |term| {
+        out.push(term);
+        out.len() < limit
+    });
+    out
+}
+
+/// Visit the terms of `field` matched by `matcher` in `[lo, hi)`, streamed
+/// from the dictionary (none retained here); `f` returns `false` to stop.
+/// The search's cancellation is polled every [`CANCEL_POLL`] terms.
+fn visit_terms(leaf: &LeafReader<'_>, field: u16, matcher: &dyn TermMatcher, lo: Option<&[u8]>, hi: Option<&[u8]>, f: &mut dyn FnMut(Term) -> bool) {
+    let mut n = 0usize;
+    leaf.term_range_visit(field, lo, hi, &mut |key, _| {
+        n += 1;
+        if n % CANCEL_POLL == 0 && crate::cancel::is_cancelled() {
+            return false;
+        }
+        let term = Term::from_key(key);
+        if !matcher.matches(&term.text) {
+            return true;
+        }
+        f(term)
+    });
+}
+
+/// Dictionary terms between cancellation polls.
+const CANCEL_POLL: usize = 4096;
+
+/// [`enumerate_terms`]'s bounds: the matcher's literal prefix narrows them.
+fn bounds_of<'a>(matcher: &'a dyn TermMatcher, lower: Option<&'a [u8]>, upper: Option<&'a [u8]>, pre_upper: &'a Option<Vec<u8>>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
     let prefix = matcher.literal_prefix();
-    let pre_upper = prefix_upper(prefix);
     let lo: Option<&[u8]> = match (lower, prefix.is_empty()) {
         (Some(l), false) => Some(if l > prefix { l } else { prefix }),
         (Some(l), true) => Some(l),
@@ -137,18 +172,7 @@ pub fn enumerate_terms(
         (Some(u), None) => Some(u),
         (None, p) => p,
     };
-    let mut out = Vec::new();
-    for (key, _) in leaf.term_range(field, lo, hi) {
-        let term = Term::from_key(&key);
-        if !matcher.matches(&term.text) {
-            continue;
-        }
-        if out.len() >= limit {
-            break;
-        }
-        out.push(term);
-    }
-    out
+    (lo, hi)
 }
 
 /// Upper bound for a prefix walk: the prefix with its last byte bumped.
@@ -203,7 +227,44 @@ pub fn expand_global_bounded(
         (MultiTermRewrite::TopTermsBoost(n),Some(max)) => MultiTermRewrite::TopTermsBoost(n.min(max)),
         (rewrite,_) => rewrite,
     };
-    let enum_limit = if rewrite.top_n().is_some() { usize::MAX } else { max_expansions.min(clause_limit.map(|n|n.saturating_add(1)).unwrap_or(usize::MAX)) };
+    // Top-terms rewrites stream every match and keep only the best n (by
+    // the selection's order), never the whole matching set.
+    if let Some(n) = rewrite.top_n() {
+        let mut best: Vec<ExpandedTerm> = Vec::new();
+        let mut kept: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // [`select`]'s order (Lucene `TopTermsRewrite`): the highest boost
+        // (a fuzzy term's normalized similarity), ties to the smaller term
+        // bytes; document frequency plays no part (#504).
+        let rank = |a: &ExpandedTerm, b: &ExpandedTerm| b.boost.total_cmp(&a.boost).then(a.term.text.cmp(&b.term.text));
+        if n > 0 {
+            for leaf in leaves {
+                let pre_upper = prefix_upper(matcher.literal_prefix());
+                let (lo, hi) = bounds_of(matcher, bounds.0, bounds.1, &pre_upper);
+                visit_terms(leaf, field, matcher, lo, hi, &mut |t| {
+                    // Seen in an earlier leaf: kept already, or evicted
+                    // (its rank, the same everywhere, is still too low).
+                    if kept.contains(&t.text) {
+                        return true;
+                    }
+                    let stats = term_stats(leaves, &t);
+                    let e = make_expanded(t, stats, distance, query_len);
+                    let at = best.partition_point(|b| rank(b, &e) == std::cmp::Ordering::Less);
+                    if at < n {
+                        kept.insert(e.term.text.clone());
+                        best.insert(at, e);
+                        if best.len() > n {
+                            if let Some(out) = best.pop() {
+                                kept.remove(&out.term.text);
+                            }
+                        }
+                    }
+                    true
+                });
+            }
+        }
+        return Ok(select(best, rewrite));
+    }
+    let enum_limit = max_expansions.min(clause_limit.map(|n|n.saturating_add(1)).unwrap_or(usize::MAX));
     let mut all: BTreeMap<Vec<u8>, Term> = BTreeMap::new();
     for leaf in leaves {
         for t in enumerate_terms(leaf, field, matcher, bounds.0, bounds.1, enum_limit) {
@@ -240,7 +301,10 @@ fn make_expanded(term: Term, stats: TermStats, distance: DistanceFn<'_>, query_l
     let (d, boost) = match distance {
         Some(f) => {
             let d = f(&term.text);
-            (d, (1.0 - d as f32 / query_len.max(1) as f32).max(0.0))
+            // Lucene `FuzzyTermsEnum`: similarity over the shorter of the
+            // query and the indexed term (code points).
+            let term_len = String::from_utf8_lossy(&term.text).chars().count();
+            (d, (1.0 - d as f32 / term_len.min(query_len).max(1) as f32).max(0.0))
         }
         None => (0, 1.0),
     };
@@ -250,12 +314,9 @@ fn make_expanded(term: Term, stats: TermStats, distance: DistanceFn<'_>, query_l
 /// Apply top-n selection and blending.
 fn select(mut terms: Vec<ExpandedTerm>, rewrite: MultiTermRewrite) -> Vec<ExpandedTerm> {
     if let Some(n) = rewrite.top_n() {
-        terms.sort_by(|a, b| {
-            a.distance
-                .cmp(&b.distance)
-                .then(b.stats.doc_freq.cmp(&a.stats.doc_freq))
-                .then(a.term.text.cmp(&b.term.text))
-        });
+        // Lucene `TopTermsRewrite`: the highest boosts, ties to the
+        // smaller term bytes (document frequency plays no part).
+        terms.sort_by(|a, b| b.boost.total_cmp(&a.boost).then(a.term.text.cmp(&b.term.text)));
         terms.truncate(n);
         terms.sort_by(|a, b| a.term.text.cmp(&b.term.text));
     }
@@ -271,16 +332,88 @@ fn select(mut terms: Vec<ExpandedTerm>, rewrite: MultiTermRewrite) -> Vec<Expand
 }
 
 /// Constant-score union of the postings of `terms` on `leaf`.
+/// Never the sum of the posting lists: a few terms are a lazy union of
+/// their postings; more set the bits of a per-leaf bitset (one bit per
+/// document, whatever the overlap of the terms), polling cancellation.
 pub fn const_union(leaf: &LeafReader<'_>, terms: &[Term], score: f32) -> Option<Box<dyn Scorer>> {
-    let mut docs: Vec<DocId> = Vec::new();
-    for t in terms {
+    if terms.len() <= LAZY_UNION_TERMS {
+        let mut parts: Vec<Box<dyn Scorer>> = Vec::new();
+        for t in terms {
+            if let Some(p) = leaf.postings(t) {
+                parts.push(Box::new(ConstScorer::new(crate::query::segment_scorer::PostingsDocSet::new(p), score)));
+            }
+        }
+        return match parts.len() {
+            0 => None,
+            1 => parts.pop(),
+            _ => Some(Box::new(ConstScorer::new(union_of(parts), score))),
+        };
+    }
+    let n = leaf.num_docs() as usize;
+    let mut words = vec![0u64; n.div_ceil(64)];
+    let mut any = false;
+    for (i, t) in terms.iter().enumerate() {
+        if i % 64 == 63 && crate::cancel::is_cancelled() {
+            break;
+        }
         if let Some(mut p) = leaf.postings(t) {
             while let Some(d) = p.next() {
-                docs.push(d);
+                if let Some(w) = words.get_mut(d as usize / 64) {
+                    *w |= 1 << (d % 64);
+                    any = true;
+                }
             }
         }
     }
-    docs_scorer(docs, score)
+    if !any {
+        return None;
+    }
+    Some(Box::new(ConstScorer::new(crate::query::docset::BitSetDocSet::new(words), score)))
+}
+
+/// [`const_union`] of the terms of `field` that `matcher` accepts in
+/// `[lower, upper)` (at most `limit`), streamed from the dictionary: up to
+/// [`LAZY_UNION_TERMS`] terms are a lazy union; past that, each further
+/// term's postings set bits of a per-leaf bitset as it is met (neither the
+/// matching terms nor their postings are listed first).
+pub fn const_union_matching(leaf: &LeafReader<'_>, field: u16, matcher: &dyn TermMatcher, lower: Option<&[u8]>, upper: Option<&[u8]>, limit: usize, score: f32) -> Option<Box<dyn Scorer>> {
+    let pre_upper = prefix_upper(matcher.literal_prefix());
+    let (lo, hi) = bounds_of(matcher, lower, upper, &pre_upper);
+    let mut first: Vec<Term> = Vec::new();
+    let mut words: Option<Vec<u64>> = None;
+    let mut count = 0usize;
+    let set = |words: &mut Vec<u64>, t: &Term| {
+        if let Some(mut p) = leaf.postings(t) {
+            while let Some(d) = p.next() {
+                if let Some(w) = words.get_mut(d as usize / 64) {
+                    *w |= 1 << (d % 64);
+                }
+            }
+        }
+    };
+    if limit > 0 {
+        visit_terms(leaf, field, matcher, lo, hi, &mut |t| {
+            count += 1;
+            match &mut words {
+                Some(w) => set(w, &t),
+                None if first.len() < LAZY_UNION_TERMS => first.push(t),
+                None => {
+                    let mut w = vec![0u64; (leaf.num_docs() as usize).div_ceil(64)];
+                    for f in first.drain(..) {
+                        set(&mut w, &f);
+                    }
+                    set(&mut w, &t);
+                    words = Some(w);
+                }
+            }
+            count < limit
+        });
+    }
+    match words {
+        Some(w) if w.iter().any(|x| *x != 0) => Some(Box::new(ConstScorer::new(crate::query::docset::BitSetDocSet::new(w), score))),
+        Some(_) => None,
+        None => const_union(leaf, &first, score),
+    }
 }
 
 /// [`const_union`] of the ascending `texts` of `field` (a `terms` query),

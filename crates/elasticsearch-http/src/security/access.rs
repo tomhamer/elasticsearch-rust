@@ -40,7 +40,9 @@ fn security_denied(user: &Authn, perm: &Permission, action: &str, indices: &[Str
 }
 
 /// Concrete indices a requested name (index, alias or data stream) stands for.
-fn concretes(node: &Node, name: &str) -> Vec<String> {
+pub(super) fn concretes(node: &Node, name: &str) -> Vec<String> {
+    // (`name::selector` reads a component of `name`)
+    let name = name.split_once("::").map_or(name, |(n, _)| n);
     if node.get_index(name).is_some() {
         return vec![name.to_string()];
     }
@@ -107,6 +109,28 @@ impl ReadAccess {
         }
     }
 
+    /// Authorize reading targets the request did not name (a point in
+    /// time's or a scroll's, resolved when it was opened, possibly by
+    /// another subject): `action` on each, directly, through its data
+    /// stream or through one of its aliases.
+    pub fn authorize_targets(&self, node: &Node, action: &str, targets: &[Target]) -> Result<(), EsError> {
+        let mut bad: Vec<String> = Vec::new();
+        for t in targets {
+            let n = &t.svc.name;
+            let ok = (self.perm.is_superuser && !elasticsearch_engine::security::roles::is_restricted(n))
+                || super::authz::allowed(node, &self.perm, action, n)
+                || t.svc.aliases().keys().any(|a| self.perm.check_index(action, a));
+            if !ok && !bad.contains(n) {
+                bad.push(n.clone());
+            }
+        }
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            Err(super::denied(node, &self.user, &self.perm, action, Some(&bad)))
+        }
+    }
+
     pub fn is_restricted(&self) -> bool {
         self.restricted
     }
@@ -114,6 +138,11 @@ impl ReadAccess {
     /// The authenticated subject (the run-as target when impersonating).
     pub fn user(&self) -> &Authn {
         &self.user
+    }
+
+    /// The subject's effective permissions.
+    pub fn permission(&self) -> &Permission {
+        &self.perm
     }
 
     /// Does any index of this request carry DLS/FLS?
@@ -294,7 +323,7 @@ pub fn check_gate(node: &Node, user: &Authn, perm: &Permission, action: &str, na
 pub fn check_unscoped_read(perm: &Permission, action: &str) -> Result<(), EsError> {
     // ES|QL stamps every index it reads with the caller's DLS/FLS (`EsqlOptions::restrict`).
     let esql = action == "indices:data/read/esql" || action.starts_with("indices:data/read/esql/");
-    if perm.has_dls_fls() && !esql && action.starts_with("indices:data/read/") && !matches!(action, "indices:data/read/scroll" | "indices:data/read/close_point_in_time" | "indices:data/read/msearch" | "indices:data/read/mget") {
+    if perm.has_dls_fls() && !esql && action.starts_with("indices:data/read/") && !matches!(action, "indices:data/read/scroll" | "indices:data/read/scroll/clear" | "indices:data/read/close_point_in_time" | "indices:data/read/msearch" | "indices:data/read/mget" | "indices:data/read/async_search/delete") {
         return Err(EsError::new(403, "security_exception", format!("action [{action}] is not permitted for subjects with field or document level security")));
     }
     Ok(())

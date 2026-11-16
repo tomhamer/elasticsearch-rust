@@ -144,32 +144,53 @@ impl<'a, 'b> Ctx<'a, 'b> {
             keyed_groups.push((legacy_tsid(&key), key_string(&key), key, d));
         }
         keyed_groups.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut by_key: Vec<(String, Map<String, Value>, Docs)> = Vec::new();
-        for (_, ks, key, d) in keyed_groups {
+        // Groups merge only when their structured dimension maps are equal
+        // (the legacy tsid: typed, length-prefixed, collision-free), never
+        // because their display strings match (`{a=x, b=y, b=z}` renders
+        // distinct maps alike).
+        let mut by_key: Vec<(Vec<u8>, String, Map<String, Value>, Docs)> = Vec::new();
+        for (lt, ks, key, d) in keyed_groups {
             match by_key.last_mut() {
-                Some(last) if last.0 == ks => {
+                Some(last) if last.0 == lt => {
                     for (i, v) in d.into_iter().enumerate() {
-                        last.2[i].extend(v);
-                        last.2[i].sort_by_key(|x| x.0);
+                        last.3[i].extend(v);
+                        last.3[i].sort_by_key(|x| x.0);
                     }
                 }
-                _ => by_key.push((ks, key, d)),
+                _ => by_key.push((lt, ks, key, d)),
             }
         }
         by_key.truncate(size as usize);
+        // A keyed response names each bucket by its display string: two
+        // distinct series with one display string cannot both be returned
+        // that way (one would overwrite the other).
+        if keyed {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            if let Some(dup) = by_key.iter().find(|b| !seen.insert(b.1.as_str())) {
+                return Err(EsError::illegal_argument(format!(
+                    "time_series aggregation [{name}]: distinct time series have the same bucket key [{}]; use [keyed: false] to return them as separate buckets",
+                    dup.1
+                )));
+            }
+        }
         self.add_buckets(by_key.len())?;
         let mut out: Vec<(String, Map<String, Value>)> = Vec::new();
-        for (ks, key, d) in by_key {
+        for (_, ks, key, d) in by_key {
             let mut m = Map::new();
             m.insert("key".into(), Value::Object(key));
             m.insert("doc_count".into(), json!(super::super::count(&d)));
             m.extend(self.subs(sub, &d)?);
             out.push((ks, m));
         }
-        let mut maps: Vec<Map<String, Value>> = out.iter().map(|x| x.1.clone()).collect();
+        let mut maps: Vec<Map<String, Value>> = out.into_iter().map(|x| x.1).collect();
         apply_parent_pipelines(sub, &mut maps)?;
         if keyed {
-            let obj: Map<String, Value> = out.into_iter().zip(maps).map(|((k, _), m)| (k, Value::Object(m))).collect();
+            // Each retained bucket named by its own key: a `bucket_sort`
+            // may have reordered or paged them.
+            let obj: Map<String, Value> = maps
+                .into_iter()
+                .map(|m| (m.get("key").and_then(Value::as_object).map(key_string).unwrap_or_default(), Value::Object(m)))
+                .collect();
             Ok(json!({ "buckets": obj }))
         } else {
             Ok(json!({ "buckets": maps }))
@@ -179,10 +200,19 @@ impl<'a, 'b> Ctx<'a, 'b> {
     /// The dimension fields of segment `s`'s mapping, by name.
     fn dimension_fields(&self, s: usize) -> Vec<(String, super::super::FieldRef)> {
         let lookup = self.segs[s].lookup;
-        let mut dims: Vec<&String> = lookup.fields.iter().filter(|(_, f)| f.time_series_dimension).map(|(n, _)| n).collect();
+        let mut dims: Vec<String> = lookup.fields.iter().filter(|(_, f)| f.time_series_dimension).map(|(n, _)| n.clone()).collect();
+        // A flattened field's `time_series_dimensions` keys are dimensions
+        // too (ES `RootFlattenedFieldType`), named `<field>.<key>`.
+        for (n, f) in &lookup.fields {
+            if f.declared != crate::mapping::EsType::Flattened {
+                continue;
+            }
+            let keys = f.ext.as_ref().and_then(|e| e.params.get("time_series_dimensions").and_then(Value::as_array).cloned()).unwrap_or_default();
+            dims.extend(keys.iter().filter_map(Value::as_str).map(|k| format!("{n}.{k}")));
+        }
         dims.sort();
         dims.dedup();
-        dims.into_iter().filter_map(|n| Some((n.clone(), self.field(n).ok()?))).collect()
+        dims.into_iter().filter_map(|n| { let f = self.field(&n).ok()?; Some((n, f)) }).collect()
     }
 
     /// The dimension values of a doc, by field name ([`Self::dimension_fields`]).
@@ -264,14 +294,124 @@ impl<'a, 'b> Ctx<'a, 'b> {
                 pts.insert(0, p);
             }
         }
-        if pts.len() < 2 || pts[pts.len() - 1].0 == pts[0].0 {
-            return Ok(Some(json!({ "value": "NaN" })));
-        }
         let mut increase = 0.0;
         for w in pts.windows(2) {
             increase += if w[1].1 >= w[0].1 { w[1].1 - w[0].1 } else { w[1].1 };
         }
-        let dt = (pts[pts.len() - 1].0 - pts[0].0) as f64;
-        Ok(Some(json!({ "value": crate::values::java_double(increase / dt * 1000.0 * (unit_ms / 1000.0)) })))
+        let mut out = if pts.len() < 2 || pts[pts.len() - 1].0 == pts[0].0 {
+            json!({ "value": "NaN" })
+        } else {
+            let dt = (pts[pts.len() - 1].0 - pts[0].0) as f64;
+            json!({ "value": crate::values::java_double(increase / dt * 1000.0 * (unit_ms / 1000.0)) })
+        };
+        // ES `InternalResetTrackingRate`: a shard response carries the
+        // series' end points and its increase so the coordinator merges a
+        // series that spans backing indices (on several shards) before
+        // normalising once, instead of adding per-shard rates.
+        if crate::search::aggregation_shard_response() {
+            if let (Some(first), Some(last)) = (pts.first(), pts.last()) {
+                out["__p"] = json!({ "counter": { "st": first.0, "sv": first.1, "et": last.0, "ev": last.1, "inc": increase, "unit_ms": unit_ms } });
+            }
+        }
+        Ok(Some(out))
+    }
+}
+
+/// Coordinator reduce of counter `rate`s inside `time_series` buckets (ES
+/// `InternalResetTrackingRate.reduce`): the shards' pieces of one series in
+/// time order, the increase across each boundary (a lower start than the
+/// previous end is a counter reset), normalised once over the whole span.
+/// `None` when a shard response lacks the state (an older node) or none
+/// has samples.
+pub fn reduce_counter_rates(vals: &[&Value]) -> Option<Value> {
+    let mut parts: Vec<(i64, f64, i64, f64, f64, f64)> = Vec::new();
+    for v in vals {
+        match v.get("__p").and_then(|p| p.get("counter")) {
+            Some(c) => parts.push((c["st"].as_i64()?, c["sv"].as_f64()?, c["et"].as_i64()?, c["ev"].as_f64()?, c["inc"].as_f64()?, c["unit_ms"].as_f64()?)),
+            // A shard without samples of the series.
+            None if v.get("value").and_then(Value::as_str) == Some("NaN") => {}
+            None => return None,
+        }
+    }
+    if parts.is_empty() {
+        // No shard has samples of the series (all NaN).
+        return Some(json!({ "value": "NaN" }));
+    }
+    parts.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+    let mut increase: f64 = parts.iter().map(|p| p.4).sum();
+    for w in parts.windows(2) {
+        let (prev_end, next_start) = (w[0].3, w[1].1);
+        increase += if next_start >= prev_end { next_start - prev_end } else { next_start };
+    }
+    let (start, end, unit_ms) = (parts[0].0, parts.iter().map(|p| p.2).max().unwrap_or(parts[0].2), parts[0].5);
+    if end == start {
+        return Some(json!({ "value": "NaN" }));
+    }
+    Some(json!({ "value": crate::values::java_double(increase / (end - start) as f64 * unit_ms) }))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use crate::node::Node;
+    use serde_json::{json, Value};
+
+    /// Two series whose dimension maps render alike: `{a=x, b=y, b=z}`.
+    fn fixture(node: &Node) {
+        let now = crate::date::now_millis();
+        let base = now - now.rem_euclid(3_600_000) - 3_600_000;
+        node.create_index("t218", &json!({
+            "settings": {"index.mode": "time_series", "index.routing_path": ["a", "b"], "index.number_of_replicas": 0,
+                "index.time_series.start_time": crate::ilm::iso_date(base - 3_600_000), "index.time_series.end_time": crate::ilm::iso_date(now + 3_600_000)},
+            "mappings": {"properties": {"@timestamp": {"type": "date"},
+                "a": {"type": "keyword", "time_series_dimension": true}, "b": {"type": "keyword", "time_series_dimension": true},
+                "v": {"type": "double", "time_series_metric": "gauge"}}}}))
+            .unwrap();
+        let svc = node.get_index("t218").unwrap();
+        let docs = [json!({"a": "x, b=y", "b": "z", "v": 1.0}), json!({"a": "x", "b": "y, b=z", "v": 100.0})];
+        let reqs = docs
+            .iter()
+            .map(|d| {
+                let mut d = d.clone();
+                d["@timestamp"] = json!(crate::ilm::iso_date(base + 1000));
+                crate::index::WriteReq::Index { id: None, source: d.to_string(), routing: None, cond: Default::default() }
+            })
+            .collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+    }
+
+    fn agg(node: &Node, keyed: bool) -> crate::error::Result<Value> {
+        let svc = node.get_index("t218").unwrap();
+        let body = json!({"size": 0, "aggs": {"ts": {"time_series": {"keyed": keyed}, "aggs": {"s": {"sum": {"field": "v"}}}}}});
+        let req = crate::search::parse_request(&body, &std::collections::HashMap::new())?;
+        let opts = crate::search::ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None };
+        let out = crate::search::execute(&[crate::search::Target::new(svc)], &req, &opts)?;
+        Ok(serde_json::from_str(&out.json)?)
+    }
+
+    /// Review finding 218: series whose dimension maps share a display
+    /// string stay two buckets with their own metrics (keyed: false); a
+    /// keyed response, which cannot name both, refuses instead of merging
+    /// or overwriting them; ES|QL `_tsid` metadata stays distinct.
+    #[test]
+    fn display_string_collisions_never_merge_series() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(tmp.path()).unwrap();
+        fixture(&node);
+        let v = agg(&node, false).unwrap();
+        let buckets = v["aggregations"]["ts"]["buckets"].as_array().cloned().unwrap_or_default();
+        assert_eq!(buckets.len(), 2, "{v}");
+        let mut sums: Vec<f64> = buckets.iter().map(|b| b["s"]["value"].as_f64().unwrap_or(f64::NAN)).collect();
+        sums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(sums, vec![1.0, 100.0], "{v}");
+        assert!(buckets.iter().all(|b| b["doc_count"] == 1), "{v}");
+        assert!(agg(&node, true).is_err(), "a keyed response cannot hold both buckets");
+        let out = crate::esql::run(&node, "FROM t218 METADATA _tsid | KEEP _tsid", crate::esql::EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }).unwrap();
+        let mut ids: Vec<String> = out.table.rows.iter().map(|r| r[0].to_text()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2, "distinct _tsid metadata: {ids:?}");
     }
 }

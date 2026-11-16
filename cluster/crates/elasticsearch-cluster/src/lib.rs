@@ -4,6 +4,7 @@
 
 pub mod allocation;
 pub mod coordination;
+pub mod graveyard;
 pub mod compatibility;
 pub mod health;
 pub mod routing;

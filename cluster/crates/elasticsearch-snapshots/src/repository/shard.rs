@@ -240,6 +240,18 @@ async fn hash_file_with_crc(path: PathBuf) -> Result<(u64, String, u32)> {
     .map_err(|e| SnapshotError::illegal_state(format!("hashing task failed: {e}")))?
 }
 
+/// fsync a directory, propagating errors.
+async fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let d = tokio::fs::File::open(dir).await.map_err(|e| SnapshotError::io(format!("fsync directory [{}]", dir.display()), e))?;
+        d.sync_all().await.map_err(|e| SnapshotError::io(format!("fsync directory [{}]", dir.display()), e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Stream `len` bytes of `path` from `offset`, rate limited and cancellable.
 fn file_range_stream(
     path: PathBuf,
@@ -370,8 +382,15 @@ impl Repository {
             .read_shard_snapshots(index_id, shard, Some(gen_))
             .await
             .map_err(|e| fail(format!("shard generation [{gen_}] is not readable: {e}")))?;
-        if !index.snapshots.values().any(|s| s.uuid == snapshot_uuid) {
+        let Some(listed_entry) = index.snapshots.values().find(|s| s.uuid == snapshot_uuid) else {
             return Err(fail(format!("shard generation [{gen_}] does not list snapshot [{snapshot_uuid}]")));
+        };
+        // The generation and the descriptor describe the same image: a
+        // restore reads the descriptor, a cleanup keeps what generations list.
+        let described: BTreeSet<&str> = meta.files.iter().map(|f| f.name.as_str()).collect();
+        let generation: BTreeSet<&str> = listed_entry.files.iter().map(String::as_str).collect();
+        if described != generation {
+            return Err(fail(format!("shard generation [{gen_}] lists another image of snapshot [{snapshot_uuid}] than its descriptor")));
         }
         let container = self.shard_container(index_id, shard);
         let listed = match container.list_blobs_by_prefix(DATA_BLOB_PREFIX).await {
@@ -408,8 +427,15 @@ impl Repository {
             st.stage = ShardStage::Started;
             st.stats.start_time = start;
         }
-        let mut shard_index = self.read_shard_snapshots(&task.index_id, task.shard, old_gen.as_deref()).await?;
+        let mut shard_index = task.cancel.run(self.read_shard_snapshots(&task.index_id, task.shard, old_gen.as_deref())).await?;
         let container = self.shard_container(&task.index_id, task.shard);
+        // One image per snapshot UUID and shard: an attempt of the same
+        // snapshot (a new master resuming it while the old one may still
+        // finalize) adopts the descriptor an earlier attempt published,
+        // never replaces it (production review #132).
+        if let Some(existing) = self.published_attempt(&task.index_id, task.shard, &task.snapshot_uuid).await? {
+            return self.adopt_attempt(shard_index, existing, task, old_gen, start).await;
+        }
 
         let mut files: Vec<FileInfo> = Vec::new();
         reserve_slots(&mut files,task.files.len(),workspace.as_mut())?;
@@ -491,7 +517,9 @@ impl Repository {
                     use std::fmt::Write;
                     write!(&mut part_name, ".part{part}").expect("writing to reserved String");
                 }
-                container.write_blob_stream(&part_name, len, stream, true).await?;
+                // A stalled blob-store request must not outlive an abort
+                // (snapshot deletion): the upload is dropped on cancellation.
+                task.cancel.run(container.write_blob_stream(&part_name, len, stream, true)).await?;
             }
             task.status.lock().stats.processed_file_count += 1;
         }
@@ -510,7 +538,18 @@ impl Repository {
             total_size: incremental_size,
             files: meta_files,
         };
-        self.write_meta(&container, &snapshot_blob_name(&task.snapshot_uuid), &meta, false).await?;
+        // Created only if absent: a concurrent attempt that published first
+        // wins, and this one adopts its image (its own blobs are garbage).
+        match task.cancel.run(self.write_meta(&container, &snapshot_blob_name(&task.snapshot_uuid), &meta, true)).await {
+            Ok(()) => {}
+            Err(e) if e.is_already_exists() => {
+                let shard_index = task.cancel.run(self.read_shard_snapshots(&task.index_id, task.shard, old_gen.as_deref())).await?;
+                let existing = self.published_attempt(&task.index_id, task.shard, &task.snapshot_uuid).await?
+                    .ok_or_else(|| SnapshotError::new("snapshot_exception", 500, format!("[{}][{}] the shard snapshot of [{}] exists but cannot be read", task.index_id, task.shard, task.snapshot_uuid)))?;
+                return self.adopt_attempt(shard_index, existing, task, old_gen, start).await;
+            }
+            Err(e) => return Err(e),
+        }
 
         // New cumulative shard index.
         let count=shard_index.files.len().checked_add(to_upload.len()).ok_or_else(||SnapshotError::new("circuit_breaking_exception",429,"snapshot file count overflow"))?;
@@ -534,7 +573,7 @@ impl Repository {
         for file in &shard_index.files {workspace.grow(workspace_size([node,file.name.len()])?,"snapshot compact names")?;}
         shard_index.compact();
         let new_gen = random_base64_uuid();
-        self.write_meta(&container, &format!("{INDEX_FILE_PREFIX}{new_gen}"), &shard_index, true).await?;
+        task.cancel.run(self.write_meta(&container, &format!("{INDEX_FILE_PREFIX}{new_gen}"), &shard_index, true)).await?;
 
         let total_size = files.iter().map(|f| f.length).sum();
         let segment_count = files.iter().filter(|f| f.physical_name.ends_with(".si")).count() as u32;
@@ -557,6 +596,58 @@ impl Repository {
         })
     }
 
+    /// The descriptor an earlier attempt of snapshot `snapshot_uuid`
+    /// published for this shard, if any (`None`: no attempt did). One that
+    /// exists but is unreadable or incomplete fails the shard: it can be
+    /// neither adopted nor replaced.
+    async fn published_attempt(&self, index_id: &str, shard: u32, snapshot_uuid: &str) -> Result<Option<ShardSnapshotMeta>> {
+        let container = self.shard_container(index_id, shard);
+        let name = snapshot_blob_name(snapshot_uuid);
+        if !container.blob_exists(&name).await? {
+            return Ok(None);
+        }
+        let meta: ShardSnapshotMeta = self.read_meta(&container, &name).await?;
+        for f in &meta.files {
+            for part in f.part_names() {
+                if !container.blob_exists(&part).await? {
+                    return Err(SnapshotError::new("snapshot_exception", 500, format!("[{index_id}][{shard}] an earlier attempt of snapshot [{snapshot_uuid}] published an incomplete image: data blob [{part}] is missing")));
+                }
+            }
+        }
+        Ok(Some(meta))
+    }
+
+    /// A new shard generation on top of `shard_index` listing the image an
+    /// earlier attempt of the same snapshot published (`existing`).
+    async fn adopt_attempt(&self, mut shard_index: ShardSnapshots, existing: ShardSnapshotMeta, task: ShardSnapshotTask, old_gen: Option<String>, start: i64) -> Result<ShardSnapshotResult> {
+        let container = self.shard_container(&task.index_id, task.shard);
+        for f in &existing.files {
+            if !shard_index.files.iter().any(|g| g.name == f.name) {
+                shard_index.files.push(f.clone());
+            }
+        }
+        shard_index.snapshots.insert(
+            task.snapshot_name.clone(),
+            ShardSnapshotFiles { uuid: task.snapshot_uuid.clone(), files: existing.files.iter().map(|f| f.name.clone()).collect() },
+        );
+        shard_index.compact();
+        let new_gen = random_base64_uuid();
+        task.cancel.run(self.write_meta(&container, &format!("{INDEX_FILE_PREFIX}{new_gen}"), &shard_index, true)).await?;
+        let total_size = existing.files.iter().map(|f| f.length).sum();
+        let segment_count = existing.files.iter().filter(|f| f.physical_name.ends_with(".si")).count() as u32;
+        let stats = {
+            let mut st = task.status.lock();
+            st.stats.start_time = start;
+            st.stats.total_file_count = existing.files.len() as u64;
+            st.stats.total_size = total_size;
+            st.stats.time = now_millis() - start;
+            st.stage = ShardStage::Done;
+            st.stats
+        };
+        tracing::info!(index_id = %task.index_id, shard = task.shard, snapshot = %task.snapshot_uuid, "adopted the shard image an earlier attempt of the snapshot published");
+        Ok(ShardSnapshotResult { index_id: task.index_id, shard: task.shard, new_gen, old_gen, stats, total_size, segment_count })
+    }
+
     /// Read the shard-level snapshot metadata (`snap-{uuid}.dat`) of a shard.
     pub async fn read_shard_snapshot(&self, index_id: &str, shard: u32, snapshot_uuid: &str) -> Result<ShardSnapshotMeta> {
         self.read_meta(&self.shard_container(index_id, shard), &snapshot_blob_name(snapshot_uuid)).await
@@ -573,7 +664,7 @@ impl Repository {
         target_dir: &Path,
         cancel: &CancelToken,
     ) -> Result<RestoreShardResult> {
-        let meta = self.read_shard_snapshot(index_id, shard, snapshot_uuid).await?;
+        let meta = cancel.run(self.read_shard_snapshot(index_id, shard, snapshot_uuid)).await?;
         let container = self.shard_container(index_id, shard);
         tokio::fs::create_dir_all(target_dir).await?;
         let mut res = RestoreShardResult { files: 0, bytes: 0, reused_files: 0, restored: Vec::with_capacity(meta.files.len()) };
@@ -609,10 +700,9 @@ impl Repository {
                 for part in 0..fi.number_of_parts() {
                     let plen = fi.part_bytes(part);
                     let mut s = container.read_blob_stream(&fi.part_name(part), plen, self.settings.io_buffer);
-                    while let Some(chunk) = s.next().await {
+                    while let Some(chunk) = cancel.run(async { Ok(s.next().await) }).await? {
                         let chunk = chunk?;
-                        cancel.check()?;
-                        self.restore_rate.acquire(chunk.len() as u64).await;
+                        cancel.run(async { self.restore_rate.acquire(chunk.len() as u64).await; Ok(()) }).await?;
                         h.update(&chunk);
                         crc = crate::util::crc32_update(crc, &chunk);
                         written += chunk.len() as u64;
@@ -647,8 +737,21 @@ impl Repository {
             res.bytes += fi.length;
             res.restored.push(RestoredFile { physical_name: fi.physical_name.clone(), length: fi.length, crc32: crc });
         }
-        if let Ok(d) = tokio::fs::File::open(target_dir).await {
-            let _ = d.sync_all().await;
+        // The restored files are only durable once their directories (and
+        // the entries of nested directories) are.
+        let mut dirs = BTreeSet::new();
+        dirs.insert(target_dir.to_path_buf());
+        for f in &res.restored {
+            let mut cur = target_dir.join(&f.physical_name);
+            while let Some(p) = cur.parent().map(Path::to_path_buf) {
+                if !p.starts_with(target_dir) || !dirs.insert(p.clone()) {
+                    break;
+                }
+                cur = p;
+            }
+        }
+        for d in &dirs {
+            sync_dir(d).await?;
         }
         Ok(res)
     }

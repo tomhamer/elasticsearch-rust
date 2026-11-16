@@ -143,8 +143,7 @@ impl TokenFilter for CommonGramsFilter {
                             text: format!("{}_{}", t.text, next.text),
                             position: t.position,
                             offset_from: t.offset_from,
-                            offset_to: next.offset_to,
-                        },
+                            offset_to: next.offset_to, keyword: false },
                         true,
                     ));
                 }
@@ -296,7 +295,7 @@ impl TokenFilter for FingerprintFilter {
         }
         let offset_from = tokens.iter().map(|t| t.offset_from).min().unwrap();
         let offset_to = tokens.iter().map(|t| t.offset_to).max().unwrap();
-        vec![Token { text, position: tokens[0].position, offset_from, offset_to }]
+        vec![Token { text, position: tokens[0].position, offset_from, offset_to, keyword: false }]
     }
 }
 
@@ -350,17 +349,17 @@ impl TokenFilter for KeepWordsFilter {
 // KeywordMarkerFilter
 // ---------------------------------------------------------------------
 
-/// Protects keywords from stemming (Lucene `KeywordMarkerFilter`).
-///
-/// Lucene sets a keyword *attribute* that stemmers consult. Our
-/// [`Token`] has no such attribute, so this filter instead *wraps* the
-/// stemmer: tokens whose text is in `keywords` pass through untouched,
-/// all others go through `inner`. `inner` is applied to each token
-/// individually, so it should be a 1:1 filter (any stemmer is).
+/// Lucene `SetKeywordMarkerFilter` / `PatternKeywordMarkerFilter` (ES
+/// `keyword_marker`): tokens whose text is one of `keywords` (or matches
+/// `pattern`) get [`Token::keyword`] set, so later stemmers leave them
+/// unchanged. [`KeywordMarkerFilter::wrap`] keeps the older form that
+/// applies a stemmer itself to the unmarked tokens.
 pub struct KeywordMarkerFilter {
-    inner: Box<dyn TokenFilter>,
+    inner: Option<Box<dyn TokenFilter>>,
     /// Protected words.
     pub keywords: HashSet<String>,
+    /// ES `keywords_pattern`: a whole-token regular expression.
+    pub pattern: Option<regex_automata::meta::Regex>,
     /// Match case-insensitively (ES `ignore_case`, default false).
     pub ignore_case: bool,
 }
@@ -368,7 +367,18 @@ pub struct KeywordMarkerFilter {
 impl KeywordMarkerFilter {
     /// Wrap `inner` so it skips `keywords`.
     pub fn wrap(inner: Box<dyn TokenFilter>, keywords: &[&str]) -> Self {
-        Self { inner, keywords: keywords.iter().map(|k| k.to_string()).collect(), ignore_case: false }
+        Self { inner: Some(inner), keywords: keywords.iter().map(|k| k.to_string()).collect(), pattern: None, ignore_case: false }
+    }
+
+    /// Mark `keywords` (Lucene `SetKeywordMarkerFilter`).
+    pub fn marker(keywords: &[&str], ignore_case: bool) -> Self {
+        Self { inner: None, keywords: keywords.iter().map(|k| k.to_string()).collect(), pattern: None, ignore_case: false }.ignore_case(ignore_case)
+    }
+
+    /// Mark tokens matching `pattern` (Lucene `PatternKeywordMarkerFilter`;
+    /// compile it anchored, `^(?:..)$`).
+    pub fn pattern(pattern: regex_automata::meta::Regex) -> Self {
+        Self { inner: None, keywords: HashSet::new(), pattern: Some(pattern), ignore_case: false }
     }
 
     /// Builder: match keywords case-insensitively.
@@ -381,6 +391,11 @@ impl KeywordMarkerFilter {
     }
 
     fn is_keyword(&self, t: &Token) -> bool {
+        if let Some(p) = &self.pattern {
+            // Compiled anchored (`^(?:..)$`): a whole-token match, as
+            // Java's `Matcher.matches`.
+            return p.is_match(t.text.as_str());
+        }
         if self.ignore_case {
             self.keywords.contains(&t.text.to_lowercase())
         } else {
@@ -398,19 +413,26 @@ impl std::fmt::Debug for KeywordMarkerFilter {
 impl TokenFilter for KeywordMarkerFilter {
     fn clone_box(&self) -> Box<dyn TokenFilter> {
         Box::new(Self {
-            inner: self.inner.clone_box(),
+            inner: self.inner.as_ref().map(|i| i.clone_box()),
             keywords: self.keywords.clone(),
+            pattern: self.pattern.clone(),
             ignore_case: self.ignore_case,
         })
     }
 
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
         let mut out = Vec::with_capacity(tokens.len());
-        for t in tokens {
-            if self.is_keyword(&t) {
-                out.push(t);
-            } else {
-                out.extend(self.inner.filter(vec![t]));
+        for mut t in tokens {
+            let kw = self.is_keyword(&t);
+            match &self.inner {
+                None => {
+                    if kw {
+                        t.keyword = true;
+                    }
+                    out.push(t);
+                }
+                Some(_) if kw || t.keyword => out.push(t),
+                Some(inner) => out.extend(inner.filter(vec![t])),
             }
         }
         out
@@ -465,10 +487,16 @@ impl TokenFilter for KeywordRepeatFilter {
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
         let mut out = Vec::with_capacity(tokens.len() * 2);
         for t in tokens {
-            out.push(t.clone());
+            // Lucene `KeywordRepeatFilter`: the first copy is a keyword (no
+            // later stemmer changes it), the second is not.
+            let mut original = t.clone();
+            original.keyword = true;
+            out.push(original);
+            let mut copy = t;
+            copy.keyword = false;
             match &self.stemmer {
-                Some(s) => out.extend(s.filter(vec![t])),
-                None => out.push(t),
+                Some(s) => out.extend(s.filter(vec![copy])),
+                None => out.push(copy),
             }
         }
         out
@@ -692,7 +720,7 @@ mod tests {
     use crate::analysis::filter::{LowerCaseFilter, PorterStemFilter, UpperCaseFilter};
 
     fn tok(text: &str, pos: u32) -> Token {
-        Token { text: text.into(), position: pos, offset_from: pos * 10, offset_to: pos * 10 + text.len() as u32 }
+        Token { text: text.into(), position: pos, offset_from: pos * 10, offset_to: pos * 10 + text.len() as u32, keyword: false }
     }
     fn toks(words: &[&str]) -> Vec<Token> {
         words.iter().enumerate().map(|(i, w)| tok(w, i as u32)).collect()

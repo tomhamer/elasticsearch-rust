@@ -59,6 +59,9 @@ pub const SCALARS: &[&str] = &[
     "BUCKET", "TBUCKET",
     // SQL extras
     "IFNULL", "ISNULL", "NULLIF", "IIF", "UPPER", "LOWER", "SUBSTR", "MOD", "POWER", "TRUNCATE", "YEAR", "MONTH", "DAY", "DAY_OF_MONTH", "HOUR", "MINUTE", "SECOND", "CURRENT_TIMESTAMP", "CURRENT_DATE", "NVL", "CHAR_LENGTH", "ASCII", "INSERT", "POSITION",
+    // ES SQL-only scalars ([`sql_scalar`]; aliases resolve in [`sql_alias`])
+    "DATETIME_FORMAT", "DATETIME_PARSE", "SIGN", "COT", "EXPM1", "RANDOM", "DEGREES", "RADIANS", "CHAR", "OCTET_LENGTH",
+    "DAY_OF_WEEK", "ISO_DAY_OF_WEEK", "DAY_OF_YEAR", "WEEK_OF_YEAR", "ISO_WEEK_OF_YEAR", "QUARTER", "MINUTE_OF_DAY", "DATE_ADD", "DATE_PART",
     // scoring
     "SCORE",
 ];
@@ -102,9 +105,20 @@ fn cidr_match(ip: &str, cidr: &str) -> bool {
         Some((n, l)) => (n, l.parse::<usize>().unwrap_or(0)),
         None => (cidr, usize::MAX),
     };
-    let (Some(a), Some(b)) = (ip_to_bytes(ip), ip_to_bytes(net)) else { return false };
+    let (Some(mut a), Some(mut b)) = (ip_to_bytes(ip), ip_to_bytes(net)) else { return false };
+    let mut len = len;
+    // ES `CIDRUtils.isBetween`: an IPv4 address and an IPv6 range (or the
+    // reverse) compare in the IPv4-mapped IPv6 form; an IPv4 prefix
+    // length counts from the mapped address's 96th bit.
     if a.len() != b.len() {
-        return false;
+        let mapped = |v: &[u8]| -> Vec<u8> { let mut m = vec![0u8; 10]; m.extend([0xff, 0xff]); m.extend_from_slice(v); m };
+        if a.len() == 4 {
+            a = mapped(&a);
+        }
+        if b.len() == 4 {
+            b = mapped(&b);
+            len = len.saturating_add(96);
+        }
     }
     let bits = len.min(a.len() * 8);
     for i in 0..bits {
@@ -117,7 +131,9 @@ fn cidr_match(ip: &str, cidr: &str) -> bool {
 }
 
 pub fn parse_date_str(s: &str) -> Option<i64> {
-    crate::date::DateFormatter::new("strict_date_optional_time||epoch_millis").ok()?.parse(s).ok()
+    let f = crate::date::DateFormatter::new("strict_date_optional_time||epoch_millis").ok()?;
+    // A SQL session zone reads a date string without an offset as local time.
+    f.parse_with_tz(s, super::literal_zone().unwrap_or(crate::date::Tz::UTC)).ok()
 }
 
 /// Arithmetic / comparison / logic.
@@ -160,6 +176,10 @@ pub fn compare(a: &Val, b: &Val) -> Option<Ordering> {
     match (a, b) {
         (Val::Date(x), Val::Str(s)) => parse_date_str(s).map(|y| x.cmp(&y)),
         (Val::Str(s), Val::Date(y)) => parse_date_str(s).map(|x| x.cmp(y)),
+        (Val::Nanos(x), Val::Str(s)) => parse_nanos_str(s).map(|y| x.cmp(&y)),
+        (Val::Str(s), Val::Nanos(y)) => parse_nanos_str(s).map(|x| x.cmp(y)),
+        (Val::ULong(x), Val::Str(s)) => s.trim().parse::<u64>().ok().map(|y| x.cmp(&y)),
+        (Val::Str(s), Val::ULong(y)) => s.trim().parse::<u64>().ok().map(|x| x.cmp(y)),
         (Val::Str(x), Val::Str(y)) => Some(x.cmp(y)),
         (Val::Bool(x), Val::Bool(y)) => Some(x.cmp(y)),
         (Val::Str(s), n) | (n, Val::Str(s)) if n.is_numeric() => {
@@ -190,6 +210,20 @@ fn arith(op: BinOp, a: &Val, b: &Val) -> Val {
         }
     }
     match (a, b) {
+        (Val::Nanos(n), Val::Dur(ms)) if matches!(op, Add | Sub) => {
+            let delta = ms.checked_mul(super::NANOS_PER_MILLI);
+            let r = delta.and_then(|d| if op == Add { n.checked_add(d) } else { n.checked_sub(d) });
+            return r.filter(|r| *r >= 0).map(Val::Nanos).unwrap_or(Val::Null);
+        }
+        (Val::Dur(ms), Val::Nanos(n)) if op == Add => {
+            return ms.checked_mul(super::NANOS_PER_MILLI).and_then(|d| n.checked_add(d)).filter(|r| *r >= 0).map(Val::Nanos).unwrap_or(Val::Null);
+        }
+        (Val::Nanos(n), Val::Period(m, days)) if matches!(op, Add | Sub) => {
+            let s = if op == Add { 1 } else { -1 };
+            let (ms, sub) = (n.div_euclid(super::NANOS_PER_MILLI), n.rem_euclid(super::NANOS_PER_MILLI));
+            let r = add_period(ms, s * m, s * days).checked_mul(super::NANOS_PER_MILLI).and_then(|x| x.checked_add(sub));
+            return r.filter(|r| *r >= 0).map(Val::Nanos).unwrap_or(Val::Null);
+        }
         (Val::Date(d), Val::Dur(ms)) if matches!(op, Add | Sub) => return Val::Date(if op == Add { d + ms } else { d - ms }),
         (Val::Dur(ms), Val::Date(d)) if op == Add => return Val::Date(d + ms),
         (Val::Date(d), Val::Period(m, days)) if matches!(op, Add | Sub) => {
@@ -235,6 +269,7 @@ fn num(v: &Val) -> Option<f64> {
     match v {
         Val::Int(i) | Val::Long(i) => Some(*i as f64),
         Val::Double(d) => Some(*d),
+        Val::ULong(u) => Some(*u as f64),
         _ => None,
     }
 }
@@ -351,12 +386,191 @@ fn period_millis(v: &Val) -> Option<i64> {
     }
 }
 
+/// An `unsigned_long` from a double: its integer part, exact `Long` below
+/// `i64::MAX`, `ULong` above; `None` when negative or beyond `u64`.
+pub fn unsigned_from_f64(d: f64) -> Option<Val> {
+    if !d.is_finite() || d < 0.0 || d >= 18_446_744_073_709_551_616.0 {
+        return None;
+    }
+    Some(unsigned(d.trunc() as u64))
+}
+
+/// An `unsigned_long` value: `Long` within `i64`, `ULong` beyond.
+pub fn unsigned(u: u64) -> Val {
+    if u <= i64::MAX as u64 { Val::Long(u as i64) } else { Val::ULong(u) }
+}
+
+/// `TO_UNSIGNED_LONG`: exact over the whole u64 range; a negative or
+/// out-of-range value is null with ES's warning.
+pub fn to_unsigned_long(v: &Val) -> Result<Val> {
+    let out_of_range = |x: String| eval_warning(format!("org.elasticsearch.xpack.esql.core.InvalidArgumentException: [{x}] out of [unsigned_long] range"));
+    Ok(match v {
+        Val::Int(i) | Val::Long(i) | Val::Date(i) => {
+            if *i < 0 {
+                return Err(out_of_range(i.to_string()));
+            }
+            Val::Long(*i)
+        }
+        Val::Nanos(n) => Val::Long(*n),
+        Val::ULong(u) => Val::ULong(*u),
+        Val::Double(d) => match unsigned_from_f64(*d) {
+            Some(u) => u,
+            None => return Err(out_of_range(fmt_double_plain(*d))),
+        },
+        Val::Bool(b) => Val::Long(*b as i64),
+        Val::Str(s) => {
+            let t = s.trim();
+            if let Ok(u) = t.parse::<u64>() {
+                unsigned(u)
+            } else if let Ok(d) = t.parse::<f64>() {
+                match unsigned_from_f64(d) {
+                    Some(u) => u,
+                    None => return Err(out_of_range(t.to_string())),
+                }
+            } else {
+                return Err(eval_warning(format!("org.elasticsearch.xpack.esql.core.InvalidArgumentException: Cannot parse number [{t}]")));
+            }
+        }
+        Val::Multi(m) => {
+            let mut out = Vec::with_capacity(m.len());
+            for x in m {
+                out.push(to_unsigned_long(x)?);
+            }
+            Val::from_list(out)
+        }
+        _ => Val::Null,
+    })
+}
+
+fn fmt_double_plain(d: f64) -> String {
+    super::fmt_double(d)
+}
+
+/// Epoch nanos of a date string: the millisecond parse plus the
+/// sub-millisecond digits of its fraction.
+pub fn parse_nanos_str(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let ms = parse_date_str(t)?;
+    match rustic_core::fieldtypes::numeric::fraction_nanos(t) {
+        Some(frac) => rustic_core::fieldtypes::numeric::nanos_from_parts(ms.div_euclid(1000), frac).ok(),
+        None => rustic_core::fieldtypes::numeric::nanos_from_millis(ms, 0).ok(),
+    }
+}
+
+/// A `date_nanos` `_source` value as the field indexes it (the mapping's
+/// format, nanosecond fraction kept).
+pub fn source_nanos(v: &serde_json::Value, fmt: Option<&crate::date::DateFormatter>) -> Option<i64> {
+    use rustic_core::fieldtypes::numeric;
+    match v {
+        serde_json::Value::String(s) => {
+            let ms = match fmt {
+                Some(f) => f.parse(s).ok()?,
+                None => parse_date_str(s)?,
+            };
+            match numeric::fraction_nanos(s) {
+                Some(frac) => numeric::nanos_from_parts(ms.div_euclid(1000), frac).ok(),
+                None => numeric::nanos_from_millis(ms, 0).ok(),
+            }
+        }
+        serde_json::Value::Number(n) => {
+            let x = n.as_f64()?;
+            let ms = match fmt {
+                Some(f) if f.accepts_numbers() => f.parse_number(x.trunc()).ok()?,
+                _ => x.trunc() as i64,
+            };
+            let sub = ((x - x.trunc()) * 1e6).round() as u32;
+            numeric::nanos_from_millis(ms, sub).ok()
+        }
+        _ => None,
+    }
+}
+
+/// `TO_DATE_NANOS`: a long (or double, or unsigned long) is epoch
+/// *nanoseconds*; a millisecond date scales up; a string keeps its
+/// sub-millisecond digits. Dates before 1970 cannot be nanosecond dates.
+pub fn to_date_nanos(v: &Val) -> Result<Val> {
+    let before = || eval_warning("java.lang.IllegalArgumentException: Nanosecond dates before 1970-01-01T00:00:00.000Z are not supported.".into());
+    Ok(match v {
+        Val::Nanos(n) => Val::Nanos(*n),
+        Val::Int(i) | Val::Long(i) => {
+            if *i < 0 {
+                return Err(before());
+            }
+            Val::Nanos(*i)
+        }
+        Val::ULong(u) => return Err(eval_warning(format!("org.elasticsearch.xpack.esql.core.InvalidArgumentException: [{u}] out of [long] range"))),
+        Val::Double(d) => {
+            if !d.is_finite() || *d < 0.0 || *d >= 9.223_372_036_854_776e18 {
+                return Err(before());
+            }
+            Val::Nanos(d.trunc() as i64)
+        }
+        Val::Date(ms) => {
+            if *ms < 0 {
+                return Err(before());
+            }
+            match ms.checked_mul(super::NANOS_PER_MILLI) {
+                Some(n) => Val::Nanos(n),
+                None => return Err(eval_warning(format!("java.lang.IllegalArgumentException: [{}] is after 2262-04-11T23:47:16.854775807 and cannot be converted to nanoseconds", super::fmt_date(*ms)))),
+            }
+        }
+        Val::Str(s) => match parse_nanos_str(s) {
+            Some(n) => Val::Nanos(n),
+            None => return Err(eval_warning(format!("java.lang.IllegalArgumentException: failed to parse date field [{}] with format [strict_date_optional_time_nanos]", s.trim()))),
+        },
+        Val::Multi(m) => {
+            let mut out = Vec::with_capacity(m.len());
+            for x in m {
+                out.push(to_date_nanos(x)?);
+            }
+            Val::from_list(out)
+        }
+        _ => Val::Null,
+    })
+}
+
+/// The arguments a function without its own `unsigned_long` /
+/// `date_nanos` handling reads: a `ULong` as a double (as before), a
+/// `Nanos` as its millisecond date.
+fn legacy_args(name: &str, args: &[Val]) -> Option<Vec<Val>> {
+    fn wide(v: &Val) -> bool {
+        match v {
+            Val::ULong(_) | Val::Nanos(_) => true,
+            Val::Multi(m) => m.iter().any(wide),
+            _ => false,
+        }
+    }
+    fn narrow(v: &Val) -> Val {
+        match v {
+            Val::ULong(u) => Val::Double(*u as f64),
+            Val::Nanos(n) => Val::Date(n.div_euclid(super::NANOS_PER_MILLI)),
+            Val::Multi(m) => Val::Multi(m.iter().map(narrow).collect()),
+            o => o.clone(),
+        }
+    }
+    let aware = name.starts_with("MV_")
+        || matches!(
+            name,
+            "TO_DATE_NANOS" | "TO_DATETIME" | "TO_DT" | "TO_LONG" | "TO_UNSIGNED_LONG" | "TO_UL" | "TO_ULONG" | "TO_DOUBLE" | "TO_DBL" | "TO_STRING" | "TO_STR" | "TO_KEYWORD"
+                | "COALESCE" | "IFNULL" | "NVL" | "CASE" | "IIF" | "GREATEST" | "LEAST" | "NULLIF"
+        );
+    (!aware && args.iter().any(wide)).then(|| args.iter().map(narrow).collect())
+}
+
+/// Java `Math.round(double)`: the closest long, ties toward positive infinity.
+pub fn java_round(d: f64) -> i64 {
+    (d + 0.5).floor() as i64
+}
+
 pub fn to_long(v: &Val) -> Val {
     match v {
         Val::Int(i) | Val::Long(i) | Val::Date(i) => Val::Long(*i),
-        Val::Double(d) if d.is_finite() && d.abs() < 9.3e18 => Val::Long(*d as i64),
+        // ES: a date_nanos as a long is its epoch nanoseconds.
+        Val::Nanos(n) => Val::Long(*n),
+        // ES `safeDoubleToLong`: Java `Math.round` (half up) in range.
+        Val::Double(d) if d.is_finite() && d.abs() < 9.3e18 => Val::Long(java_round(*d)),
         Val::Bool(b) => Val::Long(*b as i64),
-        Val::Str(s) => s.trim().parse::<i64>().map(Val::Long).or_else(|_| s.trim().parse::<f64>().map(|d| Val::Long(d as i64))).unwrap_or(Val::Null),
+        Val::Str(s) => s.trim().parse::<i64>().map(Val::Long).or_else(|_| s.trim().parse::<f64>().map_err(|_| ()).and_then(|d| if d.is_finite() && d.abs() < 9.3e18 { Ok(Val::Long(java_round(d))) } else { Err(()) })).unwrap_or(Val::Null),
         Val::Multi(m) => Val::from_list(m.iter().map(to_long).collect()),
         _ => Val::Null,
     }
@@ -373,6 +587,7 @@ pub fn to_int(v: &Val) -> Val {
 pub fn to_double(v: &Val) -> Val {
     match v {
         Val::Int(i) | Val::Long(i) | Val::Date(i) => Val::Double(*i as f64),
+        Val::ULong(u) => Val::Double(*u as f64),
         Val::Double(d) => Val::Double(*d),
         Val::Bool(b) => Val::Double(*b as i64 as f64),
         Val::Str(s) => s.trim().parse::<f64>().map(Val::Double).unwrap_or(Val::Null),
@@ -395,6 +610,7 @@ pub fn to_bool(v: &Val) -> Val {
 pub fn to_date(v: &Val) -> Val {
     match v {
         Val::Date(d) => Val::Date(*d),
+        Val::Nanos(n) => Val::Date(n.div_euclid(super::NANOS_PER_MILLI)),
         Val::Int(i) | Val::Long(i) => Val::Date(*i),
         Val::Double(d) => Val::Date(*d as i64),
         Val::Str(s) => parse_date_str(s).map(Val::Date).unwrap_or(Val::Null),
@@ -428,15 +644,49 @@ pub fn cast(v: &Val, ty: &str) -> Result<Val> {
         "int" | "integer" | "short" | "byte" => to_int(v),
         "double" | "float" | "real" | "half_float" | "scaled_float" => to_double(v),
         "bool" | "boolean" => to_bool(v),
-        "date" | "datetime" | "timestamp" | "date_nanos" => to_date(v),
+        "date" | "datetime" | "timestamp" => to_date(v),
+        "date_nanos" => to_date_nanos(v)?,
         "string" | "keyword" | "text" | "varchar" => to_string(v),
         "ip" | "version" => to_string(v),
         "geo_point" | "cartesian_point" | "geo_shape" | "cartesian_shape" => to_spatial(v, ty),
-        "unsigned_long" => to_long(v),
+        "unsigned_long" => to_unsigned_long(v)?,
         "time_duration" | "date_period" => match v {
             Val::Str(_) => call(if ty == "time_duration" { "TO_TIMEDURATION" } else { "TO_DATEPERIOD" }, &[v.clone()], &FnCtx::default())?,
             _ => v.clone(),
         },
+        // ES SQL TIME (`SqlDataTypeConverter.conversionToTime`): datetime /
+        // date in its zone, numbers as `millis % day`, booleans as 1 / 0,
+        // strings ISO local times; its text otherwise.
+        "time" => match v {
+            Val::Null => Val::Null,
+            Val::Date(ms) => Val::Str(super::sqltime::time_of_datetime(*ms)),
+            Val::Int(i) | Val::Long(i) => Val::Str(super::sqltime::time_of_long(*i)),
+            Val::ULong(u) => Val::Str(super::sqltime::time_of_long(*u as i64)),
+            Val::Double(d) => Val::Str(super::sqltime::time_of_long(d.round() as i64)),
+            Val::Bool(b) => Val::Str(super::sqltime::time_of_long(*b as i64)),
+            Val::Str(s) => Val::Str(super::sqltime::time_of_string(s)?),
+            Val::Multi(m) => Val::from_list(m.iter().map(|x| cast(x, ty)).collect::<Result<Vec<_>>>()?),
+            _ => Val::Null,
+        },
+        t if t == super::exec::TIME_MILLIS => match v {
+            Val::Str(s) => super::sqltime::time_millis(s).map(Val::Long).unwrap_or(Val::Null),
+            Val::Multi(m) => Val::from_list(m.iter().map(|x| cast(x, ty)).collect::<Result<Vec<_>>>()?),
+            _ => Val::Null,
+        },
+        t if t == super::exec::PERIOD_VALUE || t == super::exec::DURATION_VALUE => match v {
+            Val::Str(s) => match super::sqltime::parse_iso(s) {
+                Some(super::sqltime::Amount::Period(y, m)) => Val::Period(y * 12 + m, 0),
+                Some(super::sqltime::Amount::Millis(ms)) => Val::Dur(ms),
+                None => Val::Null,
+            },
+            other => other.clone(),
+        },
+        t if t == super::exec::INTERVAL_TEXT => match v {
+            Val::Str(s) => super::sqltime::sql_text(s).map(Val::Str).unwrap_or(Val::Null),
+            _ => Val::Null,
+        },
+        // An interval to its own type; an interval literal (its value).
+        t if super::sqltime::is_interval(t) || t.starts_with(super::sqltime::LITERAL_PREFIX) => v.clone(),
         other => return Err(EsError::new(400, "parsing_exception", format!("Unsupported conversion to type [{other}]"))),
     })
 }
@@ -461,7 +711,15 @@ pub fn cast_type(ty: &str) -> &'static str {
         "time_duration" => "time_duration",
         "date_period" => "date_period",
         "aggregate_metric_double" => "aggregate_metric_double",
-        _ => "keyword",
+        "time" => "time",
+        t if t == super::exec::TIME_MILLIS => "long",
+        t if t == super::exec::PERIOD_VALUE => "date_period",
+        t if t == super::exec::DURATION_VALUE => "time_duration",
+        t if t.starts_with(super::sqltime::LITERAL_PREFIX) => {
+            let name = &t[super::sqltime::LITERAL_PREFIX.len()..];
+            super::sqltime::INTERVAL_TYPES.iter().find(|n| **n == name).copied().unwrap_or("keyword")
+        }
+        t => super::sqltime::INTERVAL_TYPES.iter().find(|n| **n == t).copied().unwrap_or("keyword"),
     }
 }
 
@@ -949,8 +1207,408 @@ fn localize_date(s: String, locale: Option<&str>) -> String {
 /// The trailing argument [`super::exec`] adds to a spatial relation on geo
 /// types.
 pub const GEO_RELATION: &str = "\u{0}geo";
+/// Internal function of a bound ordering comparison (and BETWEEN) over
+/// `version` / `ip` values: the operand's sortable encoding
+/// ([`typed_key`]), so the comparison orders by version precedence / by the
+/// 16-byte address as ES does, not by rendered text.
+pub const TYPED_KEY_FN: &str = "\u{0}TYPED_KEY";
+
+/// A `version` or `ip` value (`ty`) as a string whose byte order is the
+/// type's order: versions by their sortable encoding, addresses as the
+/// hex of their IPv6(-mapped) 16 bytes. Other values pass unchanged.
+pub fn typed_key(v: &Val, ty: &str) -> Val {
+    match v {
+        Val::Multi(m) => Val::Multi(m.iter().map(|x| typed_key(x, ty)).collect()),
+        Val::Str(s) if ty == "version" => Val::Str(rustic_core::fieldtypes::version::encode(s)),
+        Val::Str(s) if ty == "ip" => match s.trim().parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                let bytes = match ip {
+                    std::net::IpAddr::V4(a) => a.to_ipv6_mapped().octets(),
+                    std::net::IpAddr::V6(a) => a.octets(),
+                };
+                Val::Str(bytes.iter().map(|b| format!("{b:02x}")).collect())
+            }
+            Err(_) => v.clone(),
+        },
+        o => o.clone(),
+    }
+}
+/// Marker argument of a bound `ST_DISTANCE` over cartesian points: the
+/// Pythagorean distance in coordinate units (ES `StDistance` on cartesian
+/// types), not geographic meters.
+pub const CARTESIAN_DISTANCE: &str = "\u{0}cartesian";
+
+/// Internal: dense-vector arithmetic `(op, a, b)` (ES `Add` / `Sub` / `Mul`
+/// / `Div` on `dense_vector`): coordinate by coordinate for two vectors of
+/// one dimension, or each coordinate with a scalar; `null` otherwise.
+pub const VECTOR_ARITH: &str = "\u{0}VECTOR_ARITH";
+
+fn vector_arith(op: &str, a: &Val, b: &Val) -> Val {
+    let coords = |v: &Val| -> Option<Vec<f64>> {
+        match v {
+            Val::Multi(m) => m.iter().map(Val::as_f64).collect(),
+            Val::Null => None,
+            other => other.as_f64().map(|x| vec![x]),
+        }
+    };
+    let (Some(x), Some(y)) = (coords(a), coords(b)) else { return Val::Null };
+    let f = |p: f64, q: f64| -> f64 {
+        match op {
+            "+" => p + q,
+            "-" => p - q,
+            "*" => p * q,
+            _ => p / q,
+        }
+    };
+    let scalar_a = !matches!(a, Val::Multi(_));
+    let scalar_b = !matches!(b, Val::Multi(_));
+    let out: Vec<f64> = match (scalar_a, scalar_b) {
+        (false, false) if x.len() == y.len() => x.iter().zip(&y).map(|(p, q)| f(*p, *q)).collect(),
+        (false, true) => x.iter().map(|p| f(*p, y[0])).collect(),
+        (true, false) => y.iter().map(|q| f(x[0], *q)).collect(),
+        (true, true) => vec![f(x[0], y[0])],
+        _ => return Val::Null,
+    };
+    if out.iter().any(|v| !v.is_finite()) {
+        return Val::Null;
+    }
+    Val::Multi(out.into_iter().map(Val::Double).collect())
+}
+
+/// Internal: SQL `DATE_DIFF(unit, start, end)` (ES SQL `DateDiff`): the
+/// number of unit boundaries crossed between the two datetimes, not the
+/// elapsed time divided by the unit (12:59 to 13:00 is one hour).
+pub const SQL_DATE_DIFF: &str = "\u{0}SQL_DATE_DIFF";
+/// Internal: a MySQL `DATE_FORMAT` pattern computed at run time, as Java.
+pub const MYSQL_PATTERN_FN: &str = "\u{0}MYSQL_PATTERN";
+
+/// A MySQL `DATE_FORMAT` pattern (ES SQL `DateFormat`) as the equivalent
+/// Java `DateTimeFormatter` pattern (literal text quoted).
+pub fn mysql_to_java_pattern(p: &str) -> String {
+    let mut out = String::new();
+    let mut lit = String::new();
+    let flush = |lit: &mut String, out: &mut String| {
+        if !lit.is_empty() {
+            out.push('\'');
+            out.push_str(&lit.replace('\'', "''"));
+            out.push('\'');
+            lit.clear();
+        }
+    };
+    let mut it = p.chars();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            lit.push(c);
+            continue;
+        }
+        let Some(spec) = it.next() else { lit.push('%'); break };
+        let java = match spec {
+            'a' => "EEE",
+            'b' => "MMM",
+            'c' => "M",
+            'd' => "dd",
+            'e' => "d",
+            'f' => "SSSSSS",
+            'H' => "HH",
+            'h' | 'I' => "hh",
+            'i' => "mm",
+            'j' => "DDD",
+            'k' => "H",
+            'l' => "h",
+            'M' => "MMMM",
+            'm' => "MM",
+            'p' => "a",
+            'r' => "hh:mm:ss a",
+            'S' | 's' => "ss",
+            'T' => "HH:mm:ss",
+            'W' => "EEEE",
+            'Y' => "yyyy",
+            'y' => "yy",
+            other => {
+                lit.push(other);
+                continue;
+            }
+        };
+        flush(&mut lit, &mut out);
+        out.push_str(java);
+    }
+    flush(&mut lit, &mut out);
+    out
+}
+
+/// [`SQL_DATE_DIFF`]: boundary counts in UTC.
+fn sql_date_diff(unit: &str, a: i64, b: i64) -> Option<i64> {
+    let span = |u: i64| Some(b.div_euclid(u) - a.div_euclid(u));
+    let ym = |ms: i64| -> Option<(i64, i64)> {
+        let d = chrono::Utc.timestamp_millis_opt(ms).single()?.naive_utc();
+        Some((d.year() as i64, d.month0() as i64))
+    };
+    match unit.to_ascii_lowercase().as_str() {
+        "millisecond" | "milliseconds" | "ms" => Some(b - a),
+        "second" | "seconds" | "ss" | "s" => span(1000),
+        "minute" | "minutes" | "mi" | "n" => span(60_000),
+        "hour" | "hours" | "hh" => span(3_600_000),
+        "day" | "days" | "dd" | "d" | "dayofyear" | "dy" | "y" => span(86_400_000),
+        "month" | "months" | "mm" | "m" => {
+            let ((ya, ma), (yb, mb)) = (ym(a)?, ym(b)?);
+            Some((yb * 12 + mb) - (ya * 12 + ma))
+        }
+        "quarter" | "quarters" | "qq" | "q" => {
+            let ((ya, ma), (yb, mb)) = (ym(a)?, ym(b)?);
+            Some((yb * 4 + mb / 3) - (ya * 4 + ma / 3))
+        }
+        "year" | "years" | "yyyy" | "yy" => Some(ym(b)?.0 - ym(a)?.0),
+        _ => date_diff(unit, a, b),
+    }
+}
+
+/// The canonical name of an ES SQL function alias (`DAYOFWEEK` is
+/// `DAY_OF_WEEK`, `CEILING` is `CEIL`, ...); other names unchanged.
+pub fn sql_alias(name: &str) -> &str {
+    match name {
+        "CEILING" => "CEIL",
+        "RAND" => "RANDOM",
+        "TRUNC" => "TRUNCATE",
+        "CHARACTER_LENGTH" => "CHAR_LENGTH",
+        "DATEDIFF" | "TIMESTAMPDIFF" | "TIMESTAMP_DIFF" => "DATE_DIFF",
+        "DATETRUNC" => "DATE_TRUNC",
+        "DATEADD" | "TIMESTAMPADD" | "TIMESTAMP_ADD" => "DATE_ADD",
+        "DATEPART" => "DATE_PART",
+        "DAYOFWEEK" | "DOW" => "DAY_OF_WEEK",
+        "ISODAYOFWEEK" | "ISODOW" | "IDOW" => "ISO_DAY_OF_WEEK",
+        "DAYOFYEAR" | "DOY" => "DAY_OF_YEAR",
+        "WEEK" => "WEEK_OF_YEAR",
+        "ISOWEEK" | "ISOWEEKOFYEAR" | "IW" | "IWOY" => "ISO_WEEK_OF_YEAR",
+        "DAYNAME" => "DAY_NAME",
+        "MONTHNAME" => "MONTH_NAME",
+        "DAYOFMONTH" | "DOM" => "DAY_OF_MONTH",
+        "MONTH_OF_YEAR" => "MONTH",
+        "HOUR_OF_DAY" => "HOUR",
+        "MINUTE_OF_HOUR" => "MINUTE",
+        "SECOND_OF_MINUTE" => "SECOND",
+        other => other,
+    }
+}
+
+/// `java.util.Random(seed).nextDouble()` (ES SQL `RANDOM(seed)`).
+pub fn java_random_double(seed: i64) -> f64 {
+    const MULT: u64 = 0x5DEECE66D;
+    const MASK: u64 = (1 << 48) - 1;
+    let mut s = (seed as u64 ^ MULT) & MASK;
+    let mut next = |bits: u32| {
+        s = (s.wrapping_mul(MULT).wrapping_add(0xB)) & MASK;
+        s >> (48 - bits)
+    };
+    let hi = next(26);
+    let lo = next(27);
+    ((hi << 27) + lo) as f64 * (1.0f64 / (1u64 << 53) as f64)
+}
+
+/// ES SQL `WEEK_OF_YEAR`: weeks start on Sunday and week 1 holds
+/// January 1st (`WeekFields.of(SUNDAY, 1).weekOfYear()`).
+fn us_week(d: &chrono::NaiveDateTime) -> i64 {
+    let jan1 = chrono::NaiveDate::from_ymd_opt(d.year(), 1, 1).map(|j| j.weekday().num_days_from_sunday() as i64).unwrap_or(0);
+    (d.ordinal() as i64 - 1 + jan1) / 7 + 1
+}
+
+/// The ES SQL-only scalars (ES SQL's `DateTimeFunction`s, `MathFunction`s
+/// and `StringFunction`s with no ES|QL counterpart); `None`: not one.
+fn sql_scalar(name: &str, args: &[Val]) -> Option<Val> {
+    let a0 = args.first().cloned().unwrap_or(Val::Null);
+    let date = |v: &Val| match v {
+        Val::Date(d) => Some(*d),
+        Val::Nanos(n) => Some(n.div_euclid(super::NANOS_PER_MILLI)),
+        _ => None,
+    };
+    let local = |v: &Val| date(v).and_then(|ms| chrono::Utc.timestamp_millis_opt(local_ms(ms)).single()).map(|d| d.naive_utc());
+    let int = |v: Option<i64>| v.map(Val::Int).unwrap_or(Val::Null);
+    Some(match name {
+        "SIGN" => match &a0 {
+            Val::Int(i) => Val::Int(i.signum()),
+            Val::Long(l) => Val::Long(l.signum()),
+            v => match f_arg(v) {
+                Some(x) => Val::Double(if x == 0.0 { 0.0 } else { x.signum() }),
+                None => Val::Null,
+            },
+        },
+        "COT" => math1(args, |x| 1.0 / x.tan()),
+        "EXPM1" => math1(args, f64::exp_m1),
+        "DEGREES" => math1(args, f64::to_degrees),
+        "RADIANS" => math1(args, f64::to_radians),
+        "RANDOM" => match i_arg(&a0) {
+            Some(seed) => Val::Double(java_random_double(seed)),
+            None => Val::Double(java_random_double(crate::date::now_millis() ^ std::process::id() as i64)),
+        },
+        "CHAR" => match i_arg(&a0) {
+            Some(c @ 0..=255) => Val::Str(char::from(c as u8).to_string()),
+            _ => Val::Null,
+        },
+        // INSERT(source, start, length, replacement): ES's
+        // `StringBuilder.replace(start - 1, start - 1 + length, ..)`.
+        "INSERT" => {
+            let (Some(src), Some(start), Some(len), Some(rep)) = (s_arg(&a0), args.get(1).and_then(i_arg), args.get(2).and_then(i_arg), args.get(3).and_then(s_arg)) else { return Some(Val::Null) };
+            let chars: Vec<char> = src.chars().collect();
+            let from = (start - 1).max(0);
+            if start - 1 > chars.len() as i64 {
+                Val::Str(src)
+            } else if len < 0 {
+                Val::Null
+            } else {
+                let from = from as usize;
+                let to = (from as i64 + len).min(chars.len() as i64) as usize;
+                let mut out: String = chars[..from].iter().collect();
+                out.push_str(&rep);
+                out.extend(&chars[to.max(from)..]);
+                Val::Str(out)
+            }
+        }
+        "OCTET_LENGTH" => match s_arg(&a0) {
+            Some(s) => Val::Int(s.len() as i64),
+            None => Val::Null,
+        },
+        // Sunday is 1 (`NonIsoDateTimeExtractor.DAY_OF_WEEK`).
+        "DAY_OF_WEEK" => int(local(&a0).map(|d| d.weekday().num_days_from_sunday() as i64 + 1)),
+        "ISO_DAY_OF_WEEK" => int(local(&a0).map(|d| d.weekday().number_from_monday() as i64)),
+        "DAY_OF_YEAR" => int(local(&a0).map(|d| d.ordinal() as i64)),
+        // Weeks start on Sunday; week 1 holds January 1st
+        // (`WeekFields.of(SUNDAY, 1).weekOfYear()`).
+        "WEEK_OF_YEAR" => int(local(&a0).map(|d| us_week(&d))),
+        "ISO_WEEK_OF_YEAR" => int(local(&a0).map(|d| d.iso_week().week() as i64)),
+        "QUARTER" => int(local(&a0).map(|d| d.month0() as i64 / 3 + 1)),
+        "MINUTE_OF_DAY" => int(local(&a0).map(|d| (d.hour() * 60 + d.minute()) as i64)),
+        // DATE_ADD(unit, count, datetime)
+        "DATE_ADD" => {
+            let (Some(unit), Some(n), Some(ms)) = (s_arg(&a0), args.get(1).and_then(i_arg), args.get(2).and_then(date)) else { return Some(Val::Null) };
+            let fixed = |step: i64| n.checked_mul(step).and_then(|d| ms.checked_add(d)).map(Val::Date).unwrap_or(Val::Null);
+            match unit.to_ascii_lowercase().as_str() {
+                "year" | "years" | "yy" | "yyyy" => Val::Date(add_period(ms, n * 12, 0)),
+                "quarter" | "quarters" | "qq" | "q" => Val::Date(add_period(ms, n * 3, 0)),
+                "month" | "months" | "mm" | "m" => Val::Date(add_period(ms, n, 0)),
+                "dayofyear" | "dy" | "y" | "day" | "days" | "dd" | "d" | "weekday" | "weekdays" | "dw" => Val::Date(add_period(ms, 0, n)),
+                "week" | "weeks" | "wk" | "ww" => Val::Date(add_period(ms, 0, n * 7)),
+                "hour" | "hours" | "hh" => fixed(3_600_000),
+                "minute" | "minutes" | "mi" | "n" => fixed(60_000),
+                "second" | "seconds" | "ss" | "s" => fixed(1000),
+                "millisecond" | "milliseconds" | "ms" => fixed(1),
+                "microsecond" | "microseconds" | "mcs" => Val::Date(ms + n / 1000),
+                "nanosecond" | "nanoseconds" | "ns" => Val::Date(ms + n / 1_000_000),
+                _ => Val::Null,
+            }
+        }
+        // DATE_PART(unit, datetime)
+        "DATE_PART" => {
+            let (Some(unit), Some(d)) = (s_arg(&a0), args.get(1).and_then(local)) else { return Some(Val::Null) };
+            let ms = args.get(1).and_then(date).unwrap_or(0);
+            int(match unit.to_ascii_lowercase().as_str() {
+                "year" | "years" | "yy" | "yyyy" => Some(d.year() as i64),
+                "quarter" | "quarters" | "qq" | "q" => Some(d.month0() as i64 / 3 + 1),
+                "month" | "months" | "mm" | "m" => Some(d.month() as i64),
+                "dayofyear" | "dy" | "y" => Some(d.ordinal() as i64),
+                "day" | "days" | "dd" | "d" => Some(d.day() as i64),
+                // ES 9.5.5: DATE_PART week is WEEK_OF_YEAR's (Sunday-start) week.
+                "week" | "weeks" | "wk" | "ww" => Some(us_week(&d)),
+                "weekday" | "weekdays" | "dw" => Some(d.weekday().num_days_from_sunday() as i64 + 1),
+                "hour" | "hours" | "hh" => Some(d.hour() as i64),
+                "minute" | "minutes" | "mi" | "n" => Some(d.minute() as i64),
+                "second" | "seconds" | "ss" | "s" => Some(d.second() as i64),
+                "millisecond" | "milliseconds" | "ms" => Some((d.nanosecond() / 1_000_000) as i64),
+                "microsecond" | "microseconds" | "mcs" => Some((d.nanosecond() / 1000) as i64),
+                "nanosecond" | "nanoseconds" | "ns" => Some(d.nanosecond() as i64),
+                "tzoffset" | "tz" => Some(super::zone().offset_at(ms) as i64 / 60),
+                _ => None,
+            })
+        }
+        _ => return None,
+    })
+}
+
+/// ES SQL's GREATEST / LEAST (nulls skipped), REPLACE (literal), CONCAT
+/// (NULL read as ''), LENGTH (trailing blanks excluded): internal names the
+/// SQL binder resolves those functions to.
+/// PromQL's label regex match: RE2 (Rust `regex`), fully anchored.
+pub const PROMQL_RE: &str = "\u{0}PROMQL_RE";
+
+pub const SQL_GREATEST: &str = "\u{0}SQL_GREATEST";
+pub const SQL_LEAST: &str = "\u{0}SQL_LEAST";
+pub const SQL_REPLACE: &str = "\u{0}SQL_REPLACE";
+pub const SQL_CONCAT: &str = "\u{0}SQL_CONCAT";
+pub const SQL_LENGTH: &str = "\u{0}SQL_LENGTH";
+
+fn sql_string_fn(name: &str, args: &[Val]) -> Option<Val> {
+    let a = |i: usize| args.get(i).and_then(s_arg);
+    Some(match name {
+        n if n == SQL_GREATEST || n == SQL_LEAST => {
+            let vals = args.iter().filter(|v| !v.is_null()).flat_map(mv_list);
+            (if n == SQL_GREATEST { vals.max_by(cmp_vals) } else { vals.min_by(cmp_vals) }).unwrap_or(Val::Null)
+        }
+        n if n == SQL_REPLACE => match (a(0), a(1), a(2)) {
+            (Some(s), Some(pat), Some(rep)) if !pat.is_empty() => Val::Str(s.replace(&pat, &rep)),
+            (Some(s), Some(_), Some(_)) => Val::Str(s),
+            _ => Val::Null,
+        },
+        n if n == SQL_CONCAT => match (a(0), a(1)) {
+            (None, None) => Val::Str(String::new()),
+            (x, y) => Val::Str(x.unwrap_or_default() + &y.unwrap_or_default()),
+        },
+        n if n == SQL_LENGTH => a(0).map(|s| Val::Int(s.trim_end_matches(' ').chars().count() as i64)).unwrap_or(Val::Null),
+        _ => return None,
+    })
+}
 
 pub fn call(name: &str, args: &[Val], ctx: &FnCtx) -> Result<Val> {
+    if name == PROMQL_RE {
+        return Ok(match (args.first().and_then(s_arg), args.get(1).and_then(s_arg)) {
+            (Some(v), Some(p)) => match ctx.regex_cache.borrow_mut().get(&format!("^(?:{p})$"))? {
+                Some(re) => Val::Bool(re.is_match(&v)?),
+                None => Val::Null,
+            },
+            _ => Val::Null,
+        });
+    }
+    if let Some(v) = sql_string_fn(name, args) {
+        return Ok(v);
+    }
+    if let Some(v) = sql_scalar(name, args) {
+        return Ok(v);
+    }
+    if name == SQL_DATE_DIFF {
+        let ms = |v: Option<&Val>| match v {
+            Some(Val::Date(d)) => Some(*d),
+            Some(Val::Nanos(n)) => Some(n.div_euclid(super::NANOS_PER_MILLI)),
+            _ => None,
+        };
+        return Ok(match (args.first().and_then(Val::as_str), ms(args.get(1)), ms(args.get(2))) {
+            (Some(u), Some(a), Some(b)) => sql_date_diff(u, a, b).and_then(|v| i32::try_from(v).ok()).map(|v| Val::Int(v as i64)).unwrap_or(Val::Null),
+            _ => Val::Null,
+        });
+    }
+    if name == MYSQL_PATTERN_FN {
+        return Ok(match args.first().and_then(Val::as_str) {
+            Some(p) => Val::Str(mysql_to_java_pattern(p)),
+            None => Val::Null,
+        });
+    }
+    if name == VECTOR_ARITH {
+        let op = args.first().and_then(Val::as_str).unwrap_or_default();
+        return Ok(vector_arith(op, args.get(1).unwrap_or(&Val::Null), args.get(2).unwrap_or(&Val::Null)));
+    }
+    if name == TYPED_KEY_FN {
+        let ty = args.get(1).and_then(Val::as_str).unwrap_or_default();
+        return Ok(typed_key(args.first().unwrap_or(&Val::Null), ty));
+    }
+    if let Some(narrowed) = legacy_args(name, args) {
+        let r = call(name, &narrowed, ctx)?;
+        // A rounding of a date_nanos stays a date_nanos (its type).
+        fn widen(v: Val) -> Val {
+            match v {
+                Val::Date(ms) => ms.checked_mul(super::NANOS_PER_MILLI).map(Val::Nanos).unwrap_or(Val::Null),
+                Val::Multi(m) => Val::Multi(m.into_iter().map(widen).collect()),
+                o => o,
+            }
+        }
+        let nanos_in = args.iter().any(|a| matches!(a, Val::Nanos(_)));
+        return Ok(if nanos_in && matches!(name, "DATE_TRUNC" | "BUCKET" | "TBUCKET") { widen(r) } else { r });
+    }
     let a0 = args.first().cloned().unwrap_or(Val::Null);
     let n = args.len();
     let arity = |lo: usize, hi: usize| -> Result<()> { if n < lo || n > hi { Err(bad_arity(name)) } else { Ok(()) } };
@@ -1112,8 +1770,14 @@ pub fn call(name: &str, args: &[Val], ctx: &FnCtx) -> Result<Val> {
             }
         }
         "REPLACE" => match (s_arg(&a0), args.get(1).and_then(s_arg), args.get(2).and_then(s_arg)) {
+            // Java `Matcher.replaceAll`: `$n` / `${name}` capture references
+            // and `\` escapes in the replacement (ES `Replace`); an invalid
+            // reference fails the row with ES's warning.
             (Some(s), Some(re), Some(rep)) => match ctx.regex_cache.borrow_mut().get(&re)? {
-                Some(r) => Val::Str(r.replace(&s,&rep)?),
+                Some(r) => match r.replace_java(&s, &rep)? {
+                    Ok(out) => Val::Str(out),
+                    Err(e) => return Err(eval_warning(e)),
+                },
                 None => Val::Null,
             },
             _ => Val::Null,
@@ -1176,7 +1840,8 @@ pub fn call(name: &str, args: &[Val], ctx: &FnCtx) -> Result<Val> {
         },
         // ---- date
         "NOW" | "CURRENT_TIMESTAMP" => Val::Date(ctx.now),
-        "CURRENT_DATE" => Val::Date(ctx.now - ctx.now.rem_euclid(86_400_000)),
+        // Today's start in the query's zone.
+        "CURRENT_DATE" => Val::Date(in_zone(ctx.now, |l| Some(l - l.rem_euclid(86_400_000))).unwrap_or(ctx.now - ctx.now.rem_euclid(86_400_000))),
         "DATE_TRUNC" => {
             arity(2, 2)?;
             match (&a0, &args[1]) {
@@ -1272,13 +1937,20 @@ pub fn call(name: &str, args: &[Val], ctx: &FnCtx) -> Result<Val> {
                 None => return Err(eval_warning(format!("org.elasticsearch.xpack.esql.core.InvalidArgumentException: Unable to convert [{v}] to number of base [{base}]"))),
             }
         }
-        "TO_LONG" | "TO_UNSIGNED_LONG" | "TO_UL" | "TO_ULONG" => to_long(&a0),
+        "TO_LONG" => to_long(&a0),
+        "TO_UNSIGNED_LONG" | "TO_UL" | "TO_ULONG" => to_unsigned_long(&a0)?,
         "TO_INTEGER" | "TO_INT" => to_int(&a0),
         "TO_DOUBLE" | "TO_DBL" => to_double(&a0),
         "TO_BOOLEAN" | "TO_BOOL" => to_bool(&a0),
-        "TO_DATETIME" | "TO_DT" | "TO_DATE_NANOS" => to_date(&a0),
+        "TO_DATETIME" | "TO_DT" => to_date(&a0),
+        "TO_DATE_NANOS" => to_date_nanos(&a0)?,
         "TO_IP" => match &a0 {
-            Val::Str(s) if ip_to_bytes(s).is_some() => Val::Str(s.trim().parse::<std::net::IpAddr>().map(|i| i.to_string()).unwrap_or_else(|_| s.clone())),
+            // An IPv4-mapped IPv6 address is the IPv4 address (Java's
+            // `InetAddress`, as ES parses it).
+            Val::Str(s) if ip_to_bytes(s).is_some() => Val::Str(s.trim().parse::<std::net::IpAddr>().map(|i| match i {
+                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_else(|| v6.to_string()),
+                v4 => v4.to_string(),
+            }).unwrap_or_else(|_| s.clone())),
             Val::Multi(m) => Val::from_list(m.iter().filter_map(|x| x.as_str().filter(|s| ip_to_bytes(s).is_some()).map(|s| Val::Str(s.to_string()))).collect()),
             _ => Val::Null,
         },
@@ -1376,10 +2048,24 @@ pub fn call(name: &str, args: &[Val], ctx: &FnCtx) -> Result<Val> {
         }
         "MV_PERCENTILE" => {
             let l = mv_list(&a0);
-            match (percentile(l.iter().filter_map(Val::as_f64).collect(), args.get(1).and_then(f_arg).unwrap_or(50.0)), l.first()) {
-                (Some(p), Some(v @ (Val::Int(_) | Val::Long(_)))) if p.fract() == 0.0 => keep_int_type(v, p),
-                (Some(p), _) => Val::Double(p),
-                _ => Val::Null,
+            let p = args.get(1).and_then(f_arg).unwrap_or(50.0);
+            match l.first() {
+                // ES `MvPercentile`: integer / long values interpolate as
+                // the lower value plus the truncated increment, in their type.
+                Some(v @ (Val::Int(_) | Val::Long(_))) => {
+                    let mut xs: Vec<i64> = l.iter().filter_map(Val::as_i64).collect();
+                    xs.sort_unstable();
+                    let rank = p.clamp(0.0, 100.0) / 100.0 * (xs.len() - 1) as f64;
+                    let lo = rank.floor() as usize;
+                    let base = xs[lo];
+                    let r = match xs.get(lo + 1) {
+                        Some(&hi) => base + ((hi - base) as f64 * (rank - lo as f64)) as i64,
+                        None => base,
+                    };
+                    keep_int_type(v, r as f64)
+                }
+                Some(_) => percentile(l.iter().filter_map(Val::as_f64).collect(), p).map(Val::Double).unwrap_or(Val::Null),
+                None => Val::Null,
             }
         }
         "MV_DEDUPE" => {
@@ -1483,10 +2169,17 @@ pub fn call(name: &str, args: &[Val], ctx: &FnCtx) -> Result<Val> {
             };
             Val::Str(addr.to_string())
         }
-        "ST_X" | "ST_Y" => match s_arg(&a0).and_then(|s| super::spatial::point_xy(&s)) {
-            Some((x, y)) => Val::Double(if name == "ST_X" { x } else { y }),
-            None => Val::Null,
-        },
+        // `@ConvertEvaluator`: every point of a multi-value converted, in order.
+        "ST_X" | "ST_Y" => {
+            let one = |v: &Val| match s_arg(v).and_then(|s| super::spatial::point_xy(&s)) {
+                Some((x, y)) => Val::Double(if name == "ST_X" { x } else { y }),
+                None => Val::Null,
+            };
+            match &a0 {
+                Val::Multi(points) => Val::from_list(points.iter().map(one).filter(|v| !matches!(v, Val::Null)).collect()),
+                point => one(point),
+            }
+        }
         "ST_DISTANCE" => {
             // ES `StDistance` (geo): Lucene's `SloppyMath.haversinMeters`
             // over the quantized coordinates (what doc values hold); a
@@ -1497,7 +2190,17 @@ pub fn call(name: &str, args: &[Val], ctx: &FnCtx) -> Result<Val> {
                     v => s_arg(v).and_then(|s| parse_point(&s)).map(|p| vec![p]),
                 }
             };
+            let cartesian = matches!(args.get(2), Some(Val::Str(m)) if m == CARTESIAN_DISTANCE);
             match (pts(&a0), args.get(1).and_then(pts)) {
+                (Some(a), Some(b)) if cartesian => {
+                    let mut best = f64::INFINITY;
+                    for (x1, y1) in &a {
+                        for (x2, y2) in &b {
+                            best = best.min((x1 - x2).hypot(y1 - y2));
+                        }
+                    }
+                    Val::Double(best)
+                }
                 (Some(a), Some(b)) => {
                     let mut best = f64::INFINITY;
                     for (lon1, lat1) in &a {
@@ -1579,8 +2282,38 @@ fn round_half_up(x: f64) -> f64 {
 
 /// Static return type of a scalar function (None = from the values).
 pub fn return_type(name: &str, arg_types: &[String]) -> Option<String> {
+    // A bound geographic envelope carries a marker argument (see
+    // `func2::GEO_ENVELOPE`): typed as the function of its geometry.
+    let arg_types = if matches!(name, "ST_ENVELOPE" | "ST_XMIN" | "ST_XMAX" | "ST_YMIN" | "ST_YMAX") && arg_types.len() == 2 && arg_types[1] == "keyword" { &arg_types[..1] } else { arg_types };
+    if name == VECTOR_ARITH {
+        return Some("dense_vector".into());
+    }
+    if name == SQL_DATE_DIFF {
+        return Some("integer".into());
+    }
+    if name == PROMQL_RE {
+        return Some("boolean".into());
+    }
+    if name == SQL_REPLACE || name == SQL_CONCAT {
+        return Some("keyword".into());
+    }
+    if name == SQL_LENGTH {
+        return Some("integer".into());
+    }
+    if name == SQL_GREATEST || name == SQL_LEAST {
+        return arg_types.iter().find(|t| t.as_str() != "null").cloned().map(|t| if t == "text" { "keyword".into() } else { t });
+    }
+    if name == MYSQL_PATTERN_FN {
+        return Some("keyword".into());
+    }
     let a0 = arg_types.first().cloned();
     let t: &str = match name {
+        "INSERT" => "keyword",
+        "DAY_OF_WEEK" | "ISO_DAY_OF_WEEK" | "DAY_OF_YEAR" | "WEEK_OF_YEAR" | "ISO_WEEK_OF_YEAR" | "QUARTER" | "MINUTE_OF_DAY" | "DATE_PART" | "OCTET_LENGTH" => "integer",
+        "COT" | "EXPM1" | "RANDOM" | "DEGREES" | "RADIANS" => "double",
+        "CHAR" => "keyword",
+        "DATE_ADD" => "date",
+        "SIGN" => return a0.filter(|t| matches!(t.as_str(), "integer" | "long")).or(Some("double".into())),
         "LENGTH" | "CHAR_LENGTH" | "BIT_LENGTH" | "BYTE_LENGTH" | "LOCATE" | "POSITION" | "MV_COUNT" | "DATE_DIFF" | "LEVENSHTEIN" | "ASCII" | "YEAR" | "MONTH" | "DAY" | "DAY_OF_MONTH" | "HOUR" | "MINUTE" | "SECOND" => "integer",
         "DATE_EXTRACT" => "long",
         "CONCAT" | "TO_UPPER" | "TO_LOWER" | "UPPER" | "LOWER" | "UCASE" | "LCASE" | "TRIM" | "LTRIM" | "RTRIM" | "LEFT" | "RIGHT" | "SUBSTRING" | "SUBSTR" | "REPLACE" | "SPLIT" | "REVERSE" | "REPEAT" | "SPACE" | "TO_BASE64" | "FROM_BASE64" | "DATE_FORMAT" | "DAY_NAME" | "MONTH_NAME" | "TO_STRING" | "TO_STR" | "TO_KEYWORD" | "MV_CONCAT" | "MV_ZIP" => "keyword",
@@ -1620,4 +2353,165 @@ pub fn return_type(name: &str, arg_types: &[String]) -> Option<String> {
         _ => return super::typecheck::lookup(name).and_then(|d| super::typecheck::return_type(d, arg_types)),
     };
     Some(t.to_string())
+}
+
+#[cfg(test)]
+mod exact_value_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn node_with(name: &str, mapping: Value, docs: &[(&str, Value)]) -> std::sync::Arc<crate::node::Node> {
+        let tmp = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        node.create_index(name, &json!({"settings": {"index.number_of_shards": 1, "index.number_of_replicas": 0}, "mappings": {"properties": mapping}})).unwrap();
+        let svc = node.get_index(name).unwrap();
+        let reqs = docs.iter().map(|(id, d)| crate::index::WriteReq::Index { id: Some(id.to_string()), source: d.to_string(), routing: None, cond: Default::default() }).collect();
+        for r in svc.write(reqs, true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        node
+    }
+
+    fn ids(node: &crate::node::Node, index: &str, query: Value) -> Vec<String> {
+        let svc = node.get_index(index).unwrap();
+        let req = crate::search::parse_request(&json!({"query": query, "size": 100}), &HashMap::new()).unwrap();
+        let opts = crate::search::ExecOpts { terms_lookup: None, cursors: None, max_buckets: node.max_buckets(), scroll_id: None, pit_id: None };
+        let out = crate::search::execute(&[crate::search::Target::new(svc)], &req, &opts).unwrap();
+        let v: Value = serde_json::from_str(&out.json).unwrap();
+        let mut ids: Vec<String> = v["hits"]["hits"].as_array().unwrap().iter().map(|h| h["_id"].as_str().unwrap().to_string()).collect();
+        ids.sort();
+        ids
+    }
+
+    fn esql(node: &crate::node::Node, q: &str) -> super::super::EsqlResult {
+        match super::super::run(node, q, super::super::EsqlOptions { default_limit: 1000, max_limit: 10_000, ..Default::default() }) {
+            Ok(r) => r,
+            Err(e) => panic!("{q}: {e:?}"),
+        }
+    }
+
+    /// Review finding 181: long term / terms / range predicates and
+    /// query-language source reads keep adjacent values above 2^53 and
+    /// both extrema exact, for JSON numbers and strings; fractional bounds
+    /// round inward; exclusive bounds past the extrema match nothing.
+    #[test]
+    fn signed_longs_are_matched_and_read_exactly() {
+        const P: i64 = 9_007_199_254_740_992;
+        let node = node_with("nums", json!({"n": {"type": "long"}}), &[
+            ("a", json!({"n": P})),
+            ("b", json!({"n": P + 1})),
+            ("mx", json!({"n": i64::MAX})),
+            ("mn", json!({"n": i64::MIN})),
+            ("s", json!({"n": "9007199254740995"})),
+        ]);
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(ids(&node, "nums", json!({"term": {"n": P + 1}})), v(&["b"]));
+        assert_eq!(ids(&node, "nums", json!({"term": {"n": (P + 1).to_string()}})), v(&["b"]));
+        assert_eq!(ids(&node, "nums", json!({"term": {"n": i64::MAX}})), v(&["mx"]));
+        assert_eq!(ids(&node, "nums", json!({"term": {"n": i64::MIN.to_string()}})), v(&["mn"]));
+        assert_eq!(ids(&node, "nums", json!({"term": {"n": 1.5}})), Vec::<String>::new());
+        assert_eq!(ids(&node, "nums", json!({"terms": {"n": [P + 1, i64::MAX]}})), v(&["b", "mx"]));
+        assert_eq!(ids(&node, "nums", json!({"range": {"n": {"gt": P, "lt": P + 3}}})), v(&["b"]));
+        assert_eq!(ids(&node, "nums", json!({"range": {"n": {"gte": (P + 1).to_string(), "lte": P + 1}}})), v(&["b"]));
+        assert_eq!(ids(&node, "nums", json!({"range": {"n": {"gt": i64::MAX}}})), Vec::<String>::new());
+        assert_eq!(ids(&node, "nums", json!({"range": {"n": {"lt": i64::MIN}}})), Vec::<String>::new());
+        assert_eq!(ids(&node, "nums", json!({"range": {"n": {"gte": i64::MAX}}})), v(&["mx"]));
+        assert_eq!(ids(&node, "nums", json!({"range": {"n": {"gt": 1.5, "lte": P + 3}}})), v(&["a", "b", "s"]));
+        let r = esql(&node, "FROM nums | KEEP n | SORT n");
+        let got: Vec<Val> = r.table.rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(got, vec![Val::Long(i64::MIN), Val::Long(P), Val::Long(P + 1), Val::Long(P + 3), Val::Long(i64::MAX)]);
+        let r = esql(&node, "FROM nums | WHERE n == 9007199254740993 | KEEP n");
+        assert_eq!(r.table.rows, vec![vec![Val::Long(P + 1)]]);
+    }
+
+    /// Review finding 182: unsigned_long values beyond i64 keep their exact
+    /// identity through projection, grouping and string round trips;
+    /// negative and out-of-range conversions are null with a warning.
+    #[test]
+    fn unsigned_longs_keep_their_full_range() {
+        let node = node_with("u", json!({"v": {"type": "unsigned_long"}}), &[
+            ("a", json!({"v": 9_223_372_036_854_775_808u64})),
+            ("b", json!({"v": 9_223_372_036_854_775_809u64})),
+            ("c", json!({"v": "9223372036854775809"})),
+            ("m", json!({"v": u64::MAX})),
+            ("s", json!({"v": 5})),
+        ]);
+        let r = esql(&node, "FROM u | STATS c = COUNT(*) BY v | SORT v");
+        let vi = r.table.cols.iter().position(|c| c.name == "v").unwrap();
+        let ci = r.table.cols.iter().position(|c| c.name == "c").unwrap();
+        let got: Vec<(Val, Val)> = r.table.rows.iter().map(|row| (row[vi].clone(), row[ci].clone())).collect();
+        assert_eq!(got, vec![
+            (Val::Long(5), Val::Long(1)),
+            (Val::ULong(9_223_372_036_854_775_808), Val::Long(1)),
+            (Val::ULong(9_223_372_036_854_775_809), Val::Long(2)),
+            (Val::ULong(u64::MAX), Val::Long(1)),
+        ]);
+        assert_eq!(crate::esql::format::cell_json(&Val::ULong(u64::MAX), "unsigned_long"), json!(u64::MAX));
+        let r = esql(&node, "FROM u | WHERE v > 9223372036854775808 | EVAL s = TO_STRING(v), back = TO_UNSIGNED_LONG(s) | KEEP v, s, back | SORT v");
+        assert_eq!(r.table.rows.len(), 3);
+        for row in &r.table.rows {
+            assert_eq!(row[0], row[2], "{row:?}");
+            assert_eq!(row[1], Val::Str(row[0].to_text()));
+        }
+        assert_eq!(to_unsigned_long(&Val::Str("18446744073709551615".into())).unwrap(), Val::ULong(u64::MAX));
+        assert!(to_unsigned_long(&Val::Long(-1)).unwrap_err().reason.contains("out of [unsigned_long] range"));
+        assert!(to_unsigned_long(&Val::Str("18446744073709551616".into())).unwrap_err().reason.contains("out of [unsigned_long] range"));
+        let r = esql(&node, "ROW x = TO_UNSIGNED_LONG(-1)");
+        assert_eq!(r.table.rows, vec![vec![Val::Null]]);
+        assert!(r.warnings.iter().any(|w| w.contains("out of [unsigned_long] range")), "{:?}", r.warnings);
+    }
+
+    /// A field mapped `date` in one index and `date_nanos` in another is one
+    /// `date_nanos` column (implicit casting): the millisecond index's values
+    /// widen, so they group with the other index's (one BUCKET row, as
+    /// logsdb's rollover from date to date_nanos expects), and nanoseconds
+    /// render as ES's `strict_date_optional_time_nanos` (3 to 9 digits).
+    #[test]
+    fn date_and_date_nanos_indices_union_to_one_nanos_column() {
+        let node = node_with("dms", json!({"t": {"type": "date"}}), &[("a", json!({"t": "2025-09-09T14:00:00Z"}))]);
+        node.create_index("dns", &json!({"settings": {"index.number_of_shards": 1, "index.number_of_replicas": 0}, "mappings": {"properties": {"t": {"type": "date_nanos"}}}})).unwrap();
+        let svc = node.get_index("dns").unwrap();
+        for r in svc.write(vec![crate::index::WriteReq::Index { id: Some("b".into()), source: json!({"t": "2025-09-09T14:00:01.000000500Z"}).to_string(), routing: None, cond: Default::default() }], true) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let r = esql(&node, "FROM dms,dns | WHERE t >= \"2025-09-09\" | STATS min = MIN(t) BY day = BUCKET(t, 1 day) | LIMIT 10");
+        assert_eq!(r.table.rows.len(), 1, "{:?}", r.table.rows);
+        let texts: Vec<String> = r.table.rows[0].iter().map(|v| v.to_text()).collect();
+        assert_eq!(texts, vec!["2025-09-09T14:00:00.000Z", "2025-09-09T00:00:00.000Z"]);
+        let r = esql(&node, "FROM dms,dns | SORT t | KEEP t");
+        let texts: Vec<String> = r.table.rows.iter().map(|row| row[0].to_text()).collect();
+        assert_eq!(texts, vec!["2025-09-09T14:00:00.000Z", "2025-09-09T14:00:01.0000005Z"]);
+        assert!(r.table.rows.iter().all(|row| matches!(row[0], Val::Nanos(_))), "{:?}", r.table.rows);
+    }
+
+    /// Review finding 183: date_nanos keeps nanoseconds in ES|QL: adjacent
+    /// nanoseconds stay distinct (grouping, ordering, filtering, output),
+    /// TO_DATE_NANOS reads a long as epoch nanoseconds and scales a
+    /// millisecond date, and string round trips are exact.
+    #[test]
+    fn date_nanos_keep_nanosecond_resolution() {
+        let node = node_with("dn", json!({"t": {"type": "date_nanos"}}), &[
+            ("a", json!({"t": "2023-01-01T00:00:00.000000001Z"})),
+            ("b", json!({"t": "2023-01-01T00:00:00.000000002Z"})),
+            ("c", json!({"t": "2023-01-01T00:00:00.000000002Z"})),
+        ]);
+        let r = esql(&node, "FROM dn | STATS c = COUNT(*) BY t | SORT t");
+        let ti = r.table.cols.iter().position(|c| c.name == "t").unwrap();
+        let got: Vec<String> = r.table.rows.iter().map(|row| row[ti].to_text()).collect();
+        assert_eq!(got, vec!["2023-01-01T00:00:00.000000001Z", "2023-01-01T00:00:00.000000002Z"]);
+        let r = esql(&node, "FROM dn | WHERE t > \"2023-01-01T00:00:00.000000001Z\" | STATS c = COUNT(*)");
+        assert_eq!(r.table.rows[0][0], Val::Long(2));
+        let r = esql(&node, "FROM dn | SORT t DESC | LIMIT 1 | EVAL s = TO_STRING(t), back = TO_DATE_NANOS(s), l = TO_LONG(t) | KEEP t, s, back, l");
+        let row = &r.table.rows[0];
+        assert_eq!(row[1], Val::Str("2023-01-01T00:00:00.000000002Z".into()));
+        assert_eq!(row[0], row[2]);
+        assert_eq!(row[3], Val::Long(1_672_531_200_000_000_002));
+        assert_eq!(to_date_nanos(&Val::Long(1_672_531_200_000_000_001)).unwrap(), Val::Nanos(1_672_531_200_000_000_001));
+        assert_eq!(to_date_nanos(&Val::Date(1_672_531_200_001)).unwrap(), Val::Nanos(1_672_531_200_001_000_000));
+        assert!(to_date_nanos(&Val::Long(-1)).is_err());
+        let r = esql(&node, "ROW x = TO_DATE_NANOS(1672531200000000001)");
+        assert_eq!(r.table.rows[0][0].to_text(), "2023-01-01T00:00:00.000000001Z");
+    }
 }

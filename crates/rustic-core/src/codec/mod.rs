@@ -167,7 +167,44 @@ pub const MAGIC: &[u8; 4] = b"RSTC";
 /// of one term every doc has stores no ordinals
 /// ([`CONSTANT_KEYWORD_COLUMN_SINCE`]). Builds before v37 refuse v37
 /// files.
-pub const VERSION: u32 = 37;
+/// v38: a merge writes its sections straight into the segment file, with
+/// no scratch file to copy back: the term dictionary may be interleaved
+/// with the postings (its closed blocks streamed between postings runs, a
+/// gap table locating the postings between them, [`INTERLEAVED_TERMS_SINCE`],
+/// see [`terms`]), and the fast-field section may hold its column directory
+/// after the columns ([`FAST_TRAILER_SINCE`], see
+/// [`fastfields::parse_column_directory`]). The terms and postings
+/// sections may then overlap. Builds before v38 refuse v38 files.
+/// First version whose term dictionaries may be interleaved with the
+/// postings section.
+pub const INTERLEAVED_TERMS_SINCE: u32 = 38;
+/// First version whose fast-field sections may hold their column directory
+/// after the columns.
+pub const FAST_TRAILER_SINCE: u32 = 38;
+/// v39: a mutable graph checkpoint may be incremental ([`GRAPH_DELTA_SINCE`]):
+/// a commit's mutable field entry lists a full checkpoint (`.rmvc`) and the
+/// `RMVD1` deltas (`.rmvd`) written over it since, each holding only the
+/// graph records and source rows that changed. Builds before v39 refuse v39
+/// files.
+/// v40: a mutable graph checkpoint's incremental saves may log link edits
+/// ([`GRAPH_LINK_LOG_SINCE`]): an `RMVD2` save holds the link lists that
+/// changed as edits (ids removed and added, ~16 bytes a list) instead of
+/// whole slot records, with the new nodes' records, replayed over the full
+/// checkpoint at open. Builds before v40 refuse v40 files.
+/// v41: the segment checksum also covers the footer's section table and
+/// doc count ([`INTEGRITY_SINCE`]), and deletion files carry a header
+/// naming their segment, doc count and deletions under a checksum.
+/// Builds before v41 refuse v41 files.
+pub const VERSION: u32 = 41;
+/// First version whose segment checksum covers the footer metadata and
+/// whose deletion files are self-validating (see [`VERSION`] v41).
+pub const INTEGRITY_SINCE: u32 = 41;
+/// First version whose mutable graph checkpoints may be incremental (delta
+/// files over a full checkpoint, see [`VERSION`] v39).
+pub const GRAPH_DELTA_SINCE: u32 = 39;
+/// First version whose incremental graph saves may log link edits (`RMVD2`,
+/// see [`VERSION`] v40).
+pub const GRAPH_LINK_LOG_SINCE: u32 = 40;
 /// First version whose boolean columns may know their docs with a value.
 pub const BOOL_PRESENCE_SINCE: u32 = 37;
 /// First version whose 1-bit integer blocks hold their minimum or maximum.
@@ -450,8 +487,8 @@ pub fn can_read_segment_version(version: u32) -> bool {
 pub fn can_read_vector_segment_version(version: u32) -> bool {
     (1..=vectors::RVEC_VERSION).contains(&version)
 }
-const NUM_SECTIONS: usize = 6;
-const FOOTER_LEN: usize = NUM_SECTIONS * 16 + 4 + 4 + 4;
+pub(crate) const NUM_SECTIONS: usize = 6;
+pub(crate) const FOOTER_LEN: usize = NUM_SECTIONS * 16 + 4 + 4 + 4;
 
 pub fn segment_file_name(id: u32) -> String {
     format!("seg_{id:08}.rstc")
@@ -612,6 +649,9 @@ impl SegmentFileFrame {
         }
         let base = NUM_SECTIONS * 16;
         footer[base..base + 4].copy_from_slice(&num_docs.to_le_bytes());
+        if version >= INTEGRITY_SINCE {
+            crc = crc32_update(crc, &footer[..base + 4]);
+        }
         footer[base + 4..base + 8].copy_from_slice(&(!crc).to_le_bytes());
         footer[base + 8..].copy_from_slice(MAGIC);
         Self { header, pads, footer }
@@ -647,6 +687,7 @@ pub struct SegmentFileWriter<'a> {
     pos: u64,
     offsets: [(u64, u64); NUM_SECTIONS],
     open: Option<usize>,
+    version: u32,
 }
 
 /// Section indexes for [`SegmentFileWriter::begin_section`].
@@ -748,7 +789,7 @@ impl<'a> SegmentFileWriter<'a> {
         header[..4].copy_from_slice(MAGIC);
         header[4..].copy_from_slice(&version.to_le_bytes());
         out.write_all(&header)?;
-        Ok(Self { out, crc: crc32_update(0xFFFF_FFFF, &header), pos: 8, offsets: [(0, 0); NUM_SECTIONS], open: None })
+        Ok(Self { out, crc: crc32_update(0xFFFF_FFFF, &header), pos: 8, offsets: [(0, 0); NUM_SECTIONS], open: None, version })
     }
 
     fn put(&mut self, data: &[u8]) -> Result<()> {
@@ -766,6 +807,19 @@ impl<'a> SegmentFileWriter<'a> {
         self.offsets[i].0 = self.pos;
         self.open = Some(i);
         Ok(())
+    }
+
+    /// Bytes written so far (the next byte's file offset).
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Close the open section and record section `i` as `len` bytes at
+    /// `off`: sections streamed together (an interleaved dictionary and
+    /// the postings it was written between) may overlap.
+    pub fn set_section(&mut self, i: usize, off: u64, len: u64) {
+        self.open = None;
+        self.offsets[i] = (off, len);
     }
 
     /// Append bytes to the open section.
@@ -791,6 +845,9 @@ impl<'a> SegmentFileWriter<'a> {
         }
         let base = NUM_SECTIONS * 16;
         footer[base..base + 4].copy_from_slice(&num_docs.to_le_bytes());
+        if self.version >= INTEGRITY_SINCE {
+            self.crc = crc32_update(self.crc, &footer[..base + 4]);
+        }
         footer[base + 4..base + 8].copy_from_slice(&(!self.crc).to_le_bytes());
         footer[base + 8..].copy_from_slice(MAGIC);
         self.out.write_all(&footer)?;
@@ -869,8 +926,15 @@ pub fn open_segment_file(data: FileSlice, verify_crc: bool) -> Result<SegmentFil
     let base = NUM_SECTIONS * 16;
     let num_docs = u32::from_le_bytes(footer[base..base + 4].try_into().unwrap());
     let stored_crc = u32::from_le_bytes(footer[base + 4..base + 8].try_into().unwrap());
-    if verify_crc && crc32(&bytes[..bytes.len() - FOOTER_LEN]) != stored_crc {
-        return Err(RusticError::Corrupted("segment checksum mismatch".into()));
+    if verify_crc {
+        // From v41 the footer's section table and doc count are covered too.
+        let mut crc = crc32_update(0xFFFF_FFFF, &bytes[..bytes.len() - FOOTER_LEN]);
+        if version >= INTEGRITY_SINCE {
+            crc = crc32_update(crc, &footer[..base + 4]);
+        }
+        if !crc != stored_crc {
+            return Err(RusticError::Corrupted("segment checksum mismatch".into()));
+        }
     }
     let slice = |(off, len): (usize, usize)| data.slice(off..off + len);
     Ok(SegmentFile {
@@ -918,11 +982,11 @@ mod tests {
         assert!(MIN_WRITE_VERSION < IMPACTS_SINCE && IMPACTS_SINCE <= VERSION);
         assert!(can_read_segment_version(DEFAULT_WRITE_VERSION) && DEFAULT_WRITE_VERSION < IMPACTS_SINCE);
         // Unset, valid, and invalid settings (the last cap at v11).
-        for (v, want) in [(None, None), (Some("11"), Some(11)), (Some(" 12 "), Some(12)), (Some("13"), Some(13)), (Some("14"), Some(14)), (Some("15"), Some(15)), (Some("16"), Some(16)), (Some("17"), Some(17)), (Some("18"), Some(18)), (Some("19"), Some(19)), (Some("20"), Some(20)), (Some("21"), Some(21)), (Some("22"), Some(22)), (Some("23"), Some(23)), (Some("24"), Some(24)), (Some("25"), Some(25)), (Some("26"), Some(26)), (Some("27"), Some(27)), (Some("28"), Some(28)), (Some("29"), Some(29)), (Some("30"), Some(30)), (Some("31"), Some(31)), (Some("32"), Some(32)), (Some("33"), Some(33)), (Some("34"), Some(34)), (Some("35"), Some(35)), (Some("36"), Some(36)), (Some("37"), Some(37)), (Some("38"), Some(11)), (Some("10"), Some(11)), (Some("v12"), Some(11)), (Some(""), Some(11))] {
+        for (v, want) in [(None, None), (Some("11"), Some(11)), (Some(" 12 "), Some(12)), (Some("13"), Some(13)), (Some("14"), Some(14)), (Some("15"), Some(15)), (Some("16"), Some(16)), (Some("17"), Some(17)), (Some("18"), Some(18)), (Some("19"), Some(19)), (Some("20"), Some(20)), (Some("21"), Some(21)), (Some("22"), Some(22)), (Some("23"), Some(23)), (Some("24"), Some(24)), (Some("25"), Some(25)), (Some("26"), Some(26)), (Some("27"), Some(27)), (Some("28"), Some(28)), (Some("29"), Some(29)), (Some("30"), Some(30)), (Some("31"), Some(31)), (Some("32"), Some(32)), (Some("33"), Some(33)), (Some("34"), Some(34)), (Some("35"), Some(35)), (Some("36"), Some(36)), (Some("37"), Some(37)), (Some("38"), Some(38)), (Some("39"), Some(39)), (Some("40"), Some(40)), (Some("41"), Some(41)), (Some("42"), Some(11)), (Some("10"), Some(11)), (Some("v12"), Some(11)), (Some(""), Some(11))] {
             assert_eq!(parse_write_version_cap(v), want, "{v:?}");
         }
         // A test override reads the same way.
-        for (v, want) in [(12, 12), (11, 11), (13, 13), (14, 14), (15, 15), (16, 16), (17, 17), (18, 18), (19, 19), (20, 20), (21, 21), (22, 22), (23, 23), (24, 24), (25, 25), (26, 26), (27, 27), (28, 28), (29, 29), (30, 30), (31, 31), (32, 32), (33, 33), (34, 34), (35, 35), (36, 36), (37, 37), (38, DEFAULT_WRITE_VERSION), (10, DEFAULT_WRITE_VERSION)] {
+        for (v, want) in [(12, 12), (11, 11), (13, 13), (14, 14), (15, 15), (16, 16), (17, 17), (18, 18), (19, 19), (20, 20), (21, 21), (22, 22), (23, 23), (24, 24), (25, 25), (26, 26), (27, 27), (28, 28), (29, 29), (30, 30), (31, 31), (32, 32), (33, 33), (34, 34), (35, 35), (36, 36), (37, 37), (38, 38), (39, 39), (40, 40), (41, 41), (42, DEFAULT_WRITE_VERSION), (10, DEFAULT_WRITE_VERSION)] {
             TEST_WRITE_VERSION.with(|t| t.set(v));
             assert_eq!(write_version(), want, "override {v}");
         }

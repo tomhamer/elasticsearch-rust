@@ -461,6 +461,7 @@ pub(super) fn query_ctx<'a>(t: &'a Target, lookup: &'a FieldLookup, leaves: &'a 
         allow_unmapped_fields: t.svc.setting("index.query.parse.allow_unmapped_fields").map(|v| v != "false").unwrap_or(true),
         knn_prefilter: t.effective_filter(),
         knn_prefilter_lookup: Some(t.svc.lookup()),
+        dls_filter: t.dls_filter(),
         allow_expensive_queries: req.allow_expensive_queries && t.svc.setting("index.search.allow_expensive_queries").map(|v| v != "false").unwrap_or(true),
         mappings: Some(&**t.svc),
     }
@@ -571,6 +572,7 @@ fn prepare<'a>(t: &Target, leaves: Vec<LeafReader<'a>>, req: &SearchRequest, ter
         allow_unmapped_fields: t.svc.setting("index.query.parse.allow_unmapped_fields").map(|v| v != "false").unwrap_or(true),
         knn_prefilter: t.effective_filter(),
         knn_prefilter_lookup: Some(t.svc.lookup()),
+        dls_filter: t.dls_filter(),
         allow_expensive_queries: req.allow_expensive_queries && t.svc.setting("index.search.allow_expensive_queries").map(|v| v != "false").unwrap_or(true),
         mappings: Some(&**t.svc),
     };
@@ -650,12 +652,11 @@ fn prepare<'a>(t: &Target, leaves: Vec<LeafReader<'a>>, req: &SearchRequest, ter
                     vals.push(SortValue::F64(v.as_f64().or_else(|| v.as_str().and_then(|x| x.parse().ok())).unwrap_or(f64::INFINITY) * s.scale));
                     continue;
                 }
-                vals.push(after_value(v, s.render, &lookup, &req.sort[i]).map_err(|e| wrap_shard_err(&t.svc.name, e))?);
+                vals.push(after_value_resolved(v, s, &lookup, &req.sort[i]).map_err(|e| wrap_shard_err(&t.svc.name, e))?);
             }
             so.search_after = Some(TopHit::new(leaf, doc, score, vals));
         }
-        let sort_names: Vec<(String, bool)> = req.sort.iter().map(|s| (s.field.clone(), s.descending)).collect();
-        let script_keys = crate::script::search::sort_keys(&sort_names, &so.sort, &req.sort_extra, &t.svc.name, &lookup).map_err(|e| wrap_shard_err(&t.svc.name, e))?;
+        let script_keys = crate::script::search::sort_keys(&req.sort, &so.sort, &t.svc.name, &lookup).map_err(|e| wrap_shard_err(&t.svc.name, e))?;
         let mut top = if k == 0 && so.track_total_hits == TrackTotalHits::False {
             TopDocs::default()
         } else if let Some(mut keys) = script_keys {
@@ -1014,7 +1015,7 @@ fn shard_aggs(t: &Target, run: &IndexRun, req: &SearchRequest, spec: &Value, now
                 }
             }
         }
-        segs.push(AggSeg { leaf: *leaf, lookup: &run.lookup, index: &t.svc.name, max_regex_length: t.svc.setting_usize("index.max_regex_length", 1000), docs, scores });
+        segs.push(AggSeg { shard: 0, leaf: *leaf, lookup: &run.lookup, index: &t.svc.name, index_uuid: &t.svc.uuid, max_regex_length: t.svc.setting_usize("index.max_regex_length", 1000), docs, scores });
     }
     let fetch = |si: usize, doc: DocId, score: f32, spec: &Value| -> Result<Value> {
         let leaf = &segs[si].leaf;
@@ -1042,7 +1043,8 @@ fn shard_aggs(t: &Target, run: &IndexRun, req: &SearchRequest, spec: &Value, now
         }
     };
     let mapping_context = [(t.svc.name.as_str(), run.lookup.as_ref())];
-    let env = AggEnv { mapping_context: &mapping_context, now, max_buckets, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: run.visibility_query.is_some(), top_metrics_max_size: 10, max_result_window: 10_000, profile: false };
+    let index_aliases = [(t.svc.name.as_str(), t.svc.aliases().keys().cloned().collect::<Vec<String>>())];
+    let env = AggEnv { mapping_context: &mapping_context, now, max_buckets, fetch_hit: &fetch, fetch_source: None, all_docs: &all, background_filtered: run.visibility_query.is_some(), top_metrics_max_size: 10, max_result_window: 10_000, profile: false, index_aliases: &index_aliases, terms_lookup: None };
     let request = AggRequest { aggs: spec.clone(), typed_keys: req.typed_keys, max_buckets, now };
     let result = crate::hooks::agg_partial::shard_partial(spec, &segs, &env, &request, skip_pipeline);
     run.visibility_result()?;

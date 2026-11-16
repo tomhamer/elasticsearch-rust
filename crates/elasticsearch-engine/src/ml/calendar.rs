@@ -77,6 +77,7 @@ pub fn put_calendar(node: &Node, id: &str, body: &Value) -> Result<Value> {
         st.calendars.insert(id.to_string(), c.clone());
         Ok(())
     })?;
+    super::process::update_calendars(node);
     Ok(render_calendar(&c))
 }
 
@@ -119,12 +120,13 @@ pub fn delete_calendar(node: &Node, id: &str) -> Result<Value> {
         st.events.retain(|e| e["calendar_id"].as_str() != Some(id));
         Ok(())
     })?;
+    super::process::update_calendars(node);
     Ok(json!({"acknowledged": true}))
 }
 
 /// `PUT _ml/calendars/{id}/jobs/{job_ids}`.
 pub fn put_calendar_job(node: &Node, id: &str, jobs: &str) -> Result<Value> {
-    service(node).mutate(|st| {
+    let out = service(node).mutate(|st| {
         let c = st.calendars.get_mut(id).ok_or_else(|| no_calendar(id))?;
         let mut ids = strings(&c["job_ids"]);
         for j in jobs.split(',').map(str::trim).filter(|j| !j.is_empty()) {
@@ -134,12 +136,14 @@ pub fn put_calendar_job(node: &Node, id: &str, jobs: &str) -> Result<Value> {
         }
         c["job_ids"] = json!(ids);
         Ok(render_calendar(c))
-    })
+    })?;
+    super::process::update_calendars(node);
+    Ok(out)
 }
 
 /// `DELETE _ml/calendars/{id}/jobs/{job_ids}`.
 pub fn delete_calendar_job(node: &Node, id: &str, jobs: &str) -> Result<Value> {
-    service(node).mutate(|st| {
+    let out = service(node).mutate(|st| {
         let c = st.calendars.get_mut(id).ok_or_else(|| no_calendar(id))?;
         let mut ids = strings(&c["job_ids"]);
         for j in jobs.split(',').map(str::trim).filter(|j| !j.is_empty()) {
@@ -151,7 +155,9 @@ pub fn delete_calendar_job(node: &Node, id: &str, jobs: &str) -> Result<Value> {
         }
         c["job_ids"] = json!(ids);
         Ok(render_calendar(c))
-    })
+    })?;
+    super::process::update_calendars(node);
+    Ok(out)
 }
 
 /// `Instant.toString()` of epoch millis (`2017-12-03T00:00:00Z`).
@@ -222,6 +228,7 @@ pub fn post_events(node: &Node, id: &str, body: &Value) -> Result<Value> {
         }
         Ok(())
     })?;
+    super::process::update_calendars(node);
     Ok(json!({"events": out}))
 }
 
@@ -275,6 +282,7 @@ pub fn delete_event(node: &Node, id: &str, event_id: &str) -> Result<Value> {
         st.events.remove(pos);
         Ok(())
     })?;
+    super::process::update_calendars(node);
     Ok(json!({"acknowledged": true}))
 }
 
@@ -362,7 +370,7 @@ pub fn get_filters(node: &Node, id: Option<&str>, from: Option<i64>, size: Optio
 /// `POST _ml/filters/{id}/_update`.
 pub fn update_filter(node: &Node, id: &str, body: &Value) -> Result<Value> {
     let o = body.as_object().cloned().unwrap_or_default();
-    service(node).mutate(|st| {
+    let updated = service(node).mutate(|st| {
         let f = st.filters.get_mut(id).ok_or_else(|| EsError::resource_not_found(format!("No filter with id [{id}] exists")))?;
         let mut items = strings(&f["items"]);
         for a in o.get("add_items").map(strings).unwrap_or_default() {
@@ -388,7 +396,11 @@ pub fn update_filter(node: &Node, id: &str, body: &Value) -> Result<Value> {
         nf.insert("items".into(), json!(items));
         *f = Value::Object(nf);
         Ok(render_filter(f))
-    })
+    })?;
+    // The rules of open jobs see the new items from their next bucket on
+    // (ES `UpdateFilterAction` notifies the jobs using the filter).
+    super::process::update_filters(node);
+    Ok(updated)
 }
 
 /// `DELETE _ml/filters/{id}`.

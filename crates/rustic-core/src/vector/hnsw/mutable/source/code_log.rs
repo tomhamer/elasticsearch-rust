@@ -158,6 +158,10 @@ pub(super) struct CodeLog {
     /// Test seam: a smaller capacity (0: none).
     #[cfg(test)]
     test_capacity: std::sync::atomic::AtomicU64,
+    /// Test seam: smaller chunks (0: [`CHUNK_BYTES`]), so a test's rows fill
+    /// some (checkpoints reference only full chunks).
+    #[cfg(test)]
+    test_chunk_bytes: AtomicUsize,
     _directory_memory: crate::admission::Reservation,
 }
 
@@ -176,6 +180,8 @@ impl CodeLog {
             live: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_capacity: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_chunk_bytes: AtomicUsize::new(0),
             _directory_memory: directory_memory })
     }
 
@@ -227,6 +233,12 @@ impl CodeLog {
     /// Test seam: pretend the log holds at most `rows` rows.
     #[cfg(test)]
     pub fn set_test_capacity(&self, rows: u64) { self.test_capacity.store(rows, Relaxed); }
+    /// Test seam: chunks of `bytes` (before the first row), and the same for
+    /// `self`'s successors made with [`Self::inherit_test_shape`].
+    #[cfg(test)]
+    pub fn set_test_chunk_bytes(&self, bytes: usize) { self.test_chunk_bytes.store(bytes, Relaxed); }
+    #[cfg(test)]
+    pub fn inherit_test_shape(&self, from: &CodeLog) { self.test_chunk_bytes.store(from.test_chunk_bytes.load(Relaxed), Relaxed); }
     /// No further row fits: appending would fail.
     pub fn is_full(&self) -> bool {
         self.capacity().is_some_and(|capacity| self.rows() >= capacity)
@@ -254,7 +266,11 @@ impl CodeLog {
 
     fn fix_shape(&self, row_words: usize) -> Result<()> {
         if row_words == 0 { return Err(failure("empty code log row")); }
-        let rows_per_chunk = (CHUNK_BYTES / (row_words * 4)).max(1);
+        #[cfg(test)]
+        let chunk_bytes = match self.test_chunk_bytes.load(Relaxed) { 0 => CHUNK_BYTES, bytes => bytes };
+        #[cfg(not(test))]
+        let chunk_bytes = CHUNK_BYTES;
+        let rows_per_chunk = (chunk_bytes / (row_words * 4)).max(1);
         self.rows_per_chunk.store(rows_per_chunk, Release);
         self.row_words.store(row_words, Release);
         Ok(())
@@ -423,6 +439,29 @@ impl CodeLog {
         Ok(out)
     }
 
+    /// Make the full chunks among the rows below `upto` durable (existing
+    /// files reused) and nothing of a partial one: their chunk references,
+    /// and the rows they cover. Checkpoints write the rows past those inline
+    /// instead of rewriting the growing last chunk's prefix at every save.
+    pub fn persist_full(&self, directory: &dyn crate::codec::directory::Directory, upto: u64) -> Result<(Vec<ChunkRef>, u64)> {
+        let _io = self.io.lock();
+        let per = self.rows_per_chunk() as u64;
+        let words = self.row_words();
+        if upto == 0 || per == 0 { return Ok((Vec::new(), 0)); }
+        if upto > self.rows() { return Err(failure("code log persistence beyond appended rows")); }
+        let full = upto / per;
+        let mut out = Vec::with_capacity(full as usize);
+        for chunk in 0..full as usize {
+            let existing = self.state.lock().persisted.get(chunk).cloned().flatten();
+            if !matches!(existing, Some((rows, _)) if u64::from(rows) >= per) {
+                let name = self.write_prefix(directory, chunk, per as usize * words, per as u32)?;
+                self.state.lock().persisted[chunk] = Some((per as u32, name));
+            }
+            out.push(ChunkRef { chunk: chunk as u32, rows: per as u32 });
+        }
+        Ok((out, full * per))
+    }
+
     /// Names of every chunk file this log wrote or restored.
     pub fn persisted_files(&self) -> Vec<String> {
         self.state.lock().persisted.iter().flatten().map(|(_, name)| name.clone()).collect()
@@ -439,6 +478,9 @@ impl CodeLog {
     pub fn restore(directory: &dyn crate::codec::directory::Directory, id: u64, row_words: usize, rows_per_chunk: usize, chunks: &[ChunkRef]) -> Result<Self> {
         let log = Self::with_id(id)?;
         if chunks.is_empty() { return Ok(log); }
+        // A test's small chunks reopen as written.
+        #[cfg(test)]
+        log.test_chunk_bytes.store(rows_per_chunk * row_words * 4, Relaxed);
         log.fix_shape(row_words)?;
         if log.rows_per_chunk() != rows_per_chunk { return Err(corrupt("code log chunk shape")); }
         if chunks.len() > MAX_CHUNKS { return Err(corrupt("code log chunk count")); }

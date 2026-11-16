@@ -11,6 +11,9 @@ pub enum Tok {
     QIdent(String),
     Str(String),
     Int(i64),
+    /// An ES|QL integer literal beyond `i64` that fits `u64` (an
+    /// `unsigned_long`, as ES's `visitIntegerValue` reads it).
+    UInt(u64),
     Dec(f64),
     /// `?` (empty), `?name`, `?1`.
     Param(String),
@@ -24,6 +27,31 @@ pub enum Tok {
     Comma,
     Eof,
 }
+
+/// ES SQL / EQL `invokeParser` depth pre-scan (`SqlParser` / `EqlParser`
+/// `MAX_EXPRESSION_DEPTH`): open parentheses plus the current run of
+/// consecutive prefix operators (`NOT`, `-`, `+`) may not exceed `max`,
+/// checked over the tokens before anything is parsed.
+pub fn prefix_depth_exceeds(toks: &[Token], max: i64) -> bool {
+    let (mut depth, mut chain) = (0i64, 0i64);
+    for t in toks {
+        match &t.tok {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth -= 1,
+            Tok::Op("-" | "+") => chain += 1,
+            Tok::Ident(s) if s.eq_ignore_ascii_case("not") => chain += 1,
+            Tok::Eof => {}
+            _ => chain = 0,
+        }
+        if depth + chain > max {
+            return true;
+        }
+    }
+    false
+}
+
+/// ES SQL / EQL `MAX_EXPRESSION_DEPTH`.
+pub const QL_MAX_EXPRESSION_DEPTH: i64 = 250;
 
 #[derive(Clone, Debug)]
 pub struct Token {
@@ -161,6 +189,7 @@ pub fn lex(full: &str, from: usize, to: usize, d: Dialect) -> Result<Vec<Token>>
             } else {
                 match t.parse::<i64>() {
                     Ok(v) => Tok::Int(v),
+                    Err(_) if d == Dialect::Esql && t.parse::<u64>().is_ok() => Tok::UInt(t.parse::<u64>().unwrap_or_default()),
                     Err(_) => Tok::Dec(t.parse().map_err(|_| parsing_err(full, i, format!("invalid number [{t}]")))?),
                 }
             };

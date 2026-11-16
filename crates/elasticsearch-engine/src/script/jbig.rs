@@ -973,6 +973,30 @@ fn bint(i: BigInt) -> Val {
     Val::Big(Rc::new(Big::Int(i)))
 }
 
+/// A JSON integer literal past `i64` / `u64` as an exact `BigInteger`
+/// (`None`: not such a literal).
+pub fn wide_integer_val(raw: &str) -> Option<Val> {
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || raw.parse::<i64>().is_ok() || raw.parse::<u64>().is_ok() {
+        return None;
+    }
+    raw.parse::<BigInt>().ok().map(bint)
+}
+
+impl Big {
+    /// Whether this is a `BigInteger`.
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Big::Int(_))
+    }
+    /// A `BigInteger`'s decimal digits (empty for other kinds).
+    pub fn integer_text(&self) -> String {
+        match self {
+            Big::Int(i) => i.to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
 /// A `BigInteger` holding an unsigned 64-bit value.
 pub fn biginteger_u64(v: u64) -> Val {
     bint(BigInt::from(v))

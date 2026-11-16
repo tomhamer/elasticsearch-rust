@@ -406,10 +406,37 @@ impl Content {
 
 /// Analyze every value of the content with `analyzer` (+ `normalizer` for
 /// keywords); positions continue across values with `gap`.
-fn tokens(vals: &[String], content: &Content, analyzer: &Analyzer, normalizer: Option<&Analyzer>, gap: u32) -> Vec<Tok> {
+/// `limit`: `max_analyzed_offset` (UTF-16 units) per value (`plain`) or
+/// over the joined content: text past it (plus [`ANALYSIS_SLACK`] for a
+/// token straddling it) is never analyzed or mapped (`whole`: keyword-like
+/// fields, whose one token is the whole value, are analyzed whole).
+fn tokens(vals: &[String], content: &Content, analyzer: &Analyzer, normalizer: Option<&Analyzer>, gap: u32, limit: Option<(usize, bool)>, whole: bool) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut next_pos: i64 = 0;
     for (vi, v) in vals.iter().enumerate() {
+        let base = content.values[vi].0;
+        // The part of the value analysis may reach.
+        let v: &str = match limit {
+            Some(_) if whole => v,
+            Some((m, per_value)) => {
+                let local = if per_value { m } else { m.saturating_sub(base) };
+                if !per_value && base > m {
+                    break;
+                }
+                let reach = local.saturating_add(ANALYSIS_SLACK);
+                let mut u = 0usize;
+                let mut cut = v.len();
+                for (bi, c) in v.char_indices() {
+                    if u > reach {
+                        cut = bi;
+                        break;
+                    }
+                    u += c.len_utf16();
+                }
+                &v[..cut]
+            }
+            None => v,
+        };
         // byte offset -> UTF-16 offset within the value
         let mut b2u = vec![0usize; v.len() + 1];
         let mut u = 0usize;
@@ -421,7 +448,8 @@ fn tokens(vals: &[String], content: &Content, analyzer: &Analyzer, normalizer: O
             u += c.len_utf16();
         }
         b2u[v.len()] = u;
-        let base = content.values[vi].0;
+        #[cfg(test)]
+        ANALYZED_BYTES.fetch_add(v.len(), std::sync::atomic::Ordering::Relaxed);
         let toks = analyzer.analyze(v);
         let first = next_pos;
         let mut last = first - 1;
@@ -440,6 +468,14 @@ fn tokens(vals: &[String], content: &Content, analyzer: &Analyzer, normalizer: O
     }
     out
 }
+
+/// UTF-16 units analyzed past `max_analyzed_offset` so a token starting at
+/// or before it is complete (tokenizers cap tokens well below this).
+const ANALYSIS_SLACK: usize = 1024;
+
+/// Tests: bytes of field text handed to analyzers (process-wide).
+#[cfg(test)]
+pub(crate) static ANALYZED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn analyzer_for(f: &ResolvedField) -> Arc<Analyzer> {
     if f.ty.is_keyword_like() {
@@ -559,6 +595,41 @@ fn highlight_field(name: &str, f: &ResolvedField, o: &HighlightOpts, src: &Value
     };
     let weighted = ty == "unified" && terms.weight_matches_setting && !matches::disables_weight_matches(q);
     let sep = if ty == "unified" { MULTIVAL_SEP } else { b' ' as u16 };
+    // The index limit is checked on the values' lengths before anything is
+    // copied, mapped or analyzed (counting UTF-16 units allocates nothing).
+    let lens: Vec<usize> = vals.iter().map(|v| v.encode_utf16().count()).collect();
+    let joined = lens.iter().sum::<usize>() + vals.len().saturating_sub(1);
+    match ty {
+        "plain" => {
+            for len in &lens {
+                analysis_check(*len)?;
+            }
+        }
+        "fvh" => {
+            if !flags.tv_offsets {
+                return Err(EsError::illegal_argument(format!("the field [{name}] should be indexed with term vector with position offsets to be used with fast vector highlighter")));
+            }
+            if terms.synthetic_source && vals.len() > 1 {
+                return Err(EsError::illegal_argument(format!(
+                    "The fast vector highlighter doesn't support loading multi-valued fields from _source in index [{}] because _source can reorder field values",
+                    terms.index
+                )));
+            }
+        }
+        _ => {
+            if !flags.postings_offsets && !flags.tv_offsets && tokenized {
+                analysis_check(joined)?;
+            }
+        }
+    }
+    // The joined content and each value's offset map, charged first.
+    let workspace = crate::memory::RequestMemory::new();
+    let mapped = vals.iter().map(|v| v.len() as u64 + 1).max().unwrap_or(0);
+    let mapped = match qmax {
+        Some(m) if tokenized => mapped.min(((m + ANALYSIS_SLACK) as u64 + 1).saturating_mul(4)),
+        _ => mapped,
+    };
+    workspace.charge((joined as u64).saturating_mul(2).saturating_add(mapped.saturating_mul(8)), "<highlight content>")?;
     let content = Content::new(&vals, sep);
     // token streams: the field itself (+ matched_fields)
     let mut stream_fields: Vec<(Option<u16>, Arc<Analyzer>, Option<Arc<Analyzer>>)> = vec![(if o.require_field_match { Some(id) } else { None }, analyzer_for(f), f.normalizer.clone())];
@@ -578,7 +649,7 @@ fn highlight_field(name: &str, f: &ResolvedField, o: &HighlightOpts, src: &Value
     let limit = qmax;
     let mut tok_lists: Vec<Vec<Tok>> = Vec::new();
     for (_, a, n) in &stream_fields {
-        let mut t = tokens(&vals, &content, a, n.as_deref(), gap);
+        let mut t = tokens(&vals, &content, a, n.as_deref(), gap, limit.map(|m| (m, ty == "plain")), !tokenized);
         if let Some(m) = limit {
             if ty == "plain" {
                 // LimitTokenOffsetFilter per value
@@ -591,29 +662,6 @@ fn highlight_field(name: &str, f: &ResolvedField, o: &HighlightOpts, src: &Value
             }
         }
         tok_lists.push(t);
-    }
-    match ty {
-        "plain" => {
-            for v in &content.values {
-                analysis_check(v.1 - v.0)?;
-            }
-        }
-        "fvh" => {
-            if !flags.tv_offsets {
-                return Err(EsError::illegal_argument(format!("the field [{name}] should be indexed with term vector with position offsets to be used with fast vector highlighter")));
-            }
-            if terms.synthetic_source && vals.len() > 1 {
-                return Err(EsError::illegal_argument(format!(
-                    "The fast vector highlighter doesn't support loading multi-valued fields from _source in index [{}] because _source can reorder field values",
-                    terms.index
-                )));
-            }
-        }
-        _ => {
-            if !flags.postings_offsets && !flags.tv_offsets && tokenized {
-                analysis_check(content.text.len())?;
-            }
-        }
     }
     let streams: Vec<Stream> = stream_fields.iter().zip(&tok_lists).map(|((fid, _, _), t)| Stream { field: *fid, toks: t }).collect();
     // plain / fvh need phrase groups (parts); unified splits them unless weighted
@@ -650,6 +698,91 @@ mod tests {
             vec![serde_json::json!(1), serde_json::json!(2), serde_json::json!(3), serde_json::json!({"nested": 5}), serde_json::json!(false)]);
         assert_eq!(source_values(&source, "").into_iter().cloned().collect::<Vec<_>>(), vec![serde_json::json!(4)]);
         assert!(source_values(&source, "absent").is_empty());
+    }
+
+    /// #323: `max_analyzed_offset` bounds the text analyzed, and the index
+    /// limit is checked before any of a long value is analyzed.
+    #[test]
+    fn analysis_stops_at_the_offset_limit() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let body = format!("alpha {} alpha", "filler ".repeat(300_000));
+        for (name, settings) in [("hl", serde_json::json!({})), ("hl_small", serde_json::json!({"index.highlight.max_analyzed_offset": 1000}))] {
+            let svc = node.create_index(name, &serde_json::json!({"settings": settings, "mappings": {"properties": {"body": {"type": "text"}}}})).unwrap();
+            let w = vec![crate::index::WriteReq::Index { id: Some("1".into()), source: serde_json::json!({"body": body}).to_string(), routing: None, cond: Default::default() }];
+            for r in svc.write(w, false) {
+                r.unwrap();
+            }
+            svc.refresh().unwrap();
+        }
+        let before = ANALYZED_BYTES.load(Relaxed);
+        let r = crate::ml::search(&node, "hl", &serde_json::json!({"query": {"match": {"body": "alpha"}}, "highlight": {"max_analyzed_offset": 50, "fields": {"body": {}}}})).unwrap();
+        let analyzed = ANALYZED_BYTES.load(Relaxed) - before;
+        assert!(analyzed < 64 * 1024, "analyzed {analyzed} of {} bytes", body.len());
+        let frags = r["hits"]["hits"][0]["highlight"]["body"].as_array().unwrap_or_else(|| panic!("{r}"));
+        assert_eq!(frags.iter().map(|f| f.as_str().unwrap().matches("<em>alpha</em>").count()).sum::<usize>(), 1, "{frags:?}");
+        let before = ANALYZED_BYTES.load(Relaxed);
+        let e = crate::ml::search(&node, "hl_small", &serde_json::json!({"query": {"match": {"body": "alpha"}}, "highlight": {"fields": {"body": {}}}}));
+        let analyzed = ANALYZED_BYTES.load(Relaxed) - before;
+        assert!(format!("{e:?}").contains("max_analyzed_offset"), "{e:?}");
+        assert!(analyzed < 64 * 1024, "refused before analysis: {analyzed}");
+    }
+
+    /// A phrase whose stop words were removed (holes in its positions)
+    /// still highlights, through `matched_fields` too (ES 9.5.5
+    /// `60_unified_matched_fields` "single masked field").
+    #[test]
+    fn phrase_with_removed_stop_words_highlights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("mf", &serde_json::json!({"mappings": {"properties": {"title": {"type": "text", "fields": {"english": {"type": "text", "analyzer": "english"}}}}}})).unwrap();
+        let w = ["dancing with the stars", "dance with star"].iter().enumerate()
+            .map(|(i, t)| crate::index::WriteReq::Index { id: Some((i + 1).to_string()), source: serde_json::json!({"title": t}).to_string(), routing: None, cond: Default::default() })
+            .collect();
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let r = crate::ml::search(&node, "mf", &serde_json::json!({
+            "query": {"query_string": {"query": "\"dancing with the stars\"", "fields": ["title^5", "title.english"], "phrase_slop": 2}},
+            "highlight": {"fields": {"title": {"matched_fields": ["title.english"]}}}})).unwrap();
+        let hits = r["hits"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "{r}");
+        assert_eq!(hits[0]["highlight"]["title"][0], "<em>dancing with the stars</em>", "{r}");
+        assert_eq!(hits[1]["highlight"]["title"][0], "<em>dance with star</em>", "{r}");
+    }
+
+    /// #325: a sloppy phrase highlight over a long run of one repeated word
+    /// stays within its work budget (the candidate tree is exponential).
+    #[test]
+    fn sloppy_phrase_highlight_is_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let svc = node.create_index("ph", &serde_json::json!({"mappings": {"properties": {"body": {"type": "text"}}}})).unwrap();
+        let body = "go ".repeat(2000);
+        let w = vec![crate::index::WriteReq::Index { id: Some("1".into()), source: serde_json::json!({"body": body}).to_string(), routing: None, cond: Default::default() }];
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let started = std::time::Instant::now();
+        let r = crate::ml::search(&node, "ph", &serde_json::json!({"query": {"match_all": {}}, "highlight": {"fields": {"body": {
+            "highlight_query": {"match_phrase": {"body": {"query": "go go go go go go go go", "slop": 50}}}}}}})).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+        let frags = r["hits"]["hits"][0]["highlight"]["body"].as_array().unwrap_or_else(|| panic!("{r}"));
+        // Weight-matches mode marks the matched phrase as one span.
+        assert!(frags[0].as_str().unwrap().starts_with("<em>go go go go go go go go</em>"), "{frags:?}");
+        // A short control keeps its exact span.
+        let svc = node.create_index("ph2", &serde_json::json!({"mappings": {"properties": {"body": {"type": "text"}}}})).unwrap();
+        let w = vec![crate::index::WriteReq::Index { id: Some("1".into()), source: serde_json::json!({"body": "the quick brown fox"}).to_string(), routing: None, cond: Default::default() }];
+        for r in svc.write(w, false) {
+            r.unwrap();
+        }
+        svc.refresh().unwrap();
+        let r = crate::ml::search(&node, "ph2", &serde_json::json!({"query": {"match_phrase": {"body": {"query": "quick fox", "slop": 1}}}, "highlight": {"fields": {"body": {}}}})).unwrap();
+        let frag = r["hits"]["hits"][0]["highlight"]["body"][0].as_str().unwrap_or_else(|| panic!("{r}")).to_string();
+        assert!(frag.contains("<em>") && frag.contains("quick") && frag.contains("fox") && !frag.contains("<em>the"), "{frag}");
     }
 
     #[test]

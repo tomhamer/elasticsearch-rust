@@ -56,47 +56,6 @@ pub fn required_ngrams(pattern: &str) -> Vec<String> {
     out
 }
 
-/// Literal runs of a regular expression that every match must contain
-/// (conservative: only top-level runs of plain characters without
-/// alternation are used).
-pub fn regex_required_ngrams(re: &str) -> Vec<String> {
-    if re.contains('|') {
-        return Vec::new();
-    }
-    let mut runs: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut it = re.chars().peekable();
-    let mut depth = 0i32;
-    while let Some(c) = it.next() {
-        let quantified = matches!(it.peek(), Some('*' | '?' | '{'));
-        match c {
-            '\\' => {
-                let n = it.next();
-                match n {
-                    Some(n) if !n.is_alphanumeric() && depth == 0 && !matches!(it.peek(), Some('*' | '?' | '{')) => cur.push(n),
-                    _ => runs.push(std::mem::take(&mut cur)),
-                }
-            }
-            '(' | '[' => {
-                depth += 1;
-                runs.push(std::mem::take(&mut cur));
-            }
-            ')' | ']' => {
-                depth -= 1;
-                runs.push(std::mem::take(&mut cur));
-            }
-            '.' | '*' | '+' | '?' | '{' | '}' | '^' | '$' | '~' | '&' | '<' | '>' | '#' | '@' | '"' => runs.push(std::mem::take(&mut cur)),
-            c if depth == 0 && !quantified => cur.push(c),
-            _ => runs.push(std::mem::take(&mut cur)),
-        }
-    }
-    runs.push(cur);
-    let mut out: Vec<String> = runs.iter().filter(|r| r.chars().count() >= NGRAM).flat_map(|r| ngrams(r)).collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// Glob match (`*` any run, `?` one char, `\` escapes).
 pub fn wildcard_match(pattern: &str, value: &str, case_insensitive: bool) -> bool {
     let (p, v): (Vec<char>, Vec<char>) = if case_insensitive {
@@ -184,7 +143,5 @@ mod tests {
         assert!(wildcard_match("*", "", false));
         assert!(wildcard_match("a*b*c", "aXXbYYc", false));
         assert!(!wildcard_match("a*b*c", "aXXbYY", false));
-        assert_eq!(regex_required_ngrams("foo.*bar"), vec!["bar", "foo"]);
-        assert!(regex_required_ngrams("foo|bar").is_empty());
     }
 }

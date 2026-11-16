@@ -24,7 +24,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 /// One built server + client pair.
 pub(crate) struct TlsPair {
-    acceptor: TlsAcceptor,
+    /// `None`: a client-only context ([`TlsConfig::client_only`]).
+    acceptor: Option<TlsAcceptor>,
     connector: TlsConnector,
 }
 
@@ -43,8 +44,8 @@ fn load_certs(src: &PemSource) -> Result<Vec<CertificateDer<'static>>, Transport
 
 impl TlsState {
     pub(crate) fn new(cfg: &TlsConfig) -> Result<TlsState, TransportError> {
-        let files = std::iter::once(&cfg.certificate)
-            .chain(std::iter::once(&cfg.key))
+        let pair = (!cfg.client_only).then_some([&cfg.certificate, &cfg.key]);
+        let files = pair.into_iter().flatten()
             .chain(cfg.certificate_authorities.iter())
             .filter_map(|src| match src {
                 PemSource::Path(p) => Some(p.clone()),
@@ -78,13 +79,21 @@ impl TlsState {
 
     pub(crate) async fn accept(&self, tcp: TcpStream) -> std::io::Result<tokio_rustls::server::TlsStream<TcpStream>> {
         let pair = self.current.load();
-        pair.acceptor.accept(tcp).await
+        match &pair.acceptor {
+            Some(a) => a.accept(tcp).await,
+            None => Err(std::io::Error::other("TLS context without a key pair cannot accept connections")),
+        }
     }
 }
 
 impl TlsPair {
     fn build(cfg: &TlsConfig) -> Result<TlsPair, TransportError> {
-        let provider = elasticsearch_ssl::provider();
+        let ciphers = elasticsearch_ssl::parse_cipher_suites(&cfg.cipher_suites, "xpack.security.transport.ssl.cipher_suites").map_err(|e| cfg_err("cipher suites", e))?;
+        let versions = elasticsearch_ssl::parse_supported_protocols(&cfg.supported_protocols, "xpack.security.transport.ssl.supported_protocols").map_err(|e| cfg_err("supported protocols", e))?;
+        let provider = elasticsearch_ssl::provider_with(ciphers.as_deref());
+        if cfg.client_only {
+            return Self::build_client_only(cfg, provider, &versions);
+        }
         let chain = load_certs(&cfg.certificate)?;
         let key_pem = cfg.key.load().map_err(|e| cfg_err("cannot read key", e))?;
         let origin = match &cfg.key {
@@ -131,7 +140,7 @@ impl TlsPair {
             }
         };
         let server = ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&versions)
             .map_err(|e| cfg_err("protocol versions", e))?
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(chain.clone(), key.clone_key())
@@ -145,13 +154,45 @@ impl TlsPair {
         };
         let verifier = PeerVerifier::with_restrictions(roots.clone(), mode, &provider, restrictions).map_err(|e| cfg_err("server verifier", e))?;
         let client = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&versions)
             .map_err(|e| cfg_err("protocol versions", e))?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_client_auth_cert(chain, key)
             .map_err(|e| cfg_err("client certificate", e))?;
 
-        Ok(TlsPair { acceptor: TlsAcceptor::from(Arc::new(server)), connector: TlsConnector::from(Arc::new(client)) })
+        Ok(TlsPair { acceptor: Some(TlsAcceptor::from(Arc::new(server))), connector: TlsConnector::from(Arc::new(client)) })
+    }
+
+    /// A client presenting no certificate (ES `remote_cluster_client.ssl`
+    /// without a key pair): servers are verified against the configured
+    /// CAs, or the default public CAs (ES: the JDK's) when none are set.
+    fn build_client_only(cfg: &TlsConfig, provider: Arc<rustls::crypto::CryptoProvider>, versions: &[&'static rustls::SupportedProtocolVersion]) -> Result<TlsPair, TransportError> {
+        let mut roots = RootCertStore::empty();
+        if cfg.certificate_authorities.is_empty() {
+            roots.roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        for ca in &cfg.certificate_authorities {
+            for c in load_certs(ca)? {
+                roots.add(c).map_err(|e| cfg_err("invalid CA certificate", e))?;
+            }
+        }
+        let restrictions = match &cfg.trust_restrictions {
+            Some(r) => Some(elasticsearch_ssl::TrustRestrictions::load(r.clone()).map_err(|e| cfg_err("trust restrictions", e))?),
+            None => None,
+        };
+        let mode = match cfg.verification_mode {
+            VerificationMode::Full => elasticsearch_ssl::VerificationMode::Full,
+            VerificationMode::Certificate => elasticsearch_ssl::VerificationMode::Certificate,
+            VerificationMode::None => elasticsearch_ssl::VerificationMode::None,
+        };
+        let verifier = PeerVerifier::with_restrictions(Arc::new(roots), mode, &provider, restrictions).map_err(|e| cfg_err("server verifier", e))?;
+        let client = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .map_err(|e| cfg_err("protocol versions", e))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Ok(TlsPair { acceptor: None, connector: TlsConnector::from(Arc::new(client)) })
     }
 }

@@ -29,7 +29,7 @@
 
 use crate::config::{TransportConfig, TransportSettings};
 use crate::error::{ACTION_NOT_FOUND_TYPE, RemoteError, TransportError};
-use crate::frame::{self, FLAG_COMPRESSED, FLAG_ERROR, FLAG_HANDSHAKE, FLAG_PING, FLAG_REQUEST, Frame, HANDSHAKE_ACTION, PING_ACTION};
+use crate::frame::{self, FLAG_COMPRESSED, FLAG_ERROR, FLAG_HANDSHAKE, FLAG_PING, FLAG_REQUEST, Frame, HANDSHAKE_ACTION, PING_ACTION, REMOTE_HANDSHAKE_ACTION};
 use bytes::Bytes;
 use elasticsearch_cluster::state::DiscoveryNode;
 use futures::FutureExt;
@@ -37,11 +37,11 @@ use futures::future::BoxFuture;
 use parking_lot::{Mutex, RwLock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter, ReadHalf, WriteHalf};
@@ -98,6 +98,63 @@ pub enum ConnectionEvent {
     Disconnected { addr: SocketAddr, node: NodeIdentity },
 }
 
+/// `cluster.remote.<alias>.transport.compress` (ES `Compression.Enabled`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteCompress {
+    /// `false`: never compress.
+    False,
+    /// `true`: compress every message above the threshold.
+    True,
+    /// `indexing_data`: compress raw indexing data only (the default).
+    IndexingData,
+}
+
+/// How a remote-cluster connection is opened ([`TransportService::connect_remote`]).
+#[derive(Clone, Debug, Default)]
+pub struct RemoteConnectOptions {
+    /// `cluster.remote.<alias>.transport.ping_schedule` (`None`: no pings).
+    pub ping_schedule: Option<Duration>,
+    /// `cluster.remote.<alias>.transport.compress` (`None`: this node's
+    /// `transport.compress`).
+    pub compress: Option<RemoteCompress>,
+    /// Connect + TLS + handshake bound (`None`: `transport.connect_timeout`).
+    pub connect_timeout: Option<Duration>,
+    /// To a remote cluster server (API key based remote cluster security):
+    /// TLS as `xpack.security.remote_cluster_client.ssl` says
+    /// ([`TransportService::set_remote_cluster_client_tls`]).
+    pub remote_cluster_server: bool,
+}
+
+/// The remote-cluster peer of an inbound request: set while a handler runs
+/// a request that arrived over a remote-cluster connection
+/// ([`inbound_remote_peer`]). Cluster members never appear here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemotePeer {
+    /// The calling node's `cluster.name` (from its handshake).
+    pub cluster_name: String,
+    pub node_name: String,
+    pub node_id: String,
+    pub address: SocketAddr,
+    /// It connected to this node's remote cluster server port (API key
+    /// based remote cluster security): every request must carry a
+    /// cross-cluster API key.
+    pub remote_cluster_server: bool,
+}
+
+tokio::task_local! {
+    static INBOUND_PEER: RemotePeer;
+}
+
+/// The remote-cluster peer of the request the current handler runs (`None`
+/// for requests from this cluster's own nodes or local calls). Read it at
+/// the start of a handler: tasks the handler spawns do not inherit it.
+pub fn inbound_remote_peer() -> Option<RemotePeer> {
+    INBOUND_PEER.try_with(Clone::clone).ok()
+}
+
+/// Remote-cluster pool key: (address, socket index).
+type RemoteKey = (SocketAddr, u16);
+
 /// The `transport` section of `_nodes/stats`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TransportStats {
@@ -145,6 +202,8 @@ pub type InboundGate = Arc<dyn Fn(&str, usize) -> Result<Box<dyn std::any::Any +
 struct Inner {
     local: NodeIdentity,
     bound_addr: SocketAddr,
+    /// Every listening address (`bound_addr` first).
+    bound_addrs: Vec<SocketAddr>,
     publish_addr: SocketAddr,
     settings: TransportSettings,
     frame_admission: Option<crate::frame::FrameAdmission>,
@@ -157,8 +216,26 @@ struct Inner {
     events: broadcast::Sender<ConnectionEvent>,
     shutdown: watch::Sender<bool>,
     gate: RwLock<Option<InboundGate>>,
+    /// Outbound remote-cluster connections (ES `RemoteClusterConnection`),
+    /// apart from this cluster's own pool: a remote's handshake carries
+    /// another cluster name, and an alias may point at this cluster itself.
+    remote_outbound: Mutex<HashMap<RemoteKey, Slot>>,
+    /// How each remote pool slot (re)connects.
+    remote_options: Mutex<HashMap<RemoteKey, RemoteConnectOptions>>,
+    /// Actions a remote cluster may call (everything else is refused on a
+    /// remote-cluster connection).
+    remote_actions: RwLock<HashSet<String>>,
+    remote_events: broadcast::Sender<ConnectionEvent>,
     #[cfg(feature = "tls")]
     tls: Option<crate::tls::TlsState>,
+    /// `xpack.security.remote_cluster_server.ssl` (the remote cluster
+    /// server listener) and `xpack.security.remote_cluster_client.ssl`.
+    #[cfg(feature = "tls")]
+    rcs_server_tls: RwLock<Option<Arc<crate::tls::TlsState>>>,
+    #[cfg(feature = "tls")]
+    rcs_client_tls: RwLock<Option<Arc<crate::tls::TlsState>>>,
+    /// The remote cluster server listener's bound address, once bound.
+    rcs_bound: RwLock<Option<SocketAddr>>,
 }
 
 impl Inner {
@@ -213,6 +290,14 @@ struct Connection {
     pending: Mutex<HashMap<u64, Pending>>,
     /// Flipped to `true` exactly once; the reader/writer/ping tasks watch it.
     closed: watch::Sender<bool>,
+    /// Inbound: the peer handshook as a remote cluster's node.
+    remote_peer: AtomicBool,
+    /// Outbound remote-cluster connection: its pool key.
+    remote_key: Option<RemoteKey>,
+    /// Outbound remote-cluster connection: its `transport.compress`.
+    compress: Option<RemoteCompress>,
+    /// Inbound on the remote cluster server listener.
+    rcs_server: AtomicBool,
 }
 
 /// Removes a pending entry when the requesting future finishes or is dropped
@@ -231,6 +316,10 @@ impl Drop for PendingGuard<'_> {
 impl Connection {
     /// Wraps an open stream and starts its reader and writer tasks.
     fn start(inner: &Arc<Inner>, io: BoxIo, addr: SocketAddr, direction: Direction) -> Arc<Connection> {
+        Self::start_with(inner, io, addr, direction, None, None)
+    }
+
+    fn start_with(inner: &Arc<Inner>, io: BoxIo, addr: SocketAddr, direction: Direction, remote_key: Option<RemoteKey>, compress: Option<RemoteCompress>) -> Arc<Connection> {
         let (rd, wr) = tokio::io::split(io);
         let (tx, rx) = mpsc::channel(1024);
         let conn = Arc::new(Connection {
@@ -242,6 +331,10 @@ impl Connection {
             writer: tx,
             pending: Mutex::new(HashMap::new()),
             closed: watch::channel(false).0,
+            remote_peer: AtomicBool::new(false),
+            remote_key,
+            compress,
+            rcs_server: AtomicBool::new(false),
         });
         if direction == Direction::Inbound {
             inner.inbound.lock().insert(conn.id, conn.clone());
@@ -279,7 +372,8 @@ impl Connection {
             inner.counters.outbound_total.fetch_add(1, Relaxed);
             inner.counters.outbound_open.fetch_add(1, Relaxed);
             if let Some(node) = self.remote.get() {
-                let _ = inner.events.send(ConnectionEvent::Connected { addr: self.addr, node: node.clone() });
+                let events = if self.remote_key.is_some() { &inner.remote_events } else { &inner.events };
+                let _ = events.send(ConnectionEvent::Connected { addr: self.addr, node: node.clone() });
             }
         }
         true
@@ -307,12 +401,16 @@ impl Connection {
                 if prev == ConnState::Established {
                     inner.counters.outbound_open.fetch_sub(1, Relaxed);
                     if let Some(node) = self.remote.get() {
-                        let _ = inner.events.send(ConnectionEvent::Disconnected { addr: self.addr, node: node.clone() });
+                        let events = if self.remote_key.is_some() { &inner.remote_events } else { &inner.events };
+                        let _ = events.send(ConnectionEvent::Disconnected { addr: self.addr, node: node.clone() });
                     }
                 }
                 // Clear the pool slot if it still points at us (if it is
                 // locked, a connector is busy and will notice we're closed).
-                let slot = inner.outbound.lock().get(&self.addr).cloned();
+                let slot = match self.remote_key {
+                    Some(key) => inner.remote_outbound.lock().get(&key).cloned(),
+                    None => inner.outbound.lock().get(&self.addr).cloned(),
+                };
                 if let Some(slot) = slot {
                     if let Ok(mut g) = slot.try_lock() {
                         if g.as_ref().is_some_and(|c| c.id == self.id) {
@@ -330,9 +428,21 @@ impl Connection {
         self.request_as(inner, flags, action, payload, timeout, false).await
     }
 
+    /// The frame of a message on this connection: a remote-cluster
+    /// connection compresses as its alias says.
+    fn encode_frame(&self, inner: &Inner, flags: u8, id: u64, action: &str, payload: &[u8], indexing: bool) -> Result<Bytes, TransportError> {
+        let threshold = match self.compress {
+            None => inner.compress_threshold(action, indexing),
+            Some(RemoteCompress::False) => None,
+            Some(RemoteCompress::True) => Some(inner.settings.compress_threshold),
+            Some(RemoteCompress::IndexingData) => (indexing || frame::indexing_data(action)).then_some(inner.settings.compress_threshold),
+        };
+        frame::encode_admitted(flags, id, action, payload, threshold, inner.settings.max_frame_size, inner.frame_admission.as_ref())
+    }
+
     async fn request_as(&self, inner: &Inner, flags: u8, action: &str, payload: &[u8], timeout: Option<Duration>, indexing: bool) -> Result<Bytes, TransportError> {
         let id = inner.next_request_id.fetch_add(1, Relaxed);
-        let frame = inner.encode_as(FLAG_REQUEST | flags, id, action, payload, indexing)?;
+        let frame = self.encode_frame(inner, FLAG_REQUEST | flags, id, action, payload, indexing)?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(id, Pending { action: action.to_string(), tx });
         let _guard = PendingGuard { conn: self, id };
@@ -361,7 +471,7 @@ impl Connection {
     /// response is (ES `InboundHandler`: a response follows its request).
     async fn respond_as(&self, inner: &Inner, id: u64, flags: u8, result: Result<Bytes, RemoteError>, indexing: bool) {
         let frame = match result {
-            Ok(payload) => inner.encode_as(flags, id, "", &payload, indexing).or_else(|e| encode_error(inner, id, &e.to_remote_error())),
+            Ok(payload) => self.encode_frame(inner, flags, id, "", &payload, indexing).or_else(|e| encode_error(inner, id, &e.to_remote_error())),
             Err(e) => encode_error(inner, id, &e),
         };
         match frame {
@@ -398,6 +508,26 @@ impl Connection {
             self.close(inner);
             return;
         }
+        // A remote cluster calls only the actions served to remote clusters.
+        let peer = if self.remote_peer.load(Relaxed) {
+            let node = self.remote.get();
+            let peer = RemotePeer {
+                cluster_name: node.map(|n| n.cluster_name.clone()).unwrap_or_default(),
+                node_name: node.map(|n| n.node.name.clone()).unwrap_or_default(),
+                node_id: node.map(|n| n.node.id.clone()).unwrap_or_default(),
+                address: self.addr,
+                remote_cluster_server: self.rcs_server.load(Relaxed),
+            };
+            if !inner.remote_actions.read().contains(&frame.action) {
+                let err = RemoteError::new("security_exception", format!(
+                    "action [{}] is not allowed over a remote cluster connection from cluster [{}]", frame.action, peer.cluster_name), 403);
+                self.respond(inner, frame.request_id, 0, Err(err)).await;
+                return;
+            }
+            Some(peer)
+        } else {
+            None
+        };
         let handler = inner.handlers.read().get(&frame.action).cloned();
         let gate = inner.gate.read().clone();
         let admitted = match gate.map(|g| g(&frame.action, frame.payload.len())).transpose() {
@@ -411,9 +541,10 @@ impl Connection {
         let inner = inner.clone();
         let compressed = frame.has(FLAG_COMPRESSED);
         tokio::spawn(async move {
-            let result = match handler {
-                Some(h) => run_handler(h, frame.payload).await,
-                None => Err(action_not_found(&frame.action)),
+            let result = match (handler, peer) {
+                (Some(h), Some(peer)) => INBOUND_PEER.scope(peer, run_handler(h, frame.payload)).await,
+                (Some(h), None) => run_handler(h, frame.payload).await,
+                (None, _) => Err(action_not_found(&frame.action)),
             };
             conn.respond_as(&inner, frame.request_id, 0, result, compressed).await;
             drop(admitted);
@@ -440,7 +571,23 @@ impl Connection {
             Ok(me) => me,
             Err(error) => { self.respond(inner, frame.request_id, FLAG_HANDSHAKE, Err(error.to_remote_error())).await; self.close(inner); return; }
         };
+        // The remote cluster server port takes remote-cluster connections only.
+        if self.rcs_server.load(Relaxed) && frame.action != REMOTE_HANDSHAKE_ACTION {
+            let err = RemoteError::new("illegal_state_exception", "the remote cluster server port only accepts remote cluster connections", 500);
+            self.respond(inner, frame.request_id, FLAG_HANDSHAKE, Err(err)).await;
+            self.close(inner);
+            return;
+        }
         self.respond(inner, frame.request_id, FLAG_HANDSHAKE, Ok(me)).await;
+        // A remote cluster's node (ES remote cluster connections handshake
+        // without the cluster-name check): only remote actions, below.
+        if frame.action == REMOTE_HANDSHAKE_ACTION {
+            debug!(addr = %self.addr, cluster = %remote.cluster_name, "accepted a remote cluster connection");
+            self.remote_peer.store(true, Relaxed);
+            let _ = self.remote.set(remote);
+            self.mark_established(inner);
+            return;
+        }
         if remote.cluster_name != inner.local.cluster_name {
             warn!(
                 addr = %self.addr,
@@ -566,7 +713,12 @@ async fn ping_loop(inner: Arc<Inner>, conn: Arc<Connection>, interval: Duration)
     }
 }
 
-async fn accept_loop(weak: Weak<Inner>, listener: TcpListener, mut shutdown: watch::Receiver<bool>) {
+async fn accept_loop(weak: Weak<Inner>, listener: TcpListener, shutdown: watch::Receiver<bool>) {
+    accept_loop_as(weak, listener, shutdown, false).await
+}
+
+/// `rcs`: the remote cluster server listener.
+async fn accept_loop_as(weak: Weak<Inner>, listener: TcpListener, mut shutdown: watch::Receiver<bool>, rcs: bool) {
     loop {
         let (tcp, peer) = tokio::select! {
             r = listener.accept() => match r {
@@ -584,8 +736,12 @@ async fn accept_loop(weak: Weak<Inner>, listener: TcpListener, mut shutdown: wat
         let _ = tcp.set_nodelay(true);
         tokio::spawn(async move {
             let deadline = inner.settings.connect_timeout;
-            let Some(io) = wrap_inbound(&inner, tcp, peer).await else { return };
+            let io = if rcs { wrap_inbound_rcs(&inner, tcp, peer).await } else { wrap_inbound(&inner, tcp, peer).await };
+            let Some(io) = io else { return };
             let conn = Connection::start(&inner, io, peer, Direction::Inbound);
+            if rcs {
+                conn.rcs_server.store(true, Relaxed);
+            }
             // A peer that never handshakes is dropped after connect_timeout.
             tokio::time::sleep(deadline).await;
             if *conn.state.lock() == ConnState::Handshaking {
@@ -614,6 +770,41 @@ async fn wrap_inbound(inner: &Inner, tcp: TcpStream, peer: SocketAddr) -> Option
 #[cfg(not(feature = "tls"))]
 async fn wrap_inbound(_inner: &Inner, tcp: TcpStream, _peer: SocketAddr) -> Option<BoxIo> {
     Some(Box::new(tcp))
+}
+
+#[cfg(feature = "tls")]
+async fn wrap_inbound_rcs(inner: &Inner, tcp: TcpStream, peer: SocketAddr) -> Option<BoxIo> {
+    let tls = inner.rcs_server_tls.read().clone();
+    match tls {
+        None => Some(Box::new(tcp)),
+        Some(tls) => match tokio::time::timeout(inner.settings.connect_timeout, tls.accept(tcp)).await {
+            Ok(Ok(s)) => Some(Box::new(s)),
+            Ok(Err(e)) => {
+                warn!(addr = %peer, "remote cluster server TLS handshake failed: {e}");
+                None
+            }
+            Err(_) => None,
+        },
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+async fn wrap_inbound_rcs(_inner: &Inner, tcp: TcpStream, _peer: SocketAddr) -> Option<BoxIo> {
+    Some(Box::new(tcp))
+}
+
+#[cfg(feature = "tls")]
+async fn wrap_outbound_rcs(inner: &Inner, tcp: TcpStream, addr: SocketAddr) -> std::io::Result<BoxIo> {
+    let tls = inner.rcs_client_tls.read().clone();
+    match tls {
+        None => Ok(Box::new(tcp)),
+        Some(tls) => Ok(Box::new(tls.connect(addr, tcp).await?)),
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+async fn wrap_outbound_rcs(_inner: &Inner, tcp: TcpStream, _addr: SocketAddr) -> std::io::Result<BoxIo> {
+    Ok(Box::new(tcp))
 }
 
 #[cfg(feature = "tls")]
@@ -684,13 +875,26 @@ impl TransportService {
         }
 
         let bind_err = |e: std::io::Error| TransportError::Config(format!("failed to bind transport to [{}]: {e}", config.bind_addr));
-        let socket = if config.bind_addr.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }.map_err(bind_err)?;
-        // Lets a restarted node rebind its port while old sockets linger in
-        // TIME_WAIT.
-        socket.set_reuseaddr(true).map_err(bind_err)?;
-        socket.bind(config.bind_addr).map_err(bind_err)?;
-        let listener = socket.listen(1024).map_err(bind_err)?;
+        let listen = |addr: SocketAddr| -> std::io::Result<TcpListener> {
+            let socket = if addr.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }?;
+            // Lets a restarted node rebind its port while old sockets linger
+            // in TIME_WAIT.
+            socket.set_reuseaddr(true)?;
+            socket.bind(addr)?;
+            socket.listen(1024)
+        };
+        let listener = listen(config.bind_addr).map_err(bind_err)?;
         let bound_addr = listener.local_addr().map_err(bind_err)?;
+        // Every further bind address on the same port (ES: one listener per
+        // resolved bind address).
+        let mut extra_listeners = Vec::with_capacity(config.extra_bind_addrs.len());
+        let mut bound_addrs = vec![bound_addr];
+        for ip in &config.extra_bind_addrs {
+            let addr = SocketAddr::new(*ip, bound_addr.port());
+            let l = listen(addr).map_err(|e| TransportError::Config(format!("failed to bind transport to [{addr}]: {e}")))?;
+            bound_addrs.push(l.local_addr().map_err(bind_err)?);
+            extra_listeners.push(l);
+        }
         let publish_addr = config.publish_addr.unwrap_or(bound_addr);
 
         let mut node = config.local_node;
@@ -705,6 +909,7 @@ impl TransportService {
         let inner = Arc::new(Inner {
             local: NodeIdentity::from_data(NodeIdentityData { cluster_name: config.cluster_name, node }, None),
             bound_addr,
+            bound_addrs,
             publish_addr,
             settings: config.settings,
             frame_admission,
@@ -717,10 +922,22 @@ impl TransportService {
             events: broadcast::channel(1024).0,
             shutdown: watch::channel(false).0,
             gate: RwLock::new(None),
+            remote_outbound: Mutex::new(HashMap::new()),
+            remote_options: Mutex::new(HashMap::new()),
+            remote_actions: RwLock::new(HashSet::new()),
+            remote_events: broadcast::channel(1024).0,
             #[cfg(feature = "tls")]
             tls,
+            #[cfg(feature = "tls")]
+            rcs_server_tls: RwLock::new(None),
+            #[cfg(feature = "tls")]
+            rcs_client_tls: RwLock::new(None),
+            rcs_bound: RwLock::new(None),
         });
         tokio::spawn(accept_loop(Arc::downgrade(&inner), listener, inner.shutdown.subscribe()));
+        for l in extra_listeners {
+            tokio::spawn(accept_loop(Arc::downgrade(&inner), l, inner.shutdown.subscribe()));
+        }
         debug!(addr = %bound_addr, "transport bound");
         Ok(TransportService { inner })
     }
@@ -758,6 +975,12 @@ impl TransportService {
         self.inner.bound_addr
     }
 
+    /// Every address the transport listens on (the first is
+    /// [`bound_address`](Self::bound_address)).
+    pub fn bound_addresses(&self) -> &[SocketAddr] {
+        &self.inner.bound_addrs
+    }
+
     /// The address advertised to peers (`transport.publish_*`).
     pub fn publish_address(&self) -> SocketAddr {
         self.inner.publish_addr
@@ -770,7 +993,8 @@ impl TransportService {
     /// Whether `addr` is this node (requests to it short-circuit).
     pub fn is_local_address(&self, addr: SocketAddr) -> bool {
         let b = self.inner.bound_addr;
-        addr == b || addr == self.inner.publish_addr || (b.ip().is_unspecified() && addr.port() == b.port() && addr.ip().is_loopback())
+        addr == self.inner.publish_addr || self.inner.bound_addrs.iter().any(|b| addr == *b)
+            || (b.ip().is_unspecified() && addr.port() == b.port() && addr.ip().is_loopback())
     }
 
     // ---- handlers ----
@@ -901,12 +1125,21 @@ impl TransportService {
 
     /// TCP connect + optional TLS + handshake.
     async fn open_connection(&self, addr: SocketAddr) -> Result<Arc<Connection>, TransportError> {
+        self.open_connection_with(addr, None).await
+    }
+
+    /// [`Self::open_connection`]; `remote`: a remote-cluster connection
+    /// (its pool key and options): the handshake says so, and the peer may
+    /// belong to any cluster.
+    async fn open_connection_with(&self, addr: SocketAddr, remote: Option<(RemoteKey, &RemoteConnectOptions)>) -> Result<Arc<Connection>, TransportError> {
         let inner = &self.inner;
         let connect_err = |reason: String| TransportError::ConnectTransport { addr, reason };
         let tcp = TcpStream::connect(addr).await.map_err(|e| connect_err(e.to_string()))?;
         let _ = tcp.set_nodelay(true);
-        let io = wrap_outbound(inner, tcp, addr).await.map_err(|e| connect_err(format!("TLS handshake failed: {e}")))?;
-        let conn = Connection::start(inner, io, addr, Direction::Outbound);
+        let rcs = remote.is_some_and(|(_, o)| o.remote_cluster_server);
+        let io = if rcs { wrap_outbound_rcs(inner, tcp, addr).await } else { wrap_outbound(inner, tcp, addr).await };
+        let io = io.map_err(|e| connect_err(format!("TLS handshake failed: {e}")))?;
+        let conn = Connection::start_with(inner, io, addr, Direction::Outbound, remote.map(|(k, _)| k), remote.and_then(|(_, o)| o.compress));
 
         // Make sure the half-open connection dies with this future (timeout,
         // cancellation) unless the handshake succeeds.
@@ -921,30 +1154,165 @@ impl TransportService {
         let mut guard = CloseOnDrop(Some((conn.clone(), inner)));
 
         let hello = frame::serialize_admitted(&inner.local, inner.frame_admission.as_ref())?;
-        let resp = conn.request(inner, FLAG_HANDSHAKE, HANDSHAKE_ACTION, &hello, None).await.map_err(|e| match e {
+        let handshake_action = if remote.is_some() { REMOTE_HANDSHAKE_ACTION } else { HANDSHAKE_ACTION };
+        let resp = conn.request(inner, FLAG_HANDSHAKE, handshake_action, &hello, None).await.map_err(|e| match e {
             TransportError::Remote(r) if r.status==429 => TransportError::Remote(r),
             TransportError::Remote(r) => connect_err(format!("handshake failed: {r}")),
             other => connect_err(format!("handshake failed: {other}")),
         })?;
-        let remote = crate::control::decode_identity(&resp, inner.frame_admission.as_ref())?;
-        if remote.cluster_name != inner.local.cluster_name {
+        let identity = crate::control::decode_identity(&resp, inner.frame_admission.as_ref())?;
+        if remote.is_none() && identity.cluster_name != inner.local.cluster_name {
             return Err(TransportError::HandshakeFailed {
                 addr,
                 reason: format!(
                     "remote cluster name [{}] does not match local cluster name [{}]",
-                    remote.cluster_name, inner.local.cluster_name
+                    identity.cluster_name, inner.local.cluster_name
                 ),
             });
         }
-        let _ = conn.remote.set(remote);
+        let _ = conn.remote.set(identity);
         if !conn.mark_established(inner) {
-            return Err(conn.disconnected(HANDSHAKE_ACTION));
+            return Err(conn.disconnected(handshake_action));
         }
         guard.0 = None;
-        if let Some(interval) = inner.settings.ping_schedule {
+        let ping = match remote {
+            Some((_, o)) => o.ping_schedule,
+            None => inner.settings.ping_schedule,
+        };
+        if let Some(interval) = ping {
             tokio::spawn(ping_loop(inner.clone(), conn.clone(), interval));
         }
         Ok(conn)
+    }
+
+    // ---- remote cluster connections ----
+
+    /// Let remote clusters call `action` (ES: the actions a remote cluster
+    /// connection is authorized for). Every other action is refused on a
+    /// remote-cluster connection.
+    pub fn allow_remote_action(&self, action: &str) {
+        self.inner.remote_actions.write().insert(action.to_string());
+    }
+
+    /// Opens (or reuses) remote-cluster connection `socket` to `addr` and
+    /// returns the peer's identity. The handshake does not require the
+    /// peer's cluster name to match (the caller validates the remote
+    /// cluster's name); requests on it go over TCP even when `addr` is this
+    /// node. `options` are kept: a later send reconnects with them.
+    pub async fn connect_remote(&self, addr: SocketAddr, socket: u16, options: RemoteConnectOptions) -> Result<NodeIdentity, TransportError> {
+        self.inner.remote_options.lock().insert((addr, socket), options);
+        let conn = self.remote_connection((addr, socket)).await?;
+        Ok(conn.remote.get().cloned().expect("established connections have an identity"))
+    }
+
+    /// The identity behind an established remote-cluster connection.
+    pub fn remote_connection_identity(&self, addr: SocketAddr, socket: u16) -> Option<NodeIdentity> {
+        let slot = self.inner.remote_outbound.lock().get(&(addr, socket)).cloned()?;
+        let g = slot.try_lock().ok()?;
+        g.as_ref().filter(|c| c.is_established()).and_then(|c| c.remote.get().cloned())
+    }
+
+    /// Closes remote-cluster connection `socket` to `addr` and forgets its
+    /// options (no later send reconnects it).
+    pub async fn disconnect_remote(&self, addr: SocketAddr, socket: u16) {
+        self.inner.remote_options.lock().remove(&(addr, socket));
+        let slot = self.inner.remote_outbound.lock().remove(&(addr, socket));
+        if let Some(slot) = slot {
+            let conn = slot.lock().await.take();
+            if let Some(c) = conn {
+                c.close(&self.inner);
+            }
+        }
+    }
+
+    /// Start the remote cluster server (ES `remote_cluster_server.enabled`,
+    /// API key based remote cluster security): a second listener whose
+    /// connections are remote-cluster connections only, with its own TLS
+    /// (`xpack.security.remote_cluster_server.ssl`). Returns the bound address.
+    pub async fn bind_remote_cluster_server(&self, addr: SocketAddr, tls: Option<crate::config::TlsConfig>) -> Result<SocketAddr, TransportError> {
+        #[cfg(feature = "tls")]
+        {
+            *self.inner.rcs_server_tls.write() = tls.as_ref().map(crate::tls::TlsState::new).transpose()?.map(Arc::new);
+        }
+        #[cfg(not(feature = "tls"))]
+        if tls.is_some() {
+            return Err(TransportError::Config("TLS configured but the `tls` feature is disabled".into()));
+        }
+        let bind_err = |e: std::io::Error| TransportError::Config(format!("failed to bind the remote cluster server to [{addr}]: {e}"));
+        let socket = if addr.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }.map_err(bind_err)?;
+        socket.set_reuseaddr(true).map_err(bind_err)?;
+        socket.bind(addr).map_err(bind_err)?;
+        let listener = socket.listen(1024).map_err(bind_err)?;
+        let bound = listener.local_addr().map_err(bind_err)?;
+        tokio::spawn(accept_loop_as(Arc::downgrade(&self.inner), listener, self.inner.shutdown.subscribe(), true));
+        *self.inner.rcs_bound.write() = Some(bound);
+        Ok(bound)
+    }
+
+    /// The remote cluster server's bound address (`None`: not enabled, or
+    /// not bound yet).
+    pub fn remote_cluster_server_address(&self) -> Option<SocketAddr> {
+        *self.inner.rcs_bound.read()
+    }
+
+    /// `xpack.security.remote_cluster_client.ssl`: TLS of connections to
+    /// remote cluster servers (`None`: plaintext).
+    pub fn set_remote_cluster_client_tls(&self, tls: Option<crate::config::TlsConfig>) -> Result<(), TransportError> {
+        #[cfg(feature = "tls")]
+        {
+            *self.inner.rcs_client_tls.write() = tls.as_ref().map(crate::tls::TlsState::new).transpose()?.map(Arc::new);
+        }
+        #[cfg(not(feature = "tls"))]
+        if tls.is_some() {
+            return Err(TransportError::Config("TLS configured but the `tls` feature is disabled".into()));
+        }
+        Ok(())
+    }
+
+    /// Subscribes to remote-cluster connect/disconnect events.
+    pub fn subscribe_remote(&self) -> broadcast::Receiver<ConnectionEvent> {
+        self.inner.remote_events.subscribe()
+    }
+
+    async fn remote_connection(&self, key: RemoteKey) -> Result<Arc<Connection>, TransportError> {
+        if self.inner.is_closed() {
+            return Err(TransportError::Closed);
+        }
+        let Some(options) = self.inner.remote_options.lock().get(&key).cloned() else {
+            return Err(TransportError::ConnectTransport { addr: key.0, reason: "no remote cluster connection is configured for this address".into() });
+        };
+        let slot = self.inner.remote_outbound.lock().entry(key).or_default().clone();
+        let mut g = slot.lock().await;
+        if let Some(c) = g.as_ref() {
+            if c.is_established() {
+                return Ok(c.clone());
+            }
+        }
+        let timeout = options.connect_timeout.unwrap_or(self.inner.settings.connect_timeout);
+        let addr = key.0;
+        let conn = tokio::time::timeout(timeout, self.open_connection_with(addr, Some((key, &options)))).await.unwrap_or_else(|_| {
+            Err(TransportError::ConnectTransport { addr, reason: format!("connect_timeout[{}ms]", timeout.as_millis()) })
+        })?;
+        *g = Some(conn.clone());
+        Ok(conn)
+    }
+
+    /// Sends `payload` to `action` over remote-cluster connection `socket`
+    /// to `addr` (reconnecting with its options if it closed).
+    pub async fn send_remote_request_bytes(&self, addr: SocketAddr, socket: u16, action: &str, payload: Bytes, timeout: impl Into<Option<Duration>>) -> Result<Bytes, TransportError> {
+        let conn = self.remote_connection((addr, socket)).await?;
+        conn.request_as(&self.inner, 0, action, &payload, timeout.into(), false).await
+    }
+
+    /// Typed [`Self::send_remote_request_bytes`].
+    pub async fn send_remote_request<Req, Resp>(&self, addr: SocketAddr, socket: u16, action: &str, req: &Req, timeout: impl Into<Option<Duration>>) -> Result<Resp, TransportError>
+    where
+        Req: Serialize + ?Sized,
+        Resp: DeserializeOwned,
+    {
+        let payload = frame::serialize_admitted(req, self.inner.frame_admission.as_ref())?;
+        let resp = self.send_remote_request_bytes(addr, socket, action, payload, timeout).await?;
+        bincode::deserialize(&resp).map_err(|e| crate::error::response_decode_error(e, action))
     }
 
     // ---- requests ----
@@ -1059,7 +1427,8 @@ impl TransportService {
         for c in inbound {
             c.close(&self.inner);
         }
-        let slots: Vec<Slot> = self.inner.outbound.lock().drain().map(|(_, s)| s).collect();
+        let mut slots: Vec<Slot> = self.inner.outbound.lock().drain().map(|(_, s)| s).collect();
+        slots.extend(self.inner.remote_outbound.lock().drain().map(|(_, s)| s));
         for s in slots {
             // A slot locked by an in-progress connect is skipped: that connect
             // fails because `mark_established` re-checks the shutdown flag.

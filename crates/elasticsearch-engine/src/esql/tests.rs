@@ -151,3 +151,45 @@ fn grid_conversions_and_npoints_follow_es() {
     let t = run("ROW n = ST_NPOINTS(TO_GEOSHAPE(\"BBOX (0, 2, 2, 0)\")), p = ST_NPOINTS(TO_GEOSHAPE(\"POLYGON((0 0, 1 0, 1 1, 0 0))\"))");
     assert_eq!(t.rows, vec![vec![Val::Int(4), Val::Int(4)]]);
 }
+
+/// Review finding 578: a geographic envelope wraps at the dateline when
+/// that is narrower (`SpatialEnvelopeVisitor` `WRAP`); the same Cartesian
+/// coordinates keep the wide box; a non-wrapping geometry is unchanged.
+#[test]
+fn geo_envelope_wraps_at_the_dateline() {
+    let t = run("ROW g = TO_GEOSHAPE(\"MULTIPOINT ((179 1), (-179 -1))\"), c = TO_CARTESIANSHAPE(\"MULTIPOINT ((179 1), (-179 -1))\"), n = TO_GEOSHAPE(\"MULTIPOINT ((10 1), (-10 -1))\") \
+        | EVAL gx0 = ST_XMIN(g), gx1 = ST_XMAX(g), cx0 = ST_XMIN(c), cx1 = ST_XMAX(c), nx0 = ST_XMIN(n), nx1 = ST_XMAX(n), e = ST_ENVELOPE(g), ce = ST_ENVELOPE(c) \
+        | EVAL ex0 = ST_XMIN(e), ex1 = ST_XMAX(e), cex0 = ST_XMIN(ce) | KEEP gx0, gx1, cx0, cx1, nx0, nx1, ex0, ex1, cex0");
+    assert_eq!(t.rows[0], vec![
+        Val::Double(179.0), Val::Double(-179.0), Val::Double(-179.0), Val::Double(179.0), Val::Double(-10.0), Val::Double(10.0),
+        Val::Double(179.0), Val::Double(-179.0), Val::Double(-179.0),
+    ]);
+}
+
+/// Review finding 579: the scalar grid functions honour their bounds: a
+/// cell outside them is null, one intersecting them is kept, null bounds
+/// give null; without bounds every point has its cell.
+#[test]
+fn scalar_grid_functions_honour_bounds() {
+    for f in ["ST_GEOTILE", "ST_GEOHASH", "ST_GEOHEX"] {
+        let q = format!("ROW p = TO_GEOPOINT(\"POINT (-100 0)\"), i = TO_GEOPOINT(\"POINT (5 5)\") | EVAL o = {f}(p, 5, TO_GEOSHAPE(\"BBOX (0, 10, 10, 0)\")), k = {f}(i, 5, TO_GEOSHAPE(\"BBOX (0, 10, 10, 0)\")), u = {f}(p, 5) | KEEP o, k, u");
+        let t = run(&q);
+        assert_eq!(t.rows[0][0], Val::Null, "{f}: outside the bounds");
+        assert!(!t.rows[0][1].is_null(), "{f}: inside the bounds");
+        assert!(!t.rows[0][2].is_null(), "{f}: unbounded");
+        let t = run(&format!("ROW p = TO_GEOPOINT(\"POINT (-100 0)\") | EVAL g = {f}(p, 5, TO_GEOSHAPE(\"BBOX (0, 10, 10, 0)\")) | WHERE g IS NOT NULL"));
+        assert!(t.rows.is_empty(), "{f}: {:?}", t.rows);
+    }
+}
+
+/// Review finding 629: ST_X / ST_Y convert every value of a multivalued
+/// point; scalars as before.
+#[test]
+fn st_x_st_y_map_multivalued_points() {
+    let t = run("ROW p = TO_CARTESIANPOINT([\"POINT (10 1)\", \"POINT (20 2)\"]), s = TO_CARTESIANPOINT(\"POINT (7 8)\") \
+        | EVAL x = ST_X(p), y = ST_Y(p), sx = ST_X(s) | EVAL mx = MV_MAX(x), n = MV_COUNT(y) | KEEP x, y, sx, mx, n");
+    assert_eq!(t.rows[0], vec![
+        Val::Multi(vec![Val::Double(10.0), Val::Double(20.0)]), Val::Multi(vec![Val::Double(1.0), Val::Double(2.0)]),
+        Val::Double(7.0), Val::Double(20.0), Val::Int(2),
+    ]);
+}

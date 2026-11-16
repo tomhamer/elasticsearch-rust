@@ -125,12 +125,38 @@ fn claim(st: &mut ClusterState, restore_uuid: &str, index: &str, index_uuid: &st
     }
 }
 
+/// Record, in the task that creates it, that incarnation `index_uuid` of
+/// `index` is the one a restore is creating (its `targets.<index>` progress
+/// is `creating` with no incarnation yet). A restore resumed after a master
+/// change deletes only that incarnation, and only while the target is
+/// incomplete (`super::restore`).
+pub fn claim_target(st: &mut ClusterState, index: &str, index_uuid: &str) {
+    let Some(custom) = st.metadata.customs.get_mut(PROGRESS_CUSTOM) else { return };
+    let Some(entries) = custom.get_mut("restore").and_then(Value::as_array_mut) else { return };
+    for e in entries.iter_mut() {
+        let Some(t) = e.get_mut("targets").and_then(|t| t.get_mut(index)).filter(|t| t.is_object()) else { continue };
+        if t["state"].as_str() == Some(super::restore::TARGET_CREATING) && t.get("index_uuid").is_none_or(Value::is_null) {
+            t["index_uuid"] = Value::String(index_uuid.to_string());
+            t["state"] = Value::String(super::restore::TARGET_RESTORING.to_string());
+        }
+    }
+}
+
 /// Routing of the index `name` a master task just added to `next`: ES's
 /// restore routing when a restore armed `name` for a file restore
 /// (claimed in the same state), else that of a new index.
 pub fn new_index_routing(alloc: &AllocationService, mut next: ClusterState, name: &str, now: i64) -> Result<ClusterState, String> {
+    if let Some(index_uuid) = next.metadata.indices.get(name).map(|im| im.uuid.clone()) {
+        claim_target(&mut next, name, &index_uuid);
+    }
     let armed = armed_file_restore(&next, name).filter(|_| next.metadata.indices.contains_key(name));
-    let Some((restore_uuid, spec)) = armed else { return alloc.add_index_routing(&next, name, now) };
+    let Some((restore_uuid, spec)) = armed else {
+        // A new index that already has in-sync copies is an imported
+        // dangling index (`rest::dangling::import_on_master`): its
+        // primaries recover the existing stores.
+        let imported = next.metadata.indices.get(name).is_some_and(|im| im.in_sync_allocation_ids.values().any(|ids| !ids.is_empty()));
+        return if imported { alloc.add_imported_index_routing(&next, name, now) } else { alloc.add_index_routing(&next, name, now) };
+    };
     let im = next.metadata.indices.get_mut(name).expect("the index is in the state");
     let index_uuid = im.uuid.clone();
     // ES restores the snapshot's index metadata, terms included (at least
@@ -168,11 +194,11 @@ pub struct RestoreFailure {
 }
 
 impl RestoreFailure {
-    fn hard(reason: impl Into<String>) -> Self {
+    pub(crate) fn hard(reason: impl Into<String>) -> Self {
         RestoreFailure { reindex: false, reason: reason.into() }
     }
 
-    fn reindex(reason: impl Into<String>) -> Self {
+    pub(crate) fn reindex(reason: impl Into<String>) -> Self {
         RestoreFailure { reindex: true, reason: reason.into() }
     }
 
@@ -186,6 +212,11 @@ impl RestoreFailure {
 pub fn requires_reindex(details: &str) -> bool {
     details.contains(REINDEX_TAG)
 }
+
+/// Test seam (hidden): the next `n` shard file restores fail as files
+/// this cluster cannot adopt ([`REINDEX_TAG`]): the master re-indexes.
+#[doc(hidden)]
+pub static FORCE_REINDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The staged files of one shard, ready to be adopted.
 pub struct Staged {
@@ -204,9 +235,17 @@ pub struct Staged {
 /// `svc` (`readable`: the segment format every member reads). Every file is
 /// verified against the snapshot's length and SHA-256 as it is written; a
 /// mismatch is a hard failure.
-pub async fn stage_shard(node: &ClusterNode, svc: &Arc<IndexService>, shard: u32, spec: &FileRestoreSpec, staging: &Path, readable: u32) -> Result<Staged, RestoreFailure> {
+pub async fn stage_shard(node: &ClusterNode, svc: &Arc<IndexService>, shard: u32, spec: &FileRestoreSpec, staging: &Path, readable: u32, cancel: &CancelToken) -> Result<Staged, RestoreFailure> {
     use elasticsearch_http::pools::{self, Pool};
+    // A CCR follower restores from its leader cluster (ES's `_ccr_<alias>`
+    // repository): the leader primary's files over the remote connection.
+    if let Some(alias) = spec.repository.strip_prefix("_ccr_") {
+        return Box::pin(crate::ccr::restore::stage_shard(node, svc, shard, spec, alias, staging, readable, cancel)).await;
+    }
     let started = std::time::Instant::now();
+    if FORCE_REINDEX.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1)).is_ok() {
+        return Err(RestoreFailure::reindex("injected: the files cannot be adopted"));
+    }
     match tokio::fs::remove_dir_all(staging).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -215,7 +254,7 @@ pub async fn stage_shard(node: &ClusterNode, svc: &Arc<IndexService>, shard: u32
     let meta = common::repos_in_state(&node.state()).remove(&spec.repository).ok_or_else(|| RestoreFailure::hard(format!("[{}] missing", spec.repository)))?;
     let repo = Repository::open(meta, &common::repo_context(node)).await.map_err(|e| RestoreFailure::hard(format!("[{}] {}", e.kind, e.reason)))?;
     let res = repo
-        .restore_shard(&spec.snapshot_uuid, &spec.index_id, shard, staging, &CancelToken::new())
+        .restore_shard(&spec.snapshot_uuid, &spec.index_id, shard, staging, cancel)
         .await
         .map_err(|e| RestoreFailure::hard(format!("[{}:{}] shard [{}][{shard}]: [{}] {}", spec.repository, spec.snapshot, spec.source_index, e.kind, e.reason)))?;
     let download_millis = started.elapsed().as_millis() as u64;
@@ -320,6 +359,24 @@ mod tests {
         assert!(armed_file_restore(&st, "dst").is_none(), "claimed: a later index of that name is a new index");
         assert_eq!(file_restore_of(&st, "dst", "u1").map(|(_, s)| s.snapshot_uuid), Some("su".into()));
         assert!(file_restore_of(&st, "dst", "u2").is_none());
+    }
+
+    /// The creating task records the incarnation of a target being created,
+    /// once: a later index of that name (another incarnation) is not taken
+    /// for the restore's, and neither is one a restore did not announce.
+    #[test]
+    fn creating_target_is_claimed_by_the_task_that_creates_it() {
+        let mut st = state_with(json!({"uuid": "ru", "targets": {"a": {"state": "creating"}, "b": {"state": "pending"}, "c": {"state": "done", "index_uuid": "old"}}}));
+        claim_target(&mut st, "a", "u1");
+        claim_target(&mut st, "a", "u2");
+        claim_target(&mut st, "b", "u3");
+        claim_target(&mut st, "c", "u4");
+        claim_target(&mut st, "other", "u5");
+        let t = &st.metadata.customs[PROGRESS_CUSTOM]["restore"][0]["targets"];
+        assert_eq!(t["a"], json!({"state": "restoring", "index_uuid": "u1"}));
+        assert_eq!(t["b"], json!({"state": "pending"}));
+        assert_eq!(t["c"], json!({"state": "done", "index_uuid": "old"}));
+        assert!(t.get("other").is_none());
     }
 
     #[test]

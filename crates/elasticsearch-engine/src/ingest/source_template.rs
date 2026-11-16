@@ -32,7 +32,7 @@ fn resolve(doc:&SourceDocument,name:&str,stack:&[Source])->Option<Source>{
     if matches!(name,"."|"this"){return stack.last().cloned()}
     let(head,tail)=name.split_once('.').unwrap_or((name,""));
     for ctx in stack.iter().rev(){if let Source::Object(m)=ctx{if let Some(v)=m.get(head){return walk(v,tail).cloned()}}}
-    doc.get(name).ok().flatten().cloned()
+    doc.get_classic(name).ok().flatten().cloned()
 }
 fn stringify(value:&Source)->Vec<u16>{source_from_json(value).string_units()}
 fn mustache(value:&Source)->Vec<u16>{

@@ -28,6 +28,16 @@ pub fn resolve(node: &Node, expr: &str, opts: ResolveOpts) -> Result<Plan> {
     Ok(Plan { targets, skipped: aliases.clone(), aliases, plan })
 }
 
+/// [`resolve`] keeping connected remote clusters out of the local targets
+/// without failing (a retriever's plan phase: its child searches read the
+/// remote clusters through the cluster's cross-cluster search).
+pub fn resolve_keeping_remotes(node: &Node, expr: &str, opts: ResolveOpts) -> Result<Plan> {
+    let (targets, plan) = remote::resolve_parts(node, expr, opts)?;
+    let plan = plan.unwrap_or_default();
+    let aliases = plan.aliases();
+    Ok(Plan { targets, skipped: aliases.clone(), aliases, plan })
+}
+
 /// `_clusters` with per-cluster `details`, as ES 8.10+ renders it.
 pub fn finish(raw: String, plan: &Plan) -> Result<String> {
     let mut v: Value = serde_json::from_str(&raw)?;
@@ -36,22 +46,9 @@ pub fn finish(raw: String, plan: &Plan) -> Result<String> {
     Ok(serde_json::to_string(&v)?)
 }
 
-pub fn stats(node: &Node, include_remotes: bool, local_stats: &Value) -> Value {
-    let mut out = json!({"_search": node.ccs_stats.lock().json()});
-    if include_remotes {
-        let info = remote::remote_info(node);
-        let mut clusters = serde_json::Map::new();
-        for alias in remote::remote_aliases(node) {
-            if info[&alias]["connected"] != true { continue; }
-            clusters.insert(alias.clone(), json!({
-                "cluster_uuid": node.cluster_uuid, "mode": info[&alias]["mode"], "skip_unavailable": info[&alias]["skip_unavailable"],
-                "version": elasticsearch_engine::node::ES_VERSION, "status": local_stats["status"],
-                "nodes_count": local_stats["nodes"]["count"]["total"], "shards_count": local_stats["indices"]["shards"]["total"],
-                "indices_count": local_stats["indices"]["count"], "indices_total_size_in_bytes": local_stats["indices"]["store"]["size_in_bytes"],
-                "max_heap_in_bytes": local_stats["nodes"]["jvm"]["mem"]["heap_max_in_bytes"], "mem_total_in_bytes": local_stats["nodes"]["os"]["mem"]["total_in_bytes"]
-            }));
-        }
-        if !clusters.is_empty() { out["clusters"] = Value::Object(clusters); }
-    }
-    out
+/// `_cluster/stats` `ccs`: this node's CCS usage. The cluster layer adds
+/// `clusters` (each connected remote's own stats) for `include_remotes`;
+/// this engine has no remote connections of its own.
+pub fn stats(node: &Node, _include_remotes: bool, _local_stats: &Value) -> Value {
+    json!({"_search": node.ccs_stats.lock().json()})
 }

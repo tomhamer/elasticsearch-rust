@@ -19,23 +19,100 @@ labels: {}
 # Cluster-wide elasticsearch.yml settings (nested or dotted keys), merged
 # under each node group's `config`. Settings the chart manages through the
 # environment (cluster.name, node.name, node.roles, network.host,
-# network.publish_host, discovery.seed_hosts, cluster.initial_master_nodes)
-# take precedence over anything set here.
-config:
-  # Security defaults to on (as in ES 8/9). The probes, preStop hook and tests
-  # of this chart use plain HTTP without credentials and transport has no TLS,
-  # so the chart turns it off explicitly. Configure TLS and authentication
-  # before running in production.
-  xpack.security.enabled: false
+# network.publish_host, discovery.seed_hosts, cluster.initial_master_nodes
+# and the xpack.security settings derived from `security` below) take
+# precedence over anything set here.
+config: {}
 #  action.destructive_requires_name: true
 #  path.repo: ["/usr/share/elasticsearch/snapshots"]
+
+# --- Security ------------------------------------------------------------------
+# Secure by default, like Elastic's chart and ECK: every request must
+# authenticate, HTTP is served over TLS and node-to-node (transport) traffic
+# is TLS with mutual certificate authentication. The probes, the preStop
+# hook, the cleanup Job, `helm test` and the metrics exporter all use HTTPS
+# with the cluster CA and the `elastic` credentials.
+#
+# Switching security on or off on a running cluster needs a FULL restart
+# (nodes with and without transport TLS cannot talk to each other): delete
+# all pods at once after the upgrade, or reinstall.
+security:
+  # false = DEVELOPMENT ONLY: no authentication, plain HTTP and transport.
+  # Anyone who can reach the Service can read and delete every index.
+  enabled: true
+
+  # Password of the built-in `elastic` superuser. The node receives it as its
+  # bootstrap password (ELASTIC_PASSWORD), which stays valid until the
+  # password is changed through the security API or
+  # `elasticsearch-reset-password`. When you change it that way, update the
+  # Secret too: the probes and hooks authenticate with it.
+  elasticPassword:
+    # An existing Secret holding the password (recommended for GitOps / `helm
+    # template`). Empty: the chart creates <clusterName>-credentials with a
+    # random 24-character password; `helm upgrade` keeps it (via `lookup`).
+    existingSecret: ""
+    key: password
+
+  tls:
+    http:
+      # HTTPS on the REST port. false keeps authentication but serves plain
+      # HTTP (only behind a mesh / proxy that encrypts the traffic).
+      enabled: true
+      # An existing Secret with tls.crt, tls.key and ca.crt (e.g. issued by
+      # your own cert-manager Certificate). Its certificate must name the
+      # client Service, <clusterName>.<namespace>.svc: the probes and hooks
+      # verify that name. Empty: certificates come from `provider`.
+      secretName: ""
+    transport:
+      # An existing Secret with tls.crt, tls.key and ca.crt, used by every
+      # node for transport TLS. Empty: certificates come from `provider`.
+      secretName: ""
+      # `certificate` (as ES's chart and ECK): peers must present a
+      # certificate signed by the CA; host names are not checked. `full`
+      # also checks names (the certificate must then name every pod IP).
+      verificationMode: certificate
+    # Where the certificates come from when no secretName is set:
+    #   generate      the chart creates a CA and the HTTP and transport
+    #                 certificates (Helm genCA / genSignedCert, RSA 2048) in
+    #                 the Secret <clusterName>-certs. `helm upgrade` keeps them
+    #                 (via `lookup`); delete that Secret and upgrade to renew
+    #                 them. Offline rendering (`helm template`, Argo CD, Flux)
+    #                 cannot `lookup` and would generate new ones on every
+    #                 render: use cert-manager or secretName there.
+    #   cert-manager  cert-manager Certificates for HTTP and transport,
+    #                 renewed automatically (the node reloads renewed
+    #                 certificate files without a restart).
+    provider: generate
+    generate:
+      caDays: 1825
+      certDays: 1095
+    certManager:
+      # Empty name: the chart creates a self-signed root, a CA Certificate
+      # and an Issuer of that CA (<clusterName>-ca) for this cluster.
+      issuerRef:
+        name: ""
+        kind: Issuer
+        group: cert-manager.io
+      duration: 8760h
+      renewBefore: 720h
+    # Extra names for the HTTP certificate (generate / cert-manager), e.g. an
+    # Ingress host or a load balancer address. The client Service names, the
+    # pods' headless-Service names, localhost and 127.0.0.1 are always
+    # included.
+    extraDnsNames: []
+    extraIPs: []
+    # Kubernetes cluster DNS domain, for the fully qualified Service names.
+    clusterDomain: cluster.local
 
 # --- Bootstrapping -----------------------------------------------------------
 # On the first install the chart passes cluster.initial_master_nodes (the pod
 # names of every master-eligible node) through the <clusterName>-bootstrap
 # ConfigMap, which is NOT part of the pod template. On `helm upgrade` the
-# chart detects (via `lookup`) that a master StatefulSet already exists and
-# renders that ConfigMap empty, so pods restarted later never re-bootstrap.
+# chart detects (via `lookup`) that a master StatefulSet has a ready replica
+# (a pod turns ready only once the cluster has formed) and renders that
+# ConfigMap empty, marking it formed, so pods restarted later never
+# re-bootstrap. A corrective upgrade of a first install whose masters never
+# started keeps the bootstrap list.
 #
 # Notes (as in the official chart):
 # * `helm template` / GitOps tools that render offline cannot `lookup`; set
@@ -209,6 +286,9 @@ service:
 ingress:
   enabled: false
   className: ""
+  # With security.tls.http.enabled the pods serve HTTPS: tell the ingress
+  # controller, e.g. for ingress-nginx:
+  #   nginx.ingress.kubernetes.io/backend-protocol: HTTPS
   annotations: {}
   hosts:
     - host: elasticsearch.local
@@ -218,7 +298,8 @@ ingress:
   tls: []
 
 # Prometheus metrics via the community elasticsearch-exporter as a sidecar
-# (scrapes the local node's REST API), optionally with a ServiceMonitor.
+# (scrapes the local node's REST API over HTTPS with the cluster CA, as the
+# `elastic` user, when security is on), optionally with a ServiceMonitor.
 metrics:
   exporter:
     enabled: false

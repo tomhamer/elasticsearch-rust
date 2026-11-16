@@ -71,14 +71,31 @@ fn opts(req: &Req) -> ResolveOpts {
 
 fn create(node: &Node, req: &Req, index: &str) -> R {
     let body = req.json()?;
-    let svc = node.create_index(index, &body)?;
+    // A snapshot restore's target (cluster-internal header): built from the
+    // snapshot's metadata only, no current template (ES).
+    let templates = !req.headers.contains_key(RESTORE_NO_TEMPLATES_HEADER);
+    let svc = node.create_index_opts(index, &body, templates)?;
     // A primary whose recovery failed (analyzers that do not build) is
     // never active: ES answers `shards_acknowledged: false` after waiting.
     Ok(Resp::ok(json!({"acknowledged": true, "shards_acknowledged": svc.failed_shards().is_empty(), "index": svc.name})))
 }
 
+/// Internal request header: delete only this incarnation (uuid) of the one
+/// concrete index named (lifecycle cleanup of an index it created; a name
+/// re-created since is never deleted).
+pub const IF_INDEX_UUID_HEADER: &str = "x-rustic-if-index-uuid";
+/// Internal header of a restore's index create (see [`create`]).
+pub const RESTORE_NO_TEMPLATES_HEADER: &str = "x-rustic-internal-restore-no-templates";
+
 fn delete(node: &Node, req: &Req, index: &str) -> R {
     elasticsearch_engine::datastream::reject_selectors(index)?;
+    if let Some(uuid) = req.headers.get(IF_INDEX_UUID_HEADER).and_then(|v| v.to_str().ok()) {
+        if index.contains(',') || index.contains('*') || index == "_all" {
+            return Err(EsError::illegal_argument(format!("a delete conditioned on an index uuid names one concrete index, not [{index}]")));
+        }
+        node.delete_index_if_uuid(index, uuid)?;
+        return Ok(Resp::ack());
+    }
     let wildcard = index == "_all" || index.split(',').any(|p| p.contains('*') || p == "_all");
     if wildcard && node.destructive_requires_name() {
         return Err(EsError::illegal_argument("Wildcard expressions or all indices are not allowed"));
@@ -298,11 +315,27 @@ fn put_settings(node: &Node, req: &Req, index: &str) -> R {
     if flat.is_empty() {
         return Err(EsError::action_validation(&["no settings to update"]));
     }
+    settings::validate_bool_index_settings(&flat)?;
     let mut o = opts(req);
     o.expand_closed = true;
     let targets = node.resolve(index, o)?;
     let preserve = req.flag("preserve_existing")?;
     let reopen = req.flag("reopen")?;
+    // Private settings (`index.downsample.status`) are Elasticsearch's own:
+    // only its internal tasks (`_system`) change them, users never.
+    if let Some(k) = flat.keys().find(|k| settings::is_private_dynamic(k)) {
+        if req.extensions.get::<crate::SystemIdentity>().is_none() {
+            return Err(EsError::illegal_argument(format!("can not update private setting [{k}]; this setting is managed by Elasticsearch")));
+        }
+        if flat.len() != 1 {
+            return Err(EsError::illegal_argument(format!("private setting [{k}] must be updated on its own")));
+        }
+        let status = flat.values().next().and_then(Value::as_str).unwrap_or_default().to_string();
+        for t in &targets {
+            t.svc.set_downsample_status(&status)?;
+        }
+        return Ok(Resp::ack());
+    }
     for t in &targets {
         t.svc.put_settings_reopen(flat.clone(), preserve, reopen)?;
     }
@@ -582,25 +615,7 @@ fn analyze(node: &Node, req: &Req, index: Option<&str>) -> R {
         && body.get("tokenizer").and_then(Value::as_str).map(|t| t == "standard").unwrap_or(true);
     let max_tokens = svc.as_ref().map(|s| s.setting_usize("index.analyze.max_token_count", 10_000)).unwrap_or(10_000);
     let max_chars = svc.as_ref().map(|s| s.setting_usize("index.analyze.max_char_count", 1_000_000)).unwrap_or(1_000_000);
-    let render = |a: &elasticsearch_engine::rustic_core::analysis::Analyzer| -> Result<Vec<Value>, EsError> {
-        let tokens = analyze_tokens(a, &texts, standard_types);
-        let chars: usize = tokens.iter().map(|t| t["token"].as_str().map(|s| s.chars().count()).unwrap_or(0)).sum();
-        if chars > max_chars {
-            return Err(EsError::new(
-                400,
-                "status_exception",
-                format!("The number of characters produced by calling _analyze has exceeded the allowed maximum of [{max_chars}]. This limit can be set by changing the [index.analyze.max_char_count] index level setting."),
-            ));
-        }
-        if tokens.len() > max_tokens {
-            return Err(EsError::new(
-                400,
-                "status_exception",
-                format!("The number of tokens produced by calling _analyze has exceeded the allowed maximum of [{max_tokens}]. This limit can be set by changing the [index.analyze.max_token_count] index level setting."),
-            ));
-        }
-        Ok(tokens)
-    };
+    let render = |a: &elasticsearch_engine::rustic_core::analysis::Analyzer| -> Result<Vec<Value>, EsError> { analyze_tokens(a, &texts, standard_types, max_tokens, max_chars) };
     let explain = body.get("explain").and_then(Value::as_bool).unwrap_or(false);
     if !explain {
         return Ok(Resp::ok(json!({"tokens": render(&analyzer)?})));
@@ -646,18 +661,48 @@ fn analyze(node: &Node, req: &Req, index: Option<&str>) -> R {
     Ok(Resp::ok(json!({"detail": detail})))
 }
 
-fn analyze_tokens(analyzer: &elasticsearch_engine::rustic_core::analysis::Analyzer, texts: &[String], standard_types: bool) -> Vec<Value> {
+/// The `_analyze` token list, contained by its limits (finding 299): each
+/// analysis stage gets a token budget (the remaining `max_tokens` plus the
+/// text's length, which no non-expanding stage exceeds), so an expanding
+/// chain stops at its first excess token; the response is built only for
+/// accepted tokens, and the token/character limits fail as soon as they
+/// are crossed. UTF-16 offsets come from one prefix table per text.
+fn analyze_tokens(
+    analyzer: &elasticsearch_engine::rustic_core::analysis::Analyzer,
+    texts: &[String],
+    standard_types: bool,
+    max_tokens: usize,
+    max_chars: usize,
+) -> Result<Vec<Value>, EsError> {
+    let too_many = || {
+        EsError::new(
+            400,
+            "status_exception",
+            format!("The number of tokens produced by calling _analyze has exceeded the allowed maximum of [{max_tokens}]. This limit can be set by changing the [index.analyze.max_token_count] index level setting."),
+        )
+    };
     let mut tokens = Vec::new();
+    let mut chars = 0usize;
     let mut base_pos = 0u32;
     let mut base_off = 0usize;
     for t in texts {
-        let toks = analyzer.analyze(t);
+        let budget = max_tokens.saturating_sub(tokens.len()).saturating_add(t.chars().count());
+        let toks = analyzer.analyze_bounded(t, budget).ok_or_else(too_many)?;
+        if tokens.len() + toks.len() > max_tokens {
+            return Err(too_many());
+        }
+        let utf16 = utf16_prefix(t);
+        let to_chars = |b: u32| -> usize { utf16[(b as usize).min(t.len())] as usize };
         let mut last = 0;
         for tk in &toks {
-            let to_chars = |b: u32| -> usize {
-                let b = (b as usize).min(t.len());
-                t.get(..b).map(|p| p.encode_utf16().count()).unwrap_or(b)
-            };
+            chars += tk.text.chars().count();
+            if chars > max_chars {
+                return Err(EsError::new(
+                    400,
+                    "status_exception",
+                    format!("The number of characters produced by calling _analyze has exceeded the allowed maximum of [{max_chars}]. This limit can be set by changing the [index.analyze.max_char_count] index level setting."),
+                ));
+            }
             let ty = if !standard_types {
                 "word"
             } else if tk.text.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',') {
@@ -676,9 +721,24 @@ fn analyze_tokens(analyzer: &elasticsearch_engine::rustic_core::analysis::Analyz
         }
         // ES: position_increment_gap 100 between array values for text, offset gap 1.
         base_pos += last + if texts.len() > 1 { 100 } else { 0 };
-        base_off += t.encode_utf16().count() + 1;
+        base_off += utf16[t.len()] as usize + 1;
     }
-    tokens
+    Ok(tokens)
+}
+
+/// UTF-16 length of `t[..b]` for every byte offset `b` (a byte inside a
+/// character maps to that character's start), in one pass.
+fn utf16_prefix(t: &str) -> Vec<u32> {
+    let mut out = Vec::with_capacity(t.len() + 1);
+    let mut n = 0u32;
+    for c in t.chars() {
+        for _ in 0..c.len_utf8() {
+            out.push(n);
+        }
+        n += c.len_utf16() as u32;
+    }
+    out.push(n);
+    out
 }
 
 /// Sparse-vector value counts only. Dense counts come from vector_stats;
@@ -828,11 +888,11 @@ fn stats_section(c: &elasticsearch_engine::shard::Counters, docs: u64, deleted: 
             "recent_search_load": recent_search_load(c)
         },
         "merges": {
-            "current": C::get(&c.merge_current), "current_docs": C::get(&c.merge_current_docs), "current_size_in_bytes": 0, "total": C::get(&c.merge_total), "total_time_in_millis": C::millis(&c.merge_time_nanos),
+            "current": C::get(&c.merge_current), "current_docs": C::get(&c.merge_current_docs), "current_size_in_bytes": C::get(&c.merge_current_bytes), "total": C::get(&c.merge_total), "total_time_in_millis": C::millis(&c.merge_time_nanos),
             "total_docs": C::get(&c.merge_docs), "total_size_in_bytes": C::get(&c.merge_size_bytes),
             "total_stopped_time_in_millis": 0,
             // Node-wide (merges' own throttle sleeps; exact for a node holding one merging shard).
-            "total_throttled_time_in_millis": elasticsearch_engine::rustic_core::merge::MERGE_OWN_THROTTLE_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+            "total_throttled_time_in_millis": elasticsearch_engine::rustic_core::merge::merge_throttled_ns() / 1_000_000,
             "total_auto_throttle_in_bytes": elasticsearch_engine::rustic_core::merge::merge_auto_throttle_rate() * shards as u64
         },
         "refresh": {
@@ -1153,6 +1213,17 @@ pub fn index_stats_in_process(node: &Node, index: &str, metrics: Option<&str>, p
 }
 
 fn open_close(node: &Node, req: &Req, index: &str, open: bool) -> R {
+    if !open {
+        // ES `TransportCloseIndexAction.doExecute`: the destructive-name
+        // guard, then `cluster.indices.close.enable`, before any target is
+        // resolved or changed (production review #481).
+        if (index.is_empty() || index == "_all" || index.split(',').any(|p| p.contains('*') || p == "_all")) && node.destructive_requires_name() {
+            return Err(EsError::illegal_argument("Wildcard expressions or all indices are not allowed"));
+        }
+        if !node.close_index_enabled() {
+            return Err(EsError::new(500, "illegal_state_exception", "closing indices is disabled - set [cluster.indices.close.enable: true] to enable it. NOTE: closed indices still consume a significant amount of diskspace"));
+        }
+    }
     let mut o = opts(req);
     o.expand_closed = true;
     let mut targets = node.resolve(index, o)?;
@@ -1405,7 +1476,9 @@ fn templates(node: &Node, req: &Req) -> R {
                 _ => body.get("template").and_then(|t| t.get("settings")).cloned(),
             };
             if let Some(s) = template_settings {
-                elasticsearch_engine::similarity::check_ranges(&elasticsearch_engine::settings::normalize_index_settings(&s))?;
+                let flat = elasticsearch_engine::settings::normalize_index_settings(&s);
+                elasticsearch_engine::settings::validate_bool_index_settings(&flat)?;
+                elasticsearch_engine::similarity::check_ranges(&flat)?;
             }
             // Strict columnar index modes: the template's (composed)
             // settings and mappings must be valid for the mode.
@@ -1486,16 +1559,25 @@ fn templates(node: &Node, req: &Req) -> R {
         Method::DELETE => {
             let name = name.ok_or_else(|| EsError::action_validation(&["name is missing"]))?;
             let mut t = node.templates.write();
+            let keys: Vec<String> = {
+                let target = match kind.as_str() {
+                    "_index_template" => &t.index,
+                    "_component_template" => &t.component,
+                    _ => &t.legacy,
+                };
+                target.keys().filter(|k| name.split(',').any(|n| elasticsearch_engine::mapping::wildcard_match(n, k))).cloned().collect()
+            };
+            if keys.is_empty() {
+                let what = if kind == "_component_template" { "component template" } else { "index template" };
+                return Err(EsError::resource_not_found(format!("{what} matching [{name}] not found")));
+            }
+            // Atomically: nothing is removed while a dependency remains.
+            node.check_template_removal(&t, &kind, &keys)?;
             let target = match kind.as_str() {
                 "_index_template" => &mut t.index,
                 "_component_template" => &mut t.component,
                 _ => &mut t.legacy,
             };
-            let keys: Vec<String> = target.keys().filter(|k| name.split(',').any(|n| elasticsearch_engine::mapping::wildcard_match(n, k))).cloned().collect();
-            if keys.is_empty() {
-                let what = if kind == "_component_template" { "component template" } else { "index template" };
-                return Err(EsError::resource_not_found(format!("{what} matching [{name}] not found")));
-            }
             for k in keys {
                 target.remove(&k);
             }

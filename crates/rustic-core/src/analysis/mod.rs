@@ -22,7 +22,7 @@ use tokenizer::{
 /// string (half-open range). `position` is the token's position in the
 /// analyzed stream; when a filter removes a token (e.g. a stop word),
 /// later tokens keep their original positions, matching Lucene.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Token {
     /// The token text.
     pub text: String,
@@ -32,6 +32,10 @@ pub struct Token {
     pub offset_from: u32,
     /// Byte offset just past the last character of the token in the input.
     pub offset_to: u32,
+    /// Lucene's `KeywordAttribute`: set by `keyword_marker` /
+    /// `keyword_repeat` (and stem exclusions); stemmers leave keyword
+    /// tokens unchanged.
+    pub keyword: bool,
 }
 
 /// Splits raw text into a sequence of [`Token`]s.
@@ -39,6 +43,13 @@ pub trait Tokenizer: Send + Sync {
     /// Tokenize `text`, producing tokens with 0-based positions and
     /// byte offsets into `text`.
     fn tokenize(&self, text: &str) -> Vec<Token>;
+
+    /// [`Tokenizer::tokenize`], or `None` once more than `budget` tokens
+    /// would be produced. Expanding tokenizers (n-grams) override this to
+    /// stop at the first excess token instead of producing the rest.
+    fn tokenize_bounded(&self, text: &str, budget: usize) -> Option<Vec<Token>> {
+        Some(self.tokenize(text)).filter(|t| t.len() <= budget)
+    }
 
     /// Create a new boxed instance of this tokenizer (for cloning an
     /// [`Analyzer`]).
@@ -81,9 +92,23 @@ pub trait TokenFilter: Send + Sync {
     /// Apply the filter to `tokens`.
     fn filter(&self, tokens: Vec<Token>) -> Vec<Token>;
 
+    /// [`TokenFilter::filter`], or `None` once more than `budget` tokens
+    /// would be produced. Expanding filters (n-grams) override this to
+    /// stop at the first excess token instead of producing the rest.
+    fn filter_bounded(&self, tokens: Vec<Token>, budget: usize) -> Option<Vec<Token>> {
+        Some(self.filter(tokens)).filter(|t| t.len() <= budget)
+    }
+
     /// Create a new boxed instance of this filter (for cloning an
     /// [`Analyzer`]).
     fn clone_box(&self) -> Box<dyn TokenFilter>;
+
+    /// Whether the filter only normalizes characters (Lucene's
+    /// multi-term-aware filters: lowercasing, folding, script
+    /// normalization), so [`Analyzer::normalize`] applies it.
+    fn normalizes(&self) -> bool {
+        false
+    }
 }
 
 /// A text analyzer: one tokenizer followed by zero or more token filters.
@@ -159,8 +184,30 @@ impl Analyzer {
     /// Analyze `text` into a token stream: char filters, then the
     /// tokenizer, then the token filters in order.
     pub fn analyze(&self, text: &str) -> Vec<Token> {
+        self.analyze_bounded(text, usize::MAX).expect("unbounded analysis")
+    }
+
+    /// [`Analyzer::analyze`] with a per-stage token budget: `None` as soon
+    /// as the tokenizer or any filter would produce more than `budget`
+    /// tokens (expanding stages stop at the first excess token rather
+    /// than materializing the rest). Used where a token-count limit must
+    /// contain the work, not only reject its result (`_analyze`).
+    pub fn analyze_bounded(&self, text: &str, budget: usize) -> Option<Vec<Token>> {
+        self.analyze_stages(text, budget).map(|(t, _)| t)
+    }
+
+    /// [`Analyzer::analyze`], also returning the number of positions the
+    /// tokenizer produced (its last position + 1): filters that drop
+    /// tokens (stop words) keep the other tokens' positions, so this is
+    /// the stream's end position including trailing removed tokens
+    /// (Lucene's final position increment).
+    pub fn analyze_with_end(&self, text: &str) -> (Vec<Token>, u32) {
+        self.analyze_stages(text, usize::MAX).expect("unbounded analysis")
+    }
+
+    fn analyze_stages(&self, text: &str, budget: usize) -> Option<(Vec<Token>, u32)> {
         let mut tokens = if self.char_filters.is_empty() {
-            self.tokenizer.tokenize(text)
+            self.tokenizer.tokenize_bounded(text, budget)?
         } else {
             let (mut filtered, m0) = self.char_filters[0].filter_mapped(text);
             let mut maps = vec![m0];
@@ -169,7 +216,7 @@ impl Analyzer {
                 filtered = f;
                 maps.push(m);
             }
-            let mut toks = self.tokenizer.tokenize(&filtered);
+            let mut toks = self.tokenizer.tokenize_bounded(&filtered, budget)?;
             if maps.iter().any(|m| !m.is_empty()) {
                 // Lucene chains `correctOffset` from the innermost filter outwards.
                 for t in &mut toks {
@@ -181,10 +228,28 @@ impl Analyzer {
             }
             toks
         };
+        let end = tokens.iter().map(|t| t.position + 1).max().unwrap_or(0);
         for f in &self.filters {
-            tokens = f.filter(tokens);
+            tokens = f.filter_bounded(tokens, budget)?;
         }
-        tokens
+        Some((tokens, end))
+    }
+
+    /// Lucene `Analyzer.normalize`: `text` as one term through the char
+    /// filters and the normalizing token filters only (no tokenizing,
+    /// stemming or stop words): what multi-term queries (wildcard, prefix,
+    /// fuzzy) compare against the index.
+    pub fn normalize(&self, text: &str) -> String {
+        let mut s = text.to_string();
+        for cf in &self.char_filters {
+            s = cf.filter(&s);
+        }
+        let len = s.len() as u32;
+        let mut toks = vec![Token { text: s, position: 0, offset_from: 0, offset_to: len, keyword: false }];
+        for f in self.filters.iter().filter(|f| f.normalizes()) {
+            toks = f.filter(toks);
+        }
+        toks.into_iter().next().map(|t| t.text).unwrap_or_default()
     }
 
     /// Stream the analyzed tokens of `text` without materializing them:
@@ -255,32 +320,53 @@ impl Analyzer {
             .with_filter(Box::new(filter::FingerprintFilter::default()))
     }
 
-    /// Build an ES language analyzer by name (`"french"`, `"cjk"`, ...).
-    ///
-    /// Each follows the ES "rebuilt" analyzer definition: standard
-    /// tokenizer + language-specific normalization/elision + lowercase +
-    /// the language's stop words + its stemmer.
-    ///
-    /// * `english` uses Porter (as ES does); `german` uses
-    ///   `light_german` after `german_normalization` (as ES does).
-    /// * Stem-exclusion (`keyword_marker`) is not configured since ES's
-    ///   default exclusion set is empty.
+    /// Build an ES language analyzer by name (`"french"`, `"cjk"`, ...)
+    /// with its default stop words and no stem exclusions.
     pub fn language(name: &str) -> Option<Self> {
+        Self::language_with(name, None, &[])
+    }
+
+    /// An ES language analyzer: Lucene's `<Language>Analyzer` chain
+    /// (Lucene 10.3.2 `createComponents`). `stop` replaces the language's
+    /// default stop filter (ES `stopwords` / `stopwords_path`, `_none_`
+    /// being an empty set); `stem_exclusion` words are marked as keywords
+    /// (Lucene `SetKeywordMarkerFilter`) where Lucene places that filter,
+    /// so its stemmer leaves them unchanged (SIDE 006).
+    pub fn language_with(name: &str, stop: Option<Box<dyn TokenFilter>>, stem_exclusion: &[String]) -> Option<Self> {
         use filter::*;
+        let stop_override = std::sync::Mutex::new(stop);
         let stop = |lang: &str| -> Box<dyn TokenFilter> {
-            Box::new(StopFilter::from_slice(stopwords::for_language(lang).unwrap_or(&[])))
+            match stop_override.lock().unwrap().take() {
+                Some(s) => s,
+                None => Box::new(StopFilter::from_slice(stopwords::for_language(lang).unwrap_or(&[]))),
+            }
         };
         let stem = |n: &str| -> Box<dyn TokenFilter> {
             Box::new(StemmerFilter::new(n).expect("built-in stemmer name"))
         };
+        let snowball = |n: &str| -> Box<dyn TokenFilter> {
+            Box::new(SnowballFilter::new(n).expect("built-in snowball language"))
+        };
+        let excl: Vec<&str> = stem_exclusion.iter().map(String::as_str).collect();
+        let keywords = |a: Self| -> Self {
+            if excl.is_empty() { a } else { a.with_filter(Box::new(KeywordMarkerFilter::marker(&excl, false))) }
+        };
         let std_lower = || Self::new(Box::new(StandardTokenizer)).with_filter(Box::new(LowerCaseFilter));
         let a = match name {
-            "english" => Self::english(),
-            "arabic" => std_lower()
-                .with_filter(Box::new(DecimalDigitFilter))
-                .with_filter(stop("arabic"))
-                .with_filter(Box::new(ArabicNormalizationFilter))
-                .with_filter(Box::new(ArabicStemFilter)),
+            "english" => keywords(
+                Self::new(Box::new(StandardTokenizer))
+                    .with_filter(Box::new(filter::EnglishPossessiveFilter))
+                    .with_filter(Box::new(LowerCaseFilter))
+                    .with_filter(stop("english")),
+            )
+            .with_filter(Box::new(StemFilter)),
+            "arabic" => keywords(
+                std_lower()
+                    .with_filter(Box::new(DecimalDigitFilter))
+                    .with_filter(stop("arabic"))
+                    .with_filter(Box::new(ArabicNormalizationFilter)),
+            )
+            .with_filter(Box::new(ArabicStemFilter)),
             // Lucene 10 `PersianAnalyzer` (indices created on 9.x) stems;
             // `persian_v8` is the pre-Lucene-10 chain without stemming.
             "persian" | "persian_v8" => {
@@ -290,64 +376,90 @@ impl Analyzer {
                     .with_filter(Box::new(ArabicNormalizationFilter))
                     .with_filter(Box::new(PersianNormalizationFilter))
                     .with_filter(stop("persian"));
-                if name == "persian" { a.with_filter(Box::new(PersianStemFilter)) } else { a }
+                if name == "persian" { keywords(a).with_filter(Box::new(PersianStemFilter)) } else { a }
             }
-            "sorani" => std_lower()
-                .with_filter(Box::new(SoraniNormalizationFilter))
-                .with_filter(Box::new(DecimalDigitFilter))
-                .with_filter(stop("sorani")),
-            "bengali" => std_lower()
-                .with_filter(Box::new(DecimalDigitFilter))
+            "sorani" => keywords(
+                Self::new(Box::new(StandardTokenizer))
+                    .with_filter(Box::new(SoraniNormalizationFilter))
+                    .with_filter(Box::new(LowerCaseFilter))
+                    .with_filter(Box::new(DecimalDigitFilter))
+                    .with_filter(stop("sorani")),
+            )
+            .with_filter(stem("sorani")),
+            "bengali" => keywords(std_lower().with_filter(Box::new(DecimalDigitFilter)))
                 .with_filter(Box::new(IndicNormalizationFilter))
-                .with_filter(stop("bengali")),
-            "hindi" => std_lower()
-                .with_filter(Box::new(DecimalDigitFilter))
+                .with_filter(Box::new(BengaliNormalizationFilter))
+                .with_filter(stop("bengali"))
+                .with_filter(stem("bengali")),
+            "hindi" => keywords(std_lower().with_filter(Box::new(DecimalDigitFilter)))
                 .with_filter(Box::new(IndicNormalizationFilter))
                 .with_filter(Box::new(HindiNormalizationFilter))
-                .with_filter(stop("hindi")),
+                .with_filter(stop("hindi"))
+                .with_filter(stem("hindi")),
             "cjk" => Self::new(Box::new(StandardTokenizer))
                 .with_filter(Box::new(CjkWidthFilter))
                 .with_filter(Box::new(LowerCaseFilter))
                 .with_filter(Box::new(CjkBigramFilter::default()))
                 .with_filter(stop("cjk")),
-            "catalan" => Self::new(Box::new(StandardTokenizer))
-                .with_filter(Box::new(ElisionFilter::catalan()))
-                .with_filter(Box::new(LowerCaseFilter))
-                .with_filter(stop("catalan")),
-            "french" => Self::new(Box::new(StandardTokenizer))
-                .with_filter(Box::new(ElisionFilter::french()))
-                .with_filter(Box::new(LowerCaseFilter))
-                .with_filter(stop("french"))
-                .with_filter(stem("light_french")),
-            "italian" => Self::new(Box::new(StandardTokenizer))
-                .with_filter(Box::new(ElisionFilter::italian()))
-                .with_filter(Box::new(LowerCaseFilter))
-                .with_filter(stop("italian"))
-                .with_filter(stem("light_italian")),
-            "irish" => Self::new(Box::new(StandardTokenizer))
-                .with_filter(stop("irish"))
-                .with_filter(Box::new(ElisionFilter::irish()))
-                .with_filter(Box::new(IrishLowerCaseFilter))
-                .with_filter(stop("irish")),
+            "catalan" => keywords(
+                Self::new(Box::new(StandardTokenizer))
+                    .with_filter(Box::new(ElisionFilter::catalan()))
+                    .with_filter(Box::new(LowerCaseFilter))
+                    .with_filter(stop("catalan")),
+            )
+            .with_filter(snowball("catalan")),
+            "french" => keywords(
+                Self::new(Box::new(StandardTokenizer))
+                    .with_filter(Box::new(ElisionFilter::french()))
+                    .with_filter(Box::new(LowerCaseFilter))
+                    .with_filter(stop("french")),
+            )
+            .with_filter(stem("light_french")),
+            "italian" => keywords(
+                Self::new(Box::new(StandardTokenizer))
+                    .with_filter(Box::new(ElisionFilter::italian()))
+                    .with_filter(Box::new(LowerCaseFilter))
+                    .with_filter(stop("italian")),
+            )
+            .with_filter(stem("light_italian")),
+            // Lucene `IrishAnalyzer`: hyphenation prefixes (h-, n-, t-)
+            // dropped, elision, Irish lowercasing, stop words, Snowball.
+            "irish" => keywords(
+                Self::new(Box::new(StandardTokenizer))
+                    .with_filter(Box::new(StopFilter::from_slice(&["h", "n", "t"])))
+                    .with_filter(Box::new(ElisionFilter::irish()))
+                    .with_filter(Box::new(IrishLowerCaseFilter))
+                    .with_filter(stop("irish")),
+            )
+            .with_filter(snowball("irish")),
             "greek" => Self::new(Box::new(StandardTokenizer))
                 .with_filter(Box::new(GreekLowerCaseFilter))
-                .with_filter(stop("greek")),
-            "turkish" => Self::new(Box::new(StandardTokenizer))
-                .with_filter(Box::new(ApostropheFilter))
-                .with_filter(Box::new(TurkishLowerCaseFilter))
-                .with_filter(stop("turkish"))
-                .with_filter(stem("turkish")),
-            "german" => std_lower()
-                .with_filter(stop("german"))
+                .with_filter(stop("greek"))
+                .with_filter(stem("greek")),
+            "turkish" => keywords(
+                Self::new(Box::new(StandardTokenizer))
+                    .with_filter(Box::new(ApostropheFilter))
+                    .with_filter(Box::new(TurkishLowerCaseFilter))
+                    .with_filter(stop("turkish")),
+            )
+            .with_filter(stem("turkish")),
+            "german" => keywords(std_lower().with_filter(stop("german")))
                 .with_filter(Box::new(GermanNormalizationFilter))
                 .with_filter(stem("light_german")),
-            "spanish" => std_lower().with_filter(stop("spanish")).with_filter(stem("light_spanish")),
-            "portuguese" => std_lower().with_filter(stop("portuguese")).with_filter(stem("light_portuguese")),
+            "spanish" => keywords(std_lower().with_filter(stop("spanish"))).with_filter(stem("light_spanish")),
+            "portuguese" => keywords(std_lower().with_filter(stop("portuguese"))).with_filter(stem("light_portuguese")),
             "danish" | "dutch" | "finnish" | "hungarian" | "norwegian" | "romanian" | "russian"
-            | "swedish" => std_lower().with_filter(stop(name)).with_filter(stem(name)),
-            "armenian" | "basque" | "brazilian" | "bulgarian" | "czech" | "estonian" | "galician"
-            | "indonesian" | "latvian" | "lithuanian" => std_lower().with_filter(stop(name)),
-            "thai" => std_lower().with_filter(Box::new(DecimalDigitFilter)).with_filter(stop("thai")),
+            | "swedish" => keywords(std_lower().with_filter(stop(name))).with_filter(stem(name)),
+            // SIDE 005: these chains end with their language's stemmer, as
+            // Lucene's analyzers do.
+            "armenian" | "basque" | "estonian" | "lithuanian" => keywords(std_lower().with_filter(stop(name))).with_filter(snowball(name)),
+            "brazilian" | "bulgarian" | "czech" | "galician" | "indonesian" | "latvian" => {
+                keywords(std_lower().with_filter(stop(name))).with_filter(stem(name))
+            }
+            "thai" => Self::new(Box::new(tokenizer::ThaiTokenizer))
+                .with_filter(Box::new(LowerCaseFilter))
+                .with_filter(Box::new(DecimalDigitFilter))
+                .with_filter(stop("thai")),
             "serbian" => std_lower().with_filter(Box::new(SerbianNormalizationFilter)),
             _ => return None,
         };
@@ -404,6 +516,7 @@ impl Analyzer {
             "path_hierarchy" | "PathHierarchy" => Box::new(PathHierarchyTokenizer::default()),
             "char_group" => Box::new(CharGroupTokenizer { whitespace: true, ..Default::default() }),
             "classic" => Box::new(ClassicTokenizer),
+            "thai" => Box::new(ThaiTokenizer),
             _ => return None,
         })
     }
@@ -468,13 +581,15 @@ impl Analyzer {
             "keyword_repeat" => Box::new(KeywordRepeatFilter::new()),
             "limit" => Box::new(LimitTokenCountFilter::default()),
             "remove_duplicates" => Box::new(RemoveDuplicatesFilter),
-            "word_delimiter" | "word_delimiter_graph" => Box::new(WordDelimiterFilter::default()),
+            "word_delimiter" => Box::new(WordDelimiterFilter::default()),
+            "word_delimiter_graph" => Box::new(WordDelimiterFilter::graph()),
             "english_possessive" | "possessive_english" => Box::new(EnglishPossessiveFilter),
             "arabic_normalization" => Box::new(ArabicNormalizationFilter),
             "persian_normalization" => Box::new(PersianNormalizationFilter),
             "sorani_normalization" => Box::new(SoraniNormalizationFilter),
             "hindi_normalization" => Box::new(HindiNormalizationFilter),
             "indic_normalization" => Box::new(IndicNormalizationFilter),
+            "bengali_normalization" => Box::new(BengaliNormalizationFilter),
             "german_normalization" => Box::new(GermanNormalizationFilter),
             "scandinavian_normalization" => Box::new(ScandinavianNormalizationFilter),
             "scandinavian_folding" => Box::new(ScandinavianFoldingFilter),
@@ -518,6 +633,15 @@ impl Analyzer {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Lucene `Analyzer.normalize`: one term, normalizing filters only.
+    #[test]
+    fn normalize_keeps_one_term_without_stemming() {
+        assert_eq!(Analyzer::english().normalize("Running"), "running");
+        assert_eq!(Analyzer::standard().normalize("FOO-Bar baz"), "foo-bar baz");
+        let folded = Analyzer::custom("standard", &[], &["lowercase", "asciifolding"]).unwrap();
+        assert_eq!(folded.normalize("Café"), "cafe");
+    }
 
     fn texts(tokens: &[Token]) -> Vec<String> {
         tokens.iter().map(|t| t.text.clone()).collect()
@@ -651,10 +775,10 @@ mod tests {
     fn stop_filter_keeps_positions() {
         let f = StopFilter::from_slice(&["the", "a"]);
         let tokens = f.filter(vec![
-            Token { text: "the".into(), position: 0, offset_from: 0, offset_to: 3 },
-            Token { text: "cat".into(), position: 1, offset_from: 4, offset_to: 7 },
-            Token { text: "a".into(), position: 2, offset_from: 8, offset_to: 9 },
-            Token { text: "dog".into(), position: 3, offset_from: 10, offset_to: 13 },
+            Token { text: "the".into(), position: 0, offset_from: 0, offset_to: 3, keyword: false },
+            Token { text: "cat".into(), position: 1, offset_from: 4, offset_to: 7, keyword: false },
+            Token { text: "a".into(), position: 2, offset_from: 8, offset_to: 9, keyword: false },
+            Token { text: "dog".into(), position: 3, offset_from: 10, offset_to: 13, keyword: false },
         ]);
         assert_eq!(texts(&tokens), vec!["cat", "dog"]);
         assert_eq!(
@@ -670,8 +794,7 @@ mod tests {
             text: "x".into(),
             position: 0,
             offset_from: 0,
-            offset_to: 1,
-        }];
+            offset_to: 1, keyword: false }];
         assert_eq!(f.filter(tokens.clone()), tokens);
     }
 
@@ -679,8 +802,8 @@ mod tests {
     fn stop_filter_english_set() {
         let f = StopFilter::english();
         let tokens = f.filter(vec![
-            Token { text: "with".into(), position: 0, offset_from: 0, offset_to: 4 },
-            Token { text: "cats".into(), position: 1, offset_from: 5, offset_to: 9 },
+            Token { text: "with".into(), position: 0, offset_from: 0, offset_to: 4, keyword: false },
+            Token { text: "cats".into(), position: 1, offset_from: 5, offset_to: 9, keyword: false },
         ]);
         assert_eq!(texts(&tokens), vec!["cats"]);
     }
@@ -690,8 +813,8 @@ mod tests {
         // Stop words are matched case-insensitively against the lowercase set.
         let f = StopFilter::english();
         let tokens = f.filter(vec![
-            Token { text: "The".into(), position: 0, offset_from: 0, offset_to: 3 },
-            Token { text: "cat".into(), position: 1, offset_from: 4, offset_to: 7 },
+            Token { text: "The".into(), position: 0, offset_from: 0, offset_to: 3, keyword: false },
+            Token { text: "cat".into(), position: 1, offset_from: 4, offset_to: 7, keyword: false },
         ]);
         assert_eq!(texts(&tokens), vec!["cat"]);
     }
@@ -704,8 +827,7 @@ mod tests {
                 text: w.to_string(),
                 position: 0,
                 offset_from: 0,
-                offset_to: w.len() as u32,
-            }]);
+                offset_to: w.len() as u32, keyword: false }]);
             assert!(tokens.is_empty(), "expected stop word: {w}");
         }
     }
@@ -822,7 +944,7 @@ mod tests {
             "scandinavian_folding", "serbian_normalization", "greek_lowercase",
             "turkish_lowercase", "irish_lowercase", "arabic_stem", "english_possessive"] {
             let filt = Analyzer::token_filter_by_name(f).unwrap_or_else(|| panic!("{f}"));
-            let _ = filt.filter(vec![Token { text: "Test".into(), position: 0, offset_from: 0, offset_to: 4 }]);
+            let _ = filt.filter(vec![Token { text: "Test".into(), position: 0, offset_from: 0, offset_to: 4, keyword: false }]);
         }
     }
 

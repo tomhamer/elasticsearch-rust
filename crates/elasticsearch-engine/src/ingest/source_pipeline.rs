@@ -12,12 +12,40 @@ fn field(cfg:&Source,key:&str)->Result<String>{text(cfg.get(key).ok_or_else(||Es
 fn rendered_field(doc:&SourceDocument,cfg:&Source,key:&str)->Result<String>{doc.render_path(&field(cfg,key)?)}
 fn media(cfg:&Source)->Result<super::jtext::MediaType>{let name=cfg.get("media_type").map(text).transpose()?.unwrap_or("application/json".into());super::jtext::MediaType::parse(&name).ok_or_else(||EsError::illegal_argument("unsupported media_type"))}
 fn boolean(cfg:&Source,key:&str,default:bool)->bool {cfg.get(key).and_then(|v|serde_json::from_str::<Value>(&v.text()).ok()).and_then(|v|v.as_bool()).unwrap_or(default)}
+/// A JSON integer literal `serde_json::Value` cannot hold exactly (beyond
+/// both `i64` and `u64`: it would parse as a rounded double).
+fn wide_integer(raw:&str)->bool {
+    let digits=raw.strip_prefix('-').unwrap_or(raw);
+    !digits.is_empty()&&digits.bytes().all(|b|b.is_ascii_digit())&&raw.parse::<i64>().is_err()&&raw.parse::<u64>().is_err()
+}
+fn has_wide(s:&Source)->bool {
+    match s {Source::Object(m)=>m.values().any(has_wide),Source::Array(a)=>a.iter().any(has_wide),Source::Scalar(r)=>wide_integer(r.get())}
+}
+/// Put back the exact text of wide integers the legacy `Value` round trip
+/// rounded, wherever the processor left them as they were (the same path
+/// still holds that rounded double): unrelated values never change.
+fn restore_wide(orig:&Source,new:&mut Source) {
+    match (orig,new) {
+        (Source::Object(o),Source::Object(n))=>for(k,v)in n.iter_mut(){if let Some(ov)=o.get(k){restore_wide(ov,v);}},
+        (Source::Array(o),Source::Array(n)) if o.len()==n.len()=>for(ov,v)in o.iter().zip(n.iter_mut()){restore_wide(ov,v);},
+        (Source::Scalar(o),n@Source::Scalar(_)) if wide_integer(o.get())=>{
+            let Source::Scalar(nr)=&*n else{return};
+            let same=o.get().parse::<f64>().ok().zip(nr.get().parse::<f64>().ok()).is_some_and(|(a,b)|a==b);
+            if same{*n=Source::Scalar(o.clone());}
+        }
+        _=>{}
+    }
+}
 fn legacy(n:&ProcessorNode,doc:&mut SourceDocument,cx:&PipelineContext)->PResult {
     let ctx:Value=serde_json::from_str(&doc.ctx.text()).map_err(EsError::from)?;
     let ingest:Value=serde_json::from_str(&doc.ingest.text()).map_err(EsError::from)?;
+    // Integers past `i64` / `u64` are kept exact (ES keeps them as
+    // `BigInteger`), not rounded by an unrelated processor's round trip.
+    let before=has_wide(&doc.ctx).then(||doc.ctx.clone());
     let mut old=IngestDocument{ctx,ingest,rerouted:doc.rerouted};
     let result=n.imp.process(&mut old,cx);
     doc.ctx=Source::from_value(&old.ctx);doc.ingest=Source::from_value(&old.ingest);doc.rerouted=old.rerouted;
+    if let Some(before)=before{restore_wide(&before,&mut doc.ctx);}
     result
 }
 /// These processors read one configured field and write one configured target.
@@ -255,13 +283,15 @@ fn process(n:&ProcessorNode,doc:&mut SourceDocument,cx:&PipelineContext,trace:&m
             let Some(Source::Object(base))=base else{return Ok(());};
             let keys:Vec<_>=base.keys().filter(|k|k.contains('.')&&(name=="*"||**k==name)&&!super::doc::METADATA_KEYS.contains(&k.as_str())).cloned().collect();
             for key in keys {
+                // Ancestors are checked before the dotted key is removed: a
+                // failed expansion keeps it (finding 249).
+                let target=path.as_ref().map(|p|format!("{p}.{key}")).unwrap_or(key.clone());
+                let segments:Vec<_>=target.split('.').collect();
+                for i in 1..segments.len(){let prefix=segments[..i].join(".");if let Ok(Some(v))=doc.get(&prefix){if !matches!(v,Source::Object(_)|Source::Array(_))&&v.text()!="null"{return Err(EsError::illegal_argument(format!("cannot expand [{key}], because [{prefix}] is not an object field, but a value field")).into());}}}
                 let value=if let Some(path)=&path {
                     let Some(Source::Object(mut parent))=doc.get(path)?.cloned()else{continue;};
                     let value=parent.remove(&key).unwrap();doc.set(path,Source::Object(parent))?;value
                 }else if let Source::Object(parent)=&mut doc.ctx{parent.remove(&key).unwrap()}else{unreachable!()};
-                let target=path.as_ref().map(|p|format!("{p}.{key}")).unwrap_or(key.clone());
-                let segments:Vec<_>=target.split('.').collect();
-                for i in 1..segments.len(){let prefix=segments[..i].join(".");if let Ok(Some(v))=doc.get(&prefix){if !matches!(v,Source::Object(_)|Source::Array(_))&&v.text()!="null"{return Err(EsError::illegal_argument(format!("cannot expand [{key}], because [{prefix}] is not an object field, but a value field")).into());}}}
                 if doc.get(&target)?.is_some()&&!boolean(cfg,"override",false){doc.append(&target,value,true)?;}else{doc.set(&target,value)?;}
             }
         },
@@ -368,13 +398,17 @@ fn process(n:&ProcessorNode,doc:&mut SourceDocument,cx:&PipelineContext,trace:&m
         "pipeline"=>{let name=rendered_field(doc,cfg,"name")?;if let Some(p)=cx.pipeline(&name){run(&p,doc,cx,trace)?;}else if !boolean(cfg,"ignore_missing_pipeline",false){return Err(EsError::illegal_argument(format!("pipeline with id [{name}] does not exist")).into());}},
         "foreach"=>{
             let path=rendered_field(doc,cfg,"field")?;let Some(value)=doc.get(&path)?.cloned() else{if boolean(cfg,"ignore_missing",false){return Ok(());}return Err(EsError::illegal_argument(format!("field [{path}] not present")).into());};
+            // ES `ForEachProcessor`: a null field is skipped with ignore_missing (finding 454).
+            if value.text()=="null"{if boolean(cfg,"ignore_missing",false){return Ok(());}return Err(EsError::illegal_argument(format!("field [{path}] is null, cannot loop over its elements.")).into());}
             let nested=cfg.get("processor").ok_or_else(||EsError::illegal_argument("[processor] required property is missing"))?;
             let wrapper=Source::Object(BTreeMap::from([("processors".into(),Source::Array(vec![nested.clone()]))]));
             let pipeline=compile_pipeline_source("_foreach",&wrapper)?;
             let previous=doc.get("_ingest._value")?.cloned();let previous_key=doc.get("_ingest._key")?.cloned();
             let result=(||->std::result::Result<Source,ProcessorError>{match value {
                 Source::Array(mut values)=>{for value in &mut values{doc.set("_ingest._value",value.clone())?;nodes(&pipeline.processors,doc,cx,&mut None)?;*value=doc.require("_ingest._value")?.clone();}Ok(Source::Array(values))},
-                Source::Object(values)=>{let mut result=BTreeMap::new();for(key,value)in values{doc.set("_ingest._key",Source::from_value(&json!(key)))?;doc.set("_ingest._value",value)?;nodes(&pipeline.processors,doc,cx,&mut None)?;let key=text(doc.require("_ingest._key")?)?;result.insert(key,doc.require("_ingest._value")?.clone());}Ok(Source::Object(result))},
+                Source::Object(values)=>{let mut result=BTreeMap::new();for(key,value)in values{doc.set("_ingest._key",Source::from_value(&json!(key)))?;doc.set("_ingest._value",value)?;nodes(&pipeline.processors,doc,cx,&mut None)?;let key=doc.require("_ingest._key")?.clone();let key=if key.text()=="null"{String::new()}else{text(&key)?};
+                    // A blank new key removes the entry (ES `Strings.hasText`, finding 476).
+                    if !key.trim().is_empty(){result.insert(key,doc.require("_ingest._value")?.clone());}}Ok(Source::Object(result))},
                 _=>Err(EsError::illegal_argument("foreach field must be a list or map").into()),
             }})();
             doc.set("_ingest._value",previous.unwrap_or_else(||Source::from_value(&Value::Null)))?;
@@ -471,6 +505,7 @@ pub(super) fn run(p:&Pipeline,doc:&mut SourceDocument,cx:&PipelineContext,trace:
     if cx.stack.borrow().len()>=100{return Err(EsError::illegal_state("Too many nested pipelines. Cannot have more than 100 nested pipelines").into());}
     let timer=cx.count_stats.get().then(||p.stats.pre());
     let previous=doc.ingest.get("pipeline").cloned();doc.set("_ingest.pipeline",Source::from_value(&json!(p.id)))?;
+    let _access=AccessPattern::enter(p.flexible);
     cx.stack.borrow_mut().push(p.id.clone());cx.executed.borrow_mut().push(p.id.clone());
     let previous_pipeline=INGEST_PIPELINE.with(|value|value.replace(p.id.clone()));
     let result=match nodes(&p.processors,doc,cx,trace) {
@@ -688,6 +723,29 @@ mod tests {
         assert!(doc.source_value().equivalent(&Source::parse(r#"{"s":"a\udfff"}"#).unwrap()));
         assert_eq!(doc.meta_str("_index").as_deref(),Some("test"));
     }
+    /// Finding 249: a dot_expander that fails on a scalar ancestor keeps
+    /// the dotted key under ignore_failure and on_failure, on the legacy
+    /// (Unicode) and the lossless (lone surrogate) paths alike.
+    #[test]
+    fn failed_dot_expansion_keeps_its_input() {
+        let store=IngestService::in_memory();let cx=PipelineContext::new(&store);
+        for processor in [json!({"dot_expander":{"field":"a.b","ignore_failure":true}}),json!({"dot_expander":{"field":"a.b","on_failure":[{"set":{"field":"failed","value":true}}]}})] {
+            for raw in [r#"{"a":"legacy","a.b":"important value"}"#,r#"{"a":"legacy","a.b":"important value","keep":"\ud800"}"#] {
+                let pipeline=compile_pipeline_source("dots",&Source::from_value(&json!({"processors":[processor.clone()]}))).unwrap();
+                let mut doc=SourceDocument::new(Source::parse(raw).unwrap(),"test",None,None,"now".into()).unwrap();
+                run(&pipeline,&mut doc,&cx,&mut None).unwrap();
+                let out=doc.source_value();
+                assert!(out.get("a.b").is_some_and(|v|v.text()=="\"important value\""),"{processor} {raw}: {}",out.text());
+                assert_eq!(out.get("a").map(|v|v.text()),Some("\"legacy\"".to_string()));
+            }
+        }
+        // A compatible expansion still moves the key.
+        let pipeline=compile_pipeline_source("dots",&Source::from_value(&json!({"processors":[{"dot_expander":{"field":"x.y"}}]}))).unwrap();
+        let mut doc=SourceDocument::new(Source::parse(r#"{"x.y":1}"#).unwrap(),"test",None,None,"now".into()).unwrap();
+        run(&pipeline,&mut doc,&cx,&mut None).unwrap();
+        assert!(doc.source_value().equivalent(&Source::parse(r#"{"x":{"y":1}}"#).unwrap()));
+    }
+
     #[test]
     fn templates_and_object_foreach_preserve_units() {
         let raw=Source::parse(r#"{"processors":[{"set":{"field":"{{name}}","value":"{{{s}}}","media_type":"text/plain"}},{"foreach":{"field":"map","processor":{"set":{"field":"_ingest._value","value":"{{{_ingest._value}}}x","media_type":"text/plain"}}}}]}"#).unwrap();
@@ -736,7 +794,15 @@ impl Node {
         }
         let mut doc = match pre {
             Some(d) => d,
-            None => SourceDocument::new(Source::parse_leading(r.source).map_err(|e|(EsError::from(e),r.index.to_string()))?,r.index,r.id,r.routing,now_timestamp()).map_err(|e|(e,r.index.to_string()))?,
+            None => {
+                let mut doc = SourceDocument::new(Source::parse_leading(r.source).map_err(|e|(EsError::from(e),r.index.to_string()))?,r.index,r.id,r.routing,now_timestamp()).map_err(|e|(e,r.index.to_string()))?;
+                // ES `IngestService.newIngestDocument`: the request's version
+                // (`MATCH_ANY` without one) and version type (`internal`
+                // without one) are the document's `_version` / `_version_type`.
+                doc.set_meta("_version", Source::from_value(&json!(r.cond.version.map(|v| v as i64).unwrap_or(super::MATCH_ANY))));
+                doc.set_meta("_version_type", Source::from_value(&json!(super::version_type_name(r.cond.version_type.unwrap_or(crate::shard::VersionType::Internal)))));
+                doc
+            }
         };
         let mut seen = vec![r.index.to_string()];
         let mut first: Option<Arc<Pipeline>> = None;
@@ -841,7 +907,11 @@ impl Node {
                 let meta = meta.map_err(|error|IngestFailure{error,index:r.index.to_string(),context:Default::default()})?;
                 let index = meta.get("_index").map(doc::value_to_string).unwrap_or_else(|| r.index.to_string());
                 let index = processors::resolve_index_expression(&index).map_err(|error| IngestFailure { error, index: r.index.to_string(), context: Default::default() })?;
+                // `updateIndexRequestMetadata`: the version and concurrency
+                // metadata the pipelines left apply to the write.
+                let cond = r.cond.after_pipelines(&meta).map_err(|error| IngestFailure { error, index: index.clone(), context: Default::default() })?;
                 IngestOutcome::Changed {
+                    cond,
                     index,
                     id: meta.get("_id").filter(|v| !v.is_null()).map(doc::value_to_string),
                     routing: meta.get("_routing").filter(|v| !v.is_null()).map(doc::value_to_string),
@@ -872,7 +942,7 @@ impl Node {
             let source=input.get("_source").cloned().ok_or_else(||EsError::illegal_argument("[_source] required property is missing"))?;
             let document=SourceDocument::new(source,&target,id.as_deref(),routing.as_deref(),now_timestamp())?;
             let context=PipelineContext{substitutions:Some(&substitutions),..PipelineContext::new(&store)};
-            let request=IngestRequest{index:&target,id:id.as_deref(),routing:routing.as_deref(),source:"",pipeline};
+            let request=IngestRequest{index:&target,id:id.as_deref(),routing:routing.as_deref(),source:"",pipeline,cond:WriteMeta::default()};
             let document=match self.execute_source_request_ix(&request,&context,Some(document)) {
                 Ok(Some(SourceExec::Doc(doc,_)))=>doc,
                 Ok(Some(SourceExec::Dropped(index)))=>{output.push(Source::from_value(&json!({"doc":{"_index":index,"_id":id.clone().unwrap_or_else(||"auto-generated".into()),"_version":-3,"result":"noop","_shards":{"total":0,"successful":0,"failed":0}}})));continue;},
@@ -891,5 +961,42 @@ impl Node {
             output.push(Source::Object(BTreeMap::from([("doc".into(),Source::Object(entry))])));
         }
         Ok(Source::Object(BTreeMap::from([("docs".into(),Source::Array(output))])))
+    }
+}
+
+#[cfg(test)]
+mod exact_integer_tests {
+    use serde_json::json;
+
+    fn run(node: &crate::node::Node, pipeline: serde_json::Value, source: &str) -> String {
+        node.ingest().put("p", pipeline, None).unwrap();
+        let r = node.run_ingest(crate::ingest::IngestRequest { index: "x", id: None, routing: None, source, pipeline: Some("p"), cond: Default::default() }).unwrap();
+        match r {
+            crate::ingest::IngestOutcome::Changed { source, .. } => source,
+            _ => panic!("pipeline did not run"),
+        }
+    }
+
+    /// Review finding 339: ingest leaves integers it does not touch exact:
+    /// an unsigned value past `i64` and an integer past `u64` keep their
+    /// digits through a script that writes another field (partial and
+    /// whole-ctx paths, and a script reading them) and through an unrelated
+    /// legacy processor.
+    #[test]
+    fn untouched_wide_integers_keep_their_digits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = crate::node::Node::open(tmp.path()).unwrap();
+        let src = r#"{"msg":"Hello","u":9223372036854775809,"max":18446744073709551615,"huge":123456789012345678901234567890,"p":{"big":99999999999999999999999}}"#;
+        let exact = |out: &str| {
+            for digits in ["9223372036854775809", "18446744073709551615", "123456789012345678901234567890", "99999999999999999999999"] {
+                assert!(out.contains(digits), "{digits} lost in {out}");
+            }
+        };
+        exact(&run(&node, json!({"processors": [{"script": {"source": "ctx.seen = 1"}}]}), src));
+        exact(&run(&node, json!({"processors": [{"script": {"source": "ctx.copy = ctx.u; ctx.whole = ctx.size()"}}]}), src));
+        let out = run(&node, json!({"processors": [{"script": {"source": "ctx.copy = ctx.u"}}]}), src);
+        assert!(out.contains(r#""copy":9223372036854775809"#), "{out}");
+        exact(&run(&node, json!({"processors": [{"lowercase": {"field": "msg"}}]}), src));
+        exact(&run(&node, json!({"processors": [{"remove": {"field": "msg"}}]}), src));
     }
 }

@@ -11,7 +11,7 @@ use crate::mapping::{EsType, FieldLookup, ResolvedField, FIELD_NAMES_FIELD, ID_F
 use crate::values;
 use rustic_core::analysis::Analyzer;
 use rustic_core::query::{
-    BoostMode, Bound, DecayKind, FieldValueModifier, Fuzziness, LeafReader, MinShouldMatch, MultiTermRewrite, Query, ScoreFunction, ScoreMode,
+    BoostMode, Bound, DecayKind, FieldValueModifier, Fuzziness, LeafReader, MinShouldMatch, MultiTermRewrite, MultiValueMode, Query, ScoreFunction, ScoreMode,
 };
 use rustic_core::types::Term;
 use serde_json::{Map, Value};
@@ -48,6 +48,11 @@ pub struct QueryContext<'a> {
     /// Full mapping for trusted alias/role filters only. User queries continue
     /// to resolve against `lookup`, which may be restricted by FLS.
     pub knn_prefilter_lookup: Option<Arc<FieldLookup>>,
+    /// The caller's document-level security filter (query DSL) on the
+    /// searched index: the inner side of a join (`has_child`, `has_parent`
+    /// and their `inner_hits`) only sees documents it matches, as ES's
+    /// DLS-wrapped reader hides the others from every query.
+    pub dls_filter: Option<Value>,
     /// `index.search.allow_expensive_queries` (default true).
     pub allow_expensive_queries: bool,
     /// The index, for its mapping (percolate builds its in-memory index
@@ -61,6 +66,20 @@ impl<'a> QueryContext<'a> {
             let trusted = QueryContext {
                 lookup: self.knn_prefilter_lookup.as_deref().unwrap_or(self.lookup),
                 knn_prefilter: None,
+                dls_filter: None,
+                ..self.clone()
+            };
+            parse_query(filter, &trusted)
+        }).transpose()
+    }
+    /// [`Self::dls_filter`] as a query (parsed against the full mapping:
+    /// a role filter may name fields FLS hides).
+    pub(crate) fn dls_query(&self) -> Result<Option<Query>> {
+        self.dls_filter.as_ref().map(|filter| {
+            let trusted = QueryContext {
+                lookup: self.knn_prefilter_lookup.as_deref().unwrap_or(self.lookup),
+                knn_prefilter: None,
+                dls_filter: None,
                 ..self.clone()
             };
             parse_query(filter, &trusted)
@@ -482,6 +501,8 @@ fn parse_named(name: &str, body: &Value, ctx: &QueryContext) -> Result<Query> {
         "geo_polygon" => super::geo::geo_polygon(body, ctx),
         "has_child" | "has_parent" | "parent_id" => Err(ctx.shard_err(format!("[{name}] queries are not supported (no join field support)"))),
         "kql" => parse_query(&super::kql::rewrite(body, ctx)?, ctx),
+        // ES|QL's pushed scalar predicates (internal).
+        "esql_single_value" => super::single_value::parse(body, ctx),
         "script" => crate::script::search::script_query(body, ctx),
         "script_score" => crate::script::search::script_score_query(body, ctx, &parse_query),
         "intervals" => super::positional::intervals_query(body, ctx),
@@ -521,7 +542,11 @@ fn unmapped(_ctx: &QueryContext) -> Query {
 /// either (binary, text with empty values, unindexed fields).
 fn field_presence(f: &ResolvedField) -> Option<Query> {
     let mut qs = Vec::new();
-    if let Some(id) = f.core_id.or(f.geo_id).or(f.lat_id) {
+    // `index: false` with `doc_values: false`: no indexed value exists (ES
+    // `exists`); the internal column kept for the field is not one. Only a
+    // `_field_names` entry (written for stored values) counts.
+    let source_only = !f.indexed && !f.doc_values && !f.ty.is_text() && !matches!(f.ty, EsType::Binary | EsType::DenseVector | EsType::SparseVector);
+    if let Some(id) = f.core_id.or(f.geo_id).or(f.lat_id).filter(|_| !source_only) {
         qs.push(Query::Exists { field: id });
     }
     if f.core_id.is_none() || f.ty.is_text() || matches!(f.ty, EsType::Binary | EsType::DenseVector | EsType::SparseVector) || (!f.indexed && !f.doc_values) {
@@ -578,6 +603,29 @@ fn normalize_keyword(f: &ResolvedField, s: &str) -> String {
     }
 }
 
+/// An integer query value: exact when it is an integer (a JSON integer or
+/// an integer string), else its double (fraction or beyond `i64`).
+pub(crate) enum QueryInt {
+    Exact(i64),
+    Approx(f64),
+}
+
+pub(crate) fn query_integer(v: &Value, s: &str) -> Option<QueryInt> {
+    match v {
+        Value::Number(n) => Some(match n.as_i64() {
+            Some(i) => QueryInt::Exact(i),
+            None => QueryInt::Approx(n.as_f64()?),
+        }),
+        _ => {
+            let t = s.trim();
+            match t.parse::<i64>() {
+                Ok(i) => Some(QueryInt::Exact(i)),
+                Err(_) => t.parse::<f64>().ok().map(QueryInt::Approx),
+            }
+        }
+    }
+}
+
 /// Exact-value query on a field (term semantics).
 pub fn term_query(f: &ResolvedField, v: &Value, case_insensitive: bool, ctx: &QueryContext) -> Result<Query> {
     if let Some(q) = crate::fieldtypes::query::term(f, v, case_insensitive, ctx)? {
@@ -608,14 +656,22 @@ pub fn term_query(f: &ResolvedField, v: &Value, case_insensitive: bool, ctx: &Qu
             }
         }
         EsType::Long | EsType::Integer | EsType::Short | EsType::Byte => {
-            let x: f64 = match v {
-                Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                _ => s.trim().parse().map_err(|_| num_err("long"))?,
+            // Exact integers (JSON or string) never go through a double;
+            // a value with a fraction matches nothing (ES `hasDecimalPart`).
+            let x = match query_integer(v, &s) {
+                Some(QueryInt::Exact(i)) => i,
+                Some(QueryInt::Approx(x)) => {
+                    if x.fract() != 0.0 {
+                        return Ok(Query::MatchNone);
+                    }
+                    if !(x >= i64::MIN as f64 && x < i64::MAX as f64) {
+                        return Err(ctx.shard_err(format!("failed to create query: Value [{s}] is out of range for a long")).caused_by(EsError::illegal_argument(format!("Value [{s}] is out of range for a long"))));
+                    }
+                    x as i64
+                }
+                None => return Err(num_err("long")),
             };
-            if x.fract() != 0.0 {
-                return Ok(Query::MatchNone);
-            }
-            Query::RangeI64 { field: id, lower: Bound::Included(x as i64), upper: Bound::Included(x as i64) }
+            Query::RangeI64 { field: id, lower: Bound::Included(x), upper: Bound::Included(x) }
         }
         EsType::UnsignedLong => {
             let x: u64 = match v {
@@ -632,7 +688,8 @@ pub fn term_query(f: &ResolvedField, v: &Value, case_insensitive: bool, ctx: &Qu
             let x = match f.ty {
                 EsType::Float => values::to_float(x),
                 EsType::HalfFloat => values::to_half_float(x),
-                EsType::ScaledFloat => (x * f.scaling_factor).round() / f.scaling_factor,
+                // The indexed encoding exactly (Java `Math.round`, saturated).
+                EsType::ScaledFloat => rustic_core::fieldtypes::numeric::scaled_round_trip(x, f.scaling_factor),
                 _ => x,
             };
             Query::RangeF64 { field: id, lower: Bound::Included(x), upper: Bound::Included(x) }
@@ -722,27 +779,70 @@ fn finest_pattern_unit(spec: &str) -> Option<Option<crate::date::CalUnit>> {
     })
 }
 
-/// A range bound given as text in an explicit non-epoch `format` (`spec`):
-/// `round_up` (`gt`, `lte`) fills the fields the format lacks as ES's
-/// round-up parser does; `gte` and `lt` take the value as parsed.
+/// A range bound given as text in a non-epoch `format` (`spec`), explicit
+/// or the mapping's: `round_up` (`gt`, `lte`) fills the fields the value
+/// lacks as ES's round-up parser does; `gte` and `lt` take the value as
+/// parsed.
 fn text_date_bound(s: &str, spec: &str, fmt: &DateFormatter, tz: Tz, now: i64, round_up: bool) -> Result<i64> {
     let unit = finest_pattern_unit(spec);
-    let ms = parse_date_math(s, fmt, tz, now, round_up && unit.is_none())?;
+    let ms = parse_date_math(s, fmt, tz, now, false)?;
     if !round_up {
         return Ok(ms);
     }
-    if let Some(unit) = unit {
-        return Ok(match unit {
-            Some(u) => crate::date::add_units(ms, u, 1, tz).saturating_sub(1),
-            None => ms,
-        });
+    // A pattern ends its finest field; a named (ISO) format ends the
+    // finest field the value gives (`2025-01-02` its day, `…T10` its hour).
+    let unit = match unit {
+        Some(u) => u,
+        None => iso_missing_unit(s),
+    };
+    Ok(match unit {
+        Some(u) => crate::date::add_units(ms, u, 1, tz).saturating_sub(1),
+        None => ms,
+    })
+}
+
+/// The finest unit an ISO-style date text gives, when it stops before
+/// milliseconds: `2025`, `2025-01`, `2025-01-02` → day (a missing month
+/// and day are their first, as ES's round-up parser), `T10` → hour, `T10:30`
+/// → minute, `T10:30:15` → second; a fraction gives everything.
+fn iso_missing_unit(s: &str) -> Option<crate::date::CalUnit> {
+    use crate::date::CalUnit;
+    let time = match s.split_once('T') {
+        Some((_, t)) => t,
+        // A time-only format (`hour_minute`: `10:30`).
+        None if s.contains(':') => s,
+        None => return Some(CalUnit::Day),
+    };
+    // Drop a zone suffix (`Z`, `+01:00`, `-0500`).
+    let time = time.split(['Z', 'z', '+', '-']).next().unwrap_or(time);
+    if time.contains(['.', ',']) {
+        return None;
     }
-    // A named format: `parse_date_math` rounded a `yyyy-MM-dd` date
-    // up already; another value without a time takes its day.
-    let b = s.as_bytes();
-    let rounded = b.len() == 10 && b[4] == b'-' && b[7] == b'-';
-    let has_time = s.contains(['T', ':']) || rounded;
-    Ok(if !has_time { ms + 86_400_000 - 1 } else { ms })
+    match time.split(':').filter(|p| !p.is_empty()).count() {
+        0 | 1 => Some(CalUnit::Hour),
+        2 => Some(CalUnit::Minute),
+        _ => Some(CalUnit::Second),
+    }
+}
+
+/// A text bound without an explicit query `format`: parsed by the
+/// mapping's first alternative that accepts it, rounded up as that
+/// alternative (production review #464: a mapped `yyyy/MM/dd` bound
+/// was never rounded up; ES applies the round-up parser whether the
+/// formatter came from the mapping or the request). `None`: no
+/// alternative parses it (the caller reports the error).
+fn mapped_text_date_bound(s: &str, mapped: &DateFormatter, tz: Tz, now: i64, round_up: bool) -> Option<i64> {
+    for alt in mapped.spec.split("||").map(str::trim).filter(|a| !a.is_empty()) {
+        let Ok(fmt) = mapped.alternative(alt) else { continue };
+        if fmt.parse_with_tz(s, tz).is_err() {
+            continue;
+        }
+        if fmt.accepts_numbers() {
+            return fmt.parse_with_tz(s, tz).ok();
+        }
+        return text_date_bound(s, alt, &fmt, tz, now, round_up).ok();
+    }
+    None
 }
 
 fn date_value(f: &ResolvedField, v: &Value, format: Option<&str>, tz: Option<Tz>, round_up: bool, ctx: &QueryContext) -> Result<i64> {
@@ -784,9 +884,16 @@ fn date_value(f: &ResolvedField, v: &Value, format: Option<&str>, tz: Option<Tz>
                 Ok(x as i64)
             }
         }
-        Value::String(s) => parse_date_math(s, &fmt, tz, ctx.now, round_up).map_err(|e| {
-            ctx.shard_err(format!("failed to create query: {}", e.reason)).caused_by(EsError::new(400, "parse_exception", e.reason.clone()))
-        }),
+        Value::String(s) => {
+            if format.is_none() && !s.contains("||") && !s.starts_with("now") {
+                if let Some(v) = mapped_text_date_bound(s, &fmt, tz, ctx.now, round_up) {
+                    return Ok(v);
+                }
+            }
+            parse_date_math(s, &fmt, tz, ctx.now, round_up).map_err(|e| {
+                ctx.shard_err(format!("failed to create query: {}", e.reason)).caused_by(EsError::new(400, "parse_exception", e.reason.clone()))
+            })
+        }
         _ => Err(ctx.shard_err("failed to create query: date value must be a string or a number")),
     }
 }
@@ -870,6 +977,18 @@ fn parse_terms(body: &Value, ctx: &QueryContext) -> Result<Query> {
             ctx.max_terms_count
         )));
     }
+    // Looked-up values take the same field-type semantics as inline ones
+    // (`constant_keyword`, ranges, ...; finding 477).
+    if spec.is_object() {
+        let mut inline = serde_json::Map::new();
+        inline.insert(field.clone(), Value::Array(values.to_vec()));
+        if let Some(b) = o.get("boost") {
+            inline.insert("boost".into(), b.clone());
+        }
+        if let Some(q) = crate::fieldtypes::query::intercept("terms", &Value::Object(inline), ctx)? {
+            return Ok(q);
+        }
+    }
     let q = match field.as_str() {
         "_id" => Query::TermSet { field: ID_FIELD, terms: values.iter().map(|v| scalar_string(v).into_bytes()).collect(), boost: 1.0 },
         "_index" => {
@@ -949,8 +1068,30 @@ fn parse_range(body: &Value, ctx: &QueryContext) -> Result<Query> {
         return Err(ctx.shard_err(format!("failed to create query: {}", crate::search::SEQ_NO_DISABLED)));
     }
     if field == "_seq_no" {
-        let lo = gte.as_ref().and_then(Value::as_i64).map(Bound::Included).or(gt.as_ref().and_then(Value::as_i64).map(Bound::Excluded)).unwrap_or(Bound::Unbounded);
-        let hi = lte.as_ref().and_then(Value::as_i64).map(Bound::Included).or(lt.as_ref().and_then(Value::as_i64).map(Bound::Excluded)).unwrap_or(Bound::Unbounded);
+        // ES `SeqNoFieldMapper.parse`: a number's long value, anything else
+        // through `Long.parseLong`. Every present bound applies; one that
+        // does not parse fails the query (production review #186: a quoted
+        // bound was dropped and the range became unbounded).
+        let seq = |v: &Option<Value>| -> Result<Option<i64>> {
+            match v {
+                None => Ok(None),
+                Some(Value::Number(n)) => Ok(Some(n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(i64::MAX))),
+                Some(other) => {
+                    let text = match other { Value::String(s) => s.clone(), o => o.to_string() };
+                    text.parse::<i64>().map(Some).map_err(|_| ctx.shard_err(format!("failed to create query: For input string: \"{text}\"")))
+                }
+            }
+        };
+        let lo = match (seq(&gte)?, seq(&gt)?) {
+            (Some(v), _) => Bound::Included(v),
+            (None, Some(v)) => Bound::Excluded(v),
+            (None, None) => Bound::Unbounded,
+        };
+        let hi = match (seq(&lte)?, seq(&lt)?) {
+            (Some(v), _) => Bound::Included(v),
+            (None, Some(v)) => Bound::Excluded(v),
+            (None, None) => Bound::Unbounded,
+        };
         return Ok(with_boost(Query::RangeI64 { field: SEQ_NO_FIELD, lower: lo, upper: hi }, boost));
     }
     let Some(f) = ctx.lookup.get(field) else { return Ok(Query::MatchNone) };
@@ -967,10 +1108,57 @@ fn parse_range(body: &Value, ctx: &QueryContext) -> Result<Query> {
     };
     let q = match f.ty {
         EsType::Long | EsType::Integer | EsType::Short | EsType::Byte => {
-            // Integer fields: round fractional bounds inward.
-            let lower = if let Some(v) = &gte { Bound::Included(num(v)?.ceil() as i64) } else if let Some(v) = &gt { let x = num(v)?; Bound::Included(if x.fract() == 0.0 { x as i64 + 1 } else { x.ceil() as i64 }) } else { Bound::Unbounded };
-            let upper = if let Some(v) = &lte { Bound::Included(num(v)?.floor() as i64) } else if let Some(v) = &lt { let x = num(v)?; Bound::Included(if x.fract() == 0.0 { x as i64 - 1 } else { x.floor() as i64 }) } else { Bound::Unbounded };
-            Query::RangeI64 { field: id, lower, upper }
+            // Integer fields: exact integer bounds (never through a double),
+            // fractional bounds rounded inward; an exclusive bound past the
+            // i64 range matches nothing.
+            let bound = |v: &Value, lower: bool, inclusive: bool| -> Result<Option<i64>> {
+                let s = scalar_string(v);
+                let q = match v {
+                    Value::Number(_) | Value::String(_) => query_integer(v, &s),
+                    _ => None,
+                };
+                Ok(match q {
+                    Some(QueryInt::Exact(i)) => match (inclusive, lower) {
+                        (true, _) => Some(i),
+                        (false, true) => i.checked_add(1),
+                        (false, false) => i.checked_sub(1),
+                    },
+                    Some(QueryInt::Approx(x)) => {
+                        let r = if lower {
+                            if inclusive || x.fract() != 0.0 { x.ceil() } else { x + 1.0 }
+                        } else if inclusive || x.fract() != 0.0 {
+                            x.floor()
+                        } else {
+                            x - 1.0
+                        };
+                        if lower && r >= i64::MAX as f64 {
+                            None
+                        } else if !lower && r < i64::MIN as f64 {
+                            None
+                        } else {
+                            Some(r.clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+                        }
+                    }
+                    None => {
+                        num(v)?;
+                        return Err(ctx.shard_err("failed to create query: range bound must be a number"));
+                    }
+                })
+            };
+            let lower = match (&gte, &gt) {
+                (Some(v), _) => bound(v, true, true)?.map(Bound::Included),
+                (None, Some(v)) => bound(v, true, false)?.map(Bound::Included),
+                (None, None) => Some(Bound::Unbounded),
+            };
+            let upper = match (&lte, &lt) {
+                (Some(v), _) => bound(v, false, true)?.map(Bound::Included),
+                (None, Some(v)) => bound(v, false, false)?.map(Bound::Included),
+                (None, None) => Some(Bound::Unbounded),
+            };
+            match (lower, upper) {
+                (Some(lower), Some(upper)) => Query::RangeI64 { field: id, lower, upper },
+                _ => Query::MatchNone,
+            }
         }
         EsType::UnsignedLong => {
             let lower = if let Some(v) = &gte { Bound::Included(num(v)?.ceil().max(0.0) as u64) } else if let Some(v) = &gt { Bound::Excluded(num(v)?.max(0.0) as u64) } else { Bound::Unbounded };
@@ -1005,8 +1193,17 @@ fn parse_range(body: &Value, ctx: &QueryContext) -> Result<Query> {
                 EsType::HalfFloat => values::to_half_float(x),
                 _ => x,
             };
-            let lower = if let Some(v) = &gte { Bound::Included(conv(num(v)?)) } else if let Some(v) = &gt { Bound::Excluded(conv(num(v)?)) } else { Bound::Unbounded };
-            let upper = if let Some(v) = &lte { Bound::Included(conv(num(v)?)) } else if let Some(v) = &lt { Bound::Excluded(conv(num(v)?)) } else { Bound::Unbounded };
+            let (lower, upper) = if f.ty == EsType::HalfFloat {
+                // Directional half-float bounds (ES `HALF_FLOAT.rangeQuery`).
+                let half = |v: &Value, lower: bool, inclusive: bool| -> Result<Bound<f64>> { Ok(Bound::Included(values::half_float_bound(num(v)?, lower, inclusive))) };
+                let lower = if let Some(v) = &gte { half(v, true, true)? } else if let Some(v) = &gt { half(v, true, false)? } else { Bound::Unbounded };
+                let upper = if let Some(v) = &lte { half(v, false, true)? } else if let Some(v) = &lt { half(v, false, false)? } else { Bound::Unbounded };
+                (lower, upper)
+            } else {
+                let lower = if let Some(v) = &gte { Bound::Included(conv(num(v)?)) } else if let Some(v) = &gt { Bound::Excluded(conv(num(v)?)) } else { Bound::Unbounded };
+                let upper = if let Some(v) = &lte { Bound::Included(conv(num(v)?)) } else if let Some(v) = &lt { Bound::Excluded(conv(num(v)?)) } else { Bound::Unbounded };
+                (lower, upper)
+            };
             Query::RangeF64 { field: id, lower, upper }
         }
         EsType::Date | EsType::DateNanos => {
@@ -1279,12 +1476,19 @@ pub struct MatchOpts {
     pub zero_terms_all: bool,
     pub lenient: bool,
     pub quoted: bool,
+    /// `auto_generate_synonyms_phrase_query` (default true): a multi-word
+    /// synonym alternative is a phrase, else all its words.
+    pub synonym_phrase: bool,
+    /// `fuzzy_rewrite` (default: top terms blended by `max_expansions`).
+    pub fuzzy_rewrite: Option<MultiTermRewrite>,
 }
 
 impl Default for MatchOpts {
     fn default() -> Self {
         Self {
             kind: MatchKind::Bool,
+            synonym_phrase: true,
+            fuzzy_rewrite: None,
             operator_and: false,
             msm: None,
             fuzziness: None,
@@ -1324,6 +1528,12 @@ pub fn match_opts_from(o: &Map<String, Value>, kind: MatchKind, ctx: &QueryConte
     m.slop = o.get("slop").or(o.get("phrase_slop")).and_then(Value::as_u64).unwrap_or(0) as u32;
     m.zero_terms_all = o.get("zero_terms_query").and_then(Value::as_str).map(|s| s.eq_ignore_ascii_case("all")).unwrap_or(false);
     m.lenient = o.get("lenient").and_then(Value::as_bool).unwrap_or(false);
+    m.synonym_phrase = o.get("auto_generate_synonyms_phrase_query").and_then(Value::as_bool).unwrap_or(true);
+    if let Some(r) = o.get("fuzzy_rewrite").and_then(Value::as_str) {
+        let mut spec = Map::new();
+        spec.insert("rewrite".into(), Value::String(r.to_string()));
+        m.fuzzy_rewrite = Some(rewrite_of(&spec));
+    }
     Ok(m)
 }
 
@@ -1357,19 +1567,46 @@ fn parse_match(body: &Value, ctx: &QueryContext, kind: MatchKind) -> Result<Quer
 
 /// Tokens grouped by position: `positions[i]` = terms at position i.
 pub(crate) fn analyze_positions(a: &Analyzer, text: &str) -> Vec<Vec<String>> {
-    let toks = a.analyze(text);
+    token_positions(&a.analyze(text))
+}
+
+/// [`analyze_positions`] of tokens already analyzed.
+fn token_positions(toks: &[rustic_core::analysis::Token]) -> Vec<Vec<String>> {
     let mut out: Vec<(u32, Vec<String>)> = Vec::new();
     for t in toks {
         match out.last_mut() {
             Some((p, v)) if *p == t.position => {
                 if !v.contains(&t.text) {
-                    v.push(t.text)
+                    v.push(t.text.clone())
                 }
             }
-            _ => out.push((t.position, vec![t.text])),
+            _ => out.push((t.position, vec![t.text.clone()])),
         }
     }
     out.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Tokens by position relative to the first token, with an empty entry for
+/// each position the analyzer left out (a removed stop word): a phrase's
+/// holes, which its later terms keep their distance across.
+pub(crate) fn analyze_positions_with_holes(a: &Analyzer, text: &str) -> Vec<Vec<String>> {
+    token_positions_with_holes(&a.analyze(text))
+}
+
+/// [`analyze_positions_with_holes`] of tokens already analyzed.
+fn token_positions_with_holes(toks: &[rustic_core::analysis::Token]) -> Vec<Vec<String>> {
+    let Some(first) = toks.iter().map(|t| t.position).min() else { return Vec::new() };
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for t in toks {
+        let i = (t.position - first) as usize;
+        if out.len() <= i {
+            out.resize(i + 1, Vec::new());
+        }
+        if !out[i].contains(&t.text) {
+            out[i].push(t.text.clone());
+        }
+    }
+    out
 }
 
 /// Expand `prefix` against the term dictionaries of the searched leaves.
@@ -1420,10 +1657,11 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
         let s = scalar_string(text);
         return Ok(if s == ctx.index_name || ctx.aliases.contains(&s) { Query::MatchAll } else { Query::MatchNone });
     }
+    // (Read in place: a match query is parsed per percolated query, and the
+    // field's resolved mapping is large.)
     let Some(f) = ctx.lookup.get(field) else {
         return Ok(Query::MatchNone);
     };
-    let f = f.clone();
     // `MatchQueryParser`: fields without text search info (`TextSearchInfo.NONE`).
     if matches!(f.declared, EsType::GeoPoint | EsType::GeoShape | EsType::DenseVector) {
         return Err(ctx.shard_err(format!("failed to create query: Field [{}] of type [{}] does not support match queries", f.name, f.declared.name())));
@@ -1431,8 +1669,54 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
     if !f.ty.is_text() {
         if matches!(opts.kind, MatchKind::PhrasePrefix | MatchKind::BoolPrefix) && f.ty.is_keyword_like() {
             if let Some(id) = f.core_id {
-                return Ok(Query::Prefix { field: id, prefix: normalize_keyword(&f, &scalar_string(text)).into_bytes(), max_expansions: opts.max_expansions, case_insensitive: false, rewrite: MultiTermRewrite::ConstantScore });
+                // `max_expansions` never limits a bool-prefix's final prefix.
+                let max = if opts.kind == MatchKind::BoolPrefix { usize::MAX } else { opts.max_expansions };
+                return Ok(Query::Prefix { field: id, prefix: normalize_keyword(&f, &scalar_string(text)).into_bytes(), max_expansions: max, case_insensitive: false, rewrite: MultiTermRewrite::ConstantScore });
             }
+        }
+        // A keyword's full-text search analysis: the request's analyzer, or
+        // `split_queries_on_whitespace` (each piece normalized), turns the
+        // text into several term queries under the operator (ES
+        // `KeywordFieldMapper` search analyzer, `MatchQueryParser`).
+        if f.ty.is_keyword_like() && opts.kind == MatchKind::Bool && (opts.analyzer.is_some() || f.split_queries_on_whitespace) {
+            let s = scalar_string(text);
+            let tokens: Vec<String> = match &opts.analyzer {
+                Some(a) => a.analyze(&s).into_iter().map(|t| t.text).collect(),
+                None => s.split_whitespace().map(str::to_string).collect(),
+            };
+            if tokens.is_empty() {
+                return Ok(if opts.zero_terms_all { Query::MatchAll } else { Query::MatchNone });
+            }
+            let mut clauses = Vec::with_capacity(tokens.len());
+            for t in &tokens {
+                let one = MatchOpts { analyzer: None, ..opts.clone() };
+                // Each piece as the field's own single-value query.
+                let q = match (&one.fuzziness, f.core_id) {
+                    (Some(fz), Some(id)) => Query::Fuzzy {
+                        field: id,
+                        text: normalize_keyword(&f, t),
+                        fuzziness: *fz,
+                        prefix_length: one.prefix_length,
+                        transpositions: one.transpositions,
+                        max_expansions: one.max_expansions,
+                        rewrite: one.fuzzy_rewrite.clone().unwrap_or(MultiTermRewrite::TopTermsBlendedFreqs(one.max_expansions)),
+                    },
+                    _ => match term_query(&f, &Value::String(t.clone()), false, ctx) {
+                        Ok(q) => q,
+                        Err(_) if opts.lenient => Query::MatchNone,
+                        Err(e) => return Err(e),
+                    },
+                };
+                clauses.push(q);
+            }
+            if clauses.len() == 1 && opts.msm.is_none() {
+                return Ok(clauses.pop().unwrap());
+            }
+            return Ok(if opts.operator_and {
+                mk_bool(clauses, vec![], vec![], vec![], MinShouldMatch::Count(0))
+            } else {
+                mk_bool(vec![], clauses, vec![], vec![], opts.msm.clone().unwrap_or(MinShouldMatch::Count(1)))
+            });
         }
         if let (Some(fz), true, Some(id)) = (&opts.fuzziness, f.ty.is_keyword_like(), f.core_id) {
             return Ok(Query::Fuzzy {
@@ -1442,7 +1726,7 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
                 prefix_length: opts.prefix_length,
                 transpositions: opts.transpositions,
                 max_expansions: opts.max_expansions,
-                rewrite: MultiTermRewrite::TopTermsBlendedFreqs(opts.max_expansions),
+                rewrite: opts.fuzzy_rewrite.clone().unwrap_or(MultiTermRewrite::TopTermsBlendedFreqs(opts.max_expansions)),
             });
         }
         return match term_query(&f, text, false, ctx) {
@@ -1458,7 +1742,15 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
         .or_else(|| if opts.quoted { f.search_quote_analyzer.clone() } else { f.search_analyzer.clone() })
         .unwrap_or_else(|| Arc::new(Analyzer::standard()));
     let s = scalar_string(text);
-    let positions = analyze_positions(&analyzer, &s);
+    // One analysis of the text: its positions, phrase holes and (for a
+    // boolean match) the synonym graph it recorded.
+    let graph = opts.kind == MatchKind::Bool && opts.fuzziness.is_none();
+    let (toks, groups, count) = if graph {
+        rustic_core::analysis::filter::synonym::record_graph(|| analyzer.analyze(&s))
+    } else {
+        (analyzer.analyze(&s), Vec::new(), None)
+    };
+    let positions = token_positions(&toks);
     if positions.is_empty() {
         return Ok(if opts.zero_terms_all { Query::MatchAll } else { Query::MatchNone });
     }
@@ -1471,14 +1763,15 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
             prefix_length: opts.prefix_length,
             transpositions: opts.transpositions,
             max_expansions: opts.max_expansions,
-            rewrite: MultiTermRewrite::TopTermsBlendedFreqs(opts.max_expansions),
+            rewrite: opts.fuzzy_rewrite.clone().unwrap_or(MultiTermRewrite::TopTermsBlendedFreqs(opts.max_expansions)),
         },
         None => term(t),
     };
     let position_query = |alts: &Vec<String>, last_prefix: bool| -> Query {
         let mk = |t: &String| {
             if last_prefix {
-                Query::Prefix { field: id, prefix: t.as_bytes().to_vec(), max_expansions: opts.max_expansions, case_insensitive: false, rewrite: MultiTermRewrite::ConstantScore }
+                // ES: `max_expansions` does not apply to the final prefix.
+                Query::Prefix { field: id, prefix: t.as_bytes().to_vec(), max_expansions: usize::MAX, case_insensitive: false, rewrite: MultiTermRewrite::ConstantScore }
             } else {
                 fuzzy_or_term(t)
             }
@@ -1492,6 +1785,44 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
             mk_bool(vec![], alts.iter().map(mk).collect(), vec![], vec![], MinShouldMatch::Count(1))
         }
     };
+    // Multi-word synonym alternatives (a synonym graph): each is one
+    // clause of its paths, a multi-word path a phrase (ES
+    // `QueryBuilder.analyzeGraphBoolean`).
+    if graph {
+        if !groups.is_empty() && count == Some(toks.len()) {
+            let grouped: std::collections::HashSet<usize> = groups.iter().flat_map(|g| g.paths.iter().flatten().copied()).collect();
+            let mut by_pos: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+            for (i, t) in toks.iter().enumerate().filter(|(i, _)| !grouped.contains(i)) {
+                let alts = by_pos.entry(t.position).or_default();
+                if !alts.contains(&t.text) {
+                    alts.push(t.text.clone());
+                }
+            }
+            let mut clauses: Vec<(u32, Query)> = by_pos.iter().map(|(p, alts)| (*p, position_query(alts, false))).collect();
+            for g in &groups {
+                let pos = g.paths.iter().flatten().map(|&i| toks[i].position).min().unwrap_or(0);
+                let paths: Vec<Query> = g.paths.iter().map(|p| {
+                    let words: Vec<&str> = p.iter().map(|&i| toks[i].text.as_str()).collect();
+                    match words.len() {
+                        1 => term(words[0]),
+                        _ if opts.synonym_phrase => Query::Phrase { terms: words.iter().map(|w| Term::new_text(id, w)).collect(), slop: 0 },
+                        _ => mk_bool(words.iter().map(|w| term(w)).collect(), vec![], vec![], vec![], MinShouldMatch::Count(0)),
+                    }
+                }).collect();
+                clauses.push((pos, mk_bool(vec![], paths, vec![], vec![], MinShouldMatch::Count(1))));
+            }
+            clauses.sort_by_key(|c| c.0);
+            let clauses: Vec<Query> = clauses.into_iter().map(|c| c.1).collect();
+            if clauses.len() == 1 && opts.msm.is_none() {
+                return Ok(clauses.into_iter().next().unwrap());
+            }
+            return Ok(if opts.operator_and {
+                mk_bool(clauses, vec![], vec![], vec![], MinShouldMatch::Count(0))
+            } else {
+                mk_bool(vec![], clauses, vec![], vec![], opts.msm.clone().unwrap_or(MinShouldMatch::Count(1)))
+            });
+        }
+    }
     match opts.kind {
         MatchKind::Bool | MatchKind::BoolPrefix => {
             let n = positions.len();
@@ -1510,8 +1841,43 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
             }
         }
         MatchKind::Phrase => {
+            // A synonym graph (multi-word alternatives): ES
+            // `analyzeGraphPhrase`, a span near of the positions in order,
+            // each group a span or of its paths (a multi-word path an exact
+            // span near).
+            let (toks, groups, count) = rustic_core::analysis::filter::synonym::record_graph(|| analyzer.analyze(&s));
+            if !groups.is_empty() && count == Some(toks.len()) {
+                use rustic_core::query::SpanQuery;
+                let grouped: std::collections::HashSet<usize> = groups.iter().flat_map(|g| g.paths.iter().flatten().copied()).collect();
+                let mut by_pos: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+                for (i, t) in toks.iter().enumerate().filter(|(i, _)| !grouped.contains(i)) {
+                    let alts = by_pos.entry(t.position).or_default();
+                    if !alts.contains(&t.text) {
+                        alts.push(t.text.clone());
+                    }
+                }
+                let span_term = |w: &str| SpanQuery::Term(Term::new_text(id, w));
+                let mut clauses: Vec<(u32, SpanQuery)> = by_pos.iter().map(|(p, alts)| {
+                    (*p, if alts.len() == 1 { span_term(&alts[0]) } else { SpanQuery::Or(alts.iter().map(|a| span_term(a)).collect()) })
+                }).collect();
+                for g in &groups {
+                    let pos = g.paths.iter().flatten().map(|&i| toks[i].position).min().unwrap_or(0);
+                    let paths: Vec<SpanQuery> = g.paths.iter().map(|p| match p.len() {
+                        1 => span_term(&toks[p[0]].text),
+                        _ => SpanQuery::Near { clauses: p.iter().map(|&i| span_term(&toks[i].text)).collect(), slop: 0, in_order: true },
+                    }).collect();
+                    clauses.push((pos, SpanQuery::Or(paths)));
+                }
+                clauses.sort_by_key(|c| c.0);
+                let mut clauses: Vec<SpanQuery> = clauses.into_iter().map(|c| c.1).collect();
+                return Ok(Query::Span(if clauses.len() == 1 { clauses.remove(0) } else { SpanQuery::Near { clauses, slop: opts.slop, in_order: true } }));
+            }
             if positions.len() == 1 {
                 return Ok(position_query(&positions[0], false));
+            }
+            let holed = token_positions_with_holes(&toks);
+            if holed.iter().any(Vec::is_empty) {
+                return Ok(Query::MultiPhrase { field: id, positions: holed.iter().map(|p| p.iter().map(|t| Term::new_text(id, t)).collect()).collect(), slop: opts.slop });
             }
             if positions.iter().all(|p| p.len() == 1) {
                 Ok(Query::Phrase { terms: positions.iter().map(|p| Term::new_text(id, &p[0])).collect(), slop: opts.slop })
@@ -1535,7 +1901,9 @@ fn match_field_inner(field: &str, text: &Value, opts: &MatchOpts, ctx: &QueryCon
             if expanded.is_empty() {
                 return Ok(Query::MatchNone);
             }
-            let mut pos: Vec<Vec<Term>> = positions[..positions.len() - 1].iter().map(|p| p.iter().map(|t| Term::new_text(id, t)).collect()).collect();
+            // Holes (removed tokens) keep the later terms' distances.
+            let holed = token_positions_with_holes(&toks);
+            let mut pos: Vec<Vec<Term>> = holed[..holed.len() - 1].iter().map(|p| p.iter().map(|t| Term::new_text(id, t)).collect()).collect();
             pos.push(expanded.iter().map(|t| Term::new_text(id, t)).collect());
             Ok(Query::MultiPhrase { field: id, positions: pos, slop: opts.slop })
         }
@@ -1622,7 +1990,10 @@ fn parse_multi_match(body: &Value, ctx: &QueryContext) -> Result<Query> {
             } else if qs.len() == 1 {
                 qs.into_iter().next().unwrap()
             } else {
-                Query::DisMax { queries: qs, tie_breaker: tie.unwrap_or(0.0) }
+                // `bool_prefix` scores like `most_fields`: ES
+                // `MultiMatchQueryBuilder.Type.BOOL_PREFIX` has tie breaker 1.
+                let default_tie = if ty == "bool_prefix" { 1.0 } else { 0.0 };
+                Query::DisMax { queries: qs, tie_breaker: tie.unwrap_or(default_tie) }
             }
         }
     };
@@ -1663,12 +2034,16 @@ pub(crate) fn parse_function(o: &Map<String, Value>, ctx: &QueryContext) -> Resu
                 let missing = fo.get("missing").and_then(Value::as_f64);
                 let f = ctx.lookup.get(field);
                 match f.and_then(|f| f.core_id) {
-                    Some(id) => func = Some(ScoreFunction::FieldValueFactor { field: id, factor, modifier, missing }),
+                    Some(id) => func = Some(ScoreFunction::FieldValueFactor { field: id, name: field.to_string(), factor, modifier, missing }),
                     None => {
-                        if missing.is_none() {
+                        let Some(missing) = missing else {
                             return Err(EsError::new(400, "exception", format!("Unable to find a field mapper for field [{field}]. No 'missing' value defined.")));
-                        }
-                        func = Some(ScoreFunction::Weight((missing.unwrap() * factor as f64) as f32));
+                        };
+                        // Unmapped: every document takes `missing`, with the
+                        // factor and modifier (ES `FieldValueFactorFunction`),
+                        // weighing 1 in an `avg` like the mapped function.
+                        let value = modifier.apply(factor as f64 * missing) as f32;
+                        func = Some(ScoreFunction::Weighted { function: Box::new(ScoreFunction::Weight(value)), weight: 1.0 });
                     }
                 }
             }
@@ -1676,6 +2051,7 @@ pub(crate) fn parse_function(o: &Map<String, Value>, ctx: &QueryContext) -> Resu
                 let ro = v.as_object().cloned().unwrap_or_default();
                 // `RandomScoreFunctionBuilder.doToFunction`: a seeded score reads
                 // its randomness from `field` (ES 9 default `_seq_no`).
+                let mut source: Option<u16> = None;
                 if ro.get("seed").is_some_and(|s| !s.is_null()) {
                     let index = format!("[{}/{}]", ctx.index_name, ctx.index_uuid);
                     let field = match ro.get("field").and_then(Value::as_str) {
@@ -1689,13 +2065,19 @@ pub(crate) fn parse_function(o: &Map<String, Value>, ctx: &QueryContext) -> Resu
                     if !mapped && !ctx.lookup.fields.is_empty() {
                         return Err(ctx.shard_err(format!("failed to create query: Field [{field}] is not mapped on [{index}] and cannot be used as a source of random numbers.")));
                     }
+                    // The field's values (doc values) drive the score.
+                    source = crate::mapping::reserved_long_field_id(&field).or_else(|| ctx.lookup.get(&field).and_then(|f| f.core_id));
                 }
                 let seed = ro.get("seed").map(|s| match s {
                     Value::Number(n) => n.as_u64().unwrap_or(0),
                     Value::String(s) => s.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64)),
                     _ => 0,
                 }).unwrap_or_else(|| crate::date::now_millis() as u64);
-                func = Some(ScoreFunction::RandomScore { seed });
+                func = Some(match source {
+                    // Salted by the index (ES salts by index and shard).
+                    Some(field) => ScoreFunction::RandomField { seed, salt: ctx.index_uuid.bytes().chain(ctx.index_name.bytes()).fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64)), field },
+                    None => ScoreFunction::RandomScore { seed },
+                });
             }
             "gauss" | "exp" | "linear" => {
                 let kind = match k.as_str() {
@@ -1704,6 +2086,16 @@ pub(crate) fn parse_function(o: &Map<String, Value>, ctx: &QueryContext) -> Resu
                     _ => DecayKind::Linear,
                 };
                 let fo = obj(k, v)?;
+                let mode = match fo.get("multi_value_mode").map(|m| m.as_str().unwrap_or("").to_ascii_lowercase()) {
+                    None => MultiValueMode::Min,
+                    Some(m) => match m.as_str() {
+                        "min" => MultiValueMode::Min,
+                        "max" => MultiValueMode::Max,
+                        "avg" => MultiValueMode::Avg,
+                        "sum" => MultiValueMode::Sum,
+                        other => return Err(EsError::illegal_argument(format!("No enum constant org.elasticsearch.search.MultiValueMode.{}", other.to_ascii_uppercase()))),
+                    },
+                };
                 let (field, spec) = fo.iter().find(|(n, _)| n.as_str() != "multi_value_mode").ok_or_else(|| parsing(format!("[{k}] requires a field")))?;
                 let so = spec.as_object().ok_or_else(|| parsing(format!("[{k}] field must be an object")))?;
                 let Some(rf) = ctx.lookup.get(field) else {
@@ -1729,7 +2121,10 @@ pub(crate) fn parse_function(o: &Map<String, Value>, ctx: &QueryContext) -> Resu
                             _ => Ok(0.0),
                         }
                     };
-                    (origin, tv("scale")?, tv("offset")?)
+                    // date_nanos values are nanoseconds: origin, scale and
+                    // offset (millis) move to that unit.
+                    let unit = if rf.ty == EsType::DateNanos || rf.declared == EsType::DateNanos { 1_000_000.0 } else { 1.0 };
+                    (origin * unit, tv("scale")? * unit, tv("offset")? * unit)
                 } else {
                     let n = |key: &str| so.get(key).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
                     (
@@ -1738,7 +2133,7 @@ pub(crate) fn parse_function(o: &Map<String, Value>, ctx: &QueryContext) -> Resu
                         n("offset").unwrap_or(0.0),
                     )
                 };
-                func = Some(ScoreFunction::Decay { field: id, origin, scale, offset, decay, kind });
+                func = Some(ScoreFunction::Decay { field: id, origin, scale, offset, decay, kind, mode });
             }
             "script_score" => return Err(ctx.shard_err("[script_score] functions are not supported (no scripting engine)")),
             "weight" | "filter" | "_name" => {}
@@ -1870,8 +2265,26 @@ fn parse_nested(o: &Map<String, Value>, ctx: &QueryContext) -> Result<Query> {
         _ if ignore_unmapped => return Ok(Query::MatchNone),
         _ => return Err(ctx.shard_err(format!("failed to create query: [nested] failed to find nested object under path [{path}]"))),
     }
-    let q = parse_query(inner, ctx).map_err(|e| e.default_key("query", Some("nested")))?;
+    NESTED_PARSE.with(|n| n.borrow_mut().push(path.to_string()));
+    let q = parse_query(inner, ctx);
+    NESTED_PARSE.with(|n| n.borrow_mut().pop());
+    let q = q.map_err(|e| e.default_key("query", Some("nested")))?;
     Ok(with_boost(Query::Nested { path: path.to_string(), query: Box::new(q), score_mode, filter: false }, boost_of(o)?))
+}
+
+thread_local! {
+    /// The `nested` query paths enclosing the query being parsed.
+    static NESTED_PARSE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The nested scope one level above the innermost `nested` query enclosing
+/// the query being parsed (ES `NestedScope.previousLevel()`): `None` for
+/// the root documents (also at the top level).
+pub fn outer_nested_scope() -> Option<String> {
+    NESTED_PARSE.with(|n| {
+        let n = n.borrow();
+        n.len().checked_sub(2).and_then(|i| n.get(i).cloned())
+    })
 }
 
 /// Is `spec` a valid `minimum_should_match` combination (`2<75%`, `-25%`, `3`)?

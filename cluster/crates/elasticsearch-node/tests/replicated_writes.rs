@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 const TERMS: usize = 3;
 const STREAMS: usize = 3;
 const STREAM_RETRY: usize = 3;
+const COMPETING: usize = 3;
+const SCRIPTED_RETRY: usize = 3;
+const ACTIVE_SHARDS: usize = 3;
 const REFRESH: usize = 3;
 const REALTIME: usize = 3;
 const TSDB_JOIN: usize = 3;
@@ -740,4 +743,319 @@ async fn conflicting_dynamic_types_converge_with_replicas() {
         let v = search(&pl, n, "/idle/_search?preference=_shards:0%7C_only_local", json!({"size": 0, "track_total_hits": true})).await;
         assert_eq!(v["hits"]["total"]["value"], 1, "n{n}'s copy: {v}");
     }
+}
+
+/// A request sent now from its own client, answered later: `(status, body)`,
+/// status 0 for no answer. `ndjson` bodies go to `_bulk`.
+fn send_later(pl: &Procs, via: usize, method: Method, path: &str, body: Value, ndjson: Option<String>) -> tokio::task::JoinHandle<(u16, Value)> {
+    let (cl, url) = (reqwest::Client::new(), format!("http://127.0.0.1:{}{path}", pl.p.http[via]));
+    tokio::spawn(async move {
+        let r = cl.request(method, url).timeout(Duration::from_secs(150));
+        let r = match ndjson {
+            Some(lines) => r.header("content-type", "application/x-ndjson").body(lines),
+            None => r.json(&body),
+        };
+        match r.send().await {
+            Ok(r) => (r.status().as_u16(), r.json::<Value>().await.unwrap_or(Value::Null)),
+            Err(e) => (0, json!(e.to_string())),
+        }
+    })
+}
+
+/// The status of a single-item bulk's item (the request's own for a 2xx/
+/// 4xx/5xx without items).
+fn item_status(st: u16, v: &Value) -> (u16, Value) {
+    match v["items"][0].as_object().and_then(|o| o.values().next()) {
+        Some(inner) if st == 200 => (inner["status"].as_u64().unwrap_or(0) as u16, inner.clone()),
+        _ => (st, v.clone()),
+    }
+}
+
+/// Production review #14: two clients send the identical create (client
+/// id), compare-and-set (`if_seq_no`/`if_primary_term`) and external-version
+/// write, individually and in bulk. Both first attempts are lost (the
+/// primary's node hangs, then dies), and both are retried on the promoted
+/// replica: one applies, the other conflicts. ES picks exactly one winner;
+/// the loser's conflict must never be turned into success by comparing the
+/// stored document with its own request (that tells both that they won).
+/// The loser gets the conflict or, as its first attempt's outcome is
+/// unknown, that attempt's 5xx; never a 2xx.
+///
+/// A single writer's lost attempt (client-id create, bulk create, CAS,
+/// auto-id create) is retried as ES does: applied exactly once, answered
+/// with success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn competing_retried_writes_have_exactly_one_winner() {
+    let mut pl = start_procs(COMPETING, &[("cluster.fault_detection.follower_check.timeout", "30s"), ("cluster.follower_lag.timeout", "120s")]).await;
+    let a = pl.master(0).await;
+    let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+    // One shard: primary on b, replica on c, coordinated by a.
+    create(&pl, a, "race", json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.routing.allocation.require._name": format!("n{b}")},
+        "mappings": {"properties": {"seq": {"type": "keyword"}}}})).await;
+    let (st, v) = pl.call(a, Method::PUT, "/race/_settings", Some(json!({"index.routing.allocation.require._name": null,
+        "index.routing.allocation.exclude._name": format!("n{a}"), "index.number_of_replicas": 1}))).await;
+    assert_eq!(st, 200, "{v}");
+    pl.wait_health(a, "race", "green", 60).await;
+    assert_eq!(holders(&pl, a, "race", 0).await, vec![b, c]);
+    // The documents the conditional writes target.
+    let mut cas = BTreeMap::new();
+    for id in ["cas", "cas-bulk", "solo-cas"] {
+        let (st, v) = pl.call(a, Method::PUT, &format!("/race/_doc/{id}"), Some(json!({"seq": "seed"}))).await;
+        assert_eq!(st, 201, "{v}");
+        cas.insert(id, (v["_seq_no"].as_i64().unwrap(), v["_primary_term"].as_i64().unwrap()));
+    }
+    for id in ["ext", "ext-bulk"] {
+        let (st, v) = pl.call(a, Method::PUT, &format!("/race/_doc/{id}?version=1&version_type=external"), Some(json!({"seq": "seed"}))).await;
+        assert_eq!(st, 201, "{v}");
+    }
+    let bulk_line = |action: Value, seq: &str| format!("{action}\n{}\n", json!({"seq": seq}));
+    let body = json!({"seq": "same"});
+    // (name, method, path, ndjson) of each competing pair's identical request.
+    let (cs, ct) = cas["cas"];
+    let (bs, bt) = cas["cas-bulk"];
+    let pairs: Vec<(&str, Method, String, Option<String>)> = vec![
+        ("create", Method::PUT, "/race/_create/c1".into(), None),
+        ("create op_type", Method::PUT, "/race/_doc/c2?op_type=create".into(), None),
+        ("cas", Method::PUT, format!("/race/_doc/cas?if_seq_no={cs}&if_primary_term={ct}"), None),
+        ("external", Method::PUT, "/race/_doc/ext?version=5&version_type=external".into(), None),
+        ("bulk create", Method::POST, "/race/_bulk".into(), Some(bulk_line(json!({"create": {"_id": "c3"}}), "same"))),
+        ("bulk cas", Method::POST, "/race/_bulk".into(), Some(bulk_line(json!({"index": {"_id": "cas-bulk", "if_seq_no": bs, "if_primary_term": bt}}), "same"))),
+        ("bulk external", Method::POST, "/race/_bulk".into(), Some(bulk_line(json!({"index": {"_id": "ext-bulk", "version": 5, "version_type": "external"}}), "same"))),
+    ];
+    let (ss, stm) = cas["solo-cas"];
+    let solos: Vec<(&str, Method, String, Option<String>)> = vec![
+        ("solo create", Method::PUT, "/race/_create/s1".into(), None),
+        ("solo bulk create", Method::POST, "/race/_bulk".into(), Some(bulk_line(json!({"create": {"_id": "s2"}}), "solo"))),
+        ("solo cas", Method::PUT, format!("/race/_doc/solo-cas?if_seq_no={ss}&if_primary_term={stm}"), None),
+        ("solo auto-id", Method::POST, "/race/_doc".into(), None),
+    ];
+
+    // b hangs: every first attempt reaches it and goes unanswered.
+    pl.pause(b);
+    let mut racing = Vec::new();
+    for (name, m, path, nd) in &pairs {
+        let first = send_later(&pl, a, m.clone(), path, body.clone(), nd.clone());
+        let second = send_later(&pl, a, m.clone(), path, body.clone(), nd.clone());
+        racing.push((*name, first, second));
+    }
+    let mut solo = Vec::new();
+    for (name, m, path, nd) in &solos {
+        solo.push((*name, send_later(&pl, a, m.clone(), path, json!({"seq": "solo"}), nd.clone())));
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(racing.iter().all(|(_, x, y)| !x.is_finished() && !y.is_finished()), "the writes wait for the hung primary");
+    // Its connections close: every first attempt's outcome is unknown, and
+    // each is retried on c, promoted.
+    pl.kill(b);
+    let mut errs = Vec::new();
+    for (name, first, second) in racing {
+        let (s1, v1) = first.await.unwrap();
+        let (s2, v2) = second.await.unwrap();
+        let ((s1, i1), (s2, i2)) = (item_status(s1, &v1), item_status(s2, &v2));
+        let won = [s1, s2].iter().filter(|s| (200..300).contains(*s)).count();
+        if won != 1 {
+            errs.push(format!("{name}: {won} winners: {s1} {i1} | {s2} {i2}"));
+            continue;
+        }
+        let lost = if (200..300).contains(&s1) { (s2, i2) } else { (s1, i1) };
+        if !(lost.0 == 409 || lost.0 >= 500) {
+            errs.push(format!("{name}: the loser answered {} {}", lost.0, lost.1));
+        }
+    }
+    let mut auto_id = None;
+    for (name, h) in solo {
+        let (st, v) = h.await.unwrap();
+        let (st, inner) = item_status(st, &v);
+        if !(200..300).contains(&st) {
+            errs.push(format!("{name}: a single writer's retry answered {st} {inner}"));
+        }
+        if name == "solo auto-id" {
+            auto_id = inner["_id"].as_str().map(str::to_string);
+        }
+    }
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+    pl.wait_nodes(a, 2, 60).await;
+    let (st, v) = pl.call(a, Method::POST, "/race/_refresh", None).await;
+    assert_eq!(st, 200, "{v}");
+    // Every document exists once, with the value written.
+    let (_, all) = scroll_all(&pl, a, "race").await;
+    let ids: BTreeSet<&str> = all.iter().filter_map(|h| h["_id"].as_str()).collect();
+    assert_eq!(ids.len(), all.len(), "{}", json!(all));
+    for id in ["c1", "c2", "c3", "cas", "cas-bulk", "ext", "ext-bulk"] {
+        let doc = all.iter().find(|h| h["_id"] == id).unwrap_or_else(|| panic!("{id} missing"));
+        assert_eq!(doc["_source"]["seq"], "same", "{doc}");
+    }
+    for id in ["s1", "s2", "solo-cas"] {
+        let doc = all.iter().find(|h| h["_id"] == id).unwrap_or_else(|| panic!("{id} missing"));
+        assert_eq!(doc["_source"]["seq"], "solo", "{doc}");
+    }
+    let autos: Vec<&Value> = all.iter().filter(|h| h["_source"]["seq"] == "solo" && !["s1", "s2", "solo-cas"].contains(&h["_id"].as_str().unwrap_or_default())).collect();
+    assert_eq!(autos.len(), 1, "the auto-id create applied once: {}", json!(autos));
+    assert_eq!(autos[0]["_id"].as_str(), auto_id.as_deref());
+    // External versions: the winner's.
+    for id in ["ext", "ext-bulk"] {
+        let (_, v) = pl.call(a, Method::GET, &format!("/race/_doc/{id}"), None).await;
+        assert_eq!(v["_version"], 5, "{v}");
+    }
+}
+
+/// Production review #35: a scripted update whose response is lost (the
+/// primary's node dies with updates in flight; the replica is promoted)
+/// is never run a second time by the coordinator's retry. Each writer
+/// appends its own sequence numbers to its own document, one update at a
+/// time, by single `_update` and by bulk `update` items: no number appears
+/// twice, every acknowledged one appears exactly once, and a definitely
+/// failed one never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scripted_update_is_never_applied_twice_by_a_retry() {
+    let mut pl = start_procs(SCRIPTED_RETRY, &[]).await;
+    let a = pl.master(0).await;
+    let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+    create(&pl, a, "incr", json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0, "index.routing.allocation.require._name": format!("n{b}")},
+        "mappings": {"properties": {"applied": {"type": "long"}}}})).await;
+    let (st, v) = pl.call(a, Method::PUT, "/incr/_settings", Some(json!({"index.routing.allocation.require._name": null,
+        "index.routing.allocation.exclude._name": format!("n{a}"), "index.number_of_replicas": 1}))).await;
+    assert_eq!(st, 200, "{v}");
+    pl.wait_health(a, "incr", "green", 60).await;
+    assert_eq!(holders(&pl, a, "incr", 0).await, vec![b, c]);
+    const WRITERS: usize = 6;
+    for w in 0..WRITERS {
+        let (st, v) = pl.call(a, Method::PUT, &format!("/incr/_doc/w{w}"), Some(json!({"applied": []}))).await;
+        assert_eq!(st, 201, "{v}");
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    // (acked, definitely failed, unknown) sequence numbers per writer.
+    let writers: Vec<_> = (0..WRITERS).map(|w| {
+        // Coordinated by a or c (b dies).
+        let (cl, port, stop) = (reqwest::Client::new(), pl.p.http[if w % 2 == 0 { a } else { c }], stop.clone());
+        tokio::spawn(async move {
+            let (mut acked, mut failed, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
+            let mut i: i64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                i += 1;
+                let script = json!({"source": "ctx._source.applied.add(params.i)", "params": {"i": i}});
+                let r = if w < WRITERS / 2 {
+                    cl.post(format!("http://127.0.0.1:{port}/incr/_update/w{w}")).timeout(Duration::from_secs(90)).json(&json!({"script": script})).send().await
+                } else {
+                    let lines = format!("{}\n{}\n", json!({"update": {"_index": "incr", "_id": format!("w{w}")}}), json!({"script": script}));
+                    cl.post(format!("http://127.0.0.1:{port}/_bulk")).timeout(Duration::from_secs(90)).header("content-type", "application/x-ndjson").body(lines).send().await
+                };
+                let (st, v) = match r {
+                    Ok(r) => (r.status().as_u16(), r.json::<Value>().await.unwrap_or(Value::Null)),
+                    Err(_) => (0, Value::Null),
+                };
+                let st = match v["items"][0]["update"]["status"].as_u64() {
+                    Some(s) if st == 200 => s as u16,
+                    _ => st,
+                };
+                match st {
+                    200..=299 => acked.push(i),
+                    400..=499 => failed.push(i),
+                    _ => unknown.push(i),
+                }
+            }
+            (w, acked, failed, unknown)
+        })
+    }).collect();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    pl.kill(b);
+    pl.wait_nodes(a, 2, 60).await;
+    wait_promoted(&pl, a, "incr", 0, b).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    stop.store(true, Ordering::Relaxed);
+    let mut errs = Vec::new();
+    let mut total_acked = 0;
+    for h in writers {
+        let (w, acked, failed, unknown) = h.await.unwrap();
+        total_acked += acked.len();
+        let (st, doc) = pl.call(a, Method::GET, &format!("/incr/_doc/w{w}"), None).await;
+        assert_eq!(st, 200, "{doc}");
+        let applied: Vec<i64> = doc["_source"]["applied"].as_array().unwrap_or(&Vec::new()).iter().filter_map(Value::as_i64).collect();
+        let distinct: BTreeSet<i64> = applied.iter().copied().collect();
+        if distinct.len() != applied.len() {
+            errs.push(format!("w{w}: an update applied twice: {applied:?} (unknown outcomes {unknown:?})"));
+        }
+        for i in &acked {
+            if !distinct.contains(i) {
+                errs.push(format!("w{w}: acknowledged {i} is missing: {applied:?}"));
+            }
+        }
+        for i in &failed {
+            if distinct.contains(i) {
+                errs.push(format!("w{w}: definitely failed {i} was applied: {applied:?}"));
+            }
+        }
+        for i in &distinct {
+            if !acked.contains(i) && !unknown.contains(i) {
+                errs.push(format!("w{w}: {i} applied but never answered: {applied:?}"));
+            }
+        }
+    }
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+    assert!(total_acked > WRITERS * 5, "too few updates acknowledged to test anything: {total_acked}");
+}
+
+/// Production review #63: a document write or bulk item checks
+/// `wait_for_active_shards` (else `index.write.wait_for_active_shards`)
+/// against its shard's active copies before anything is mutated: with a
+/// replica that cannot be assigned, `all` times out with ES's 503
+/// `unavailable_shards_exception` and writes nothing; once the replica is
+/// allocated, the same request succeeds. The default (1) is unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_wait_for_the_requested_active_shards() {
+    let pl = start_procs(ACTIVE_SHARDS, &[]).await;
+    let a = pl.master(0).await;
+    // Every copy must live on a: the replica stays unassigned.
+    create_yellow(&pl, a, "was", json!({"settings": {"number_of_shards": 1, "number_of_replicas": 1, "index.routing.allocation.require._name": format!("n{a}")}})).await;
+    let short = |st: u16, v: &Value| st == 503 && v["error"]["type"] == "unavailable_shards_exception"
+        && v["error"]["reason"].as_str().is_some_and(|r| r.contains("Not enough active copies to meet shard count of [ALL] (have 1, needed 2)"));
+    // Default: one active copy is enough.
+    let (st, v) = pl.call(a, Method::PUT, "/was/_doc/d0", Some(json!({"n": 0}))).await;
+    assert_eq!(st, 201, "{v}");
+    // The request parameter: single write, update, delete and bulk.
+    let started = Instant::now();
+    let (st, v) = pl.call(a, Method::PUT, "/was/_doc/d1?wait_for_active_shards=all&timeout=2s", Some(json!({"n": 1}))).await;
+    assert!(short(st, &v), "{st} {v}");
+    assert!(started.elapsed() >= Duration::from_secs(2), "answered before the timeout: {:?}", started.elapsed());
+    let (st, v) = pl.call(a, Method::POST, "/was/_update/d0?wait_for_active_shards=all&timeout=1s", Some(json!({"doc": {"n": 9}}))).await;
+    assert!(short(st, &v), "{st} {v}");
+    let (st, v) = pl.call(a, Method::DELETE, "/was/_doc/d0?wait_for_active_shards=all&timeout=1s", None).await;
+    assert!(short(st, &v), "{st} {v}");
+    let lines = format!("{}\n{}\n{}\n", json!({"index": {"_id": "d2"}}), json!({"n": 2}), json!({"delete": {"_id": "d0"}}));
+    let (st, v) = pl.ndjson(a, "/was/_bulk?wait_for_active_shards=all&timeout=1s", lines.clone()).await;
+    assert_eq!(st, 200, "{v}");
+    for item in v["items"].as_array().cloned().unwrap_or_default() {
+        let inner = item.as_object().and_then(|o| o.values().next()).cloned().unwrap_or(Value::Null);
+        assert!(short(inner["status"].as_u64().unwrap_or(0) as u16, &json!({"error": inner["error"]})), "{v}");
+    }
+    // The index setting, without the parameter.
+    let (st, v) = pl.call(a, Method::PUT, "/was/_settings", Some(json!({"index.write.wait_for_active_shards": "all"}))).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = pl.call(a, Method::PUT, "/was/_doc/d3?timeout=1s", Some(json!({"n": 3}))).await;
+    assert!(short(st, &v), "{st} {v}");
+    // Nothing was mutated.
+    let (st, v) = pl.call(a, Method::POST, "/was/_refresh", None).await;
+    assert_eq!(st, 200, "{v}");
+    let (_, v) = pl.call(a, Method::GET, "/was/_doc/d0", None).await;
+    assert_eq!((v["found"].clone(), v["_source"]["n"].clone(), v["_version"].clone()), (json!(true), json!(0), json!(1)), "{v}");
+    for id in ["d1", "d2", "d3"] {
+        let (st, v) = pl.call(a, Method::GET, &format!("/was/_doc/{id}"), None).await;
+        assert_eq!(st, 404, "{id}: {v}");
+    }
+    // Allocating the replica unblocks the same requests.
+    let (st, v) = pl.call(a, Method::PUT, "/was/_settings", Some(json!({"index.routing.allocation.require._name": null}))).await;
+    assert_eq!(st, 200, "{v}");
+    pl.wait_health(a, "was", "green", 60).await;
+    let (st, v) = pl.call(a, Method::PUT, "/was/_doc/d1?wait_for_active_shards=all&timeout=5s", Some(json!({"n": 1}))).await;
+    assert_eq!(st, 201, "{v}");
+    let (st, v) = pl.call(a, Method::PUT, "/was/_doc/d3?timeout=5s", Some(json!({"n": 3}))).await;
+    assert_eq!(st, 201, "{v}");
+    let (st, v) = pl.ndjson(a, "/was/_bulk?wait_for_active_shards=all&timeout=5s", lines).await;
+    assert_eq!((st, v["errors"].clone()), (200, json!(false)), "{v}");
+}
+
+async fn create_yellow(pl: &Procs, via: usize, index: &str, body: Value) {
+    let (st, v) = pl.call(via, Method::PUT, &format!("/{index}"), Some(body)).await;
+    assert_eq!(st, 200, "{v}");
+    pl.wait_health(via, index, "yellow", 60).await;
 }

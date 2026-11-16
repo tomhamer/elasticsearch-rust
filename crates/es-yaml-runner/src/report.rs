@@ -34,7 +34,7 @@ fn md_escape(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ").replace('`', "'")
 }
 
-pub fn write_json(path: &Path, results: &[TestResult]) {
+pub fn write_json(path: &Path, results: &[TestResult]) -> std::io::Result<()> {
     let v: Vec<_> = results
         .iter()
         .map(|r| {
@@ -46,7 +46,7 @@ pub fn write_json(path: &Path, results: &[TestResult]) {
             json!({"file": r.file, "dir": r.dir, "name": r.name, "status": status, "msg": msg, "category": cat})
         })
         .collect();
-    let _ = std::fs::write(path, serde_json::to_vec_pretty(&v).unwrap_or_default());
+    std::fs::write(path, serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?)
 }
 
 #[derive(Default)]
@@ -56,7 +56,7 @@ struct Counts {
     skip: usize,
 }
 
-pub fn write_markdown(path: &Path, results: &[TestResult], version: &str, filters: &[String]) {
+pub fn write_markdown(path: &Path, results: &[TestResult], version: &str, filters: &[String]) -> std::io::Result<()> {
     let old_notes = std::fs::read_to_string(path).ok().and_then(|s| {
         let a = s.find(NOTES_START)?;
         let b = s.find(NOTES_END)?;
@@ -157,5 +157,5 @@ pub fn write_markdown(path: &Path, results: &[TestResult], version: &str, filter
     for (why, n) in sk.iter().take(40) {
         s.push_str(&format!("| {} | {n} |\n", md_escape(why)));
     }
-    let _ = std::fs::write(path, s);
+    std::fs::write(path, s)
 }

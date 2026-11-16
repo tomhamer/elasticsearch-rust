@@ -68,7 +68,11 @@ pub(crate) fn write_durable(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
     }
     std::fs::rename(&tmp, path)?;
     if durable {
-        sync_dir(path.parent());
+        // A failed directory fsync fails the write: the rename may not be
+        // durable, and the caller must not report the state as persisted.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            rustic_core::platform::sync_dir(dir)?;
+        }
     }
     Ok(())
 }

@@ -3,13 +3,15 @@
 use crate::crd::{Elasticsearch, NodeSet};
 use crate::es_client::Health;
 use crate::names::{self, *};
+use crate::security;
 use crate::settings::{self, RenderedConfig};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetPersistentVolumeClaimRetentionPolicy, StatefulSetSpec, StatefulSetUpdateStrategy};
 use k8s_openapi::api::core::v1::{
     Affinity, ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource, ExecAction, ObjectFieldSelector, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Service, ServicePort, ServiceSpec,
-    Volume, VolumeMount, VolumeResourceRequirements, WeightedPodAffinityTerm,
+    PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Secret, SecretKeySelector,
+    SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements, WeightedPodAffinityTerm,
 };
+use k8s_openapi::ByteString;
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
@@ -22,9 +24,13 @@ pub const DEFAULT_MEMORY: &str = "2Gi";
 pub const DEFAULT_STORAGE: &str = "1Gi";
 pub const DEFAULT_TERMINATION_GRACE_SECONDS: i64 = 180;
 
-/// Readiness: the node's HTTP layer answers `GET /_cluster/health?local=true`
-/// with 200 within 3 seconds (same contract as ECK's readiness script).
-pub const READINESS_SCRIPT: &str = r#"code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:9200/_cluster/health?local=true") && [ "$code" = 200 ]"#;
+/// Readiness: the node's HTTP layer answers an authenticated
+/// `GET /_cluster/health?local=true` over HTTPS with 200 within 3 seconds
+/// (same contract as ECK's readiness script). The certificate is verified
+/// against the HTTP Service name (`ES_HTTP_HOST`, resolved to the local
+/// node) and the cluster CA when the certificate Secret has one; the
+/// password reaches curl through a config file descriptor, not argv.
+pub const READINESS_SCRIPT: &str = r##"ca=/usr/share/elasticsearch/certs/http/ca.crt; opts=(); [ -s "$ca" ] && opts=(--cacert "$ca"); p="${ELASTIC_PASSWORD//\\/\\\\}"; p="${p//\"/\\\"}"; code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "${opts[@]}" --resolve "${ES_HTTP_HOST}:9200:127.0.0.1" -K <(printf 'user = "elastic:%s"\n' "$p") "https://${ES_HTTP_HOST}:9200/_cluster/health?local=true") && [ "$code" = 200 ]"##;
 
 pub fn image(es: &Elasticsearch, default_repo: &str) -> String {
     es.spec.image.clone().unwrap_or_else(|| format!("{default_repo}:{}", es.spec.version))
@@ -183,12 +189,24 @@ pub fn statefulset(es: &Elasticsearch, ns: &NodeSet, cfg: &RenderedConfig, repli
         ]);
     }
     let env = ct.env.get_or_insert_with(Vec::new);
+    let namespace = es.namespace().unwrap_or_else(|| "default".into());
     let ours = [
         env_field("POD_NAME", "metadata.name"),
         env_field("POD_IP", "status.podIP"),
         env_field("NODE_NAME", "spec.nodeName"),
         env_field("NAMESPACE", "metadata.namespace"),
         EnvVar { name: "ES_PATH_CONF".into(), value: Some(CONFIG_DIR.into()), ..Default::default() },
+        // The `elastic` user's bootstrap password (the node reads it).
+        EnvVar {
+            name: "ELASTIC_PASSWORD".into(),
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector { name: security::elastic_user_secret(&c), key: security::ELASTIC_USER_KEY.into(), optional: Some(false) }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        // Name the readiness probe verifies the HTTP certificate against.
+        EnvVar { name: "ES_HTTP_HOST".into(), value: Some(security::http_service_host(&c, &namespace)), ..Default::default() },
     ];
     for (i, e) in ours.into_iter().enumerate() {
         if !env.iter().any(|x| x.name == e.name) {
@@ -200,6 +218,10 @@ pub fn statefulset(es: &Elasticsearch, ns: &NodeSet, cfg: &RenderedConfig, repli
         if !mounts.iter().any(|m| m.mount_path == path) {
             mounts.push(VolumeMount { name: vol.into(), mount_path: path.into(), ..Default::default() });
         }
+    }
+    for (vol, path) in [(security::HTTP_CERTS_VOLUME, security::HTTP_CERTS_DIR), (security::TRANSPORT_CERTS_VOLUME, security::TRANSPORT_CERTS_DIR)] {
+        mounts.retain(|m| m.mount_path != path);
+        mounts.push(VolumeMount { name: vol.into(), mount_path: path.into(), read_only: Some(true), ..Default::default() });
     }
     if ct.resources.is_none() {
         let mem = BTreeMap::from([("memory".to_string(), Quantity(DEFAULT_MEMORY.into()))]);
@@ -218,6 +240,7 @@ pub fn statefulset(es: &Elasticsearch, ns: &NodeSet, cfg: &RenderedConfig, repli
     }
 
     // --- volumes
+    let fs_group = spec.security_context.as_ref().is_some_and(|s| s.fs_group.is_some());
     let vols = spec.volumes.get_or_insert_with(Vec::new);
     if !vols.iter().any(|v| v.name == CONFIG_VOLUME) {
         vols.push(Volume {
@@ -228,6 +251,13 @@ pub fn statefulset(es: &Elasticsearch, ns: &NodeSet, cfg: &RenderedConfig, repli
     }
     if !vols.iter().any(|v| v.name == LOGS_VOLUME) {
         vols.push(Volume { name: LOGS_VOLUME.into(), empty_dir: Some(EmptyDirVolumeSource::default()), ..Default::default() });
+    }
+    // Certificates: readable by the node's group (fsGroup) only; without an
+    // fsGroup the files are owned by root and must be world-readable.
+    let mode = if fs_group { 0o440 } else { 0o444 };
+    for (vol, secret) in [(security::HTTP_CERTS_VOLUME, security::http_certs_internal_secret(&c)), (security::TRANSPORT_CERTS_VOLUME, security::transport_certs_secret(&c))] {
+        vols.retain(|v| v.name != vol);
+        vols.push(Volume { name: vol.into(), secret: Some(SecretVolumeSource { secret_name: Some(secret), default_mode: Some(mode), optional: Some(false), ..Default::default() }), ..Default::default() });
     }
 
     let mut claims: Vec<PersistentVolumeClaim> = match &ns.volume_claim_templates {
@@ -258,6 +288,20 @@ pub fn statefulset(es: &Elasticsearch, ns: &NodeSet, cfg: &RenderedConfig, repli
         }),
         ..Default::default()
     })
+}
+
+/// A Secret owned by the cluster (garbage-collected with it).
+pub fn secret(es: &Elasticsearch, name: &str, data: &security::SecretData) -> Secret {
+    let mut metadata = meta(es, name.to_string(), BTreeMap::new());
+    if !data.annotations.is_empty() {
+        metadata.annotations = Some(data.annotations.clone());
+    }
+    Secret {
+        metadata,
+        type_: Some("Opaque".into()),
+        data: Some(data.data.iter().map(|(k, v)| (k.clone(), ByteString(v.clone()))).collect()),
+        ..Default::default()
+    }
 }
 
 /// The PodDisruptionBudget, or `None` when disabled (`podDisruptionBudget: {}`).
@@ -335,6 +379,24 @@ mod tests {
         assert!(env.contains(&"POD_NAME") && env.contains(&"POD_IP"));
         assert!(ct.volume_mounts.as_ref().unwrap().iter().any(|m| m.mount_path == DATA_DIR));
         assert_eq!(spec.volume_claim_templates.unwrap()[0].metadata.name.as_deref(), Some(DATA_VOLUME));
+        // Security: the elastic password from its Secret, certificates mounted
+        // read-only, an HTTPS + credentials readiness probe.
+        let pw = ct.env.as_ref().unwrap().iter().find(|e| e.name == "ELASTIC_PASSWORD").unwrap();
+        let sel = pw.value_from.as_ref().unwrap().secret_key_ref.as_ref().unwrap();
+        assert_eq!((sel.name.as_str(), sel.key.as_str()), ("prod-es-elastic-user", "elastic"));
+        let host = ct.env.as_ref().unwrap().iter().find(|e| e.name == "ES_HTTP_HOST").unwrap();
+        assert_eq!(host.value.as_deref(), Some("prod-es-http.search.svc"));
+        for (dir, secret) in [(security::HTTP_CERTS_DIR, "prod-es-http-certs-internal"), (security::TRANSPORT_CERTS_DIR, "prod-es-transport-certs")] {
+            let m = ct.volume_mounts.as_ref().unwrap().iter().find(|m| m.mount_path == dir).unwrap();
+            assert_eq!(m.read_only, Some(true));
+            let v = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == m.name).unwrap();
+            let s = v.secret.as_ref().unwrap();
+            assert_eq!(s.secret_name.as_deref(), Some(secret));
+            assert_eq!(s.default_mode, Some(0o440));
+        }
+        let probe = ct.readiness_probe.as_ref().unwrap().exec.as_ref().unwrap().command.as_ref().unwrap();
+        assert!(probe[2].contains("https://${ES_HTTP_HOST}:9200") && probe[2].contains("--cacert") && probe[2].contains("-K <("));
+        assert!(!probe[2].contains("http://"), "no plain-text HTTP");
     }
 
     #[test]
@@ -368,6 +430,26 @@ mod tests {
         let claims = spec.volume_claim_templates.unwrap();
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].spec.as_ref().unwrap().storage_class_name.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn readiness_script_runs_in_bash() {
+        // Syntax only (bash -n): the probe is a bash one-liner.
+        let out = std::process::Command::new("bash").args(["-n", "-c", READINESS_SCRIPT]).output();
+        if let Ok(out) = out {
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    #[test]
+    fn secrets_are_owned_and_annotated() {
+        let e = es(ElasticsearchSpec { version: "9".into(), ..Default::default() });
+        let d = security::SecretData { data: BTreeMap::from([("k".into(), b"v".to_vec())]), annotations: BTreeMap::from([("a".into(), "b".into())]) };
+        let s = secret(&e, "prod-es-elastic-user", &d);
+        assert_eq!(s.metadata.owner_references.unwrap()[0].uid, "uid-1");
+        assert_eq!(s.metadata.annotations.unwrap()["a"], "b");
+        assert_eq!(s.data.unwrap()["k"].0, b"v");
+        assert_eq!(s.metadata.labels.unwrap()[LABEL_CLUSTER_NAME], "prod");
     }
 
     #[test]

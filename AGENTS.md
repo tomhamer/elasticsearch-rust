@@ -63,8 +63,12 @@ Repository overview and doc map: [README.md](README.md).
 - Use two real nodes by default for core/security/x-pack fixtures so replicas
   can allocate. Match module-specific users, roles, licences, registries, test
   services and explicit topology exceptions. Real CCS requires separate
-  clusters and networking; a self-alias test is not enough. CCR is not
-  supported (requests are rejected with `connect_transport_exception`).
+  clusters and networking; a self-alias test is not enough. CCS and CCR
+  run between separate rustic clusters (`cluster/ARCHITECTURE.md`); test
+  them with the multi-process suites (`ccs_cross_cluster`,
+  `ccr_cross_cluster`) and `bench/path-poc/es9-parity/ccs_ccr_yaml.py`
+  (ES 9.5.5 mcss/ccr/oss-ccs YAML). Interop with real ES clusters is not
+  supported.
 - Fix related functionality in batches, then build and run the affected
   groups on EC2. Start from the failure batches of the existing baseline; don't
   wait for supplemental coverage runs before fixing known defects.
